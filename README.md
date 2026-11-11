@@ -177,6 +177,35 @@ additionally needs the reference `flac` encoder. The binaries are built for
 **x86-64-v3** (AVX2, i.e. Haswell/Excavator 2013 and later); on older hardware build
 from source without `--target-cpu`.
 
+### Are those artefacts reproducible?
+
+Within one toolchain, yes — measured, not asserted. The same commit built from two
+different checkout paths now yields **byte-identical** files for all five, and
+`sha256sums.txt` is the evidence. Four things were in the way, found in this order:
+
+- a Rust release binary keeps the source path of every panic message in `.rodata`, and
+  `strip --strip-all` does not remove it → `--remap-path-prefix`
+- `tar` and `zip` record mtimes and ownership, `gzip` records a timestamp → fixed
+  mtime/owner/order, `gzip -n`, zip written with a fixed stamp
+- the AppImage's squashfs records the build time → `SOURCE_DATE_EPOCH=0`
+- GNU `ld` writes the link time into the PE `TimeDateStamp`, and GNU `strip` then writes
+  the *current* clock there even after you asked `ld` not to → both it and the image
+  checksum covering it are zeroed after stripping (0 means "not computed", which an
+  application may say). The exe still loads and still renders a bit-identical FLAC,
+  checked under Wine.
+
+Across **different distributions**, no — and it is worth being exact about why: the final
+link uses the distro's `ld` and CRT objects (for the Windows target, its mingw binutils),
+so Arch and GitHub's Ubuntu runner produce different bytes from identical source.
+Same distro plus same tag gives the same file; that is the honest claim, and closing the
+rest means a pinned container rather than another compiler flag.
+
+What *is* guaranteed across machines is the thing that matters here: the **audio**.
+`810.mka` rendered by the Windows binary under Wine against a BtbN ffmpeg, and by the
+Linux binary against a distro ffmpeg, produced SHA-256
+`0c3d30cdaff5dffc5db24360b353bca9d1a8393a664a1e13a085540434a2eb9a` both times — the same
+file, from different builds, on different platforms.
+
 ## Optimized builds (x86-64-v3)
 
 The default release build is generic x86-64. The optimized flavour is **explicit**, never
