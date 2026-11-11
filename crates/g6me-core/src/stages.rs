@@ -147,8 +147,18 @@ impl Default for IrCfg {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum OutFormat {
-    /// FLAC. 16/32-bit come from ffmpeg's encoder; 24-bit needs the reference
-    /// `flac` encoder, because ffmpeg's FLAC encoder only emits 16 or 32.
+    /// FLAC, written by ffmpeg's own encoder.
+    ///
+    /// Depth is 16 or 24 bit integer. ffmpeg's encoder advertises `s16 s32` as
+    /// its input sample formats and derives the stream's bits-per-sample from what
+    /// it is fed: fed 24-bit samples it writes a genuine `bps=24` stream, and
+    /// decoding that stream returns the input bytes exactly (`flac -t` says ok).
+    /// It cannot carry 32-bit PCM — fed true 32-bit it still writes bps=24 and
+    /// drops the low byte of every sample — so 32-bit output is WAV only, and
+    /// asking for 32-bit FLAC is rejected rather than quietly downgraded.
+    ///
+    /// `level` is ffmpeg's FLAC compression level, 0..=12 (12 packs smallest);
+    /// 13 is refused by the encoder at init, which `g6me --caps` demonstrates.
     Flac {
         level: u32,
     },
@@ -202,7 +212,7 @@ impl Default for OutCfg {
     fn default() -> Self {
         Self {
             format: OutFormat::Flac { level: 8 },
-            depth: BitDepth::S32,
+            depth: BitDepth::S24,
             resample: None,
             precision: 33.0,
             dither: Dither::None,
@@ -226,13 +236,29 @@ impl OutCfg {
                 ));
             }
             if !matches!(level, 0..=12) {
-                return Err(Error::msg("FLAC compression level must be 0..=12"));
-            }
-            if self.depth == BitDepth::S24 && !caps.flac_cli {
+                // Measured against ffmpeg n9.0.2: 0..=12 encode, 13 and up fail at
+                // encoder init with "invalid compression level". The reference flac
+                // CLI's -0..-8 presets are a different scale and no longer in play.
                 return Err(Error::msg(
-                    "24-bit FLAC needs the reference `flac` encoder (ffmpeg's FLAC \
-                     encoder only writes 16- or 32-bit). Install flac, or choose \
-                     16/32-bit FLAC or WAV 24-bit.",
+                    "FLAC compression level must be 0..=12 (ffmpeg's FLAC encoder; \
+                     12 is the smallest file, 13 is refused)",
+                ));
+            }
+            if self.depth == BitDepth::S24 && !caps.flac24 {
+                return Err(Error::msg(
+                    "this ffmpeg was not verified able to write a lossless 24-bit FLAC \
+                     (run `g6me --caps` for the reason). Use '--depth 16', or \
+                     '--format wav --depth 24' which never touches the FLAC encoder.",
+                ));
+            }
+            if self.depth == BitDepth::S32 {
+                return Err(Error::msg(
+                    "32-bit FLAC is not available: ffmpeg's FLAC encoder writes at \
+                     most 24-bit and drops the low byte of every 32-bit sample, so \
+                     the file would be labelled 24-bit while looking 32-bit. Use \
+                     '--format flac --depth 24' for the lossless int file, or \
+                     '--format wav --depth 32' / '--depth f32' for the full width \
+                     of the DSP output.",
                 ));
             }
         }
@@ -477,22 +503,21 @@ pub fn encoder_pump_args(work_rate: u32) -> Vec<String> {
     ]
 }
 
-/// Command line for the consuming (encode) child. `use_flac_cli` means ffmpeg
-/// writes raw 24-bit PCM to stdout and the reference `flac` encoder turns that
-/// into a true 24-bit FLAC file.
+/// Command line for the consuming (encode) child — one ffmpeg process, whatever
+/// the format.
 pub fn output_args(
     cfg: &RenderCfg,
     work_rate: u32,
     out_path: &Path,
     src: &Path,
     caps: &Caps,
-) -> Result<(Vec<String>, bool)> {
+) -> Result<Vec<String>> {
     let o = &cfg.out;
     o.validate(caps)?;
 
     if o.format.is_null() {
         // No encoder child at all; the pump hands samples to the tap.
-        return Ok((Vec::new(), false));
+        return Ok(Vec::new());
     }
     let mut args: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
     if let Some(t) = o.filter_threads {
@@ -535,20 +560,16 @@ pub fn output_args(
     }
     args.push("-y".into());
 
-    let flac_cli = matches!(o.format, OutFormat::Flac { .. }) && o.depth == BitDepth::S24;
     match &o.format {
-        OutFormat::Flac { .. } if flac_cli => {
-            args.push("-f".into());
-            args.push("s24le".into());
-            args.push("-c:a".into());
-            args.push("pcm_s24le".into());
-            args.push("-".into());
-        }
         OutFormat::Flac { level } => {
             args.push("-c:a".into());
             args.push("flac".into());
             args.push("-compression_level".into());
             args.push(level.to_string());
+            // Ask for the depth explicitly instead of letting the encoder pick: a
+            // 24-bit request lands on s32 (libswresample has no s24 format) and the
+            // encoder then derives bps=24 from it, which is what makes the stream
+            // genuinely 24-bit rather than a widened one.
             args.push("-sample_fmt".into());
             args.push(o.depth.swr_fmt().into());
             args.push(out_path.display().to_string());
@@ -560,45 +581,13 @@ pub fn output_args(
         }
         OutFormat::Null => unreachable!("handled above"),
     }
-    Ok((args, flac_cli))
-}
-
-/// Command line for the reference FLAC encoder (stdin raw -> 24-bit FLAC).
-/// The reference encoder's command line, shared by the renderer and by the probe
-/// that decides whether 24-bit is available.
-///
-/// One builder for both on purpose: the probe once carried its own copy of these
-/// flags, so it happily approved a spelling `flac` rejected and the render hung.
-/// `input` is `"-"` when reading PCM from a pipe, or a file path when probing.
-pub fn flac_cli_args(cfg: &RenderCfg, work_rate: u32, out_path: &Path, input: &str) -> Vec<String> {
-    let level = match &cfg.out.format {
-        OutFormat::Flac { level } => *level,
-        OutFormat::Wav | OutFormat::Null => 8,
-    };
-    // The raw-input spellings are `--endian=` / `--sign=` (there is no
-    // `--force-raw-endianness`; flac exits on an unknown option, which would
-    // otherwise strand the render). `-s` suppresses its encode statistics so the
-    // pipe we do not drain cannot fill.
-    vec![
-        "--force-raw-format".into(),
-        "--endian=little".into(),
-        "--sign=signed".into(),
-        "--bps=24".into(),
-        "--channels=2".into(),
-        format!("--sample-rate={work_rate}"),
-        format!("-{level}"),
-        "-s".into(),
-        "-o".into(),
-        out_path.display().to_string(),
-        input.to_string(),
-        "-f".into(),
-    ]
+    Ok(args)
 }
 
 /// Plain-language description of what will happen to the samples, in order. The
 /// GUI shows this so the loss chain is never something you have to reconstruct
 /// from three dropdowns.
-pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32, caps: &Caps) -> Vec<String> {
+pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
     let mut v = Vec::new();
     let (stage, _) = input_stage(cfg, info, mask);
     v.push(format!(
@@ -644,7 +633,7 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32, caps: &Caps) -> 
         _ => "no resample".to_string(),
     };
     v.push(format!(
-        "5. encode {} {}{}{}",
+        "5. encode {} {}{}",
         o.format.label(),
         o.depth.label(),
         if rate == "no resample" {
@@ -652,15 +641,6 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32, caps: &Caps) -> 
         } else {
             format!(", {rate}")
         },
-        if matches!(&o.format, OutFormat::Flac { .. }) && o.depth == BitDepth::S24 {
-            if caps.flac_cli {
-                " [reference flac encoder]".to_string()
-            } else {
-                " [needs flac!]".to_string()
-            }
-        } else {
-            String::new()
-        }
     ));
     v
 }
@@ -721,17 +701,17 @@ mod tests {
     }
 
     #[test]
-    fn default_output_is_flac32_with_no_dither_and_no_resample() {
+    fn default_output_is_flac24_with_no_dither_and_no_resample() {
         let cfg = RenderCfg::with_defaults();
-        let (args, cli) = output_args(
+        let args = output_args(
             &cfg,
             48000,
             Path::new("/tmp/o.flac"),
             Path::new("/tmp/i.mka"),
-            &Caps::default(),
+            &caps_flac24(),
         )
         .unwrap();
-        assert!(!cli);
+        assert_eq!(cfg.out.depth, BitDepth::S24);
         let j = args.join(" ");
         assert!(j.contains("-c:a flac"), "{j}");
         assert!(j.contains("-sample_fmt s32"), "{j}");
@@ -798,19 +778,39 @@ mod tests {
         assert_eq!(stage, InputStage::Noop);
     }
 
+    /// A capability set whose ffmpeg has been measured writing lossless 24-bit
+    /// FLAC, i.e. the state a machine with a working ffmpeg reports.
+    fn caps_flac24() -> Caps {
+        Caps {
+            flac24: true,
+            ..Caps::default()
+        }
+    }
+
     #[test]
-    fn flac_rejects_float_and_24bit_without_the_reference_encoder() {
+    fn flac_rejects_float_and_unverified_24bit() {
         let mut cfg = RenderCfg::with_defaults();
         cfg.out.format = OutFormat::Flac { level: 8 };
         cfg.out.depth = BitDepth::F64;
-        assert!(cfg.out.validate(&Caps::default()).is_err());
+        assert!(cfg.out.validate(&caps_flac24()).is_err());
+        // The default depth is 24-bit, and it is refused on a build where the
+        // probe could not prove 24-bit FLAC is lossless — a file labelled 24-bit
+        // that quietly dropped bits is worse than an error.
         cfg.out.depth = BitDepth::S24;
         assert!(cfg.out.validate(&Caps::default()).is_err());
-        let with_cli = Caps {
-            flac_cli: true,
-            ..Caps::default()
-        };
-        cfg.out.validate(&with_cli).unwrap();
+        cfg.out.validate(&caps_flac24()).unwrap();
+    }
+
+    #[test]
+    fn flac_refuses_32_bit_instead_of_writing_a_24_bit_file() {
+        // ffmpeg labels what it writes bps=24 and throws the low byte of every
+        // 32-bit sample away, so the combination has to be refused by name.
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.out.format = OutFormat::Flac { level: 8 };
+        cfg.out.depth = BitDepth::S32;
+        let e = cfg.out.validate(&caps_flac24()).unwrap_err().to_string();
+        assert!(e.contains("32-bit FLAC"), "{e}");
+        assert!(e.contains("--depth 24"), "{e}");
     }
 
     #[test]
@@ -827,12 +827,12 @@ mod tests {
     fn output_resample_uses_soxr_with_precision() {
         let mut cfg = RenderCfg::with_defaults();
         cfg.out.resample = Some(96000);
-        let (args, _) = output_args(
+        let args = output_args(
             &cfg,
             48000,
             Path::new("/tmp/o.flac"),
             Path::new("/tmp/i.mka"),
-            &Caps::default(),
+            &caps_flac24(),
         )
         .unwrap();
         let j = args.join(" ");
@@ -852,12 +852,7 @@ mod tests {
 
     #[test]
     fn loss_chain_says_off_when_off() {
-        let lines = loss_chain(
-            &RenderCfg::with_defaults(),
-            &info(),
-            crate::dsp::MASK_7_1,
-            &Caps::default(),
-        );
+        let lines = loss_chain(&RenderCfg::with_defaults(), &info(), crate::dsp::MASK_7_1);
         assert_eq!(lines.len(), 5);
         assert!(lines[1].contains("off"), "{}", lines[1]);
         assert!(lines[2].contains("off"), "{}", lines[2]);

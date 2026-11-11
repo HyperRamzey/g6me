@@ -18,16 +18,12 @@ use crate::mask::{format_order, is_downmixable, mask_of, order_from_layout, Slot
 use crate::pcm::Sha256;
 use crate::probe::{probe_audio, AudioInfo, Caps, Tools};
 use crate::stages::{
-    effective_input_rate, flac_cli_args, input_args, input_stage, loss_chain, output_args,
-    InputStage, RenderCfg,
+    effective_input_rate, input_args, input_stage, loss_chain, output_args, InputStage, RenderCfg,
 };
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Instant;
 
 /// Progress callback, called from the worker thread: must be cheap and must not
@@ -197,7 +193,6 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         chain,
         input_args: in_args,
         encode_cmd: enc_args,
-        use_flac_cli,
         ir_info,
         warnings: plan_warnings,
         ..
@@ -205,7 +200,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     warnings.extend(plan_warnings);
 
     let mut producer = Proc::spawn_reader("decode", &opts.tools.ffmpeg, &in_args)?;
-    let mut consumer = EncoderSink::new(cfg, work_rate, dst, opts, &enc_args, use_flac_cli)?;
+    let mut consumer = EncoderSink::new(cfg, opts, &enc_args)?;
 
     // ---- three concurrent stages, one file -------------------------------
     //
@@ -443,8 +438,6 @@ pub struct Plan {
     pub chain: Vec<String>,
     pub input_args: Vec<String>,
     pub encode_cmd: Vec<String>,
-    /// True when the 24-bit FLAC route is in play (`ffmpeg | flac`).
-    pub use_flac_cli: bool,
     pub ir_info: Option<AudioInfo>,
     pub warnings: Vec<String>,
 }
@@ -474,7 +467,7 @@ pub fn plan_file(
     let channels = order.len();
     let work_rate = effective_input_rate(cfg, &info);
     let (stage, _) = input_stage(cfg, &info, mask);
-    let chain = loss_chain(cfg, &info, mask, caps);
+    let chain = loss_chain(cfg, &info, mask);
 
     if !caps.soxr && (stage == InputStage::Soxr || stage == InputStage::SoxrAndDepth) {
         return Err(Error::NoSoxr);
@@ -521,7 +514,7 @@ pub fn plan_file(
     };
 
     let (input_args, _, _) = input_args(cfg, &info, mask, src, ir_info.as_ref())?;
-    let (encode_cmd, use_flac_cli) = output_args(cfg, work_rate, dst, src, caps)?;
+    let encode_cmd = output_args(cfg, work_rate, dst, src, caps)?;
     Ok(Plan {
         info,
         order,
@@ -532,7 +525,6 @@ pub fn plan_file(
         chain,
         input_args,
         encode_cmd,
-        use_flac_cli,
         ir_info,
         warnings,
     })
@@ -756,8 +748,16 @@ fn interleave_f64(l: &[f64], r: &[f64], out: &mut Vec<u8>) {
     }
 }
 
-/// The consuming end: plain ffmpeg, or ffmpeg piped into the reference FLAC
-/// encoder for the 24-bit case ffmpeg's own encoder cannot write.
+/// The consuming end: one ffmpeg encode child per file.
+///
+/// There used to be a second shape here — ffmpeg writing raw 24-bit PCM into the
+/// reference `flac` binary — because ffmpeg's FLAC encoder was believed to write
+/// only 16 or 32 bits. It does not: fed 24-bit samples it emits a genuine
+/// bps=24 stream, and decoding it gives back the same samples the reference
+/// encoder's output gives (`scripts/check-flac-depth.sh` proves it). The extra
+/// child and its pump thread existed only for a limitation that is not there, and
+/// they were the source of the worst bug this project ever shipped, so the
+/// encode side is one process again.
 enum EncoderSink {
     /// Monitoring: samples are dropped after the tap, because a device is the
     /// only destination.
@@ -769,134 +769,16 @@ enum EncoderSink {
         name: String,
         bytes: u64,
     },
-    /// ffmpeg writes raw 24-bit PCM; a pump thread forwards it to `flac`.
-    ///
-    /// The `flac` child lives inside the pump thread, because it must be waited
-    /// on there (it only finishes once ffmpeg's stdout closes) and its exit
-    /// status has to travel back to [`EncoderSink::finish`].
-    TwoStage {
-        ffmpeg: Proc,
-        pump: Option<std::thread::JoinHandle<Result<()>>>,
-        /// Set the moment the pump gives up (`flac` died, its pipe broke). The
-        /// writer checks it on every block, so a dead encoder aborts the render
-        /// instead of the DSP feeding a pipe nobody will ever read.
-        pump_failed: Arc<AtomicBool>,
-        pump_msg: Arc<Mutex<String>>,
-        bytes: u64,
-    },
 }
 
 impl EncoderSink {
-    fn new(
-        cfg: &RenderCfg,
-        work_rate: u32,
-        dst: &Path,
-        opts: &RenderOpts,
-        enc_args: &[String],
-        use_flac_cli: bool,
-    ) -> Result<Self> {
+    fn new(cfg: &RenderCfg, opts: &RenderOpts, enc_args: &[String]) -> Result<Self> {
         if cfg.out.format.is_null() {
             return Ok(Self::Null { bytes: 0 });
         }
-        if !use_flac_cli {
-            let name = format!("ffmpeg {}", cfg.out.format.label());
-            return Ok(Self::Plain {
-                p: Proc::spawn_writer("encode", &opts.tools.ffmpeg, enc_args)?,
-                name,
-                bytes: 0,
-            });
-        }
-        let flac_bin = opts.caps.flac_cli_path.clone().ok_or_else(|| {
-            Error::msg("24-bit FLAC needs the reference flac encoder, which was not found")
-        })?;
-        // "-" : ffmpeg's raw 24-bit PCM arrives on flac's stdin.
-        let flac_args = flac_cli_args(cfg, work_rate, dst, "-");
-        let mut ffmpeg = Proc::spawn_rw("encode", &opts.tools.ffmpeg, enc_args)?;
-        let mut flac = Command::new(&flac_bin)
-            .args(&flac_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                Error::msg(format!(
-                    "could not start {} for 24-bit FLAC: {e}",
-                    flac_bin.display()
-                ))
-            })?;
-        let mut flac_stdin = flac
-            .stdin
-            .take()
-            .ok_or_else(|| Error::msg("flac stdin unavailable"))?;
-        // Read flac's stderr *while it runs* (see the note on the helper): reading
-        // it only after wait() would deadlock a long encode that warns a lot.
-        let flac_err = Arc::new(Mutex::new(Vec::<u8>::new()));
-        crate::child::spawn_stderr_reader("flac", &mut flac, &flac_err);
-        let mut from = ffmpeg
-            .take_stdout()
-            .ok_or_else(|| Error::msg("internal: ffmpeg stdout missing"))?;
-        let pump_failed = Arc::new(AtomicBool::new(false));
-        let pump_msg = Arc::new(Mutex::new(String::new()));
-        let (flag, msg_sink) = (pump_failed.clone(), pump_msg.clone());
-        let pump = std::thread::Builder::new()
-            .name("g6me-flac-pump".into())
-            .spawn(move || {
-                // Heap buffer: this thread exists for the whole render, and a
-                // 64 KiB stack array buys nothing over a Vec allocated once.
-                let mut buf = vec![0u8; 1 << 16];
-                let mut broke_pipe = false;
-                loop {
-                    match from.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if std::io::Write::write_all(&mut flac_stdin, &buf[..n]).is_err() {
-                                // flac is gone. Say so at once: the writer would
-                                // otherwise keep feeding ffmpeg to a full pipe.
-                                broke_pipe = true;
-                                *msg_sink.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    "the flac encoder closed its input".into();
-                                // Order matters: this is the abort signal, so it
-                                // goes out before anything that can block.
-                                flag.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                    }
-                }
-                // Dropping our read end of ffmpeg's stdout is what tells ffmpeg its
-                // output is gone, so it exits instead of blocking forever.
-                drop(from);
-                drop(flac_stdin);
-                let status = flac.wait()?;
-                let err =
-                    crate::probe::tail(&flac_err.lock().unwrap_or_else(|e| e.into_inner()), 600);
-                flag.store(true, Ordering::SeqCst);
-                if status.success() && !broke_pipe {
-                    Ok(())
-                } else {
-                    *msg_sink.lock().unwrap_or_else(|e| e.into_inner()) = err.clone();
-                    // Name the route, not just the binary: "flac failed" on its own
-                    // does not tell you this was the 24-bit path, nor where to look.
-                    Err(Error::ChildFailed {
-                        stage: "24-bit FLAC encoder (flac)",
-                        code: status.code().unwrap_or(-1),
-                        msg: if err.trim().is_empty() {
-                            "it wrote nothing to stderr; the file may be incomplete \
-                             — check `g6me --caps` for whether this flac accepts the \
-                             raw 24-bit options"
-                                .to_string()
-                        } else {
-                            err
-                        },
-                    })
-                }
-            })
-            .map_err(Error::Io)?;
-        Ok(Self::TwoStage {
-            ffmpeg,
-            pump: Some(pump),
-            pump_failed,
-            pump_msg,
+        Ok(Self::Plain {
+            p: Proc::spawn_writer("encode", &opts.tools.ffmpeg, enc_args)?,
+            name: format!("ffmpeg {}", cfg.out.format.label()),
             bytes: 0,
         })
     }
@@ -919,33 +801,6 @@ impl EncoderSink {
                 }
                 *bytes += buf.len() as u64;
             }
-            Self::TwoStage {
-                ffmpeg,
-                pump_failed,
-                pump_msg,
-                bytes,
-                ..
-            } => {
-                if pump_failed.load(Ordering::SeqCst) {
-                    let said = pump_msg
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .trim()
-                        .to_string();
-                    // Never end on a bare colon: the flag can be set by an abort
-                    // before any message exists.
-                    return Err(if said.is_empty() {
-                        Error::msg("the 24-bit FLAC encode stopped: its flac encoder is gone")
-                    } else {
-                        Error::msg(format!("the 24-bit FLAC encode stopped: flac said {said}"))
-                    });
-                }
-                if let Err(e) = ffmpeg.write(buf) {
-                    let tail = pump_msg.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    return Err(encoder_pipe_err("24-bit FLAC (ffmpeg | flac)", &tail, e));
-                }
-                *bytes += buf.len() as u64;
-            }
         }
         Ok(())
     }
@@ -954,7 +809,6 @@ impl EncoderSink {
         match self {
             Self::Null { bytes } => *bytes,
             Self::Plain { bytes, .. } => *bytes,
-            Self::TwoStage { bytes, .. } => *bytes,
         }
     }
 
@@ -965,33 +819,6 @@ impl EncoderSink {
                 p.finish()?;
                 Ok(std::mem::take(name))
             }
-            Self::TwoStage {
-                ffmpeg,
-                pump,
-                pump_msg,
-                ..
-            } => {
-                ffmpeg.close_input();
-                // Ask the pump before ffmpeg. The pump owns `flac` and is therefore
-                // the authority on whether it died; ffmpeg's own exit is almost
-                // always the *symptom* (a broken pipe, once its reader is gone), and
-                // reporting that would blame the wrong child.
-                let pump_err = match pump.take() {
-                    Some(h) => h
-                        .join()
-                        .map_err(|_| Error::msg("the flac pump thread panicked"))
-                        .and_then(|r| r)
-                        .err(),
-                    None => None,
-                };
-                let ffmpeg_err = ffmpeg.finish().err();
-                pump_msg.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                match (pump_err, ffmpeg_err) {
-                    (Some(e), _) => Err(e),
-                    (None, Some(e)) => Err(e),
-                    (None, None) => Ok("ffmpeg | flac (24-bit)".to_string()),
-                }
-            }
         }
     }
 
@@ -999,20 +826,6 @@ impl EncoderSink {
         match self {
             Self::Null { .. } => {}
             Self::Plain { p, .. } => p.kill(),
-            Self::TwoStage {
-                ffmpeg,
-                pump,
-                pump_failed,
-                ..
-            } => {
-                // Closing ffmpeg's stdin ends its output, which ends the pump
-                // thread's read, which lets flac see EOF and exit.
-                ffmpeg.kill();
-                pump_failed.store(true, Ordering::SeqCst);
-                if let Some(h) = pump.take() {
-                    drop(h);
-                }
-            }
         }
     }
 }
@@ -1305,7 +1118,7 @@ mod tests {
         let dir = workdir("e2e");
         let mut cfg = RenderCfg::with_defaults();
         cfg.out.format = OutFormat::Flac { level: 8 };
-        cfg.out.depth = BitDepth::S32;
+        cfg.out.depth = BitDepth::S24;
         cfg.sha256 = true;
         let out = dir.join("e2e.flac");
         let opts = RenderOpts::new(&tools, &caps);
@@ -1345,17 +1158,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The 24-bit route (`ffmpeg | flac`) is the only two-child encoder chain, so it
-    /// is the one that can stall on a pipe nobody drains. It hung once on wrong
-    /// `flac` options and once on a consumer that died without closing its channel,
-    /// so this asserts both the result and that it *finished*.
+    /// The default output: 24-bit FLAC written by ffmpeg. This route used to run
+    /// as two children (`ffmpeg | flac`) and hung twice — once on `flac` options it
+    /// rejected, once on a consumer that died without closing its channel. The
+    /// second failure mode belongs to the pipe, not to the number of children, so
+    /// the test stays: it asserts the file is really bps=24 *and* that the render
+    /// finished inside a watchdog.
     #[test]
     fn flac24_encodes_a_long_file_without_stalling() {
         let Some((tools, caps)) = tools_ok() else {
             return;
         };
-        if !caps.flac_cli {
-            eprintln!("skipping: no flac encoder that passes the 24-bit probe");
+        if !caps.flac24 {
+            eprintln!("skipping: this ffmpeg failed the 24-bit FLAC round-trip probe");
             return;
         }
         let dir = workdir("flac24");
@@ -1394,7 +1209,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(r.encoder.contains("flac"), "encoder: {}", r.encoder);
+        assert!(
+            r.encoder.to_lowercase().contains("flac"),
+            "encoder: {}",
+            r.encoder
+        );
         let (rate, ch, bps) = crate::probe::flac_streaminfo(&out).expect("FLAC stream info");
         assert_eq!((rate, ch, bps), (48000, 2, 24), "a true 24-bit FLAC file");
         std::fs::remove_dir_all(&dir).ok();
@@ -1479,17 +1298,18 @@ mod tests {
     /// DSP on a stdin pipe nothing will ever read again.
     #[test]
     fn a_dead_encoder_aborts_instead_of_hanging() {
-        let Some((tools, mut caps)) = tools_ok() else {
+        let Some((tools, caps)) = tools_ok() else {
             return;
         };
-        let dead = if cfg!(unix) { "/bin/false" } else { "cmd.exe" };
-        caps.flac_cli = true;
-        caps.flac_cli_path = Some(PathBuf::from(dead));
 
         let dir = workdir("deadenc");
         let w = dir.join("in.wav");
         impulse_wav(&w, 8, 48000);
+        // An output path that cannot be opened makes ffmpeg exit at init while the
+        // decoder is still feeding us — the encoder-is-gone case, with a working
+        // ffmpeg on the decode side so the decode cannot mask it.
         let out = dir.join("out.flac");
+        std::fs::create_dir(&out).expect("output path made into a directory");
         let mut cfg = RenderCfg::with_defaults();
         cfg.out.format = OutFormat::Flac { level: 5 };
         cfg.out.depth = BitDepth::S24;
@@ -1515,15 +1335,11 @@ mod tests {
             "the error must name the encoder that died: {msg}"
         );
         assert!(
-            msg.contains("24-bit"),
-            "the error must say which stage of the chain failed: {msg}"
-        );
-        assert!(
             !msg.trim().ends_with(':') && !msg.trim().ends_with("aborted"),
             "the error must carry a reason, not trail off: {msg}"
         );
         assert!(
-            !out.exists(),
+            std::fs::read_dir(&out).map(|d| d.count()).unwrap_or(0) == 0,
             "a failed encode leaves no file behind: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();

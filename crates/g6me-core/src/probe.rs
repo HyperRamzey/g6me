@@ -107,10 +107,10 @@ pub struct Caps {
     pub flac: bool,
     /// True when lavfi is available, which is what the probes below need.
     pub lavfi: bool,
-    /// Reference `flac` encoder present — the only way to write a true 24-bit
-    /// FLAC, since ffmpeg's FLAC encoder emits 16 or 32 bits only.
-    pub flac_cli: bool,
-    pub flac_cli_path: Option<PathBuf>,
+    /// This ffmpeg was measured writing a genuine, lossless 24-bit FLAC (see
+    /// [`probe_flac24`]). It is what the default output depth rests on, so it is
+    /// checked by round-tripping bytes rather than inferred from the version.
+    pub flac24: bool,
     pub notes: Vec<String>,
 }
 
@@ -123,19 +123,23 @@ impl Caps {
 
     pub fn summary(&self) -> String {
         format!(
-            "ffmpeg {} — soxr:{} afir:{} flac:{} lavfi:{}",
+            "ffmpeg {} — soxr:{} afir:{} flac:{} flac24:{} lavfi:{}",
             self.ffmpeg_version,
             yes_no(self.soxr),
             yes_no(self.afir),
             yes_no(self.flac),
+            yes_no(self.flac24),
             yes_no(self.lavfi)
         )
     }
 
+    /// The fact behind the default output depth, without a leading label: callers
+    /// print their own heading, and a label in here came out doubled in `--caps`.
     pub fn flac_summary(&self) -> String {
-        match &self.flac_cli_path {
-            Some(p) => format!("reference flac encoder: {}", p.display()),
-            None => "reference flac encoder: absent (24-bit FLAC unavailable)".to_string(),
+        if self.flac24 {
+            "verified lossless (encoded bps=24, decoded bytes came back identical)".to_string()
+        } else {
+            "NOT verified on this ffmpeg — use 16-bit FLAC or WAV (see the notes)".to_string()
         }
     }
 }
@@ -155,13 +159,6 @@ pub fn probe_caps(tools: &Tools) -> Caps {
         ffmpeg_version: version(tools).unwrap_or_else(|e| format!("unknown ({e})")),
         ..Caps::default()
     };
-    let flac_cli = discover_flac_cli();
-    caps.flac_cli_path = flac_cli.path;
-    caps.flac_cli = caps.flac_cli_path.is_some();
-    if let Some(n) = flac_cli.note {
-        caps.notes.push(format!("24-bit FLAC: {n}"));
-    }
-
     // lavfi first: three of the four probes need it. If it is missing (a
     // deliberately minimal build) the probes are meaningless, so report that.
     caps.lavfi = probe_lavfi(tools);
@@ -171,14 +168,26 @@ pub fn probe_caps(tools: &Tools) -> Caps {
         return caps;
     }
 
+    let mut flac24_note = None;
     std::thread::scope(|s| {
         let soxr = s.spawn(|| probe_soxr(tools));
         let afir = s.spawn(|| probe_afir(tools));
         let flac = s.spawn(|| probe_flac(tools));
+        let flac24 = s.spawn(|| probe_flac24(tools));
         caps.soxr = soxr.join().unwrap_or(false);
         caps.afir = afir.join().unwrap_or(false);
         caps.flac = flac.join().unwrap_or(false);
+        match flac24.join() {
+            Ok(None) => caps.flac24 = true,
+            // The reason matters more than the flag: a build that fails this writes
+            // a file labelled 24-bit while losing bits, so name what it did.
+            Ok(Some(note)) => flac24_note = Some(note),
+            Err(_) => flac24_note = Some("the 24-bit FLAC probe panicked".into()),
+        }
     });
+    if let Some(n) = flac24_note {
+        caps.notes.push(format!("24-bit FLAC: {n}"));
+    }
 
     if !caps.soxr {
         caps.notes.push(
@@ -189,93 +198,106 @@ pub fn probe_caps(tools: &Tools) -> Caps {
         caps.notes
             .push("no afir: IR headphone calibration unavailable".into());
     }
+
     caps
 }
 
-/// What the reference FLAC encoder probe found.
-#[derive(Clone, Debug, Default)]
-pub struct FlacCli {
-    /// Set only when a real 24-bit encode succeeded.
-    pub path: Option<PathBuf>,
-    /// Why 24-bit is unavailable, when it is. Surfaced by `--caps` instead of a
-    /// bare "no", because "flac exists" and "flac can do this" are different facts.
-    pub note: Option<String>,
-}
-
-/// Can this machine write a **true 24-bit FLAC**? Established by doing it, not by
-/// asking: ffmpeg's FLAC encoder emits 16 or 32 bits, so 24-bit needs the
-/// reference encoder driven with the same raw-input options the renderer uses.
+/// Can this ffmpeg write a **genuine 24-bit FLAC**?
 ///
-/// A `--version` check would happily report success for a `flac` that rejects
-/// those options (the spellings vary between releases), and the render would then
-/// fail — or worse, hang — later. So the probe encodes a synthetic block and
-/// reads the bit depth back out of the file's own STREAMINFO.
-pub fn discover_flac_cli() -> FlacCli {
-    let p = match std::env::var_os("G6ME_FLAC")
-        .map(PathBuf::from)
-        .or_else(|| which("flac"))
-    {
-        Some(p) => p,
-        None => {
-            return FlacCli {
-                note: Some("no reference flac encoder found; 24-bit FLAC is unavailable".into()),
-                ..Default::default()
-            }
-        }
-    };
+/// Established by doing it and checking the bytes came back, not by asking. The
+/// encoder advertises only `s16 s32` as input sample formats and derives the
+/// stream's bit depth from what it is fed, which is subtle enough to be worth
+/// proving on the machine that will use it: fed a true 32-bit signal it writes a
+/// `bps=24` stream and discards the low byte of every sample, while fed 24-bit
+/// samples it is lossless. A `--version` or `-codecs` check cannot tell those
+/// apart, and only the second one is what the default output depth relies on.
+///
+/// `None` means a synthetic 24-bit block went through the renderer's own encode
+/// command line and decoded back byte-identical; `Some(note)` says why 24-bit
+/// FLAC cannot be trusted here, and `--caps` shows it instead of a bare "no".
+pub fn probe_flac24(tools: &Tools) -> Option<String> {
     let dir = match probe_dir("flac24") {
         Ok(d) => d,
-        Err(e) => {
-            return FlacCli {
-                note: Some(e),
-                ..Default::default()
-            }
-        }
+        Err(e) => return Some(e),
     };
-    let raw = dir.join("probe.raw");
-    let out = dir.join("probe.flac");
+    let raw = dir.join("probe.s24");
+    let enc = dir.join("probe.flac");
+    let back = dir.join("back.s24");
     let result = (|| -> std::result::Result<(), String> {
-        // 0.1 s of stereo 24-bit PCM, a small ramp so nothing is all-zero.
-        let mut pcm = Vec::with_capacity(4800 * 2 * 3);
-        for i in 0..(4800 * 2) {
-            let v: i32 = (i % 997) * 64;
-            pcm.extend_from_slice(&(v.to_le_bytes()[..3]));
+        // 0.1 s of stereo 24-bit PCM. The stride is odd and coprime with 256, so
+        // the low byte of most samples is non-zero: an encoder that throws the low
+        // 8 bits away — or rounds toward zero instead of quantizing at 24-bit —
+        // cannot survive the byte comparison at the end of this probe.
+        const N: usize = 4800 * 2;
+        let mut pcm = Vec::with_capacity(N * 3);
+        for i in 0..N {
+            let v: i32 = ((i as i32) * 149) % (1 << 23);
+            pcm.extend_from_slice(&v.to_le_bytes()[..3]);
         }
         std::fs::write(&raw, &pcm).map_err(|e| format!("probe write: {e}"))?;
-        // The renderer's own command line, with a file instead of the pipe.
-        let mut cfg = crate::stages::RenderCfg::with_defaults();
-        cfg.out.format = crate::stages::OutFormat::Flac { level: 5 };
-        let args = crate::stages::flac_cli_args(&cfg, 48000, &out, &raw.display().to_string());
-        let enc = Command::new(&p)
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("could not run {}: {e}", p.display()))?;
-        if !enc.status.success() {
-            return Err(format!(
-                "{} rejected the raw 24-bit options: {}",
-                p.display(),
-                tail(&enc.stderr, 300)
-            ));
-        }
-        let info = flac_streaminfo(&out)
-            .ok_or_else(|| "flac produced no readable FLAC stream info".to_string())?;
+        let raw_s = raw.display().to_string();
+        let enc_s = enc.display().to_string();
+        let back_s = back.display().to_string();
+        // Exactly the renderer's encode shape: depth asked for explicitly, level
+        // from the default config.
+        ffmpeg_ok(
+            tools,
+            &[
+                "-f",
+                "s24le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-i",
+                &raw_s,
+                "-c:a",
+                "flac",
+                "-compression_level",
+                "5",
+                "-sample_fmt",
+                "s32",
+                "-y",
+                &enc_s,
+            ],
+        )?;
+        let info = flac_streaminfo(&enc).ok_or("ffmpeg wrote no readable FLAC stream info")?;
         if info.2 != 24 {
-            return Err(format!("flac wrote {}-bit FLAC, not 24-bit", info.2));
+            return Err(format!("ffmpeg wrote {}-bit FLAC, not 24-bit", info.2));
+        }
+        ffmpeg_ok(tools, &["-i", &enc_s, "-f", "s24le", "-y", &back_s])?;
+        let got = std::fs::read(&back).map_err(|e| format!("probe decode read: {e}"))?;
+        if got != pcm {
+            let diff = pcm.iter().zip(&got).filter(|(a, b)| a != b).count();
+            return Err(format!(
+                "24-bit FLAC is not lossless on this build: {diff} of {} bytes differ                  after a decode",
+                pcm.len()
+            ));
         }
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&dir);
-    match result {
-        Ok(()) => FlacCli {
-            path: Some(p),
-            note: None,
-        },
-        Err(note) => FlacCli {
-            path: None,
-            note: Some(note),
-        },
+    result.err()
+}
+
+/// Run ffmpeg to completion, reporting its stderr as the reason on failure.
+fn ffmpeg_ok(tools: &Tools, args: &[&str]) -> std::result::Result<(), String> {
+    let out = Command::new(&tools.ffmpeg)
+        .arg("-v")
+        .arg("error")
+        .arg("-nostdin")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "ffmpeg failed: {}",
+            tail(&out.stderr, 300).replace('\n', " ")
+        ))
     }
 }
 
@@ -582,31 +604,18 @@ mod tests {
         assert!(t.ffmpeg.to_string_lossy().contains("ffmpeg"));
     }
 
-    /// The 24-bit render test skips when no `flac` passes the probe — which is
-    /// right for a bare CI runner, but would also have hidden the wrong-flag bug it
-    /// was written for. So here is the non-skippable half: if `flac` is on PATH, our
-    /// exact option spellings must be accepted by it. When `flac`'s raw-input
-    /// options change, this fails by name instead of 24-bit silently vanishing.
+    /// The default output depth rests on this, so it is proven by encoding and
+    /// decoding rather than assumed. Skips only when there is no ffmpeg at all.
     #[test]
-    fn a_flac_on_path_is_accepted_for_24_bit() {
-        let Some(found) = which("flac") else {
-            eprintln!("skipping: no flac on PATH");
+    fn flac24_probe_passes_on_a_working_ffmpeg() {
+        let tools = Tools::default();
+        if version(&tools).is_err() {
+            eprintln!("skipping: no ffmpeg on PATH");
             return;
-        };
-        let via_env = std::env::var_os("G6ME_FLAC").is_some();
-        let probe = discover_flac_cli();
-        assert_eq!(
-            probe.path.as_deref(),
-            Some(found.as_path()),
-            "flac found at {} but the 24-bit probe rejected it: {:?}",
-            found.display(),
-            probe.note
-        );
-        assert!(probe.note.is_none());
-        assert!(
-            !via_env,
-            "G6ME_FLAC should not be set in the test environment"
-        );
+        }
+        if let Some(note) = probe_flac24(&tools) {
+            panic!("this ffmpeg cannot round-trip a 24-bit FLAC: {note}");
+        }
     }
 
     /// A file that is not FLAC at all, and a truncated header, must not parse.

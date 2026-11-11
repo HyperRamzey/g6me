@@ -12,8 +12,8 @@ plugin can only play in real time through a host.
 
 ```
 multichannel file ──ffmpeg decode──► f64 samples ──► Dsp (f64) ──► encoder ──► FLAC/WAV
-   .mka .wav .flac .mkv .mp4 …        (optional soxr      (the exact        (optional 24-bit
-                                       resample, IR)       plugin matrix)    via `flac`)
+   .mka .wav .flac .mkv .mp4 …        (optional soxr      (the exact        (24-bit FLAC,
+                                       resample, IR)       plugin matrix)    or any depth in WAV)
 ```
 
 ## What is guaranteed
@@ -37,9 +37,10 @@ pleasant. The matrix is the plugin's, gains and all.
   Developed and tested against `n9.0.2`. Without libsoxr the program refuses to
   resample rather than silently picking another resampler; the default
   (no resample) path still works.
-* **`flac`** from the reference `flac-tools` build only if you want **24-bit FLAC** —
-  ffmpeg's own FLAC encoder emits 16- or 32-bit, so 24-bit goes through the
-  reference encoder. Other depths and WAV need nothing extra.
+* Nothing else for output. ffmpeg's own FLAC encoder writes genuine 16- and 24-bit
+  FLAC — `g6me --caps` proves it on your build by encoding a known 24-bit block and
+  decoding it back — and FLAC carries integers only, so 32-bit and float go to WAV.
+  Compression levels are ffmpeg's own scale, 0 (fastest) to 12 (smallest).
 * **Rust 1.87+** to build (developed on 1.99). A C compiler only for
   `g6me-verify`, which builds the reference binaries to compare against; without a
   compiler those checks are skipped rather than failing the build.
@@ -48,7 +49,7 @@ pleasant. The matrix is the plugin's, gains and all.
   the samples being rendered.
 
 ```sh
-# capability check: what can this ffmpeg actually do, and is 24-bit FLAC available
+# capability check: what can this ffmpeg actually do, incl. the 24-bit FLAC round-trip
 cargo run -p g6me-cli -- --caps
 ```
 
@@ -172,8 +173,9 @@ Each tag publishes, from one commit and one `Cargo.lock`:
 
 **ffmpeg is not bundled** — it is a separate GPL program and any desktop that plays
 audio already has it; put it on `PATH`, or point `G6ME_FFMPEG` / `G6ME_FFPROBE` at a
-specific build. `g6me --caps` says what your ffmpeg can actually do. 24-bit FLAC
-additionally needs the reference `flac` encoder. The binaries are built for
+specific build. `g6me --caps` says what your ffmpeg can actually do, including a
+measured 24-bit FLAC round-trip rather than a guess from the version string. The
+binaries are built for
 **x86-64-v3** (AVX2, i.e. Haswell/Excavator 2013 and later); on older hardware build
 from source without `--target-cpu`.
 
@@ -272,9 +274,12 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
   peak (EBU Tech 3341 / BS.1770-4) is planned next; sample peak alone under-reports
   up to ~3 dB for material near full scale, which matters exactly when you are
   closest to clipping.
-* **24-bit FLAC depends on the reference `flac` CLI** being installed. It is detected
-  at runtime; without it the GUI says so and the CLI refuses, rather than quietly
-  writing 32-bit.
+* **FLAC stops at 24 bits.** That is the container and the encoder, not a choice:
+  ffmpeg's FLAC encoder writes `bps=24` and, fed 32-bit PCM, drops the low byte of
+  every sample. G6ME therefore refuses `--format flac --depth 32` instead of shipping
+  a file labelled 24-bit that looks 32-bit, and sends 32-bit int and float to WAV
+  (`pcm_s32le` / `pcm_f32le`, both genuine). If an ffmpeg ever failed the 24-bit
+  round-trip probe, 24-bit FLAC is refused on that machine too and `--caps` says why.
 * **No macOS CI**, although the mount-list code has a macOS path and eframe runs
   there.
 * `--monitor` (CLI only) is deliberately unverified on Windows.

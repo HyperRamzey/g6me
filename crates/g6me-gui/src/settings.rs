@@ -152,7 +152,8 @@ impl Settings {
     pub fn out_format(&self) -> OutFormat {
         match self.format {
             Format::Flac => OutFormat::Flac {
-                level: self.flac_level.min(8),
+                // ffmpeg's FLAC encoder counts 0..=12; 12 packs smallest.
+                level: self.flac_level.min(12),
             },
             Format::Wav => OutFormat::Wav,
         }
@@ -265,10 +266,17 @@ impl Settings {
                 self.ir_file.display()
             ));
         }
-        if self.depth == BitDepth::S24 && !caps.flac_cli {
+        if self.depth == BitDepth::S24 && self.format == Format::Flac && !caps.flac24 {
             p.push(
-                "24-bit needs the reference `flac` encoder and none was found \
-                 (see `g6me --caps`). Choose 16 or 32 bit, or install flac."
+                "This ffmpeg failed the 24-bit FLAC check (see the capabilities window). \
+                 Choose 16-bit FLAC, or WAV for 24/32-bit and float."
+                    .to_string(),
+            );
+        }
+        if self.depth == BitDepth::S32 && self.format == Format::Flac {
+            p.push(
+                "FLAC cannot carry 32-bit PCM: ffmpeg writes a 24-bit stream and drops the \
+                 low byte of every sample. Use WAV for 32-bit or float."
                     .to_string(),
             );
         }
@@ -284,8 +292,16 @@ impl Settings {
         if self.queue_blocks == 0 || self.queue_blocks > 4096 {
             p.push("Queue depth must be between 1 and 4096 blocks.".to_string());
         }
-        if self.format == Format::Flac && self.flac_level > 8 {
-            p.push("FLAC level is 0..=8.".to_string());
+        if self.format == Format::Flac && self.flac_level > 12 {
+            p.push("FLAC level is 0..=12 (ffmpeg's encoder; 12 is smallest).".to_string());
+        }
+        if self.format == Format::Flac
+            && matches!(self.depth, BitDepth::S32 | BitDepth::F32 | BitDepth::F64)
+        {
+            p.push(
+                "FLAC carries 16- or 24-bit integers only. Use WAV for 32-bit or float."
+                    .to_string(),
+            );
         }
         if self.use_resample_depth && self.resample_depth.is_float() {
             p.push(format!(
@@ -351,7 +367,7 @@ pub fn describe(s: &Settings) -> String {
         "{} {}",
         s.depth.label(),
         match s.format {
-            Format::Flac => format!("FLAC -{}", s.flac_level.min(8)),
+            Format::Flac => format!("FLAC -{}", s.flac_level.min(12)),
             Format::Wav => "WAV".to_string(),
         }
     ));
@@ -455,15 +471,33 @@ mod tests {
         assert_eq!(s.threads(), 1);
     }
 
+    /// The bound is the encoder's, not the reference CLI's: ffmpeg's FLAC encoder
+    /// accepts 0..=12 and refuses 13 at init.
     #[test]
-    fn flac_level_is_bounded_like_flac() {
+    fn flac_level_is_bounded_like_ffmpeg_flac() {
         let s = Settings {
             flac_level: 99,
             ..Default::default()
         };
         match s.out_format() {
-            OutFormat::Flac { level } => assert_eq!(level, 8),
+            OutFormat::Flac { level } => assert_eq!(level, 12),
             other => panic!("expected flac, got {other:?}"),
+        }
+        let ok = Settings {
+            flac_level: 12,
+            ..Default::default()
+        };
+        assert!(!ok
+            .problems(&caps_none())
+            .iter()
+            .any(|p| p.contains("FLAC level")));
+    }
+
+    fn caps_none() -> Caps {
+        Caps {
+            ffmpeg_version: "test".into(),
+            lavfi: true,
+            ..Default::default()
         }
     }
 
@@ -475,8 +509,7 @@ mod tests {
             afir: false,
             flac: false,
             lavfi: true,
-            flac_cli: false,
-            flac_cli_path: None,
+            flac24: false,
             notes: Vec::new(),
         };
         let mut s = Settings::default();
@@ -498,9 +531,9 @@ mod tests {
         assert!(s
             .problems(&caps)
             .iter()
-            .any(|p| p.contains("24-bit needs the reference")));
-        // 24-bit on a machine without flac is exactly the case that used to hang a
-        // render; it must be refused before any file is opened.
+            .any(|p| p.contains("failed the 24-bit FLAC check")));
+        // 24-bit on an ffmpeg that fails the round-trip check must be refused
+        // before any file is opened.
         s.depth = BitDepth::S16;
         assert!(!s
             .problems(&caps)

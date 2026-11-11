@@ -277,7 +277,7 @@ impl App {
                             flag(c.soxr),
                             flag(c.afir),
                             flag(c.flac),
-                            flag(c.flac_cli),
+                            flag(c.flac24),
                         ));
                         if ui.link("details").clicked() {
                             self.show_caps = !self.show_caps;
@@ -642,10 +642,12 @@ impl App {
                 ui.separator();
                 ui.label("level");
                 let mut l = self.settings.flac_level;
-                if ui.add(egui::DragValue::new(&mut l).range(0..=8)).changed() {
-                    self.settings.flac_level = l.min(8);
+                // ffmpeg's FLAC encoder counts 0..=12 and refuses 13; the reference
+                // flac CLI's -0..-8 presets are a different scale and not in use.
+                if ui.add(egui::DragValue::new(&mut l).range(0..=12)).changed() {
+                    self.settings.flac_level = l.min(12);
                 }
-                ui.weak("(0 fast … 8 smallest)");
+                ui.weak("(0 fast … 12 smallest)");
             }
         });
         ui.horizontal(|ui| {
@@ -662,8 +664,10 @@ impl App {
                         ui.selectable_value(&mut self.settings.depth, d, label);
                     }
                 });
-            if self.settings.depth == BitDepth::S24 {
-                let ok = caps.map(|c| c.flac_cli).unwrap_or(true);
+            if self.settings.depth == BitDepth::S24 && self.settings.format == Format::Flac {
+                // Not a claim about a version string: the probe encodes a known
+                // 24-bit block with this ffmpeg and checks the bytes come back.
+                let ok = caps.map(|c| c.flac24).unwrap_or(true);
                 ui.colored_label(
                     if ok {
                         egui::Color32::from_rgb(120, 190, 120)
@@ -671,17 +675,17 @@ impl App {
                         egui::Color32::from_rgb(226, 110, 90)
                     },
                     if ok {
-                        "24-bit FLAC goes through the reference flac encoder"
+                        "24-bit FLAC verified lossless on this ffmpeg"
                     } else {
-                        "no reference flac found — 24-bit is unavailable on this machine"
+                        "this ffmpeg failed the 24-bit FLAC check — see capabilities"
                     },
                 );
             }
         });
-        if self.settings.depth == BitDepth::S24 {
+        if self.settings.format == Format::Flac {
             ui.weak(
-                "ffmpeg's own FLAC encoder only writes 16- or 32-bit FLAC, so 24-bit runs \
-                 ffmpeg | flac as one pipe.",
+                "FLAC carries 16- or 24-bit integers only: ffmpeg writes a genuine bps=24 \
+                   stream, but it cannot carry 32-bit PCM or float — WAV does both.",
             );
         }
         ui.checkbox(&mut self.settings.copy_metadata, "copy source metadata");
@@ -1096,7 +1100,7 @@ impl App {
                             ("afir convolution", c.afir),
                             ("FLAC encode", c.flac),
                             ("lavfi synthetic sources", c.lavfi),
-                            ("reference flac (24-bit FLAC)", c.flac_cli),
+                            ("24-bit FLAC round-trip", c.flac24),
                         ] {
                             let (mark, col) = if v {
                                 ("available", egui::Color32::from_rgb(120, 190, 120))
@@ -1108,9 +1112,7 @@ impl App {
                                 ui.colored_label(col, mark);
                             });
                         }
-                        if let Some(p) = &c.flac_cli_path {
-                            ui.weak(format!("flac: {}", p.display()));
-                        }
+
                         for n in &c.notes {
                             ui.weak(n.clone());
                         }
@@ -1287,14 +1289,6 @@ impl App {
                 lines.push(String::new());
                 lines.push("encode".to_string());
                 lines.push(format!("  {}", p.encode_cmd.join(" ")));
-                if p.use_flac_cli {
-                    lines.push(String::new());
-                    lines.push(
-                        "  24-bit route: ffmpeg writes raw s24le to a pipe, the reference \
-                         flac encoder reads it"
-                            .to_string(),
-                    );
-                }
                 for w in &p.warnings {
                     lines.push(format!("warning: {w}"));
                 }
@@ -1398,14 +1392,19 @@ fn truncate(s: &str, max: usize) -> String {
 /// Note shown next to a bit-depth choice, or `None` when there is nothing to warn
 /// about.
 fn depth_note(d: BitDepth, f: Format, caps: Option<&Caps>) -> Option<&'static str> {
-    if d == BitDepth::S24 && f == Format::Flac {
-        if caps.map(|c| c.flac_cli) == Some(false) {
-            return Some("needs flac, not found");
-        }
-        return Some("via reference flac");
+    if f != Format::Flac {
+        return None;
     }
-    if d.is_float() && f == Format::Flac {
-        return Some("lossless container for floats — large files");
+    // FLAC is an integer container and ffmpeg's encoder stops at 24 bits, so these
+    // combinations are refused by the validator rather than quietly downgraded.
+    if d.is_float() {
+        return Some("not available in FLAC — use WAV");
+    }
+    if d == BitDepth::S32 {
+        return Some("not available in FLAC — use WAV");
+    }
+    if d == BitDepth::S24 && caps.map(|c| !c.flac24).unwrap_or(false) {
+        return Some("unverified on this ffmpeg");
     }
     None
 }

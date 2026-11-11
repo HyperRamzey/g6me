@@ -39,12 +39,14 @@ pub struct Cli {
     #[arg(short = 'f', long, default_value = "flac", value_parser = ["flac", "wav"])]
     pub format: String,
 
-    /// FLAC compression level, 0 (fastest) .. 8 (smallest). Lossless either way.
+    /// FLAC compression level, 0 (fastest) .. 12 (smallest), as ffmpeg's encoder
+    /// counts them. Lossless at every level; 13 is refused by the encoder.
     #[arg(long, default_value_t = 8, value_parser = parse_level)]
     pub level: u32,
 
-    /// Output bit depth. 24-bit FLAC needs the reference `flac` encoder.
-    #[arg(long, default_value = "s32", value_parser = parse_depth)]
+    /// Output bit depth: 16, 24, 32, f32, f64. FLAC takes 16 or 24 only — ffmpeg's
+    /// FLAC encoder writes at most 24-bit, so 32-bit and float need --format wav.
+    #[arg(long, default_value = "s24", value_parser = parse_depth)]
     pub depth: BitDepth,
 
     /// libsoxr precision in bits, 17..=33, used whenever a bit depth is reduced.
@@ -276,7 +278,7 @@ macro_rules! int_arg {
     };
 }
 
-int_arg!(parse_level, u32, 0, 8, "FLAC compression level");
+int_arg!(parse_level, u32, 0, 12, "FLAC compression level");
 int_arg!(parse_rate, u32, 8_000, 384_000, "sample rate (--rate)");
 int_arg!(parse_part, u32, 256, 65_536, "convolver FFT partition size");
 int_arg!(parse_block, usize, 64, 1_048_576, "block size (--block)");
@@ -700,7 +702,6 @@ fn println_plan(plan: &Plan, json: bool) {
                 "chain": plan.chain,
                 "decode_cmd": plan.input_args,
                 "encode_cmd": plan.encode_cmd,
-                "two_stage_flac": plan.use_flac_cli,
                 "warnings": plan.warnings,
             })
         );
@@ -720,9 +721,6 @@ fn println_plan(plan: &Plan, json: bool) {
     }
     println!("  decode: {}", join_cmd(&plan.input_args));
     println!("  encode: {}", join_cmd(&plan.encode_cmd));
-    if plan.use_flac_cli {
-        println!("          + reference flac encoder (24-bit FLAC; ffmpeg cannot write it)");
-    }
     for w in &plan.warnings {
         println!("  warning: {w}");
     }
@@ -753,21 +751,7 @@ fn caps_report(tools: &Tools, json: bool) -> std::io::Result<()> {
         println!("afir        {}", yes(caps.afir));
         println!("flac enc    {}", yes(caps.flac));
         println!("lavfi       {}", yes(caps.lavfi));
-        println!(
-            "flac CLI    {}",
-            match (&caps.flac_cli_path, caps.flac_cli) {
-                (Some(p), true) => format!("yes  {}", p.display()),
-                _ => "no".into(),
-            }
-        );
-        println!(
-            "24-bit FLAC {}",
-            if caps.flac_cli {
-                "available (via ffmpeg | flac)"
-            } else {
-                "needs the reference flac encoder"
-            }
-        );
+        println!("24-bit FLAC {}", caps.flac_summary());
         for n in &caps.notes {
             println!("note        {n}");
         }
@@ -981,7 +965,10 @@ mod tests {
         assert!(!cfg.resample.enable, "resampling must be off by default");
         assert!(!cfg.ir.enable, "IR must be off by default");
         assert_eq!(cfg.out.dither, Dither::None, "no dither by default");
-        assert_eq!(cfg.out.depth, BitDepth::S32);
+        // 24-bit, because that is the deepest FLAC stream ffmpeg's encoder
+        // actually writes. The bytes are the same ones the old "32-bit" default
+        // produced — only the label was wrong.
+        assert_eq!(cfg.out.depth, BitDepth::S24);
         assert!(matches!(cfg.out.format, OutFormat::Flac { level: 8 }));
         assert!(cfg.out.copy_metadata);
         assert!(!cfg.out.overwrite);
@@ -1097,9 +1084,15 @@ mod tests {
             .is_ok());
     }
 
+    /// The bound is ffmpeg's FLAC encoder's own: on n9.0.2 levels 0..=12 encode
+    /// (12 packs smallest) and 13 fails at encoder init with "invalid compression
+    /// level". The reference `flac` CLI's -0..-8 presets are a different scale and
+    /// are not what G6ME drives, so 9 is legal here even though flac reserves it.
     #[test]
-    fn level_is_bounded_like_flac() {
-        assert!(Cli::try_parse_from(["g6me", "--level", "9", "x"]).is_err());
+    fn level_is_bounded_like_ffmpeg_flac() {
+        assert!(Cli::try_parse_from(["g6me", "--level", "9", "x"]).is_ok());
+        assert!(Cli::try_parse_from(["g6me", "--level", "12", "x"]).is_ok());
+        assert!(Cli::try_parse_from(["g6me", "--level", "13", "x"]).is_err());
         assert!(Cli::try_parse_from(["g6me", "--level", "0", "x"]).is_ok());
         assert!(Cli::try_parse_from(["g6me", "--level", "-1", "x"]).is_err());
     }
