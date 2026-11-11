@@ -1,0 +1,27 @@
+[package]
+name = "g6me-core"
+description = "G6 Media Encoder (G6ME) engine: 7.1/5.1 -> binaural downmixer with exact f64 DSP, ffmpeg I/O, batch + monitoring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["monitor"]
+# Live monitoring through an output device (WASAPI on Windows, ALSA/PipeWire on Linux).
+monitor = ["dep:cpal"]
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+sha2.workspace = true
+cpal = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# cpal uses the windows crate for WASAPI; nothing extra needed here, this only
+# pins the path used for the file-dialog-free device enumeration on Windows.
+
+[dev-dependencies]
+serde_json.workspace = true

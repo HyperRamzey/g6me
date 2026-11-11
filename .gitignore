@@ -1,0 +1,19 @@
+target*/
+**/*.rs.bk
+# Cargo.lock is deliberately NOT ignored: this workspace builds binaries, and a
+# release resolved from a different lockfile is a different program.
+*.raw
+*.i64
+*.idb
+.g6me-cache/
+out/
+.venv/
+__pycache__/
+.DS_Store
+
+# Rendered audio, wherever a run happens to write it. Test and demo fixtures are
+# the only audio that belongs in the repository.
+*.flac
+*.wav
+!fixtures/**/*.wav
+!tests/**/*.wav

@@ -1,0 +1,24 @@
+[package]
+name = "g6me-cli"
+description = "G6 Media Encoder (G6ME) command line: batch renderer and live monitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "g6me"
+path = "src/main.rs"
+
+[dependencies]
+g6me-core = { workspace = true }
+clap = { workspace = true }
+serde_json.workspace = true
+# Ctrl-C has to cancel the queue and let the pipeline delete partial outputs,
+# not tear the process down mid-write.
+ctrlc = "3"
+
+[features]
+default = ["monitor"]
+monitor = ["g6me-core/monitor"]

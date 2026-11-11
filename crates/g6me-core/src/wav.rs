@@ -1,0 +1,327 @@
+//! Minimal RIFF/WAVE reader and writer.
+//!
+//! ffmpeg handles every real container; this exists for the two places where
+//! spawning a process for a handful of bytes is silly: the tests build and check
+//! their own WAVs, and the live monitor wraps a PCM stream in a WAV header when
+//! asked to record a file.
+//!
+//! Multi-channel files are written as `WAVE_FORMAT_EXTENSIBLE` with an explicit
+//! channel mask, because that mask is exactly the field the C reference and
+//! ffmpeg both read to learn the channel *order*. A plain PCM header carries no
+//! order at all, which is how 7.1 files end up with their surrounds in the front
+//! slots.
+
+use crate::error::{Error, Result};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+const WAVE_FORMAT_PCM: u16 = 0x0001;
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+const SUBTYPE_PCM: [u8; 16] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+const SUBTYPE_FLOAT: [u8; 16] = [
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+
+/// Standard channel order for a mask-free file, most-common-first.
+pub fn guess_mask(channels: u16) -> u32 {
+    const BITS: [u32; 18] = [
+        0x1,    // FL
+        0x2,    // FR
+        0x4,    // FC
+        0x8,    // LFE
+        0x10,   // BL
+        0x20,   // BR
+        0x200,  // SL
+        0x400,  // SR
+        0x40,   // FLC
+        0x80,   // FRC
+        0x100,  // BC
+        0x800,  // FLC(SLc?)
+        0x1000, // FRC
+        0x2000, // LTR
+        0x4000, // LTR
+        0x8000, // RSL
+        0x10000, 0x20000,
+    ];
+    BITS.iter()
+        .take(channels.min(BITS.len() as u16) as usize)
+        .fold(0, |acc, bit| acc | bit)
+}
+
+/// Classic 44-byte header when the file is 1–2 channels and needs no mask,
+/// otherwise the 58-byte extensible header.
+pub fn header(rate: u32, channels: u16, bits: u32, float: bool, mask: Option<u32>) -> Vec<u8> {
+    let block = channels as u32 * bits / 8;
+    let extensible = channels > 2 || mask.is_some_and(|m| m != guess_mask(channels));
+    let mut h = Vec::with_capacity(58);
+    let tag = if float {
+        WAVE_FORMAT_IEEE_FLOAT
+    } else {
+        WAVE_FORMAT_PCM
+    };
+    let fmt_tag = if extensible {
+        WAVE_FORMAT_EXTENSIBLE
+    } else {
+        tag
+    };
+    let fmt_len = if extensible { 40u32 } else { 16u32 };
+    // RIFF header: size is patched by the writer, so zero it here.
+    h.extend_from_slice(b"RIFF");
+    h.extend_from_slice(&0u32.to_le_bytes());
+    h.extend_from_slice(b"WAVE");
+    h.extend_from_slice(b"fmt ");
+    h.extend_from_slice(&fmt_len.to_le_bytes());
+    h.extend_from_slice(&fmt_tag.to_le_bytes());
+    h.extend_from_slice(&channels.to_le_bytes());
+    h.extend_from_slice(&rate.to_le_bytes());
+    h.extend_from_slice(&(rate * block).to_le_bytes());
+    h.extend_from_slice(&(block as u16).to_le_bytes());
+    h.extend_from_slice(&(bits as u16).to_le_bytes());
+    if extensible {
+        // wValidBitsPerSample: the container and the payload have the same width
+        // here, because ffmpeg hands us exactly the precision we asked for.
+        h.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        h.extend_from_slice(&(bits as u16).to_le_bytes()); // wValidBitsPerSample
+        h.extend_from_slice(&(mask.unwrap_or_else(|| guess_mask(channels))).to_le_bytes());
+        h.extend_from_slice(if float { &SUBTYPE_FLOAT } else { &SUBTYPE_PCM });
+    }
+    h.extend_from_slice(b"data");
+    h.extend_from_slice(&0u32.to_le_bytes());
+    h
+}
+
+/// Streaming WAV writer: header first, sizes patched on [`finish`].
+pub struct WavWriter {
+    f: std::fs::File,
+    rate: u32,
+    channels: u16,
+    bits: u32,
+    float: bool,
+    data_len: u64,
+}
+
+impl WavWriter {
+    pub fn create(
+        path: &Path,
+        rate: u32,
+        channels: u16,
+        bits: u32,
+        float: bool,
+        mask: Option<u32>,
+    ) -> Result<Self> {
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&header(rate, channels, bits, float, mask))?;
+        Ok(Self {
+            f,
+            rate,
+            channels,
+            bits,
+            float,
+            data_len: 0,
+        })
+    }
+
+    pub fn write(&mut self, pcm: &[u8]) -> Result<()> {
+        self.f.write_all(pcm)?;
+        self.data_len += pcm.len() as u64;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<u64> {
+        let total = self.data_len;
+        // RIFF chunk size = file size - 8; data chunk size = payload.
+        self.f.seek(SeekFrom::Start(4))?;
+        self.f.write_all(&((total + 36) as u32).to_le_bytes())?;
+        // The header ends with "data" followed by its 4-byte size, so the size
+        // field is the last 4 bytes of the header — writing 8 bytes back would
+        // land on the "data" tag itself and ffmpeg would reject the file.
+        let hdr = header(self.rate, self.channels, self.bits, self.float, None);
+        let data_off = (hdr.len() - 4) as u64;
+        self.f.seek(SeekFrom::Start(data_off))?;
+        self.f.write_all(&(total as u32).to_le_bytes())?;
+        self.f.flush()?;
+        Ok(total)
+    }
+}
+
+/// Convenience used by the tests: an s32 WAV with a standard mask.
+pub fn write_pcm_s32(path: &Path, rate: u32, channels: u16, pcm: &[u8]) -> Result<()> {
+    let mut w = WavWriter::create(path, rate, channels, 32, false, None)?;
+    w.write(pcm)?;
+    w.finish()?;
+    Ok(())
+}
+
+/// What a WAV header claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WavInfo {
+    pub rate: u32,
+    pub channels: u16,
+    pub bits: u32,
+    pub float: bool,
+    pub mask: Option<u32>,
+    pub data_len: u64,
+}
+
+impl WavInfo {
+    pub fn frames(&self) -> u64 {
+        let b = (self.channels as u64) * (self.bits as u64 / 8);
+        // A header claiming zero bytes per frame is corrupt, not infinite.
+        self.data_len.checked_div(b).unwrap_or(0)
+    }
+}
+
+/// Parse a WAV header and report where the samples start.
+pub fn read_info(path: &Path) -> Result<(WavInfo, u64)> {
+    read_info_file(&mut std::fs::File::open(path)?)
+}
+
+pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
+    let mut riff = [0u8; 12];
+    f.read_exact(&mut riff).map_err(short)?;
+    if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return Err(Error::msg("not a RIFF/WAVE file"));
+    }
+    let mut info = WavInfo {
+        rate: 0,
+        channels: 0,
+        bits: 0,
+        float: false,
+        mask: None,
+        data_len: 0,
+    };
+    loop {
+        let mut ch = [0u8; 8];
+        match f.read_exact(&mut ch) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(Error::msg("WAV has no data chunk"))
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+        // The chunk header is 4 bytes of id followed by 4 bytes of size.
+        let id = &ch[0..4];
+        let size = u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]) as u64;
+        if id == b"fmt " {
+            let mut b = vec![0u8; size as usize];
+            f.read_exact(&mut b).map_err(short)?;
+            if b.len() < 16 {
+                return Err(Error::msg("short WAV fmt chunk"));
+            }
+            let tag = u16::from_le_bytes([b[0], b[1]]);
+            info.channels = u16::from_le_bytes([b[2], b[3]]);
+            info.rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+            info.bits = u16::from_le_bytes([b[14], b[15]]) as u32;
+            info.float = tag == WAVE_FORMAT_IEEE_FLOAT;
+            if tag == WAVE_FORMAT_EXTENSIBLE && b.len() >= 40 {
+                // cbSize is at 16, so dwChannelMask follows the 2-byte valid-bits
+                // field at 20, and the 16-byte sub-format GUID starts at 24.
+                info.mask = Some(u32::from_le_bytes([b[20], b[21], b[22], b[23]]));
+                info.float = b[24] == 0x03; // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            } else if info.channels > 2 {
+                info.mask = Some(guess_mask(info.channels));
+            }
+        } else if id == b"data" {
+            let off = f.stream_position()?;
+            info.data_len = size;
+            return Ok((info, off));
+        } else {
+            f.seek(SeekFrom::Current(size as i64 + (size & 1) as i64))?;
+        }
+    }
+}
+
+fn short(e: std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        Error::msg("file is shorter than its WAV header")
+    } else {
+        Error::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("g6me-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    #[test]
+    fn roundtrip_8ch_s32_carries_the_7_1_mask() {
+        let p = tmp("8ch.wav");
+        let pcm = vec![0u8; 48000 * 8 * 4];
+        write_pcm_s32(&p, 48000, 8, &pcm).unwrap();
+        let (info, off) = read_info(&p).unwrap();
+        assert_eq!(info.channels, 8);
+        assert_eq!(info.rate, 48000);
+        assert_eq!(info.bits, 32);
+        assert_eq!(info.mask, Some(0x63f), "7.1 mask");
+        // 12 (RIFF) + 8 + 40 (fmt with 40-byte extensible body) + 8 (data header)
+        assert_eq!(off as usize, 68, "extensible header is 68 bytes");
+        assert_eq!(info.frames(), 48000);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn stereo_stays_classic_44_bytes() {
+        let p = tmp("st.wav");
+        write_pcm_s32(&p, 44100, 2, &vec![0u8; 44100 * 2 * 4]).unwrap();
+        let (info, off) = read_info(&p).unwrap();
+        assert_eq!(off as usize, 44);
+        assert_eq!(info.mask, None);
+        assert_eq!(info.frames(), 44100);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn patched_sizes_are_right() {
+        let p = tmp("sizes.wav");
+        let pcm = vec![7u8; 1000];
+        let mut w = WavWriter::create(&p, 48000, 2, 16, false, None).unwrap();
+        w.write(&pcm).unwrap();
+        w.finish().unwrap();
+        let len = std::fs::metadata(&p).unwrap().len();
+        let b = std::fs::read(&p).unwrap();
+        assert_eq!(len, 44 + 1000);
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as u64, len - 8);
+        assert_eq!(
+            u32::from_le_bytes([b[40], b[41], b[42], b[43]]) as u64,
+            1000,
+            "data chunk size"
+        );
+        assert_eq!(&b[44..], &pcm[..]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_non_wav() {
+        let p = tmp("bad.wav");
+        std::fs::write(&p, b"not a wav at all, really").unwrap();
+        assert!(read_info(&p).is_err());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn f64_float_header_roundtrip() {
+        let p = tmp("f64.wav");
+        let h = header(48000, 8, 64, true, Some(0x63f));
+        assert_eq!(h.len(), 68);
+        assert_eq!(u16::from_le_bytes([h[20], h[21]]), WAVE_FORMAT_EXTENSIBLE);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&h).unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+        drop(f);
+        let (info, _) = read_info(&p).unwrap();
+        assert!(info.float);
+        assert_eq!(info.bits, 64);
+        assert_eq!(info.mask, Some(0x63f));
+        std::fs::remove_file(&p).ok();
+    }
+}

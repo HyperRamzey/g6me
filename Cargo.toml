@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/g6me-core",
+    "crates/g6me-cli",
+    "crates/g6me-gui",
+    "crates/g6me-verify",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/HyperRamzey/g6me"
+authors = ["HyperRamzey"]
+
+[workspace.dependencies]
+g6me-core = { path = "crates/g6me-core" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Numerical note: the downmixer in g6me-core must stay IEEE-754 exact. Rust
+# already compiles `+ - *` with fp-contract=off (no FMA contraction), which is
+# what keeps the port bit-identical to the C reference. Do not add
+# `-C target-cpu=native` + fma, `-C llvm-args=--fp-contract=fast`, or any
+# fast-math here; crates/g6me-verify/tests/asm_guard.rs fails the build if FMA
+# ever shows up in the DSP disassembly.

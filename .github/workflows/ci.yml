@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # `--locked` everywhere: this workspace ships binaries, so the committed
+  # Cargo.lock is part of what is being tested.
+  RUSTFLAGS: ""
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: System packages
+        # libasound2-dev: cpal's ALSA backend (g6me-core's `monitor` feature).
+        # The rest are what winit/eframe link against for a Wayland/X11 build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libpulse-dev \
+            libxcb1-dev libx11-dev libxcursor-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev
+      - run: cargo fmt --check --all
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo build --locked --release --workspace
+      - run: cargo test --locked --workspace
+      # The evidence: builds vendor/g6ct in eight configurations and compares.
+      # --require-all makes any skip a failure, so a missing C compiler cannot
+      # quietly turn the numerical contract back into a no-op.
+      - name: Bit-exactness verification
+        run: cargo run --locked --release -p g6me-verify -- --require-all
+      - name: Capabilities probe (smoke)
+        run: ./target/release/g6me --caps
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo build --locked --release --workspace
+      - run: cargo test --locked --workspace
+      - name: Bit-exactness verification
+        run: cargo run --locked --release -p g6me-verify -- --require-all
+
+  # The optimized flavour: the same numerical contract under explicit x86-64-v3
+  # codegen. If FMA contraction ever appeared in the DSP, this job is what catches
+  # it — the generic job above would stay green.
+  linux-v3:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v3 -C opt-level=3 -C llvm-args=-unroll-threshold=1000"
+      CARGO_TARGET_DIR: target-v3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libpulse-dev \
+            libxcb1-dev libx11-dev libxcursor-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev
+      - run: >-
+          cargo build --locked --release --workspace
+          --config 'profile.release.lto="thin"'
+          --config 'profile.release.codegen-units=1'
+      - name: Bit-exactness verification (x86-64-v3)
+        run: ./target-v3/release/g6me-verify --require-all
+
+  # The GNU target is the one a Windows user without Visual Studio can build, and
+  # it is also what a cross-compile from Linux produces.
+  windows-gnu:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: actions/checkout@v4
+      - run: cargo build --locked --release --target x86_64-pc-windows-gnu --workspace

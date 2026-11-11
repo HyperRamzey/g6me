@@ -1,0 +1,34 @@
+[package]
+name = "g6me-gui"
+description = "G6 Media Encoder (G6ME) desktop app: queue, per-file meters, format controls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "g6me-gui"
+path = "src/main.rs"
+
+[dependencies]
+g6me-core = { workspace = true }
+# eframe's default features already cover the three platforms this project
+# promises: winit's X11 and Wayland backends, native Windows, and AccessKit for
+# screen readers. Keeping them default rather than hand-picked means an
+# upgrade cannot silently drop one.
+eframe = "0.31"
+egui = "0.31"
+
+# Native file dialogs need GTK or an XDG portal on Linux, which a minimal
+# Wayland or dwm session may not have. The default build therefore uses a pure
+# egui browser that works wherever eframe does; this feature opts into the
+# platform dialogs for people who want the native look.
+rfd = { version = "0.15", optional = true }
+
+[features]
+# No `monitor` feature here on purpose: this app never opens an audio device. The
+# levels come from taps on the render itself, which needs no cpal, no device and
+# no portal — see `g6me_core::meter::MeterTap`.
+default = []
+native-dialogs = ["dep:rfd"]
