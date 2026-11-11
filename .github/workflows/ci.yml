@@ -48,11 +48,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Tests skip when ffmpeg/flac are absent, so this only buys coverage — but it
+      # buys the *whole* render path on Windows, which is where the release binaries
+      # for that platform run. If the package manager hiccups, the suite still runs.
+      - name: ffmpeg and flac on PATH
+        continue-on-error: true
+        run: choco install ffmpeg flac -y --no-progress
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo build --locked --release --workspace
       - run: cargo test --locked --workspace
-      - name: Bit-exactness verification
-        run: cargo run --locked --release -p g6me-verify -- --require-all
+      # Deliberately not --require-all here: the reference comparisons need a C
+      # compiler on PATH, and MSVC runners do not guarantee one. A missing compiler
+      # must read as "these checks did not run on this target", not as a green light,
+      # so the hard gate lives in the msys2 job, which installs gcc explicitly.
+      - name: Bit-exactness verification (skips reported, not fatal)
+        run: cargo run --locked --release -p g6me-verify
 
   # The optimized flavour: the same numerical contract under explicit x86-64-v3
   # codegen. If FMA contraction ever appeared in the DSP, this job is what catches
@@ -93,9 +103,16 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
-            git mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-binutils
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-gnu
       - uses: actions/checkout@v4
       - run: cargo build --locked --release --target x86_64-pc-windows-gnu --workspace
+      # gcc is in this job's PATH by construction, so a skip here is a real failure:
+      # it would mean the Windows reference binaries never got built.
+      - name: Bit-exactness verification (windows-gnu, must not skip)
+        run: cargo run --locked --release -p g6me-verify --target x86_64-pc-windows-gnu -- --require-all
