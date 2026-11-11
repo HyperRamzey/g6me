@@ -260,7 +260,22 @@ pub fn derived_branches(upsample: usize, taps: usize) -> Vec<Vec<f64>> {
 }
 
 /// Over-sampling ratios G6ME offers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+///
+/// Serialises as its label (`"x4"`) so a saved settings file says what it means to a
+/// human. Both spellings parse on the command line, per [`Ratio::from_str`].
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Ratio {
     /// Half-band only. Annex 2: sufficient when the source rate is already high.
     X2,
@@ -1368,5 +1383,131 @@ mod tests {
         m2.push_ch(0, &a);
         m2.push_ch(1, &b);
         assert!((m1.peak() - m2.peak()).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod reference {
+    use super::*;
+
+    /// A near-exact interpolator: 128 phases of a 48-tap Blackman-windowed sinc,
+    /// 6 144 MAC/sample. Slow enough to be a test-only instrument, good enough that its
+    /// own error (a few thousandths of a dB) is far below the errors being measured.
+    fn reference_branches(oversample: usize, taps: usize) -> Vec<Vec<f64>> {
+        derived_branches(oversample, taps)
+    }
+
+    fn reference_peak(block: &[f64]) -> f64 {
+        let bank = reference_branches(128, 48);
+        let mut peak = block.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+        let t = bank[0].len();
+        let mut hist = vec![0.0f64; t];
+        for &x in block {
+            hist.copy_within(1.., 0);
+            hist[t - 1] = x;
+            for b in &bank {
+                let mut acc = 0.0;
+                for (h, c) in hist.iter().zip(b) {
+                    acc += h * c;
+                }
+                if acc.abs() > peak {
+                    peak = acc.abs();
+                }
+            }
+        }
+        peak
+    }
+
+    /// Program-like material, the kinds of crest a real render produces.
+    fn cases() -> Vec<(&'static str, Vec<f64>)> {
+        let n = 4096;
+        let mut out: Vec<(&'static str, Vec<f64>)> = Vec::new();
+
+        // Two tones beating near Nyquist: the crest lands between samples.
+        let a: Vec<f64> = (0..n)
+            .map(|i| {
+                0.62 * (2.0 * std::f64::consts::PI * 0.47 * i as f64 / 4.0).sin()
+                    + 0.62 * (2.0 * std::f64::consts::PI * 0.43 * i as f64 / 4.0).sin()
+            })
+            .collect();
+        out.push(("two tones near nyquist", a));
+
+        // A near-Nyquist tone amplitude-modulated to a crest.
+        let b: Vec<f64> = (0..n)
+            .map(|i| {
+                let e = (-(i as f64 - 2048.0).powi(2) / (2.0 * 3.0f64.powi(2))).exp();
+                e * (2.0 * std::f64::consts::PI * 0.49 * i as f64 / 4.0).sin()
+            })
+            .collect();
+        out.push(("nyquist burst", b));
+
+        // Dense impulses: each one's crest is at its own sample, the neighbours ring.
+        let mut c = vec![0.0f64; n];
+        for i in (0..n).step_by(37) {
+            c[i] = 0.9;
+        }
+        out.push(("impulse train", c));
+
+        // White noise: worst-case peak statistics, every phase exercised.
+        let mut state = 0x2545F491u64;
+        let d: Vec<f64> = (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 40) as f64 / (1u64 << 24) as f64 * 2.0 - 1.0
+            })
+            .collect();
+        out.push(("white noise", d));
+        out
+    }
+
+    /// Diagnostic: how far each ratio sits below the reference on program material.
+    #[test]
+    #[ignore = "diagnostic; run with --nocapture to print the table"]
+    fn error_against_a_reference_interpolator() {
+        println!(
+            "case                    x2       x4       x8      x16      x32   (dB vs reference)"
+        );
+        for (name, block) in cases() {
+            let r = reference_peak(&block);
+            let mut row = String::new();
+            for ratio in [Ratio::X2, Ratio::X4, Ratio::X8, Ratio::X16, Ratio::X32] {
+                let mut d = Detector::new(ratio);
+                d.push_block(&block);
+                row.push_str(&format!(
+                    "{:+8.3} ",
+                    db_from_peak(d.peak()) - db_from_peak(r)
+                ));
+            }
+            println!("{name:22}{row}");
+        }
+    }
+
+    /// The same measurement, as a gate: no ratio may under-read the reference by more
+    /// than the figure the limiter's guard band is built from.
+    #[test]
+    fn no_ratio_underreads_the_reference_by_more_than_its_stated_error() {
+        for ratio in [Ratio::X2, Ratio::X4, Ratio::X8, Ratio::X16, Ratio::X32] {
+            let mut worst = 0.0f64;
+            let mut where_worst = "";
+            for (name, block) in cases() {
+                let r = reference_peak(&block);
+                let mut d = Detector::new(ratio);
+                d.push_block(&block);
+                let err = db_from_peak(r) - db_from_peak(d.peak());
+                if err > worst {
+                    worst = err;
+                    where_worst = name;
+                }
+            }
+            assert!(
+                worst <= ratio.worst_underread_db() + 1e-9,
+                "{} under-read the reference by {worst:.3} dB on {where_worst}, more than \
+                 the {} dB it claims (the limiter's guard band is built from that figure)",
+                ratio.label(),
+                ratio.worst_underread_db()
+            );
+        }
     }
 }

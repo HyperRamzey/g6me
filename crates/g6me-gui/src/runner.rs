@@ -11,6 +11,7 @@
 //! encoder saw. Nothing in this file opens an audio device.
 
 use g6me_core::batch::{self, Batch, BatchCfg, Counters, Item, Outcome, Phase};
+use g6me_core::pipeline::Report;
 use g6me_core::probe::{Caps, Tools};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -29,10 +30,16 @@ pub enum Level {
 #[derive(Clone, Debug)]
 pub enum Event {
     /// A queued file reached a terminal state.
+    ///
+    /// `report` rides along with the success so the meter history can be written down
+    /// while the numbers are fresh. The live bars decay to rest in a third of a second —
+    /// correct for a bar, useless as a record — so without this the peak of a finished
+    /// file exists nowhere after the run.
     ItemState {
         index: usize,
         phase: Phase,
         note: String,
+        report: Option<Box<Report>>,
     },
     /// The batch finished; the UI stops showing a spinner.
     Finished(Summary),
@@ -223,6 +230,9 @@ impl Runner {
                 index,
                 phase: item.phase,
                 note,
+                // Boxed: a Report is a dozen PathBufs, Vecs and strings, and this event
+                // is cloned through a channel for every file in a queue of thousands.
+                report: item.report.clone().map(Box::new),
             });
             wake_progress();
         });

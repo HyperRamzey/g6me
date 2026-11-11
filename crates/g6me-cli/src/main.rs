@@ -8,12 +8,16 @@
 
 use clap::Parser;
 use g6me_core::batch::{self, Batch, BatchCfg, Item, Phase, Progress};
+use g6me_core::limiter::{
+    Cfg as LimiterCfg, MAX_CEILING_DB, MAX_LOOKAHEAD_MS, MIN_CEILING_DB, MIN_LOOKAHEAD_MS,
+};
 use g6me_core::mask::Slot;
 use g6me_core::meter::Meters;
 use g6me_core::pcm::{BitDepth, Dither};
 use g6me_core::pipeline::{self, Plan, RenderOpts};
 use g6me_core::probe::{probe_caps, Caps, Tools};
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
+use g6me_core::tp::Ratio;
 use g6me_core::util;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -48,6 +52,33 @@ pub struct Cli {
     /// FLAC encoder writes at most 24-bit, so 32-bit and float need --format wav.
     #[arg(long, default_value = "s24", value_parser = parse_depth)]
     pub depth: BitDepth,
+
+    /// Over-sampling ratio the true peak is measured at: 2, 4, 8, 16 or 32 ("x4" works
+    /// too). Every render reports the result, quoted with this ratio, because a dBTP
+    /// without one is not a comparable number.
+    #[arg(long = "true-peak", default_value = "4", value_parser = parse_ratio)]
+    pub true_peak: Ratio,
+
+    /// Limit the true peak instead of only reporting it. The last stage before the
+    /// encoder: it holds the real ceiling on the delivered file.
+    #[arg(long)]
+    pub limit: bool,
+
+    /// Ceiling for --limit, in dBTP (-24 ..= 0).
+    // `allow_negative_numbers` because `--ceiling -1` is how it is typed, and without it
+    // clap reads the -1 as a flag and refuses the whole command line.
+    #[arg(long, allow_negative_numbers = true, default_value_t = -1.0, value_parser = parse_ceiling_db)]
+    pub ceiling: f64,
+
+    /// Lookahead --limit may use, in ms (0.2 ..= 2.0). A deeper filter needs more; what
+    /// was actually used is reported, because a deep filter cannot honour a shallow ask.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_lookahead_ms)]
+    pub lookahead: f64,
+
+    /// Over-sampling ratio the limiter runs at. Defaults to --true-peak, and lowering it
+    /// widens the guard band the ceiling aims below.
+    #[arg(long, value_parser = parse_ratio)]
+    pub limit_ratio: Option<Ratio>,
 
     /// libsoxr precision in bits, 17..=33, used whenever a bit depth is reduced.
     #[arg(long, default_value_t = 33.0, value_parser = parse_precision_bits)]
@@ -136,7 +167,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 16, value_parser = parse_queue)]
     pub queue: usize,
 
-    /// SHA-256 every finished output (evidence that two runs agree).
+    /// SHA-256 every finished output: the sample stream (container-independent, so two
+    /// runs of different formats agree) and the file itself (`sha256sum` reproduces this
+    /// one). Both appear in --json as `sha256` and `file_sha256`.
     #[arg(long)]
     pub sha256: bool,
 
@@ -304,6 +337,34 @@ fn parse_ir_norm(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+fn parse_ratio(s: &str) -> Result<Ratio, String> {
+    s.parse()
+}
+
+fn parse_ceiling_db(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a dBTP ceiling"))?;
+    if !v.is_finite() || v < MIN_CEILING_DB || v > MAX_CEILING_DB {
+        return Err(format!(
+            "ceiling must be between {MIN_CEILING_DB} and {MAX_CEILING_DB} dBTP, got {v}"
+        ));
+    }
+    Ok(v)
+}
+
+fn parse_lookahead_ms(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a lookahead in ms"))?;
+    if !v.is_finite() || v < MIN_LOOKAHEAD_MS || v > MAX_LOOKAHEAD_MS {
+        return Err(format!(
+            "lookahead must be between {MIN_LOOKAHEAD_MS} and {MAX_LOOKAHEAD_MS} ms, got {v}"
+        ));
+    }
+    Ok(v)
+}
+
 /// Threads are capped at the logical CPU count, the same ceiling the GUI slider
 /// uses. More workers than cores only adds contention, and each worker already
 /// runs three threads plus two ffmpeg children.
@@ -370,6 +431,13 @@ impl Cli {
                 filter_threads: None,
             },
             order: self.order.clone(),
+            true_peak: self.true_peak,
+            limiter: LimiterCfg {
+                enable: self.limit,
+                ceiling_db: self.ceiling,
+                ratio: self.limit_ratio.unwrap_or(self.true_peak),
+                lookahead_ms: self.lookahead,
+            },
             block: self.block,
             queue_blocks: self.queue,
             stream: self.stream,

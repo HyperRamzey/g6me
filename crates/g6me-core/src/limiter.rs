@@ -98,7 +98,7 @@ pub const MIN_LOOKAHEAD_MS: f64 = 0.2;
 pub const MAX_LOOKAHEAD_MS: f64 = 2.0;
 
 /// Settings for the true-peak limiter.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cfg {
     /// Off by default: the whole point of G6ME is that nothing happens unless asked.
     pub enable: bool,
@@ -238,7 +238,7 @@ impl Cfg {
 }
 
 /// What one file's limiter pass measured.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     /// True peak at the limiter input, dBTP.
     pub pre_dbtp: f64,
@@ -422,6 +422,18 @@ impl Limiter {
         self.latency
     }
 
+    /// Post-limiter true peak per channel, dBTP.
+    ///
+    /// [`Report::post_dbtp`] is the group maximum, because that is what the ceiling is
+    /// judged against — one gain for the whole group means one number that has to hold.
+    /// A meter panel wants the breakdown, and the difference is not cosmetic: on 5.1
+    /// material the group maximum and the loudest single channel can disagree by several
+    /// dB once the LFE is in the group.
+    #[must_use]
+    pub fn per_channel_post_dbtp(&self) -> Vec<f64> {
+        self.out_meter.per_channel_dbtp()
+    }
+
     #[must_use]
     pub fn report(&self) -> Report {
         let mut r = self.report;
@@ -500,7 +512,13 @@ impl Limiter {
 
     /// Process one block of planar samples in place. Every channel in `planar` must be
     /// the same length.
-    pub fn process(&mut self, planar: &mut [Vec<f64>]) {
+    /// # Input
+    ///
+    /// One mutable slice per channel, all the same length, processed in place. Slices
+    /// rather than `Vec`s because the render loop hands over a window of buffers it
+    /// already owns; making it copy a block to satisfy the signature would be pure cost
+    /// on the one path that has to stay ahead of a live device.
+    pub fn process(&mut self, planar: &mut [&mut [f64]]) {
         if !self.cfg.enable || planar.is_empty() {
             return;
         }
@@ -610,6 +628,15 @@ impl Limiter {
                 slot + 1
             };
         }
+        // The tail is programme, not debris: it is the last `latency` frames of the
+        // file, delayed, and a peak can absolutely live in it. Measuring only what
+        // `process` emitted would report the post-limiter true peak of everything
+        // except the end of the file, which is exactly where a limiter's own report has
+        // to be right — so the tail goes through the same detector the ceiling was
+        // judged by before the report is allowed to be read.
+        for (c, buf) in out.iter().enumerate() {
+            self.out_meter.push_ch(c, buf);
+        }
         out
     }
 }
@@ -659,10 +686,12 @@ mod tests {
     fn run(cfg: Cfg, planar: &[Vec<f64>], chunk: usize) -> (Vec<Vec<f64>>, Report) {
         let mut lim = Limiter::enabled(cfg, FS as u32, planar.len());
         let mut out = vec![Vec::new(); planar.len()];
+        // The limiter works in place, so the fixture keeps its own copy to feed it.
+        let mut data: Vec<Vec<f64>> = planar.to_vec();
         let mut i = 0usize;
-        while i < planar[0].len() {
-            let end = (i + chunk).min(planar[0].len());
-            let mut block: Vec<Vec<f64>> = planar.iter().map(|p| p[i..end].to_vec()).collect();
+        while i < data[0].len() {
+            let end = (i + chunk).min(data[0].len());
+            let mut block: Vec<&mut [f64]> = data.iter_mut().map(|d| &mut d[i..end]).collect();
             lim.process(&mut block);
             for (c, b) in block.iter().enumerate() {
                 out[c].extend_from_slice(b);
@@ -918,11 +947,12 @@ mod tests {
     /// With the limiter disabled nothing is delayed and nothing is changed.
     #[test]
     fn disabled_limiter_is_an_identity() {
-        let x = worst_case(1000);
+        let mut x = worst_case(1000);
+        let before = x.clone();
         let mut lim = Limiter::disabled();
-        let mut block = vec![x.clone()];
+        let mut block: [&mut [f64]; 1] = [x.as_mut_slice()];
         lim.process(&mut block);
-        assert_eq!(block[0], x, "disabled limiter changed samples");
+        assert_eq!(x, before, "disabled limiter changed samples");
         assert_eq!(lim.flush().len(), 0, "disabled limiter added frames");
         assert_eq!(lim.latency_samples(), 0);
         assert!(!lim.is_enabled());
@@ -940,12 +970,40 @@ mod tests {
         assert!(Cfg::default().validate().is_ok());
     }
 
+    /// The end of the file is inside the ceiling claim, not outside it.
+    #[test]
+    fn a_peak_in_the_flushed_tail_is_measured() {
+        let lat = cfg(-1.0, Ratio::X4, 1.0).latency_samples(48_000);
+        let mut lim = Limiter::enabled(cfg(-1.0, Ratio::X4, 1.0), 48_000, 1);
+        // Silence, then a full-scale crest in the last few samples: those frames leave
+        // through flush(), so a report that metered only process() would call this file
+        // silent.
+        let mut buf = vec![0.0f64; lat * 2];
+        let last = buf.len() - 1;
+        buf[last] = 0.9;
+        let mut block: [&mut [f64]; 1] = [buf.as_mut_slice()];
+        lim.process(&mut block);
+        let tail = lim.flush();
+        let r = lim.report();
+        assert!(!tail[0].is_empty(), "flush returned nothing");
+        let tail_peak = tail[0].iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(tail_peak > 0.5, "the crest did not reach the tail");
+        assert!(
+            r.post_dbtp > -2.0,
+            "post-limiter true peak {:+.2} dBTP does not know about the tail crest \
+             at {:+.2} dBFS",
+            r.post_dbtp,
+            crate::tp::db_from_peak(tail_peak)
+        );
+    }
+
     /// Trailing frames are output, not debris.
     #[test]
     fn flush_returns_the_delayed_tail() {
         let lat = cfg(-1.0, Ratio::X4, 1.0).latency_samples(48_000);
         let mut lim = Limiter::enabled(cfg(-1.0, Ratio::X4, 1.0), 48_000, 1);
-        let mut block = vec![vec![0.5f64; 100]];
+        let mut buf = vec![0.5f64; 100];
+        let mut block: [&mut [f64]; 1] = [buf.as_mut_slice()];
         lim.process(&mut block);
         let tail = lim.flush();
         assert_eq!(tail[0].len(), lat);

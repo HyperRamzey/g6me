@@ -14,12 +14,14 @@
 use crate::child::Proc;
 use crate::dsp::{Dsp, SLOTS};
 use crate::error::{Error, Result};
+use crate::limiter::{Limiter, Report as LimiterReport};
 use crate::mask::{format_order, is_downmixable, mask_of, order_from_layout, Slot};
 use crate::pcm::Sha256;
 use crate::probe::{probe_audio, AudioInfo, Caps, Tools};
 use crate::stages::{
     effective_input_rate, input_args, input_stage, loss_chain, output_args, InputStage, RenderCfg,
 };
+use crate::tp::{db_from_peak, Ratio, TruePeak};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -95,15 +97,41 @@ pub struct Report {
     pub output_bytes: u64,
     pub encoder: String,
     pub sha256: Option<String>,
+    /// SHA-256 of the finished file, which is the number `sha256sum` prints.
+    ///
+    /// Both hashes are reported because they answer different questions, and confusing
+    /// them has a cost: `sha256` covers the samples handed to the encoder, so two runs
+    /// compare equal even when the container differs (a WAV and a FLAC of one render
+    /// share it), while `file_sha256` covers the bytes on disk and is what an evidence
+    /// log or a dedupe pass needs. Only the second is reproducible with an external tool.
+    pub file_sha256: Option<String>,
     pub warnings: Vec<String>,
     pub input_cmd: Vec<String>,
     pub encode_cmd: Vec<String>,
     pub chain: Vec<String>,
+    /// True peak of the samples handed to the encoder, dBTP. This is the file's true
+    /// peak, not an estimate taken before the last gain stage.
+    pub true_peak_dbtp: f64,
+    /// The same measurement per channel, in output channel order.
+    pub per_channel_true_peak_dbtp: Vec<f64>,
+    /// Which detector produced the two numbers above, because a dBTP without its ratio
+    /// is not a comparable number.
+    pub true_peak_ratio: Ratio,
+    /// What the limiter did, when it was asked to do anything.
+    pub limiter: Option<LimiterReport>,
+    /// Sample peak per channel of the delivered output, dBFS. Distinguished from the
+    /// true peak on purpose: a file can sit at -1 dBFS in samples and +0.8 dBTP between
+    /// them, and only one of those two numbers is what a sample-rate converter clips on.
+    pub sample_peak_dbfs: Vec<f64>,
+    /// RMS per channel of the delivered output, dBFS: `sqrt(mean(x^2))` over the whole
+    /// file, which is the mean-square figure the source meter showed next to its peak.
+    /// Silence reports `f64::NEG_INFINITY`, not a lie.
+    pub rms_dbfs: Vec<f64>,
 }
 
 impl Report {
     pub fn one_line(&self) -> String {
-        format!(
+        let mut s = format!(
             "{} -> {}  [{}] {} frames  {:.1}s  {:.1}x realtime  {}",
             self.source
                 .file_name()
@@ -118,7 +146,77 @@ impl Report {
             self.seconds,
             self.realtime_factor,
             crate::util::human_bytes(self.output_bytes)
-        )
+        );
+        // The true peak belongs on the headline line: it is the only number there that
+        // describes the audio rather than the job, and it is quoted with its ratio
+        // because a x2 reading and a x32 reading of one file differ by a third of a dB —
+        // more than most delivery specs are graded on.
+        s.push_str(&format!(
+            "  tp {:+.2} dBTP @{}",
+            self.true_peak_dbtp,
+            self.true_peak_ratio.label()
+        ));
+        if let Some(l) = &self.limiter {
+            s.push_str(&format!(
+                "  limited to {:+.2} dBTP (peak reduction {:.2} dB)",
+                l.ceiling_db, l.max_gain_reduction_db
+            ));
+        }
+        s
+    }
+
+    /// The whole true-peak story for one file, as text, for the log and for the GUI's
+    /// meter history.
+    ///
+    /// This exists because the numbers are worthless after a render unless they stay
+    /// next to the file they describe: what the ceiling was asked to be, what the
+    /// detector could actually see, what the limiter really did, and what came out.
+    /// Every figure here is a measurement of the delivered stream.
+    #[must_use]
+    pub fn peak_line(&self) -> String {
+        let chans = self
+            .per_channel_true_peak_dbtp
+            .iter()
+            .map(|v| format!("{v:+.2}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut s = format!(
+            "true peak {:+.2} dBTP @{}  per channel: {}",
+            self.true_peak_dbtp,
+            self.true_peak_ratio.label(),
+            chans
+        );
+        if let Some(l) = &self.limiter {
+            s.push_str(&format!(
+                "\nlimiter: ceiling {:+.2} dBTP @{}; aims {:.2} dB low ({:.2} dB meter + {:.2} dB gain slew)",
+                l.ceiling_db,
+                l.ratio.label(),
+                l.guard_db,
+                l.ratio.worst_underread_db(),
+                l.guard_db - l.ratio.worst_underread_db()
+            ));
+            s.push_str(&format!(
+                "; lookahead {:.2} ms asked, {:.2} ms used; latency {} samples ({:.3} ms), gain ramp {} frames",
+                l.requested_lookahead_ms,
+                l.effective_lookahead_ms,
+                l.latency_samples,
+                l.latency_ms,
+                l.ramp_frames
+            ));
+            s.push_str(&format!(
+                "; pre {:+.2} dBTP -> post {:+.2} dBTP ({} the ceiling); peak reduction {:.2} dB over {} engaged frames",
+                l.pre_dbtp,
+                l.post_dbtp,
+                if l.within_ceiling() {
+                    "measured within"
+                } else {
+                    "OVER"
+                },
+                l.max_gain_reduction_db,
+                l.engaged_frames
+            ));
+        }
+        s
     }
 }
 
@@ -157,6 +255,137 @@ pub fn resolve_order(cfg: &RenderCfg, info: &AudioInfo) -> Result<Vec<Slot>> {
 }
 
 /// Render `src` to `dst`.
+/// What [`PeakStage`] measured about the delivered stream.
+struct PeakSummary {
+    true_peak_dbtp: f64,
+    per_channel_true_peak_dbtp: Vec<f64>,
+    sample_peak_dbfs: Vec<f64>,
+    rms_dbfs: Vec<f64>,
+    limiter: Option<LimiterReport>,
+}
+
+/// The last thing to touch a sample, and the pair of numbers that describe it.
+///
+/// Its own type because the two jobs belong together and neither reads well inline: the
+/// limiter is the reason a ceiling claim is worth making, the meter is the reason it can
+/// be checked. Keeping them in one place also makes the interesting part explicit rather
+/// than implicit — when both want the same ratio, one measurement serves both.
+struct PeakStage {
+    tp: TruePeak,
+    limiter: Option<Limiter>,
+    /// The limiter's own post-limiter measurement is the file's measurement.
+    shared: bool,
+    /// Per channel: held sample peak, running sum of squares, frames seen.
+    accum: [Accum; 2],
+}
+
+/// Peak and mean-square, held per channel for the whole file.
+///
+/// The live meter bars decay to rest within a third of a second, which is right for a
+/// bar and useless as a record: once a file is finished the numbers that describe it have
+/// to exist somewhere other than the screen.
+#[derive(Clone, Copy, Default)]
+struct Accum {
+    peak: f64,
+    sum_sq: f64,
+    frames: u64,
+}
+
+impl Accum {
+    fn push(&mut self, buf: &[f64]) {
+        let mut p = self.peak;
+        let mut ss = self.sum_sq;
+        // Written as an explicit loop, in this order, because the sum is a reduction:
+        // it must not be reassociated or contracted into an FMA any more than the
+        // filters are. It is a meter, but a meter that moves between runs is a meter
+        // nobody trusts.
+        for &x in buf {
+            let a = x.abs();
+            if a > p {
+                p = a;
+            }
+            ss += x * x;
+        }
+        self.peak = p;
+        self.sum_sq = ss;
+        self.frames += buf.len() as u64;
+    }
+
+    fn peak_db(&self) -> f64 {
+        db_from_peak(self.peak)
+    }
+
+    fn rms_db(&self) -> f64 {
+        if self.frames == 0 {
+            return f64::NEG_INFINITY;
+        }
+        db_from_peak((self.sum_sq / self.frames as f64).sqrt())
+    }
+}
+
+impl PeakStage {
+    fn new(cfg: &RenderCfg, rate: u32) -> Self {
+        let limiter = cfg
+            .limiter
+            .enable
+            .then(|| Limiter::enabled(cfg.limiter, rate, 2));
+        Self {
+            tp: TruePeak::new(cfg.true_peak, 2),
+            shared: cfg.limiter.enable && cfg.limiter.ratio == cfg.true_peak,
+            limiter,
+            accum: std::array::from_fn(|_| Accum::default()),
+        }
+    }
+
+    /// Limit, then measure, in that order. Stereo, in place.
+    fn process(&mut self, left: &mut [f64], right: &mut [f64]) {
+        if let Some(l) = self.limiter.as_mut() {
+            let mut chans: [&mut [f64]; 2] = [left, right];
+            l.process(&mut chans);
+        }
+        if !self.shared {
+            self.tp.push_ch(0, left);
+            self.tp.push_ch(1, right);
+        }
+        // Sample peak and mean-square are always accumulated, shared meter or not: two
+        // passes over a block that is already in cache, and they are the numbers the
+        // history panel is built from.
+        for (acc, buf) in self.accum.iter_mut().zip([left, right]) {
+            acc.push(buf);
+        }
+    }
+
+    /// Frames the limiter was still holding when input ended. Programme, not debris.
+    fn finish_input(&mut self) -> Vec<Vec<f64>> {
+        self.limiter
+            .as_mut()
+            .map(Limiter::flush)
+            .unwrap_or_default()
+    }
+
+    /// The report's true-peak numbers, and what the limiter did if it ran.
+    fn summarize(&self) -> PeakSummary {
+        let report = self.limiter.as_ref().map(Limiter::report);
+        let (true_peak_dbtp, per_channel_true_peak_dbtp) = match (&report, self.shared) {
+            (Some(r), true) => (
+                r.post_dbtp,
+                self.limiter
+                    .as_ref()
+                    .map(Limiter::per_channel_post_dbtp)
+                    .unwrap_or_default(),
+            ),
+            _ => (self.tp.dbtp(), self.tp.per_channel_dbtp()),
+        };
+        PeakSummary {
+            true_peak_dbtp,
+            per_channel_true_peak_dbtp,
+            sample_peak_dbfs: self.accum.iter().map(Accum::peak_db).collect(),
+            rms_dbfs: self.accum.iter().map(Accum::rms_db).collect(),
+            limiter: report,
+        }
+    }
+}
+
 pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -> Result<Report> {
     let started = Instant::now();
     let mut warnings = Vec::new();
@@ -198,6 +427,18 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         ..
     } = plan;
     warnings.extend(plan_warnings);
+
+    cfg.limiter
+        .validate()
+        .map_err(|e| Error::msg(format!("true-peak limiter: {e}")))?;
+
+    // ---- true peak, and the limiter that owns it -----------------------------------
+    //
+    // This sits after every stage that can move a sample and before the encoder, so the
+    // reported dBTP is a property of the file on disk. Metering the input, or the
+    // downmixer's output before the limiter touched it, would report a number the
+    // delivered file does not have.
+    let mut peak = PeakStage::new(cfg, work_rate);
 
     let mut producer = Proc::spawn_reader("decode", &opts.tools.ffmpeg, &in_args)?;
     let mut consumer = EncoderSink::new(cfg, opts, &enc_args)?;
@@ -296,6 +537,11 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             bail!(Error::NonFinite { frames });
         }
 
+        // Last stage to touch a sample, and deliberately before the tap: a monitor
+        // should hear what the file will contain, ceiling and all, and the latency it
+        // hears is real — which is why the report states it.
+        peak.process(&mut out_l[..n], &mut out_r[..n]);
+
         // The tap runs before the encoder so a monitor that paces itself on a
         // device FIFO sets the tempo of the whole chain.
         if let Some(t) = &opts.tap {
@@ -323,6 +569,21 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         pipe_bytes_in += dec.bytes.len() as u64;
         if let Some(p) = &opts.progress {
             p.update(frames, bytes_out.load(Ordering::Relaxed));
+        }
+    }
+
+    // The limiter holds the last `latency` frames of the file back. They are programme,
+    // not debris, and they have to reach the encoder before the stream closes: a file
+    // that lost its tail would be audibly truncated at exactly the point where the
+    // limiter added delay. If the encoder has already died the send fails quietly and the
+    // join below reports its error, which is the informative one.
+    let tail = peak.finish_input();
+    if let (Some(tl), Some(tr)) = (tail.first(), tail.get(1)) {
+        if !tl.is_empty() {
+            frames += tl.len() as u64;
+            let mut tb = Vec::with_capacity(tl.len() * 4);
+            interleave_f64(tl, tr, &mut tb);
+            let _ = enc_tx.send(Encoded { bytes: tb });
         }
     }
 
@@ -374,6 +635,15 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     };
     let encoder_name = wr.encoder;
     let sha256 = wr.sha256;
+    // Hashed here, after the encoder child has been waited on and its file closed,
+    // because a hash of a half-written file is worse than no hash: it looks like evidence.
+    let file_sha256 = if cfg.sha256 && to_disk {
+        hash_file(dst).ok()
+    } else {
+        None
+    };
+
+    let peak_summary = peak.summarize();
 
     let wall = started.elapsed();
     let seconds = frames as f64 / work_rate as f64;
@@ -414,10 +684,17 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         output_bytes,
         encoder: encoder_name,
         sha256,
+        file_sha256,
         warnings,
         input_cmd: in_args,
         encode_cmd: enc_args,
         chain,
+        true_peak_dbtp: peak_summary.true_peak_dbtp,
+        per_channel_true_peak_dbtp: peak_summary.per_channel_true_peak_dbtp,
+        true_peak_ratio: cfg.true_peak,
+        limiter: peak_summary.limiter,
+        sample_peak_dbfs: peak_summary.sample_peak_dbfs,
+        rms_dbfs: peak_summary.rms_dbfs,
     })
 }
 
@@ -668,6 +945,25 @@ fn encode_stage(
         encoder,
         sha256: hasher.map(|h| h.finish_hex()),
     }
+}
+
+/// SHA-256 of a file, streamed, so a 3-hour render costs the same memory as a clip.
+fn hash_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| Error::msg(format!("cannot open {} to hash it: {e}", path.display())))?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| Error::msg(format!("cannot read {} to hash it: {e}", path.display())))?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finish_hex())
 }
 
 /// Wait for both peer stages, never leaking a thread even if one panicked.
@@ -1092,6 +1388,25 @@ mod tests {
         let r = render_file(&w, &out, &cfg, &opts).unwrap();
         assert_eq!(r.mask, crate::dsp::MASK_STEREO);
         let a = r.sha256.clone().unwrap();
+        // The two hashes answer different questions, and a reader who assumes they are
+        // the same number will chase a phantom: `sha256` covers the sample stream, so it
+        // is deliberately *not* what `sha256sum` prints for the file.
+        let on_disk = {
+            use crate::pcm::Sha256;
+            let mut h = Sha256::new();
+            h.update(&std::fs::read(&out).unwrap());
+            h.finish_hex()
+        };
+        assert_eq!(
+            r.file_sha256.as_deref(),
+            Some(on_disk.as_str()),
+            "file_sha256 must be the hash of the bytes on disk"
+        );
+        assert_ne!(
+            a, on_disk,
+            "the stream hash and the file hash are different scopes; if this ever flips, \
+             one of them stopped meaning what it says"
+        );
         // Same input, same config, same hash: rendering is deterministic.
         let out2 = dir.join("st2.flac");
         let mut cfg2 = cfg.clone();
@@ -1341,6 +1656,157 @@ mod tests {
         assert!(
             std::fs::read_dir(&out).map(|d| d.count()).unwrap_or(0) == 0,
             "a failed encode leaves no file behind: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A near-full-scale impulse is the cleanest true-peak fixture available: the
+    /// inter-sample peak of an isolated impulse *is* its sample value, so a detector that
+    /// reads materially above it is reporting its own ringing.
+    fn impulse_dbfs() -> f64 {
+        crate::tp::db_from_peak(1_073_741_823.0 / (1u32 << 31) as f64)
+    }
+
+    fn tone_wav(path: &Path, channels: u16, rate: u32, seconds: f64) {
+        let n = (rate as f64 * seconds) as usize;
+        let amp = 0.99f64;
+        let mut pcm = vec![0u8; n * channels as usize * 4];
+        for i in 0..n {
+            // 440 Hz on one channel, 997 Hz on the other: two crest factors, and a beat
+            // between them that puts inter-sample peaks well above either sample peak.
+            for c in 0..channels as usize {
+                let f = if c == 0 { 440.0 } else { 997.0 };
+                let v = amp * (2.0 * std::f64::consts::PI * f * i as f64 / rate as f64).sin();
+                let q = (v * (1i64 << 31) as f64).clamp(-2147483648.0, 2147483647.0) as i32;
+                let off = (i * channels as usize + c) * 4;
+                pcm[off..off + 4].copy_from_slice(&q.to_le_bytes());
+            }
+        }
+        crate::wav::write_pcm_s32(path, rate, channels, &pcm).unwrap();
+    }
+
+    #[test]
+    fn a_render_reports_the_true_peak_of_what_it_wrote() {
+        let Some((tools, caps)) = tools_ok() else {
+            return;
+        };
+        let dir = workdir("tp-meter");
+        let w = dir.join("imp.wav");
+        impulse_wav(&w, 2, 48000);
+        let opts = RenderOpts::new(&tools, &caps);
+        let r = render_file(
+            &w,
+            &dir.join("imp.flac"),
+            &RenderCfg::with_defaults(),
+            &opts,
+        )
+        .unwrap();
+        // Nothing limited it, so the file's true peak is the impulse's own level.
+        assert!(
+            (r.true_peak_dbtp - impulse_dbfs()).abs() < 0.05,
+            "reported {:+.2} dBTP, impulse sits at {:+.2} dBFS",
+            r.true_peak_dbtp,
+            impulse_dbfs()
+        );
+        assert_eq!(r.per_channel_true_peak_dbtp.len(), 2);
+        assert_eq!(r.true_peak_ratio, Ratio::X4);
+        assert!(
+            r.limiter.is_none(),
+            "a default render must not report a limiter"
+        );
+        assert!(r.one_line().contains("tp "), "{}", r.one_line());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Metering is a measurement. Choosing a different ratio may not move a byte, which
+    /// is what lets the GUI offer x32 without invalidating a previously published hash.
+    #[test]
+    fn the_meter_ratio_changes_no_output_bytes() {
+        let Some((tools, caps)) = tools_ok() else {
+            return;
+        };
+        let dir = workdir("tp-ratio");
+        let w = dir.join("tone.wav");
+        tone_wav(&w, 2, 48000, 0.05);
+        let opts = RenderOpts::new(&tools, &caps);
+        let mut bytes: Vec<Vec<u8>> = Vec::new();
+        let mut read: Vec<f64> = Vec::new();
+        for ratio in [Ratio::X2, Ratio::X4, Ratio::X32] {
+            let mut cfg = RenderCfg::with_defaults();
+            cfg.true_peak = ratio;
+            let out = dir.join(format!("x{}.flac", ratio.n()));
+            let r = render_file(&w, &out, &cfg, &opts).unwrap();
+            bytes.push(std::fs::read(&out).unwrap());
+            read.push(r.true_peak_dbtp);
+        }
+        assert_eq!(bytes[0], bytes[1], "x2 and x4 wrote different files");
+        assert_eq!(bytes[1], bytes[2], "x4 and x32 wrote different files");
+        // The whole point of the ratio knob: x2 must under-read where x32 does not.
+        assert!(
+            read[0] <= read[2] + 1e-9,
+            "x2 read {:+.2} above x32's {:+.2}",
+            read[0],
+            read[2]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The claim a user actually cares about, checked on the file rather than inside the
+    /// limiter: decode what was written, measure it independently, stay under the ceiling.
+    #[test]
+    fn the_finished_file_respects_the_ceiling() {
+        let Some((tools, caps)) = tools_ok() else {
+            return;
+        };
+        let dir = workdir("tp-limit");
+        let w = dir.join("tone.wav");
+        tone_wav(&w, 2, 48000, 0.4);
+        let opts = RenderOpts::new(&tools, &caps);
+
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.limiter = crate::limiter::Cfg {
+            enable: true,
+            ceiling_db: -6.0,
+            ratio: Ratio::X4,
+            lookahead_ms: 1.0,
+        };
+        let out = dir.join("limited.wav");
+        let r = render_file(&w, &out, &cfg, &opts).unwrap();
+
+        let l = r.limiter.expect("a limited render must report the limiter");
+        assert!(
+            l.post_dbtp <= -6.0 + 0.01,
+            "limiter reported post {:+.2} dBTP against a -6.00 dBTP ceiling",
+            l.post_dbtp
+        );
+        assert!(l.pre_dbtp > -6.0, "the input was never over the ceiling");
+        assert!(l.max_gain_reduction_db > 0.0, "the limiter never engaged");
+
+        // Independent measurement of the bytes on disk, with a detector that shares no
+        // state with the one that made the gain decisions.
+        let pcm = ffmpeg_to_f64(&tools, &out);
+        let mut tp = TruePeak::new(Ratio::X4, 2);
+        tp.push_interleaved(&pcm);
+        assert!(
+            tp.dbtp() <= -6.0 + 0.05,
+            "the file measures {:+.2} dBTP against a -6.00 dBTP ceiling",
+            tp.dbtp()
+        );
+
+        // Delayed output is longer output, and the report has to say so.
+        let mut plain = RenderCfg::with_defaults();
+        plain.true_peak = Ratio::X4;
+        let r0 = render_file(&w, &dir.join("plain.wav"), &plain, &opts).unwrap();
+        assert_eq!(
+            r.frames,
+            r0.frames + l.latency_samples as u64,
+            "the limiter's tail did not reach the file"
+        );
+        assert!(r.peak_line().contains("limiter: ceiling -6.00 dBTP"));
+        assert!(
+            r.peak_line().contains("measured within"),
+            "{}",
+            r.peak_line()
         );
         std::fs::remove_dir_all(&dir).ok();
     }

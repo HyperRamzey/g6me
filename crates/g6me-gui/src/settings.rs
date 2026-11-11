@@ -18,6 +18,7 @@ use g6me_core::mask::{self, Slot};
 use g6me_core::pcm::{BitDepth, Dither};
 use g6me_core::probe::Caps;
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
+use g6me_core::tp::Ratio;
 use g6me_core::util;
 use std::path::PathBuf;
 
@@ -53,12 +54,29 @@ pub struct Settings {
 
     // ---- output ------------------------------------------------------------
     pub format: Format,
-    /// FLAC compression level, 0..=8, same bounds as `flac -0..-8`.
+    /// FLAC compression level, 0..=12 on ffmpeg's encoder scale. Lossless at every
+    /// level; the reference `flac` CLI's `-0..-8` presets are a different scale.
     pub flac_level: u32,
     pub depth: BitDepth,
     pub copy_metadata: bool,
     pub overwrite: bool,
     pub sha256: bool,
+
+    // ---- true peak ---------------------------------------------------------
+    /// Over-sampling ratio every file's true peak is measured at. Affects the reported
+    /// number only, never a byte of output.
+    pub tp_ratio: Ratio,
+    /// Hold the delivered file under a true-peak ceiling. The last stage before the
+    /// encoder, so this is the real ceiling on the file.
+    pub limiter: bool,
+    /// Ceiling in dBTP.
+    pub ceiling_db: f64,
+    /// Lookahead the limiter may ask for, ms; the effective value is reported per file
+    /// because a deep filter cannot honour a shallow request.
+    pub lookahead_ms: f64,
+    /// Ratio the limiter's own detector runs at. `None` = the meter's ratio, which is
+    /// also the cheap case: one measurement serves both jobs.
+    pub limit_ratio: Option<Ratio>,
 
     // ---- resample ----------------------------------------------------------
     pub resample: bool,
@@ -108,6 +126,14 @@ impl Default for Settings {
             copy_metadata: true,
             overwrite: false,
             sha256: false,
+            // x4 is what BS.1770 measures at, so a reported dBTP is comparable with any
+            // other tool's without the user knowing it.
+            tp_ratio: Ratio::X4,
+            // Off: nothing happens to a file unless it was asked for.
+            limiter: false,
+            ceiling_db: -1.0,
+            lookahead_ms: 1.0,
+            limit_ratio: None,
             resample: false,
             rate: 48000,
             resample_depth: BitDepth::S32,
@@ -197,6 +223,13 @@ impl Settings {
                 filter_threads: None,
             },
             order: self.order.clone(),
+            true_peak: self.tp_ratio,
+            limiter: g6me_core::limiter::Cfg {
+                enable: self.limiter,
+                ceiling_db: self.ceiling_db,
+                ratio: self.limit_ratio.unwrap_or(self.tp_ratio),
+                lookahead_ms: self.lookahead_ms,
+            },
             block: self.block as usize,
             queue_blocks: self.queue_blocks as usize,
             stream: self.stream as usize,

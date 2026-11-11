@@ -37,6 +37,7 @@ use g6me_core::mask;
 use g6me_core::meter::{MeterTap, Meters};
 use g6me_core::pcm::{BitDepth, Dither};
 use g6me_core::pipeline;
+use g6me_core::pipeline::Report;
 use g6me_core::probe::{probe_caps, Caps, Tools};
 use g6me_core::stages::Gtype;
 use g6me_core::util;
@@ -47,17 +48,25 @@ use std::sync::Mutex;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Output,
+    TruePeak,
     Resample,
     Ir,
     Advanced,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Output, Tab::Resample, Tab::Ir, Tab::Advanced];
+    const ALL: [Tab; 5] = [
+        Tab::Output,
+        Tab::TruePeak,
+        Tab::Resample,
+        Tab::Ir,
+        Tab::Advanced,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Output => "Output",
+            Tab::TruePeak => "True peak",
             Tab::Resample => "Resample",
             Tab::Ir => "IR calibration",
             Tab::Advanced => "Advanced",
@@ -167,6 +176,14 @@ pub struct App {
     browser: Browser,
     log: Vec<(Level, String)>,
     summary: Option<Summary>,
+    /// Every file that has finished this session, with the levels it was measured at.
+    ///
+    /// This is the reason the report carries true peak, sample peak and RMS at all. The
+    /// live bars fall to rest in a third of a second, which is what a bar should do and
+    /// the opposite of what a record needs: after a render the user asks "did that one
+    /// come in over the ceiling", and the answer has to still be on the screen. Kept
+    /// across runs, cleared by hand, newest first.
+    history: Vec<MeterRow>,
     status: String,
     show_caps: bool,
     dry_run: Mutex<Option<DryRun>>,
@@ -180,6 +197,66 @@ struct DryRun {
     src: PathBuf,
     lines: Vec<String>,
     error: Option<String>,
+}
+
+/// One finished file, as the meters remembered it.
+///
+/// The strings are built once, when the file finishes, rather than formatted every frame:
+/// a queue of two thousand files redraws sixty times a second and should not be asked to
+/// re-render two thousand float formats to do it.
+struct MeterRow {
+    /// Compact levels for the list row.
+    levels: String,
+    /// The same measurement in full, for copying.
+    text: String,
+    /// Came in at or over 0 dBTP, or failed to render.
+    hot: bool,
+    ok: bool,
+}
+
+/// A dB figure the user can read, including the one value that has no logarithm.
+fn db(v: f64) -> String {
+    if v == f64::NEG_INFINITY {
+        "−inf".to_string()
+    } else if !v.is_finite() {
+        "n/a".to_string()
+    } else {
+        format!("{v:+.2}")
+    }
+}
+
+impl MeterRow {
+    fn from_report(r: &Report) -> Self {
+        let name = r
+            .output
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let list = |v: &[f64]| {
+            if v.is_empty() {
+                "—".to_string()
+            } else {
+                v.iter().map(|x| db(*x)).collect::<Vec<_>>().join("/")
+            }
+        };
+        let levels = format!(
+            "{} — tp {} dBTP @{} · peak {} dBFS · rms {} dBFS",
+            name,
+            db(r.true_peak_dbtp),
+            r.true_peak_ratio.label(),
+            list(&r.sample_peak_dbfs),
+            list(&r.rms_dbfs)
+        );
+        let hot =
+            r.true_peak_dbtp > -0.05 || r.limiter.as_ref().is_some_and(|l| !l.within_ceiling());
+        Self {
+            levels,
+            text: format!("{}\n{}", name, r.peak_line()),
+            hot,
+            ok: true,
+        }
+    }
 }
 
 impl App {
@@ -199,6 +276,7 @@ impl App {
             browser: Browser::default(),
             log: Vec::new(),
             summary: None,
+            history: Vec::new(),
             status: "idle".to_string(),
             show_caps: false,
             dry_run: Mutex::new(None),
@@ -452,12 +530,79 @@ impl App {
                     }
                 });
         }
+        self.history_panel(ui, ctx);
         ui.horizontal(|ui| {
             ui.weak(widgets::caption(self.cards.live()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak(self.status.clone());
             });
         });
+    }
+
+    /// The retained numbers, one line per finished file.
+    ///
+    /// Text rather than bars, deliberately: a bar is a memory of a moment and cannot be
+    /// read off a screen two seconds later, copied into a delivery note, or compared
+    /// between two runs. Every figure is what was measured on the bytes that were
+    /// written, so this is a record of the output, not of the rendering.
+    fn history_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.history.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.weak(format!("finished files — {}", self.history.len()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("copy all")
+                    .on_hover_text("Copy every line as text, newest last.")
+                    .clicked()
+                {
+                    let text = self.history_text();
+                    ctx.copy_text(text);
+                }
+                if ui
+                    .small_button("clear")
+                    .on_hover_text("Forget this session's history.")
+                    .clicked()
+                {
+                    self.history.clear();
+                }
+            });
+        });
+        let rows = self.history.len().min(12) as f32;
+        egui::ScrollArea::vertical()
+            .max_height((rows * 17.0).clamp(34.0, 210.0))
+            .auto_shrink([false, false])
+            .stick_to_bottom(false)
+            .show(ui, |ui| {
+                // Drawn newest first: the file that just finished is the one being asked
+                // about, and a list that grows downwards pushes it off screen.
+                for row in self.history.iter().rev() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(widgets::status_dot(ui, row.hot, row.ok), "●");
+                        // Selectable so a single line can be copied without the button.
+                        ui.add(egui::Label::new(&row.levels).selectable(true));
+                        if ui
+                            .small_button("⧉")
+                            .on_hover_text("Copy this file's full measurement as text.")
+                            .clicked()
+                        {
+                            ctx.copy_text(row.text.clone());
+                        }
+                    });
+                }
+            });
+    }
+
+    /// The whole history as plain text, newest last, for a log or a delivery note.
+    fn history_text(&self) -> String {
+        let mut out = String::new();
+        for row in self.history.iter().rev() {
+            out.push_str(&row.text);
+            out.push('\n');
+        }
+        out
     }
 
     /// Title and status for a card, read from the queue row: a card must never
@@ -623,6 +768,7 @@ impl App {
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.tab {
                     Tab::Output => self.tab_output(ui, caps.as_ref()),
+                    Tab::TruePeak => self.tab_true_peak(ui),
                     Tab::Resample => self.tab_resample(ui, caps.as_ref()),
                     Tab::Ir => self.tab_ir(ui, caps.as_ref()),
                     Tab::Advanced => self.tab_advanced(ui),
@@ -695,7 +841,7 @@ impl App {
         );
         ui.checkbox(
             &mut self.settings.sha256,
-            "hash each output (sha256 in the report)",
+            "hash each output (the sample stream, and the file as sha256sum sees it)",
         );
         ui.separator();
         ui.weak(
@@ -703,6 +849,155 @@ impl App {
              that is not a choice: it is what makes the output match the reference build for \
              build. Bit depth here only decides how the result is written.",
         );
+    }
+
+    /// True-peak metering and limiting.
+    ///
+    /// The consequences shown here — guard band, latency, the lookahead actually used —
+    /// are computed by the core from the same functions the render uses, not restated,
+    /// because a panel that recalculates them is a panel that will quietly disagree with
+    /// the file it produced.
+    fn tab_true_peak(&mut self, ui: &mut egui::Ui) {
+        use g6me_core::limiter::Cfg as LCfg;
+        use g6me_core::tp::Ratio;
+
+        // The rate the DSP runs at: the resampler's target when resampling is on, and
+        // otherwise whatever the source is. Lookahead in ms and latency in samples trade
+        // on that number, so it is stated rather than assumed.
+        let rate = if self.settings.resample {
+            self.settings.rate
+        } else {
+            48_000
+        };
+        ui.horizontal(|ui| {
+            ui.label("measure at");
+            egui::ComboBox::from_id_salt("tp-ratio")
+                .selected_text(self.settings.tp_ratio.label())
+                .show_ui(ui, |ui| {
+                    for r in Ratio::ALL {
+                        ui.selectable_value(
+                            &mut self.settings.tp_ratio,
+                            r,
+                            format!(
+                                "{} — {} MAC/sample, ≤{} dB under-read",
+                                r.label(),
+                                r.mac_per_sample(),
+                                r.worst_underread_db()
+                            ),
+                        );
+                    }
+                });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!("at {}", self.settings.tp_ratio.chain()));
+            });
+        });
+        ui.weak(format!(
+            "Every render reports the true peak of what it wrote, in dBTP. The ratio is the \
+             detector's over-sampling factor: a lower one cannot see a crest that falls \
+             between its grid points, so it under-reads — x2 by up to {} dB. Metering changes \
+             no output bytes.",
+            Ratio::X2.worst_underread_db()
+        ));
+        ui.add_space(6.0);
+        ui.checkbox(&mut self.settings.limiter, "limit the true peak");
+        if !self.settings.limiter {
+            ui.weak("Off: files are measured, never changed.");
+            return;
+        }
+        let st = &mut self.settings;
+        let mut cfg = LCfg {
+            enable: true,
+            ceiling_db: st.ceiling_db,
+            ratio: st.limit_ratio.unwrap_or(st.tp_ratio),
+            lookahead_ms: st.lookahead_ms,
+        };
+        ui.horizontal(|ui| {
+            ui.label("ceiling");
+            let mut c = st.ceiling_db;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut c)
+                        .range(-24.0..=0.0)
+                        .speed(0.05)
+                        .suffix(" dBTP"),
+                )
+                .changed()
+            {
+                st.ceiling_db = c.clamp(-24.0, 0.0);
+            }
+            ui.label("lookahead");
+            let mut la = st.lookahead_ms;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut la)
+                        .range(
+                            g6me_core::limiter::MIN_LOOKAHEAD_MS
+                                ..=g6me_core::limiter::MAX_LOOKAHEAD_MS,
+                        )
+                        .speed(0.02)
+                        .suffix(" ms"),
+                )
+                .changed()
+            {
+                st.lookahead_ms = la;
+            }
+            ui.label("limit at");
+            egui::ComboBox::from_id_salt("limit-ratio")
+                .selected_text(match st.limit_ratio {
+                    None => "same as meter".to_string(),
+                    Some(r) => r.label().to_string(),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut st.limit_ratio, None, "same as meter");
+                    for r in Ratio::ALL {
+                        ui.selectable_value(&mut st.limit_ratio, Some(r), r.label());
+                    }
+                });
+        });
+        cfg.ceiling_db = st.ceiling_db;
+        cfg.ratio = st.limit_ratio.unwrap_or(st.tp_ratio);
+        cfg.lookahead_ms = st.lookahead_ms;
+        let lat = cfg.latency_samples(rate);
+        let asked = cfg.lookahead_ms;
+        let used = cfg.effective_lookahead_ms(rate);
+        ui.weak(format!(
+            "aims {:.2} dB below the ceiling ({:.2} dB the meter cannot see + {:.2} dB of \
+             gain slew), so a -1.00 dBTP ceiling lands near {:.2} dBTP.",
+            cfg.guard_db(),
+            cfg.ratio.worst_underread_db(),
+            cfg.guard_db() - cfg.ratio.worst_underread_db(),
+            st.ceiling_db - cfg.guard_db()
+        ));
+        ui.weak(format!(
+            "latency {} samples ({:.3} ms) at {} Hz, added to the end of the file. {}",
+            lat,
+            lat as f64 / rate as f64 * 1000.0,
+            rate,
+            if used > asked + 1e-6 {
+                format!(
+                    "{} ms lookahead asked for is shallower than the {} filter's own memory \
+                     ({} samples), so {:.2} ms is used.",
+                    asked,
+                    cfg.ratio.label(),
+                    cfg.ratio.group_delay().ceil() as usize,
+                    used
+                )
+            } else {
+                format!("{:.2} ms of lookahead is honoured as asked.", used)
+            }
+        ));
+        if st.limit_ratio.is_some() && st.limit_ratio != Some(st.tp_ratio) {
+            ui.weak(format!(
+                "Meter and limiter are running different ratios, so each measures once \
+                 more than they would agree: the report's dBTP is the {} reading, the \
+                 ceiling is held by the {} one.",
+                st.tp_ratio.label(),
+                cfg.ratio.label()
+            ));
+        }
+        if let Err(e) = cfg.validate() {
+            ui.colored_label(egui::Color32::from_rgb(226, 110, 90), e);
+        }
     }
 
     fn tab_resample(&mut self, ui: &mut egui::Ui, caps: Option<&Caps>) {
@@ -1336,10 +1631,24 @@ impl App {
     fn drain_events(&mut self) {
         for e in self.runner.drain() {
             match e {
-                Event::ItemState { index, phase, note } => {
+                Event::ItemState {
+                    index,
+                    phase,
+                    note,
+                    report,
+                } => {
                     if let Some(r) = self.queue.get_mut(index) {
                         r.phase = phase;
                         r.note = note.clone();
+                    }
+                    if let Some(r) = report {
+                        self.history.push(MeterRow::from_report(&r));
+                        // A library is thousands of files; the list is a record of the
+                        // session, not a database. Oldest rows go first.
+                        const HISTORY_CAP: usize = 4000;
+                        if self.history.len() > HISTORY_CAP {
+                            self.history.remove(0);
+                        }
                     }
                     if phase == Phase::Failed {
                         self.push_log(Level::Error, note);

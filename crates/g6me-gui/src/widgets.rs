@@ -67,6 +67,33 @@ fn level_color(ui: &Ui, p: f32) -> Color32 {
     }
 }
 
+/// Colour for the state dot in the finished-file history.
+///
+/// Deliberately the same semantic ramp as [`level_color`]: a red dot in the list and a
+/// red bar on a card have to mean the same thing, or the two halves of the meter say
+/// contradictory things about the same file.
+pub fn status_dot(ui: &Ui, hot: bool, ok: bool) -> Color32 {
+    if !ok {
+        tone(
+            ui,
+            Color32::from_rgb(240, 110, 96),
+            Color32::from_rgb(176, 26, 16),
+        )
+    } else if hot {
+        tone(
+            ui,
+            Color32::from_rgb(222, 84, 66),
+            Color32::from_rgb(188, 42, 28),
+        )
+    } else {
+        tone(
+            ui,
+            Color32::from_rgb(96, 176, 92),
+            Color32::from_rgb(30, 122, 60),
+        )
+    }
+}
+
 /// Parameter (0..=1) for a dBFS value, mirroring the plugin's mapping.
 pub fn db_to_param(db: f32) -> f32 {
     // The inverse of what `param_to_db` prints; -60 dBFS is the floor.

@@ -23,9 +23,11 @@
 //! that this neither reorders nor folds any channel.
 
 use crate::error::{Error, Result};
+use crate::limiter::Cfg as LimiterCfg;
 use crate::mask::format_mask_hex;
 use crate::pcm::{BitDepth, Dither};
 use crate::probe::{AudioInfo, Caps};
+use crate::tp::Ratio;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -289,7 +291,28 @@ pub struct RenderCfg {
     pub queue_blocks: usize,
     /// Which audio stream to take, 0-based.
     pub stream: usize,
-    /// Hash each finished output (evidence / dedupe).
+    /// Over-sampling ratio the true peak is measured at, for every render.
+    ///
+    /// Measured always rather than behind a flag: it is the one number in a report that
+    /// says something about the signal instead of about the pipeline, and the cost is
+    /// [`Ratio::mac_per_sample`] multiply-adds per sample per channel — 48 at the
+    /// default x4, which is a fraction of what the downmixer already does.
+    ///
+    /// The reading is of the signal the encoder receives, so it is the same number a
+    /// BS.1770 consumer gets from the finished file, not a pre-limiter estimate.
+    #[serde(default)]
+    pub true_peak: Ratio,
+    /// True-peak limiter, applied after the downmixer and before the encoder.
+    ///
+    /// Off by default, like every other stage here. When enabled it is the last thing
+    /// that touches the samples, because a ceiling asserted before the last gain stage
+    /// is not a ceiling.
+    #[serde(default)]
+    pub limiter: LimiterCfg,
+    /// Hash every finished output, twice over: the samples handed to the encoder
+    /// (container-independent, so a WAV and a FLAC of one render agree) and the file on
+    /// disk (what `sha256sum` prints, so the number is checkable with a tool the user
+    /// already has). See [`crate::pipeline::Report::file_sha256`].
     pub sha256: bool,
 }
 
@@ -625,6 +648,31 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
         crate::mask::format_order(&order_for_mask(mask)),
         f64::PRECISION_NAME
     ));
+    // 5. the true-peak stage. Printed whether or not it is limiting, because the meter
+    // runs either way and a dry run that hides the one stage that measures the file
+    // would leave `--dry-run` unable to explain the number in the report.
+    let la = cfg.limiter;
+    let work_rate = effective_input_rate(cfg, info);
+    v.push(if !la.enable {
+        format!(
+            "5. true-peak: meter at {}x ({}), limiter off",
+            cfg.true_peak.n(),
+            cfg.true_peak.chain()
+        )
+    } else {
+        format!(
+            "5. true-peak: limit to {:.2} dBTP at {}x ({}), lookahead {:.2} ms -> {:.2} ms \
+             effective, +{} samples latency, aims {:.2} dB low ({}x meter)",
+            la.ceiling_db,
+            la.ratio.n(),
+            la.ratio.chain(),
+            la.lookahead_ms,
+            la.effective_lookahead_ms(work_rate),
+            la.latency_samples(work_rate),
+            la.guard_db(),
+            cfg.true_peak.n(),
+        )
+    });
     let o = &cfg.out;
     let rate = match o.resample {
         Some(r) if r != effective_input_rate(cfg, info) => {
@@ -633,7 +681,7 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
         _ => "no resample".to_string(),
     };
     v.push(format!(
-        "5. encode {} {}{}",
+        "6. encode {} {}{}",
         o.format.label(),
         o.depth.label(),
         if rate == "no resample" {
@@ -853,7 +901,7 @@ mod tests {
     #[test]
     fn loss_chain_says_off_when_off() {
         let lines = loss_chain(&RenderCfg::with_defaults(), &info(), crate::dsp::MASK_7_1);
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
         assert!(lines[1].contains("off"), "{}", lines[1]);
         assert!(lines[2].contains("off"), "{}", lines[2]);
         assert!(lines[3].contains("bit-exact port"), "{}", lines[3]);
@@ -862,7 +910,9 @@ mod tests {
             "{}",
             lines[3]
         );
-        assert!(lines[4].contains("FLAC"), "{}", lines[4]);
+        assert!(lines[4].contains("limiter off"), "{}", lines[4]);
+        assert!(lines[4].contains("meter at 4x"), "{}", lines[4]);
+        assert!(lines[5].contains("FLAC"), "{}", lines[5]);
     }
 
     #[test]
