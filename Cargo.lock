@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "g6me-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "g6me-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "serde",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "g6me-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "egui",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "g6me-verify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "g6me-core",
