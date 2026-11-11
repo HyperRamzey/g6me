@@ -1,0 +1,59 @@
+name: release
+
+# Tag-driven, because the artefacts are only meaningful once the tree they came from
+# is fixed: the Linux AppImage, the Linux tarball and the Windows zip are built from
+# one commit, with the same pinned x86-64-v3 flags, by scripts/release.sh, which also
+# runs the numerical verifier and the FMA guard before anything is uploaded.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+permissions:
+  contents: write
+
+jobs:
+  artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: System packages
+        # mingw-w64 cross-builds the Windows binaries here (one job, one resolve, so
+        # the Linux and Windows artefacts provably come from the same Cargo.lock),
+        # squashfs-tools gives linuxdeploy mksquashfs for the AppImage.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mingw-w64 binutils-mingw-w64-x86-64 g++-mingw-w64-x86-64 squashfs-tools \
+            libasound2-dev libpulse-dev \
+            libxcb1-dev libx11-dev libxcursor-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev
+      - name: Build, verify, guard
+        run: ./scripts/release.sh
+      - name: What shipped
+        run: |
+          cd dist
+          sha256sum -c sha256sums.txt
+          { echo '```'; cat sha256sums.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g6me-artifacts
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=${GITHUB_REF_NAME}
+          notes="Built by CI from $tag. Needs ffmpeg on PATH; x86-64-v3 (AVX2, 2013+) CPU."
+          gh release create "$tag" --title "G6ME $tag" --notes "$notes" --latest \
+            dist/G6_Media_Encoder-*.AppImage \
+            dist/g6me-*-linux-x86_64.tar.gz \
+            dist/g6me-*-linux-x86_64-desktop.tar.gz \
+            dist/g6me-*-windows-x86_64.zip \
+            dist/README-WINDOWS.txt dist/sha256sums.txt

@@ -1,4 +1,5 @@
 target*/
+dist/
 **/*.rs.bk
 # Cargo.lock is deliberately NOT ignored: this workspace builds binaries, and a
 # release resolved from a different lockfile is a different program.

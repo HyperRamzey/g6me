@@ -142,7 +142,40 @@ and runs:
 ```
 
 Run it through `cargo run -p g6me-verify` (or `cargo test -p g6me-verify`) rather
-than a stale binary in `target/` — an out-of-date verifier is worse than none.
+than a stale binary in `target/` — an out-of-date verifier is worse than none. Every
+check also runs per-group (`--group bitexact` …), so a failure can be reproduced
+without waiting for the whole suite.
+
+Two claims beyond the check itself are worth stating, because both are cheap to assert
+falsely:
+
+* **The verifier has teeth.** Changing one coefficient in `dsp.rs` by one ULP turns 33
+  `bitexact` checks red with `max |d| = 2.98e-8` — the kind of difference no listening
+  test would ever find.
+* **Cross-platform, not just cross-build.** The `x86_64-pc-windows-gnu` binaries
+  produced by the release script render a TrueHD/Atmos `.mka` to a FLAC with the same
+  SHA-256 as the Linux build — checked by running the Windows `g6me.exe` under Wine
+  against a *different* ffmpeg build (`n9.0.2-48-gd4070a14ce` vs `n9.0.2`), so the
+  agreement covers the decoder and encoder choices too, not just the DSP.
+
+## Releases
+
+Each tag publishes, from one commit and one `Cargo.lock`:
+
+| file | what it is |
+|---|---|
+| `G6_Media_Encoder-<ver>-x86_64.AppImage` | Linux, one file, no install. Runs on Wayland and X11; contains `g6me-gui` and `g6me` (`G6ME_BIN=g6me ./G6_Media_Encoder-*.AppImage --caps` runs the CLI). |
+| `g6me-<ver>-linux-x86_64.tar.gz` | the same two binaries unpacked, for a headless box or a server where FUSE is not available. |
+| `g6me-<ver>-linux-x86_64-desktop.tar.gz` | `.desktop` entry and icon, if you want the AppImage in an application menu. |
+| `g6me-<ver>-windows-x86_64.zip` | `g6me.exe` and `g6me-gui.exe`, built for x86-64-v3. |
+| `sha256sums.txt` | checksums of all of the above. |
+
+**ffmpeg is not bundled** — it is a separate GPL program and any desktop that plays
+audio already has it; put it on `PATH`, or point `G6ME_FFMPEG` / `G6ME_FFPROBE` at a
+specific build. `g6me --caps` says what your ffmpeg can actually do. 24-bit FLAC
+additionally needs the reference `flac` encoder. The binaries are built for
+**x86-64-v3** (AVX2, i.e. Haswell/Excavator 2013 and later); on older hardware build
+from source without `--target-cpu`.
 
 ## Optimized builds (x86-64-v3)
 
@@ -200,6 +233,8 @@ crates/g6me-cli      `g6me`
 crates/g6me-gui      `g6me-gui` — eframe, no audio backend
 crates/g6me-verify   bit-exactness harness; builds vendor/g6ct in 8 configurations
 vendor/g6ct          the C reference, byte-identical to upstream (see UPSTREAM.md)
+packaging/linux      desktop entry, icon, AppRun for the AppImage
+scripts/             build-optimized.sh (verified v3 build), release.sh (artefacts)
 ```
 
 ## Known gaps

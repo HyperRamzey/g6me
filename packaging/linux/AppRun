@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Inside a mounted AppImage $APPDIR is the root of the bundle; this script sits at
+# its top level, which is also where the runtime points ARGV0.
+#
+# Both binaries ship in one bundle: the desktop launcher gets the GUI, and
+# `G6ME.appimage --args` style invocations of the CLI work through argv[0] or
+# G6ME_BIN, so there is one file to keep handy rather than two.
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+export APPDIR=${APPDIR:-$here}
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+prog=${G6ME_BIN:-$(basename "${ARGV0:-g6me-gui}")}
+case $prog in
+  g6me | g6me-cli) prog=g6me ;;
+  *) prog=g6me-gui ;;
+esac
+
+# ffmpeg is deliberately not inside the bundle: it is a separate GPL program, it is
+# enormous, and a desktop already has it. It is found on PATH; G6ME_FFMPEG and
+# G6ME_FFPROBE point at a specific build if PATH is not the one you want.
+exec "$APPDIR/usr/bin/$prog" "$@"

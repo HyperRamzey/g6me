@@ -17,6 +17,11 @@
 //! The layout is deliberately fixed — queue left, controls centre, meters and
 //! progress along the bottom — because a mixer's muscle memory is the point.
 
+// A released Windows GUI must not drag a console window along with it. Debug builds
+// keep the console, because a panic that prints nowhere is a worse trade than one
+// extra window while developing.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod runner;
 mod settings;
 mod theme;

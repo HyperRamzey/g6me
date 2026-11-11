@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=G6 Media Encoder
+GenericName=Audio encoder
+Comment=Binaural downmix of 7.1, 5.1 and Atmos multichannel audio
+Exec=g6me-gui %F
+Icon=g6me
+Terminal=false
+Categories=AudioVideo;Audio;AudioVideoEditing;
+Keywords=binaural;downmix;surround;atmos;flac;encoder;
+MimeType=audio/flac;audio/x-flac;audio/x-wav;audio/wav;audio/x-matroska;audio/aac;audio/x-m4a;
+StartupNotify=true

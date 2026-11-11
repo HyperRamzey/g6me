@@ -417,6 +417,7 @@ pub struct Mount {
     pub fstype: String,
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// Filesystems that are plumbing rather than a place someone keeps music: kernel
 /// interfaces, container and package overhead, and the loop mounts a desktop
 /// accumulates by the hundred.
@@ -449,10 +450,12 @@ const SKIP_FS: [&str; 26] = [
     "squashfs",
 ];
 
+#[cfg(any(target_os = "linux", test))]
 /// Prefixes of filesystem names that are plumbing. Checked separately because
 /// `fuse.sshfs` is a real mount while `fuse.portal` is not, and both start `fuse.`.
 const SKIP_FS_PREFIX: [&str; 3] = ["fuse.portal", "fuse.snapfuse", "fuse.gvfs"];
 
+#[cfg(any(target_os = "linux", test))]
 /// Mount points that are never interesting, whatever is under them.
 const SKIP_UNDER: [&str; 6] = [
     "/snap/",
@@ -463,9 +466,11 @@ const SKIP_UNDER: [&str; 6] = [
     "/sys/",
 ];
 
+#[cfg(any(target_os = "linux", test))]
 /// Where removable and network media turns up.
 const MEDIA_PREFIX: [&str; 4] = ["/run/media/", "/media/", "/mnt/", "/Volumes/"];
 
+#[cfg(any(target_os = "linux", test))]
 /// Is this mount worth a button?
 fn show_mount(fstype: &str, point: &str) -> bool {
     // Media first: a disc formatted as squashfs, or a stick mounted under a media
@@ -488,6 +493,7 @@ fn show_mount(fstype: &str, point: &str) -> bool {
     !SKIP_FS_PREFIX.iter().any(|p| fstype.starts_with(p))
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// `/proc/self/mountinfo` escapes a space as `\040`, a tab as `\011`, a newline as
 /// `\012` and a backslash as `\134` — and a folder called `My Music` is common
 /// enough in a media library that ignoring it would drop the mount that matters.
@@ -520,6 +526,7 @@ fn unescape_mount(s: &str) -> String {
     out
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// What a person would call this mount: the volume name for media, `root` for `/`,
 /// otherwise the last path component.
 fn mount_label(point: &str) -> String {
@@ -532,6 +539,7 @@ fn mount_label(point: &str) -> String {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// Pick the interesting mounts out of `/proc/self/mountinfo` text. `exists` says
 /// whether a mount point is currently reachable — a stale entry (an unmounted stick
 /// the kernel still lists) would open an empty folder.
