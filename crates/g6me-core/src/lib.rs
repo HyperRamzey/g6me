@@ -50,6 +50,7 @@ pub mod batch;
 pub mod child;
 pub mod dsp;
 pub mod error;
+pub mod limiter;
 pub mod mask;
 pub mod meter;
 pub mod pcm;
@@ -57,6 +58,7 @@ pub mod pipeline;
 pub mod probe;
 pub mod stage;
 pub mod stages;
+pub mod tp;
 pub mod util;
 pub mod wav;
 
