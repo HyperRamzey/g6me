@@ -27,7 +27,12 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 cd "$here"
 
+# `--remap-path-prefix` because a Rust release binary keeps the source paths of every
+# panic message in .rodata, and `strip --strip-all` does not remove them. Without this,
+# the same commit compiled in /home/runner/work/g6me/g6me and in a checkout on /mnt
+# are different bytes for a reason that has nothing to do with the program.
 export RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C llvm-args=-unroll-threshold=1000"
+RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$here=/build --remap-path-prefix=${HOME:-/root}/.cargo=/cargo"
 # Symbols stay in while the verifier runs — its disassembly guard reads them — and are
 # stripped from the copies that actually ship, below.
 CARGO_CFG=(--config 'profile.release.lto="thin"' --config 'profile.release.codegen-units=1'
@@ -103,8 +108,16 @@ fi
 printf '  %s\n' "$dist"/*.AppImage
 
 say "linux tarball (for a headless box or a server, no FUSE needed)"
-tar -C "$bin" -czf "$dist/g6me-$V-linux-x86_64.tar.gz" g6me g6me-gui
-tar -C packaging/linux -czf "$dist/g6me-$V-linux-x86_64-desktop.tar.gz" g6me.desktop g6me.svg
+# Fixed mtime, ownership and order, `gzip -n` to drop the timestamp gzip would embed:
+# an archive that differs per build machine cannot be checked by a user who downloads
+# it twice from two mirrors, which is the entire point of publishing sha256sums.
+tarball() {
+  local dir=$1 out=$2; shift 2
+  tar --sort=name --format=gnu --owner=0 --group=0 --numeric-owner \
+    --mtime='UTC 1970-01-01' -C "$dir" -cf - "$@" | gzip -n >"$out"
+}
+tarball "$bin" "$dist/g6me-$V-linux-x86_64.tar.gz" g6me g6me-gui
+tarball "$here/packaging/linux" "$dist/g6me-$V-linux-x86_64-desktop.tar.gz" g6me.desktop g6me.svg
 
 # -------------------------------------------------------------- windows ---------
 say "windows x86_64-pc-windows-gnu, same flags"
@@ -135,19 +148,22 @@ Built for x86-64-v3 (AVX2 and later: Haswell/Excavator 2013+). On an older CPU u
 generic build instead — cargo build --release --locked.
 EOF
 
-if command -v zip >/dev/null; then
-  (cd "$W" && zip -q -X "$dist/g6me-$V-windows-x86_64.zip" g6me.exe g6me-gui.exe)
-  (cd "$dist" && zip -q -g "$dist/g6me-$V-windows-x86_64.zip" README-WINDOWS.txt)
-else
-  python3 - "$W" "$dist" "$V" <<'PY'
+# `zip` stores each file's mtime, so the same exes zipped an hour apart are different
+# bytes. python's zipfile with a fixed timestamp is deterministic and always present.
+python3 - "$W" "$dist" "$V" <<'PY'
 import pathlib, sys, zipfile
 w, d, v = map(pathlib.Path, sys.argv[1:4])
 with zipfile.ZipFile(d / f"g6me-{v}-windows-x86_64.zip", "w", zipfile.ZIP_DEFLATED) as z:
     for n in ("g6me.exe", "g6me-gui.exe"):
-        z.write(w / n, n)
-    z.write(d / "README-WINDOWS.txt", "README-WINDOWS.txt")
+        info = zipfile.ZipInfo(n, date_time=(1980, 1, 1, 0, 0, 0))
+        info.external_attr = 0o755 << 16
+        info.compress_type = zipfile.ZIP_DEFLATED
+        z.writestr(info, (w / n).read_bytes())
+    info = zipfile.ZipInfo("README-WINDOWS.txt", date_time=(1980, 1, 1, 0, 0, 0))
+    info.external_attr = 0o644 << 16
+    info.compress_type = zipfile.ZIP_DEFLATED
+    z.writestr(info, (d / "README-WINDOWS.txt").read_bytes())
 PY
-fi
 
 # ------------------------------------------------------------- the guard --------
 say "FMA guard over the artefacts themselves"

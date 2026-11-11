@@ -90,29 +90,33 @@ jobs:
       - name: Bit-exactness verification (x86-64-v3)
         run: ./target-v3/release/g6me-verify --require-all
 
-  # The GNU target is the one a Windows user without Visual Studio can build, and
-  # it is also what a cross-compile from Linux produces.
+  # The GNU target is what a Windows user without Visual Studio builds, and what
+  # scripts/release.sh cross-builds for the release zip — so prove it from Linux,
+  # where the mingw toolchain is a package and not a shell-PATH lottery. (An earlier
+  # version of this job ran inside msys2 and died with exit 127: `cargo` was on the
+  # Windows PATH, which the msys2 login shell does not inherit the way you expect.)
   windows-gnu:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
     steps:
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            git
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-pkg-config
-            mingw-w64-ucrt-x86_64-binutils
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-gnu
-      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mingw-w64 binutils-mingw-w64-x86-64
       - run: cargo build --locked --release --target x86_64-pc-windows-gnu --workspace
-      # gcc is in this job's PATH by construction, so a skip here is a real failure:
-      # it would mean the Windows reference binaries never got built.
-      - name: Bit-exactness verification (windows-gnu, must not skip)
-        run: cargo run --locked --release -p g6me-verify --target x86_64-pc-windows-gnu -- --require-all
+      # Same guard as the release script, on the binary this target actually ships:
+      # an instruction count is asserted too, because a scan that decoded nothing
+      # would also report zero FMA and read as a pass.
+      - name: No FMA in the Windows binaries
+        run: |
+          for f in target/x86_64-pc-windows-gnu/release/g6me.exe \
+                   target/x86_64-pc-windows-gnu/release/g6me-gui.exe; do
+            ins=$(x86_64-w64-mingw32-objdump -d "$f" | grep -cE '^ ') || ins=0
+            fma=$(x86_64-w64-mingw32-objdump -d "$f" | grep -cE '\b(vfmadd|vfmsub|vfnmadd|vfnmsub)' || true)
+            echo "$(basename "$f"): ins=$ins fma=$fma"
+            test "$ins" -gt 1000 || { echo "cannot disassemble $f" >&2; exit 1; }
+            test "$fma" -eq 0 || { echo "FMA in $f" >&2; exit 1; }
+          done
