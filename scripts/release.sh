@@ -92,9 +92,11 @@ fi
 # names it after the desktop file's Name= ("G6 Media Encoder" ->
 # G6_Media_Encoder-<ver>-x86_64.AppImage), so globbing for a guessed name is how an
 # AppImage gets quietly left behind in the source tree.
+# SOURCE_DATE_EPOCH is honoured by the AppImage tooling, so the squashfs carries a
+# fixed timestamp instead of the minute this machine happened to run.
 (
   cd "$dist"
-  LINUXDEPLOY_OUTPUT_VERSION=$V APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=true \
+  SOURCE_DATE_EPOCH=0 LINUXDEPLOY_OUTPUT_VERSION=$V APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=true \
     "$tool" --appdir "$appdir" "${EXCLUDES[@]}" \
     --desktop-file "$here/packaging/linux/g6me.desktop" \
     --icon-file "$here/packaging/linux/g6me.svg" \
@@ -121,14 +123,28 @@ tarball "$here/packaging/linux" "$dist/g6me-$V-linux-x86_64-desktop.tar.gz" g6me
 
 # -------------------------------------------------------------- windows ---------
 say "windows x86_64-pc-windows-gnu, same flags"
-CARGO_TARGET_DIR=target-win cargo build --release --locked "${CARGO_CFG[@]}" \
+# `--no-insert-timestamp`: GNU ld writes the link time into the PE header's
+# TimeDateStamp, which is 4 bytes at 0x88 and also feeds the image checksum — the
+# whole difference between two builds of the same commit was those bytes.
+RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--no-insert-timestamp" \
+  CARGO_TARGET_DIR=target-win cargo build --release --locked "${CARGO_CFG[@]}" \
   --target x86_64-pc-windows-gnu --workspace
 W=target-win/x86_64-pc-windows-gnu/release
+# GNU strip stamps the *current time* into TimeDateStamp even when the link already
+# zeroed it, so the two PE header fields are normalised afterwards: the timestamp, and
+# the image checksum that covers it — 0 means "not computed", which a plain application
+# is allowed to say, and leaving the old value would mean a checksum over bytes that are
+# no longer there.
+zero_pe_stamps() {
+  printf '\0\0\0\0' | dd of="$1" bs=1 seek=136 count=4 conv=notrunc status=none
+  printf '\0\0\0\0' | dd of="$1" bs=1 seek=216 count=4 conv=notrunc status=none
+}
 for e in g6me.exe g6me-gui.exe; do
   [[ -f $W/$e ]] || { echo "missing $W/$e" >&2; exit 1; }
   # Stripped by the mingw binutils, not the host's — the wrong `strip` on a PE either
   # fails or quietly does nothing.
   x86_64-w64-mingw32-strip --strip-all "$W/$e" 2>/dev/null || true
+  zero_pe_stamps "$W/$e"
 done
 
 cat >"$dist/README-WINDOWS.txt" <<EOF
