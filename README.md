@@ -1,7 +1,7 @@
 # G6ME — G6 Media Encoder
 
 Batch renderer for the **G6 Creative MatrixEncoder** binaural downmixer: takes
-7.1 / 5.1 / Dolby-Atmos-12 multichannel audio and writes the same 2-channel
+7.1 / 5.1 / Dolby-Atmos-12 (overheads are nulled, use DME\EE first) multichannel audio and writes the same 2-channel
 sum-and-biquad matrix the original plugin produces, as FLAC or WAV, from a
 command line or a GUI, on Linux and Windows.
 
