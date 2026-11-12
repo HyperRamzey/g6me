@@ -1207,6 +1207,17 @@ struct Encoded {
 /// Result of the decode stage.
 struct DecodeDone {
     result: Result<()>,
+    /// Tail of the decoder's stderr (`-v error`), empty for a clean decode.
+    stderr: String,
+}
+
+impl DecodeDone {
+    fn failed(e: Error) -> Self {
+        Self {
+            result: Err(e),
+            stderr: String::new(),
+        }
+    }
 }
 
 /// Result of the encode stage, including the things only it knows: which encoder
@@ -1382,9 +1393,7 @@ fn decode_stage(
         if let Some(c) = &cancel {
             if c.load(Ordering::Relaxed) {
                 producer.kill();
-                return DecodeDone {
-                    result: Err(Error::Cancelled),
-                };
+                return DecodeDone::failed(Error::Cancelled);
             }
         }
         raw.resize(size, 0);
@@ -1392,7 +1401,7 @@ fn decode_stage(
             Ok(n) => n,
             Err(e) => {
                 producer.kill();
-                return DecodeDone { result: Err(e) };
+                return DecodeDone::failed(e);
             }
         };
         if raw_bytes == 0 {
@@ -1400,11 +1409,9 @@ fn decode_stage(
         }
         if raw_bytes % stride != 0 {
             producer.kill();
-            return DecodeDone {
-                result: Err(Error::msg(format!(
-                    "decode produced a partial frame ({raw_bytes} bytes, not a multiple of {stride})"
-                ))),
-            };
+            return DecodeDone::failed(Error::msg(format!(
+                "decode produced a partial frame ({raw_bytes} bytes, not a multiple of {stride})"
+            )));
         }
         raw.truncate(raw_bytes);
         if !tx.send(Decoded {
@@ -1413,16 +1420,18 @@ fn decode_stage(
         }) {
             // Downstream gave up; stop reading and take the child with us.
             producer.kill();
-            return DecodeDone {
-                result: Err(Error::Cancelled),
-            };
+            return DecodeDone::failed(Error::Cancelled);
         }
         // `send` moved the buffer; allocate the next one. The queue is bounded, so
         // at most `queue_blocks + 1` of these exist at any moment.
         raw = Vec::new();
     }
+    let result = producer.finish();
     DecodeDone {
-        result: producer.finish(),
+        result,
+        // Kept on success too: ffmpeg exits 0 after skipping a corrupt or truncated
+        // stretch, and this is the only trace of it.
+        stderr: producer.err_tail(),
     }
 }
 
@@ -1501,9 +1510,9 @@ fn join_stages(
     reader: std::thread::JoinHandle<DecodeDone>,
     writer: std::thread::JoinHandle<EncoderDone>,
 ) -> (DecodeDone, EncoderDone) {
-    let rd = reader.join().unwrap_or_else(|_| DecodeDone {
-        result: Err(Error::msg("decode stage panicked")),
-    });
+    let rd = reader
+        .join()
+        .unwrap_or_else(|_| DecodeDone::failed(Error::msg("decode stage panicked")));
     let wr = writer.join().unwrap_or_else(|_| EncoderDone {
         result: Err(Error::msg("encode stage panicked")),
         encoder: String::new(),
