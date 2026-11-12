@@ -290,18 +290,21 @@ pub fn discover(
             push_file(input, &loose_base, out_dir, ext, &mut seen, &mut items);
         }
     }
+    // The stack pops last-in-first-out; reversed, folder arguments are walked in the
+    // order they were given.
+    stack.reverse();
     while let Some((dir, base)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue; // unreadable directory: skip it, do not fail the batch
         };
         let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-        // Deterministic order, so two runs of the same batch queue identically.
+        // Deterministic order, so two runs of the same batch queue identically: a folder's
+        // own files first, ascending, then its subfolders, ascending. Files are queued as
+        // they are seen, so they are walked forwards; subfolders go on the stack, so they
+        // are pushed in reverse to pop in ascending order.
         names.sort();
-        // The stack is last-in-first-out, so pushing sorted names visits the last one first:
-        // a library of `Disc 1`, `Disc 2` queued Disc 2 first and the progress line, the ETA
-        // and a cancelled run's remaining files all disagreed with the listing the user read.
-        // Walking in reverse puts the pop order back to ascending.
-        for p in names.iter().rev() {
+        let mut subdirs = Vec::new();
+        for p in &names {
             // A render writes to a staging sibling and renames it into place, so a name with
             // that prefix is an unfinished render, not a track. It should not exist at all --
             // that is the point of the rename -- and the case for recognising it is the hard
@@ -324,13 +327,88 @@ pub fn discover(
                     continue;
                 }
                 entered.push(key);
-                stack.push((p.clone(), base.clone()));
+                subdirs.push(p.clone());
             } else if looks_like_audio(p) {
                 push_file(p, &base, out_dir, ext, &mut seen, &mut items);
             }
         }
+        for p in subdirs.into_iter().rev() {
+            stack.push((p, base.clone()));
+        }
     }
+    flag_collisions(&mut items);
     items
+}
+
+/// Where a path lands on disk, for comparing outputs with each other and with inputs.
+/// Outputs usually do not exist yet, so only the parent is resolved.
+fn path_key(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    match (abs.parent(), abs.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|d| d.join(name))
+            .unwrap_or(abs.clone()),
+        _ => abs,
+    }
+}
+
+/// Fail, before anything runs, every item whose output name an earlier item already has.
+///
+/// Each render only checks its own source against its own destination, so `song.wav`
+/// next to `song.aiff` had the second one skipped as "already exists" by a file the
+/// batch had just written itself, or, with `--force`, written over it. The first item
+/// keeps the name.
+fn flag_collisions(items: &mut [Item]) {
+    let mut taken: std::collections::HashMap<PathBuf, PathBuf> = Default::default();
+    for item in items.iter_mut() {
+        let key = path_key(&item.dst);
+        // An item that maps onto itself writes nothing (the render refuses it), so it
+        // does not hold the name.
+        if key == path_key(&item.src) {
+            continue;
+        }
+        if let Some(first) = taken.get(&key) {
+            item.phase = Phase::Failed;
+            item.error = Some(format!(
+                "{} is already the output of {}; rename one, or render them separately",
+                item.dst.display(),
+                first.display()
+            ));
+        } else {
+            taken.insert(key, item.src.clone());
+        }
+    }
+}
+
+/// With overwriting on, fail every item whose output is a *different* input of the same
+/// batch: `song.wav` next to `song.flac` would otherwise render over the original
+/// `song.flac`. Without overwriting the render already skips an existing output, so
+/// nothing is refused. Called by [`Batch::start`]; public for `--dry-run`.
+pub fn refuse_overwriting_inputs(items: &mut [Item]) {
+    let srcs: std::collections::HashSet<PathBuf> =
+        items.iter().map(|i| path_key(&i.src)).collect();
+    for item in items.iter_mut() {
+        if item.phase == Phase::Failed {
+            continue;
+        }
+        let key = path_key(&item.dst);
+        if key != path_key(&item.src) && srcs.contains(&key) {
+            item.phase = Phase::Failed;
+            item.error = Some(format!(
+                "its output {} is also an input of this batch, and overwriting is on; \
+                 rendering it would replace that file (use an output folder, or render \
+                 them separately)",
+                item.dst.display()
+            ));
+        }
+    }
 }
 
 fn push_file(
@@ -512,6 +590,10 @@ impl Batch {
         caps: Caps,
         progress: Option<Progress>,
     ) -> Self {
+        let mut items = items;
+        if cfg.render.out.overwrite {
+            refuse_overwriting_inputs(&mut items);
+        }
         let total = items.len();
         let items = Arc::new(Mutex::new(items));
         let counters = Arc::new(Counters {
@@ -551,6 +633,18 @@ impl Batch {
                         if idx >= total {
                             break;
                         }
+                        // Refused at discovery (`flag_collisions`): counted, never rendered.
+                        let refused = {
+                            let guard = items.lock().unwrap_or_else(|e| e.into_inner());
+                            (guard[idx].phase == Phase::Failed).then(|| guard[idx].clone())
+                        };
+                        if let Some(item) = refused {
+                            counters.failed.fetch_add(1, Ordering::Relaxed);
+                            if let Some(p) = &progress {
+                                p(idx, &item);
+                            }
+                            continue;
+                        }
                         let (src, dst) = {
                             let guard = items.lock().unwrap_or_else(|e| e.into_inner());
                             (guard[idx].src.clone(), guard[idx].dst.clone())
@@ -576,7 +670,20 @@ impl Batch {
                             progress: Some(feed),
                             tap,
                         };
-                        let result = render_file(&src, &dst, &cfg.render, &opts);
+                        // A panic in one render fails that file, not the worker: an unwound
+                        // worker never reports its item, and a caller waiting for every item
+                        // to finish waits forever.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            render_file(&src, &dst, &cfg.render, &opts)
+                        }))
+                        .unwrap_or_else(|p| {
+                            let why = p
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| p.downcast_ref::<&str>().copied())
+                                .unwrap_or("unknown cause");
+                            Err(Error::msg(format!("render panicked: {why}")))
+                        });
 
                         counters.running.fetch_sub(1, Ordering::Relaxed);
                         let mut guard = items.lock().unwrap_or_else(|e| e.into_inner());
@@ -712,6 +819,102 @@ mod tests {
     fn touch(p: &Path) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, b"fake audio").unwrap();
+    }
+
+    #[test]
+    fn a_folder_queues_in_ascending_order_files_before_subfolders() {
+        let root = tmp("order");
+        let lib = root.join("lib");
+        for n in ["b.wav", "a.wav", "c.wav", "Disc 2/01.wav", "Disc 1/02.wav", "Disc 1/01.wav"] {
+            touch(&lib.join(n));
+        }
+        let items = discover(std::slice::from_ref(&lib), Some(&root.join("out")), "flac", true);
+        let got: Vec<String> = items
+            .iter()
+            .map(|i| {
+                i.src
+                    .strip_prefix(&lib)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            got,
+            ["a.wav", "b.wav", "c.wav", "Disc 1/01.wav", "Disc 1/02.wav", "Disc 2/01.wav"]
+        );
+    }
+
+    #[test]
+    fn colliding_outputs_are_refused_before_anything_renders() {
+        let root = tmp("collide");
+        let lib = root.join("lib");
+        touch(&lib.join("song.wav"));
+        touch(&lib.join("song.flac"));
+        touch(&lib.join("take.wav"));
+        touch(&lib.join("take.aiff"));
+        touch(&lib.join("solo.wav"));
+
+        // In place: take.* share an output name; the first one keeps it.
+        let mut items = discover(std::slice::from_ref(&lib), None, "flac", true);
+        let state = |items: &[Item], name: &str| {
+            let i = items.iter().find(|i| i.src.ends_with(name)).unwrap();
+            (i.phase, i.error.clone().unwrap_or_default())
+        };
+        assert_eq!(state(&items, "take.aiff").0, Phase::Queued);
+        let (p, e) = state(&items, "take.wav");
+        assert_eq!(p, Phase::Failed);
+        assert!(e.contains("already the output of"), "{e}");
+        assert_eq!(state(&items, "solo.wav").0, Phase::Queued);
+        // song.wav -> song.flac (an input) only skips without overwriting...
+        assert_eq!(state(&items, "song.wav").0, Phase::Queued);
+        // ...and is refused with it. song.flac -> itself stays the render's own
+        // same-file refusal.
+        refuse_overwriting_inputs(&mut items);
+        let (p, e) = state(&items, "song.wav");
+        assert_eq!(p, Phase::Failed);
+        assert!(e.contains("also an input"), "{e}");
+        assert_eq!(state(&items, "song.flac").0, Phase::Queued);
+
+        // With an output folder nothing is an input any more, but take.* still collide,
+        // and so do song.flac and song.wav, which now both map to out/song.flac.
+        let mut items = discover(std::slice::from_ref(&lib), Some(&root.join("out")), "flac", true);
+        refuse_overwriting_inputs(&mut items);
+        let failed: Vec<_> = items
+            .iter()
+            .filter(|i| i.phase == Phase::Failed)
+            .map(|i| i.src.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(failed, vec!["song.wav".to_string(), "take.wav".to_string()]);
+    }
+
+    #[test]
+    fn refused_items_count_as_failed_and_never_reach_a_render() {
+        let Some((tools, caps)) = tools_and_caps() else {
+            return;
+        };
+        let root = tmp("refused");
+        let lib = root.join("lib");
+        touch(&lib.join("song.wav"));
+        touch(&lib.join("song.flac"));
+        let before = std::fs::read(lib.join("song.flac")).unwrap();
+        let cfg = BatchCfg {
+            inputs: vec![lib.clone()],
+            workers: 1,
+            render: RenderCfg {
+                out: crate::stages::OutCfg {
+                    overwrite: true,
+                    copy_metadata: false,
+                    ..Default::default()
+                },
+                ..RenderCfg::default()
+            },
+            ..Default::default()
+        };
+        let items = discover(&cfg.inputs, None, "flac", true);
+        let out = Batch::run(items, &cfg, tools, caps, None);
+        assert_eq!(out.failed, 2, "song.wav refused, song.flac is its own output");
+        assert_eq!(std::fs::read(lib.join("song.flac")).unwrap(), before);
     }
 
     /// A batch over `dir` that may overwrite and does not copy metadata (the
