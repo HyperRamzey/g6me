@@ -191,6 +191,29 @@ under-read on a crest between grid points costs. That is why the limiter's ratio
 meter's are different constants, and why a `--limit-ratio 4` render prints a `guard_db` of
 0.62 rather than quietly keeping the old number.
 
+**Measured, every ratio, both ends of the lookahead.** Same file, `--ceiling -1`, and the
+ceiling checked three ways: what the limiter says it left, what this program measures after
+re-decoding the finished file, and what ffmpeg's own `ebur128=peak=true` reads on the file.
+The last column is an independent implementation of the standard's detector, and it prints
+one decimal, so it agrees or doesn't at 0.1 dB.
+
+| ratio | `guard_db` | lookahead asked → honoured | limiter post | file re-decoded | ffmpeg |
+|:-:|:-:|:-:|:-:|:-:|:-:|
+| x2 | 0.32 | 0.20 → 0.60 ms | −1.320 | −1.300 | −1.3 |
+| x4 | 0.62 | 0.20 → 0.21 ms | −1.620 | −1.620 | −1.5 |
+| x8 | 0.04 | 0.20 → 0.60 ms | −1.040 | −1.021 | −1.0 |
+| x16 | 0.04 | 0.20 → 0.60 ms | −1.040 | −1.022 | −1.0 |
+| x32 | 0.04 | 0.20 → 0.60 ms | −1.040 | −1.022 | −1.0 |
+
+and every one of them identical at `--lookahead 2`, which is the default. Two things in that
+table are worth reading rather than nodding at. The honoured lookahead is not always what was
+asked for: 0.2 ms is below the interpolator's own delay at x2/x8/x16/x32, so the limiter says
+so and runs at 0.60 ms, while x4 — whose bank is the shortest — really can act in 0.21 ms, and
+both numbers are in the report as `requested_lookahead_ms` and `effective_lookahead_ms`. And
+ffmpeg reads the x4 file 0.12 dB *hotter* than this program's own x4 measurement of the same
+bytes does; it is under the ceiling either way, but it is the reason a reading is quoted with
+its ratio and never treated as the last word.
+
 **Latency.** Lookahead plus the interpolator's own delay, both appended to the end of the
 file and reported, never hidden. At the defaults that is 96 samples of lookahead — **2.00 ms
 at 48 kHz, honoured as asked** — plus 26 samples of filter delay: **122 samples, 2.542 ms**,
