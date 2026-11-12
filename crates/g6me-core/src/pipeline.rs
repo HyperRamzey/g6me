@@ -176,6 +176,15 @@ impl Report {
                 l.ceiling_db, l.max_gain_reduction_db
             ));
         }
+        // The file's own number, on the line people actually scan and paste into issue
+        // threads — but only when it differs from the metered stream by more than the
+        // tolerance. Printing it on every render would say "the same" a thousand times and
+        // train the eye past the one time it says "different".
+        if self.delivered_note.is_some() {
+            if let Some(d) = &self.delivered {
+                s.push_str(&format!("  file {:+.2} dBTP", d.true_peak_dbtp));
+            }
+        }
         s
     }
 
@@ -239,6 +248,26 @@ impl Report {
                 l.max_gain_reduction_db,
                 l.engaged_frames
             ));
+        }
+        // The number that describes the file, printed next to the one that describes the
+        // stream, so a reader never has to know which of the two a clause was measured on.
+        if let Some(d) = &self.delivered {
+            let mut peak = f64::NEG_INFINITY;
+            for &p in &d.sample_peak_dbfs {
+                peak = peak.max(p);
+            }
+            let mut level = f64::NEG_INFINITY;
+            for &v in &d.rms_dbfs {
+                level = level.max(v);
+            }
+            s.push_str(&format!(
+                "\nfile on disk, decoded back: true peak {:+.2} dBTP, sample peak {:+.2} dBFS, \
+                 level {:+.2} dBFS",
+                d.true_peak_dbtp, peak, level
+            ));
+        }
+        if let Some(n) = &self.delivered_note {
+            s.push_str(&format!("\nWARNING: {n}"));
         }
         s
     }
@@ -759,6 +788,12 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             )
         })
     });
+    // Same channel as every other caveat, deliberately: the CLI prints `warnings`, the GUI
+    // shows them, and `--json` carries them. A report that buries its one bad number behind
+    // a field name a reader has to know about is how a false reading survives review.
+    if let Some(n) = &delivered_note {
+        warnings.push(n.clone());
+    }
 
     let wall = started.elapsed();
     let seconds = frames as f64 / work_rate as f64;
@@ -1595,6 +1630,7 @@ mod tests {
         );
         let d = r
             .delivered
+            .as_ref()
             .expect("the file was written, so it can be measured");
         let over = d
             .sample_peak_dbfs
@@ -1611,10 +1647,24 @@ mod tests {
         );
         let note = r
             .delivered_note
+            .as_ref()
             .expect("a clamped file must be reported, not implied");
         assert!(
             note.contains("true peak moved"),
             "the note names the wrong thing: {note}"
+        );
+        // And both reach a human, not just the JSON: the headline line carries the file's own
+        // number, and the note rides the shared warnings channel the CLI prints and the GUI
+        // shows. A caveat nobody reads is a caveat nobody acts on.
+        let line = r.one_line();
+        assert!(
+            line.contains("file "),
+            "the headline hides the file's number: {line}"
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("true peak moved")),
+            "the note is missing from the shared warnings channel: {:?}",
+            r.warnings
         );
         std::fs::remove_dir_all(&dir).ok();
     }
