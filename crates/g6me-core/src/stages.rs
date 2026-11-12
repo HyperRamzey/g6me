@@ -382,9 +382,18 @@ pub fn input_stage(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> (InputStage,
     } else {
         None
     };
-    // A depth request equal to what the decoder already produced is not a step.
-    let depth =
-        depth.filter(|d| !matches!(d, BitDepth::S32 | BitDepth::F64) || info.bits == Some(32));
+    // A depth request is dropped only when it provably cannot change anything. swresample
+    // computes in double, so asking for `f64` is not a step at all.
+    //
+    // Nothing else is dropped. The probe reports a bit *width*, not a sample format, so a
+    // file with bits=32 could be `s32` or `flt` or `flt64`, and `--depth s32` on the float
+    // one is exactly the conversion the caller named. What the old condition did was drop
+    // `s32` for every source that was *not* 32-bit — the one case where the step is
+    // guaranteed to do something — so a user asking for 32-bit output of a 24-bit file got
+    // the file back unchanged and a chain line that no longer matched the command. A
+    // redundant filter argument costs one parse; a requested depth that silently evaporates
+    // costs the render.
+    let depth = depth.filter(|d| !matches!(d, BitDepth::F64));
 
     let stage = match (want_rate || want_dither, depth.is_some()) {
         (true, true) => InputStage::SoxrAndDepth,
@@ -852,6 +861,34 @@ mod tests {
         cfg.resample.rate = 48000;
         let (stage, _) = input_stage(&cfg, &info(), crate::dsp::MASK_7_1);
         assert_eq!(stage, InputStage::Noop);
+    }
+
+    /// A depth asked for is a depth delivered, unless it provably does nothing.
+    ///
+    /// The condition this covers dropped `s32` for every source that was *not* already
+    /// 32-bit — the one case where the step is guaranteed to do something — so a 24-bit file
+    /// asked for 32-bit came back unchanged. The fixture is exactly that file: the probe
+    /// reports 24-bit, and `s32` has to survive into a step. `f64` is the only request that
+    /// can be proven a no-op from what the probe reports, because swresample computes in
+    /// double; `bits` is a width, not a format, so nothing else may be quietly dropped.
+    #[test]
+    fn a_requested_depth_survives_unless_it_provably_does_nothing() {
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.resample.enable = true;
+        cfg.resample.rate = 48000; // the source rate: depth is then the only step
+        for (d, want) in [
+            (BitDepth::S32, InputStage::DepthOnly),
+            (BitDepth::S16, InputStage::DepthOnly),
+            (BitDepth::F32, InputStage::DepthOnly),
+            (BitDepth::F64, InputStage::Noop),
+        ] {
+            cfg.resample.depth = Some(d);
+            let (stage, steps) = input_stage(&cfg, &info(), crate::dsp::MASK_7_1);
+            assert_eq!(
+                stage, want,
+                "{d:?} asked of a 24-bit source produced {stage:?}, steps {steps:?}"
+            );
+        }
     }
 
     /// A capability set whose ffmpeg has been measured writing lossless 24-bit

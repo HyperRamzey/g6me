@@ -723,7 +723,7 @@ fn device_list_flag() -> ExitCode {
 /// The ordinary path: discover, then render the queue (or describe it).
 fn render_batch(cli: &Cli, cfg: BatchCfg, tools: &Tools, caps: &Caps) -> ExitCode {
     let ext = cfg.render.out.format.extension().to_string();
-    let items = batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext);
+    let items = batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext, cfg.recursive);
     if items.is_empty() {
         return fail(&format!(
             "no audio files found in {}",
@@ -954,7 +954,8 @@ fn monitor_files(cli: &Cli, tools: &Tools, caps: &Caps) -> ExitCode {
     };
     cfg.out.format = OutFormat::Null;
     let ext = "flac".to_string();
-    let items = batch::discover(&cli.input, cli.out_dir.as_deref(), &ext);
+    let items = batch::discover(&cli.input, cli.out_dir.as_deref(), &ext, true);
+    // No flag for this on the check path; folders are scanned recursively, as documented.
     if items.is_empty() {
         eprintln!("error: no audio files found");
         return ExitCode::from(2);

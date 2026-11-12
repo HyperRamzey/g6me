@@ -1089,6 +1089,11 @@ impl Limiter {
         for (c, buf) in out.iter().enumerate() {
             self.out_meter.push_ch(c, buf);
         }
+        // And that detector's own memory is run out too. When the limiter's ratio equals
+        // the render's meter ratio this meter *is* the file's measurement, so a crest in the
+        // last frames would otherwise be missing from `post_dbtp` — the one number the
+        // ceiling claim rests on.
+        self.out_meter.drain();
         out
     }
 }
@@ -1157,6 +1162,61 @@ mod tests {
         }
         let r = lim.report();
         (out, r)
+    }
+
+    /// A peak that arrives in the first frames of a file still cannot beat the ceiling.
+    ///
+    /// Nothing precedes a burst at frame 1, so there is no history in the bank to smooth it
+    /// and no earlier gain to lean on; the limiter meets it with whatever it can schedule
+    /// from a cold start. The burst is Nyquist-alternating because an interpolating lowpass
+    /// is in its own transition band there, which leaves the sample-peak floor as the only
+    /// thing the meter can see — the hardest thing to catch, at the worst moment to catch
+    /// it.
+    ///
+    /// Measured with a second meter rather than `r.post_dbtp`, because the limiter's own
+    /// optics are the thing under test and would agree with whatever they did wrong. The
+    /// allowance is the limiter's guard band plus this meter's own over-read: a ceiling is a
+    /// statement about the file, and both instruments standing between the two are measured
+    /// numbers, not fudge.
+    #[test]
+    fn a_peak_inside_the_filter_depth_is_limited_where_it_lands() {
+        let mut x = vec![0.0f64; 4096];
+        for (i, slot) in x.iter_mut().enumerate().take(9).skip(1) {
+            *slot = if i % 2 == 0 { -4.0 } else { 4.0 };
+        }
+        let mut worst = f64::NEG_INFINITY;
+        let mut detail = String::new();
+        for &ratio in Ratio::ALL.iter() {
+            let (out, r) = run(
+                cfg(-3.0, ratio, MIN_LOOKAHEAD_MS),
+                std::slice::from_ref(&x),
+                777,
+            );
+            let mut meter = TruePeak::new(Ratio::X8, 1);
+            meter.push_ch(0, &out[0]);
+            meter.drain();
+            let got = meter.dbtp();
+            // What the ceiling permits, in reading terms: the limiter may under-read the
+            // crest by up to its guard band and still have done its duty, and the meter
+            // doing this measurement has an error of its own in the other direction.
+            let allowed = -3.0 + r.guard_db + Ratio::X8.worst_overread_db();
+            if got - allowed > worst {
+                worst = got - allowed;
+                detail = format!(
+                    "{ratio}: measured {got:+.3} dBTP, allowed {allowed:+.3} (guard {:.3} + \
+                     meter over-read {:.3}), reduction {:.3} dB",
+                    r.guard_db,
+                    Ratio::X8.worst_overread_db(),
+                    r.max_gain_reduction_db
+                );
+            }
+        }
+        assert!(
+            worst <= 0.0,
+            "delivered file exceeded the ceiling by {:+.3} dB: {}",
+            worst,
+            detail
+        );
     }
 
     /// The headline claim: measured output true peak never exceeds the ceiling, for

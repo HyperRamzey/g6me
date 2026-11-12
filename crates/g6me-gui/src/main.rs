@@ -1555,7 +1555,7 @@ impl App {
     fn rebuild_queue(&mut self) {
         let cfg = self.settings.batch_cfg();
         let ext = cfg.render.out.format.extension().to_string();
-        let items = batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext);
+        let items = batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext, cfg.recursive);
         self.queue = items
             .iter()
             .map(|i| Row {

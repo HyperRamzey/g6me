@@ -237,36 +237,83 @@ fn relative_within<'a>(child: &'a Path, root: &Path) -> Option<&'a Path> {
 ///
 /// `base` is the folder whose structure is mirrored into `out_dir` — the first
 /// folder given on the command line, which is what a user means by "this tree".
-pub fn discover(inputs: &[PathBuf], out_dir: Option<&Path>, ext: &str) -> Vec<Item> {
+pub fn discover(
+    inputs: &[PathBuf],
+    out_dir: Option<&Path>,
+    ext: &str,
+    recursive: bool,
+) -> Vec<Item> {
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut items: Vec<Item> = Vec::new();
-    // The mirror root is the first directory argument.
-    let base = inputs
+    // What a loose file argument mirrors against. This stays "the first directory argument,
+    // else the working directory", because that is the long-standing behaviour for a file
+    // named on the command line and nothing below changes it.
+    let loose_base = inputs
         .iter()
         .find(|p| p.is_dir())
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let mut stack: Vec<PathBuf> = Vec::new();
+    // Each folder mirrors against *itself*. With one shared root for every argument, the
+    // second folder's files lose their structure and land on the first folder's names:
+    // `Library/AlbumA/01.mka` and `Library/AlbumB/01.mka` both asked for `out/01.flac`, so
+    // the second was skipped as "already rendered" and one file of the batch quietly never
+    // happened.
+    let mut stack: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Folders already entered, by canonical path. A directory reached twice is a queue
+    // written twice, and a symlink pointing at an ancestor is a walk that never ends.
+    let mut entered: Vec<PathBuf> = Vec::new();
+    // One folder in: its contents mirror into `out_dir` directly, which is what `g6me Music/`
+    // has always meant. Two or more: each keeps its own folder name, because mirroring both
+    // against their own root puts `AlbumA/01.mka` and `AlbumB/01.mka` on the same
+    // `out/01.flac`, and the second would be skipped as already rendered — a batch that
+    // quietly renders one file fewer than it was handed.
+    let nested = inputs.iter().filter(|p| p.is_dir()).count() > 1;
+    let mut enter = |dir: &Path, stack: &mut Vec<(PathBuf, PathBuf)>| {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if entered.iter().any(|e| e == &key) {
+            return;
+        }
+        entered.push(key);
+        let base = if nested {
+            dir.parent().unwrap_or(dir).to_path_buf()
+        } else {
+            dir.to_path_buf()
+        };
+        stack.push((dir.to_path_buf(), base));
+    };
+
     for input in inputs {
         if input.is_dir() {
-            stack.push(input.clone());
+            enter(input, &mut stack);
         } else if input.is_file() {
-            push_file(input, &base, out_dir, ext, &mut seen, &mut items);
+            push_file(input, &loose_base, out_dir, ext, &mut seen, &mut items);
         }
     }
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, base)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue; // unreadable directory: skip it, do not fail the batch
         };
         let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
         // Deterministic order, so two runs of the same batch queue identically.
         names.sort();
-        for p in names {
+        // The stack is last-in-first-out, so pushing sorted names visits the last one first:
+        // a library of `Disc 1`, `Disc 2` queued Disc 2 first and the progress line, the ETA
+        // and a cancelled run's remaining files all disagreed with the listing the user read.
+        // Walking in reverse puts the pop order back to ascending.
+        for p in names.iter().rev() {
             if p.is_dir() {
-                stack.push(p);
-            } else if looks_like_audio(&p) {
-                push_file(&p, &base, out_dir, ext, &mut seen, &mut items);
+                if !recursive {
+                    continue;
+                }
+                let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                if entered.iter().any(|e| e == &key) {
+                    continue;
+                }
+                entered.push(key);
+                stack.push((p.clone(), base.clone()));
+            } else if looks_like_audio(p) {
+                push_file(p, &base, out_dir, ext, &mut seen, &mut items);
             }
         }
     }
@@ -684,7 +731,7 @@ mod tests {
         touch(&root.join("loose.m4a"));
 
         let out = root.join("out");
-        let items = discover(std::slice::from_ref(&music), Some(&out), "flac");
+        let items = discover(std::slice::from_ref(&music), Some(&out), "flac", true);
         let names: Vec<String> = items
             .iter()
             .map(|i| {
@@ -702,17 +749,89 @@ mod tests {
         );
 
         // Passing the same folder twice must not queue anything twice.
-        let twice = discover(&[music.clone(), music], Some(&out), "flac");
+        let twice = discover(&[music.clone(), music], Some(&out), "flac", true);
         assert_eq!(twice.len(), 3);
 
         // Loose file argument: output goes next to it.
-        let loose = discover(&[root.join("loose.m4a")], None, "flac");
+        let loose = discover(&[root.join("loose.m4a")], None, "flac", true);
         assert_eq!(loose.len(), 1);
         assert_eq!(
             loose[0].dst.file_name().unwrap().to_string_lossy(),
             "loose.flac"
         );
         assert_eq!(loose[0].dst.parent(), Some(root.as_path()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two folders on one command line each keep their own output.
+    ///
+    /// Both albums hold a file named `01.mka`. Mirroring every argument against the first
+    /// one's root — and then, in the naive fix, each against its own root — puts both on
+    /// `out/01.flac`, and the collision is silent: the second file is skipped as already
+    /// rendered, so the batch reports success having written one file of two.
+    #[test]
+    fn several_folders_do_not_write_on_each_other() {
+        let root = tmp("roots");
+        let a = root.join("AlbumA");
+        let b = root.join("AlbumB");
+        touch(&a.join("01.mka"));
+        touch(&b.join("01.mka"));
+        let out = root.join("out");
+        let items = discover(&[a, b], Some(&out), "flac", true);
+        assert_eq!(items.len(), 2, "both albums must be queued");
+        let mut names: Vec<String> = items
+            .iter()
+            .map(|i| {
+                i.dst
+                    .strip_prefix(&out)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        assert_ne!(names[0], names[1], "both wrote {names:?}");
+        assert_eq!(
+            names,
+            ["AlbumA/01.flac", "AlbumB/01.flac"],
+            "each folder should keep its own name"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `recursive: false` has to mean flat.
+    #[test]
+    fn a_flat_scan_stays_at_the_top() {
+        let root = tmp("flat");
+        touch(&root.join("top.mka"));
+        touch(&root.join("Deep/inner.mka"));
+        let items = discover(std::slice::from_ref(&root), None, "flac", false);
+        assert_eq!(
+            items.len(),
+            1,
+            "a non-recursive scan found a file in a subfolder: {:?}",
+            items.iter().map(|i| &i.src).collect::<Vec<_>>()
+        );
+        let deep = discover(std::slice::from_ref(&root), None, "flac", true);
+        assert_eq!(deep.len(), 2, "the same tree must still walk recursively");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A symlink pointing back at an ancestor must not spin forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_is_entered_once() {
+        let root = tmp("loop");
+        let inner = root.join("Artist");
+        touch(&inner.join("01.mka"));
+        std::os::unix::fs::symlink(&root, inner.join("back")).unwrap();
+        let items = discover(std::slice::from_ref(&root), None, "flac", true);
+        assert_eq!(
+            items.len(),
+            1,
+            "the loop should add nothing, got {:?}",
+            items.iter().map(|i| &i.src).collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -773,7 +892,7 @@ mod tests {
         let mut cfg = failing_cfg(src_dir, 2);
         cfg.out_dir = Some(out.clone());
 
-        let items = discover(&cfg.inputs, cfg.out_dir.as_deref(), "flac");
+        let items = discover(&cfg.inputs, cfg.out_dir.as_deref(), "flac", cfg.recursive);
         assert_eq!(items.len(), 3);
         let done = Arc::new(AtomicUsize::new(0));
         let sink = {
@@ -822,7 +941,7 @@ mod tests {
         .unwrap();
         crate::wav::write_pcm_s32(&dir.join("good.wav"), 48000, 2, &vec![0u8; 4800]).unwrap();
         let cfg = failing_cfg(dir.clone(), 2);
-        let items = discover(&cfg.inputs, None, "flac");
+        let items = discover(&cfg.inputs, None, "flac", cfg.recursive);
         assert_eq!(items.len(), 2);
         let o = Batch::run(items, &cfg, tools, caps, None);
         assert_eq!(
@@ -858,7 +977,7 @@ mod tests {
             workers: 1,
             ..Default::default()
         };
-        let items = discover(&cfg.inputs, None, "flac");
+        let items = discover(&cfg.inputs, None, "flac", cfg.recursive);
         let o = Batch::run(items, &cfg, tools, caps, None);
         assert_eq!(o.skipped, 1, "{:?}", o.items[0].error);
         assert_eq!(o.done, 0);
@@ -882,7 +1001,7 @@ mod tests {
             .unwrap();
         }
         let cfg = failing_cfg(dir.clone(), 2);
-        let items = discover(&cfg.inputs, None, "flac");
+        let items = discover(&cfg.inputs, None, "flac", cfg.recursive);
         let b = Batch::start(items, &cfg, tools, caps, None);
         std::thread::sleep(Duration::from_millis(150));
         b.cancel();
@@ -912,7 +1031,7 @@ mod tests {
         crate::wav::write_pcm_s32(&dir.join("d.wav"), 44100, 6, &vec![9u8; 44100 * 6 * 4]).unwrap();
         let mut cfg = failing_cfg(dir.clone(), 1);
         cfg.render.sha256 = true;
-        let items = discover(&cfg.inputs, None, "flac");
+        let items = discover(&cfg.inputs, None, "flac", cfg.recursive);
         let first = Batch::run(items.clone(), &cfg, tools.clone(), caps.clone(), None);
         let h1 = first.items[0]
             .report
@@ -961,7 +1080,7 @@ mod tests {
             Some(Arc::new(crate::meter::MeterTap::new(m)))
         })));
 
-        let items = discover(&cfg.inputs, cfg.out_dir.as_deref(), "flac");
+        let items = discover(&cfg.inputs, cfg.out_dir.as_deref(), "flac", cfg.recursive);
         assert_eq!(items.len(), 3);
         let outcome = Batch::run(items, &cfg, tools, caps, None);
         assert_eq!(

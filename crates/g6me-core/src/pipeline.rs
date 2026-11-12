@@ -292,10 +292,6 @@ struct PeakStage {
     /// Output gain staging in force: applied to every sample, before the limiter, as one
     /// constant multiplier.
     gain: f64,
-    /// Frames the meter's own filter still holds when input ends. Run out with zeros at
-    /// the end of the file, or the crest in the middle of that bank never reaches the
-    /// reading and the whole file's number stops one group delay short of the truth.
-    drain: usize,
     /// Per channel: held sample peak, running sum of squares, frames seen.
     accum: [Accum; 2],
 }
@@ -355,7 +351,6 @@ impl PeakStage {
             shared: cfg.limiter.enable && cfg.limiter.ratio == cfg.true_peak,
             limiter,
             gain: 10f64.powf(cfg.output_gain_db / 20.0),
-            drain: cfg.true_peak.group_delay().ceil() as usize + 1,
             accum: std::array::from_fn(|_| Accum::default()),
         }
     }
@@ -420,16 +415,12 @@ impl PeakStage {
             {
                 acc.push(buf);
             }
-            // Then run the filter memory out. A crest sitting in the middle of a 51-tap
-            // bank at end of file has its output samples still to come, and without the
-            // drain the reading for the whole file stops one group delay short of the truth.
-            // Zeros only, and only into the meter: they are not samples of the file, so they
-            // must not enter the RMS average.
-            let zeros = vec![0.0f64; self.drain];
-            for ch in 0..2 {
-                self.tp.push_ch(ch, &zeros);
-            }
         }
+        // Outside the `if let`, because it has nothing to do with the tail: this is the
+        // meter's own filter memory, and a render with the limiter off has no tail at all
+        // while having exactly the same memory to run out. Inside the guard it silently
+        // applied to one of three modes and not the other two.
+        self.tp.drain();
         tail
     }
 
@@ -1788,6 +1779,64 @@ mod tests {
         assert_eq!(r.true_peak_ratio, Ratio::X4);
         assert!(r.limiter.is_none(), "this render asked for no limiter");
         assert!(r.one_line().contains("tp "), "{}", r.one_line());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A crest in the last samples of a file is measured — with the limiter off.
+    ///
+    /// The meter is a polyphase bank with a group delay of several samples, so the
+    /// interpolated output describing a peak in the final frames has not been produced when
+    /// input stops. Running the memory out with silence is the difference between "the
+    /// true peak of this file" and "the true peak of everything except its last few
+    /// samples". The case that needs it most is the render with no limiter: it has no flush
+    /// tail to lean on, and it is the path whose numbers get quoted as the untouched one.
+    #[test]
+    fn a_crest_in_the_final_samples_is_measured_with_the_limiter_off() {
+        let Some((tools, caps)) = tools_ok() else {
+            return;
+        };
+        let dir = workdir("tp-tail");
+        let w = dir.join("tail.wav");
+        // Four samples of a 12 kHz tone at 45° — [+0.707, +0.707, -0.707, -0.707] — and
+        // nothing else in the file. The sample peak is -3.01 dBFS; the band-limited peak is
+        // the tone's own 0 dBFS, and it sits between those samples, in the last few frames.
+        // A longer burst would not test this: a sustained tone has crests throughout, so
+        // losing the interpolated outputs of the final group delay costs the reading
+        // nothing, which is exactly how this fixture first failed to fail.
+        let n = 1024usize;
+        let mut pcm = vec![0u8; n * 2 * 4];
+        let pat = [
+            1_518_500_350i32,
+            1_518_500_350,
+            -1_518_500_350,
+            -1_518_500_350,
+        ];
+        for (k, &v) in pat.iter().enumerate() {
+            let base = (n - pat.len() + k) * 2 * 4;
+            for c in 0..2usize {
+                pcm[base + c * 4..base + c * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        crate::wav::write_pcm_s32(&w, 48000, 2, &pcm).unwrap();
+        let opts = RenderOpts::new(&tools, &caps);
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.limiter.enable = false;
+        let r = render_file(&w, &dir.join("t.flac"), &cfg, &opts).unwrap();
+        let samp = r
+            .sample_peak_dbfs
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        assert!(
+            samp > -3.10 && samp < -2.95,
+            "sample peak {samp:+.3} is not the pattern's -3.01: the tail was not accumulated"
+        );
+        assert!(
+            r.true_peak_dbtp > samp + 1.0,
+            "true peak {:+.2} dBTP is barely off a sample peak of {samp:+.2}: the interpolated \
+             crest in the file's last frames was never measured, because nothing ran the \
+             meter's filter memory out at end of input",
+            r.true_peak_dbtp,
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

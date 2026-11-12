@@ -179,7 +179,7 @@ impl Runner {
             return Err("a run is already in progress".into());
         }
         let ext = cfg.render.out.format.extension().to_string();
-        let items = batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext);
+        let items = batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext, cfg.recursive);
         if items.is_empty() {
             return Err(
                 "no audio files found — check the queue, the extension filter, and whether \

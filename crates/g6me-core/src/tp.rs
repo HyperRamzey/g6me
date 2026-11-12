@@ -600,6 +600,10 @@ pub struct Detector {
     /// successor yet, so it cannot be refined and waits for the next output.
     older: f64,
     newest: f64,
+    /// Index from the newest input back to the sample the filter output describes: the
+    /// group delay, in whole samples. The sample-peak floor is read here rather than off
+    /// `x`, so it describes the same instant as the interpolation it is the floor for.
+    lag: usize,
 }
 
 impl Detector {
@@ -609,6 +613,7 @@ impl Detector {
             stage: Stage::new(ratio),
             peak: 0.0,
             ratio,
+            lag: ratio.group_delay().round() as usize,
             refine: ratio.refines(),
             older: 0.0,
             newest: 0.0,
@@ -686,12 +691,30 @@ impl Detector {
         } else {
             peak = raw;
         }
-        let xs = x.abs();
+        // The floor is read at the filter centre, not off `x`. Everything `peak` describes
+        // is the waveform around the tap in the middle of the bank — 25 samples back for a
+        // 51-tap one — while `x` is the newest sample, that many samples in its future. A
+        // floor taken from `x` therefore reports a crest that belongs to a later instant as
+        // though it belonged here, and a limiter acting on it sags and returns to unity
+        // before the peak it was reacting to has arrived.
+        //
+        // Reading the centre loses nothing over the whole file: every sample passes through
+        // the centre exactly once as input advances, including the first ones, which arrive
+        // there while `drain()` is clocking the bank out.
+        let centre = self.stage.hist.len() - 1 - self.lag;
+        let xs = self.stage.hist[centre].abs();
         if xs > peak {
             peak = xs;
         }
         if peak > self.peak {
             self.peak = peak;
+        }
+        // The newest sample still counts toward the file's maximum — that number has no
+        // instant to be wrong at, and under-reading a true peak is the one error a ceiling
+        // cannot survive.
+        let newest = x.abs();
+        if newest > self.peak {
+            self.peak = newest;
         }
         peak
     }
@@ -747,6 +770,25 @@ impl TruePeak {
         for frame in block.chunks_exact(nch) {
             for (c, &v) in frame.iter().enumerate() {
                 self.chans[c].push(v);
+            }
+        }
+    }
+
+    /// Run the filter memory out so the last crest is measured instead of assumed.
+    ///
+    /// A finite oversampled bank holds a group delay of history, so the output samples that
+    /// describe a peak in the last few frames of a file have not been produced when input
+    /// stops: without this, the reading for the whole file stops one group delay short of
+    /// the truth, and it is exactly the crest at the end of a track that a limiter or a
+    /// clipping check cares about. Feeding silence finishes those outputs. The zeros are not
+    /// samples of the file and go nowhere else — a meter that counted them in an average
+    /// would be folding in audio nobody wrote.
+    pub fn drain(&mut self) {
+        let n = self.ratio.group_delay().ceil() as usize + 1;
+        let zeros = vec![0.0f64; n];
+        for d in &mut self.chans {
+            for &z in &zeros {
+                d.push(z);
             }
         }
     }
