@@ -292,6 +292,10 @@ struct PeakStage {
     /// Output gain staging in force: applied to every sample, before the limiter, as one
     /// constant multiplier.
     gain: f64,
+    /// Frames the meter's own filter still holds when input ends. Run out with zeros at
+    /// the end of the file, or the crest in the middle of that bank never reaches the
+    /// reading and the whole file's number stops one group delay short of the truth.
+    drain: usize,
     /// Per channel: held sample peak, running sum of squares, frames seen.
     accum: [Accum; 2],
 }
@@ -351,6 +355,7 @@ impl PeakStage {
             shared: cfg.limiter.enable && cfg.limiter.ratio == cfg.true_peak,
             limiter,
             gain: 10f64.powf(cfg.output_gain_db / 20.0),
+            drain: cfg.true_peak.group_delay().ceil() as usize + 1,
             accum: std::array::from_fn(|_| Accum::default()),
         }
     }
@@ -389,11 +394,43 @@ impl PeakStage {
     }
 
     /// Frames the limiter was still holding when input ended. Programme, not debris.
+    /// Hand over the frames the limiter was still holding, and measure them.
+    ///
+    /// They are programme: the delay line lets in as much silence at the head as it holds
+    /// back at the tail, so a tail that is emitted without being metered leaves the report
+    /// describing a file with its last `latency` frames cut off — the peak, the RMS and the
+    /// true peak all quietly missing the part of the file the limiter wrote last. With the
+    /// limiter running at 8x and the meter at 4x the meter is not shared, so nothing else
+    /// would ever see them.
     fn finish_input(&mut self) -> Vec<Vec<f64>> {
-        self.limiter
+        let tail = self
+            .limiter
             .as_mut()
             .map(Limiter::flush)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let [left, right] = tail.as_slice() {
+            if !self.shared {
+                self.tp.push_ch(0, left);
+                self.tp.push_ch(1, right);
+            }
+            for (acc, buf) in self
+                .accum
+                .iter_mut()
+                .zip([left.as_slice(), right.as_slice()])
+            {
+                acc.push(buf);
+            }
+            // Then run the filter memory out. A crest sitting in the middle of a 51-tap
+            // bank at end of file has its output samples still to come, and without the
+            // drain the reading for the whole file stops one group delay short of the truth.
+            // Zeros only, and only into the meter: they are not samples of the file, so they
+            // must not enter the RMS average.
+            let zeros = vec![0.0f64; self.drain];
+            for ch in 0..2 {
+                self.tp.push_ch(ch, &zeros);
+            }
+        }
+        tail
     }
 
     /// The report's true-peak numbers, and what the limiter did if it ran.

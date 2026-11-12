@@ -177,12 +177,18 @@ two opinions about one level is not a command line. On `810.mka`, whose true pea
 
 | | max reduction | limiter engaged | delivered TP |
 |---|---|---|---|
-| `--ceiling -3` alone | 3.85 dB | 99.6 % of frames | −3.57 dBTP |
-| `--setpoint -3` | 0.85 dB | 87 % of frames | −3.62 dBTP |
+| `--ceiling -3` alone | 3.85 dB | 99.6 % of frames | −3.61 dBTP |
+| `--setpoint -3` | 0.85 dB | 17.1 % of frames | −3.62 dBTP |
 
 That table is the argument. A ceiling asked to do level work holds the file by riding gain
-through nearly all of it; a setpoint takes the level off as gain and leaves the limiter to
-catch peaks. ffmpeg's own peak meter agrees on the delivered file (−3.4 dBFS against our
+through nearly all of it — and that 99.6 % is the processor genuinely holding a reduction of
+0.75 dB through the file, not a stuck counter; the same file trimmed by a setpoint is touched
+on 17.1 % of its frames instead. (`engaged_frames` used to latch: a one-pole release
+converges to within 2.1e-11 dB of unity and then stops in IEEE 754, so `gain < 1.0` stayed
+true for the rest of the file after the first peak. The follower is now told to arrive, and
+the counters ask for a reduction of at least 0.001 dB. Both numbers above are post-fix
+measurements; the 87 % this table first claimed for the setpoint row was the latch, not the
+limiter.) ffmpeg's own peak meter agrees on the delivered file (−3.4 dBFS against our
 −3.62 dBTP @x4, both under the −3 ceiling).
 
 **Defaults**: limiter on, −3 dBTP, 2 ms lookahead, 60/900 ms, 100 %/75 % linking, 8x on a 4x

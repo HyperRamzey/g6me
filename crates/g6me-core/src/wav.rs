@@ -97,10 +97,10 @@ pub fn header(rate: u32, channels: u16, bits: u32, float: bool, mask: Option<u32
 /// Streaming WAV writer: header first, sizes patched on [`finish`].
 pub struct WavWriter {
     f: std::fs::File,
-    rate: u32,
-    channels: u16,
-    bits: u32,
-    float: bool,
+    /// The length of the header that was actually written. Not a constant: a classic
+    /// 2-channel header is 44 bytes and a `WAVE_FORMAT_EXTENSIBLE` one is 68, and both
+    /// size fields patched at the end are measured from it.
+    hdr_len: u64,
     data_len: u64,
 }
 
@@ -113,14 +113,17 @@ impl WavWriter {
         float: bool,
         mask: Option<u32>,
     ) -> Result<Self> {
+        let hdr = header(rate, channels, bits, float, mask);
+        // Recorded rather than recomputed at the end: the header that exists and the
+        // header guessed from the channel count are different lengths as soon as a custom
+        // mask is involved, and the two size fields live at the end of whichever one was
+        // actually written.
+        let hdr_len = hdr.len() as u64;
         let mut f = std::fs::File::create(path)?;
-        f.write_all(&header(rate, channels, bits, float, mask))?;
+        f.write_all(&hdr)?;
         Ok(Self {
             f,
-            rate,
-            channels,
-            bits,
-            float,
+            hdr_len,
             data_len: 0,
         })
     }
@@ -133,15 +136,18 @@ impl WavWriter {
 
     pub fn finish(mut self) -> Result<u64> {
         let total = self.data_len;
-        // RIFF chunk size = file size - 8; data chunk size = payload.
+        // RIFF chunk size = file size - 8; data chunk size = payload. Both measured from
+        // `hdr_len`, because a hard-coded 36 (the 44-byte classic header minus 8) writes a
+        // RIFF size 24 bytes short onto every 68-byte extensible file — which is every
+        // multichannel WAV this program writes. A strict parser honours that size and
+        // drops the last 24 bytes of audio, so the file plays and is quietly truncated.
         self.f.seek(SeekFrom::Start(4))?;
-        self.f.write_all(&((total + 36) as u32).to_le_bytes())?;
+        self.f
+            .write_all(&((total + self.hdr_len - 8) as u32).to_le_bytes())?;
         // The header ends with "data" followed by its 4-byte size, so the size
         // field is the last 4 bytes of the header — writing 8 bytes back would
         // land on the "data" tag itself and ffmpeg would reject the file.
-        let hdr = header(self.rate, self.channels, self.bits, self.float, None);
-        let data_off = (hdr.len() - 4) as u64;
-        self.f.seek(SeekFrom::Start(data_off))?;
+        self.f.seek(SeekFrom::Start(self.hdr_len - 4))?;
         self.f.write_all(&(total as u32).to_le_bytes())?;
         self.f.flush()?;
         Ok(total)
@@ -207,6 +213,13 @@ pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
         let id = &ch[0..4];
         let size = u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]) as u64;
         if id == b"fmt " {
+            // Cap checked before the allocation, not after. A chunk header can claim any
+            // 32-bit size, and `vec![0u8; size]` on the strength of it means a 44-byte
+            // file can ask for 4 GiB of RAM before anything reads it and notices. The
+            // largest fmt chunk that exists in the wild is 40 bytes.
+            if size > 1024 {
+                return Err(Error::msg("absurd WAV fmt chunk size"));
+            }
             let mut b = vec![0u8; size as usize];
             f.read_exact(&mut b).map_err(short)?;
             if b.len() < 16 {
@@ -226,6 +239,12 @@ pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
                 info.mask = Some(guess_mask(info.channels));
             }
         } else if id == b"data" {
+            // Samples with no format in front of them are not a stream. Returned as a
+            // parsed header it says 0 channels at 0 Hz and 0 bits, which every caller
+            // believes until it divides.
+            if info.channels == 0 || info.rate == 0 || info.bits == 0 {
+                return Err(Error::msg("WAV data chunk before any fmt chunk"));
+            }
             let off = f.stream_position()?;
             info.data_len = size;
             return Ok((info, off));
@@ -251,6 +270,93 @@ mod tests {
         let d = std::env::temp_dir().join(format!("g6me-wav-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d.join(name)
+    }
+
+    /// The declared sizes of an 8-channel file, read back as bytes rather than through
+    /// this module's own reader: a reader that trusts the header cannot catch a header
+    /// that lies, and `finish()` used to patch 36 bytes of header onto a 68-byte one.
+    #[test]
+    fn multichannel_wav_declares_its_real_sizes() {
+        let p = tmp("8ch-sizes.wav");
+        let pcm = vec![0x5au8; 1024 * 8 * 4];
+        write_pcm_s32(&p, 48000, 8, &pcm).unwrap();
+        let b = std::fs::read(&p).unwrap();
+        let len = b.len() as u64;
+        assert_eq!(len, 68 + pcm.len() as u64, "extensible header is 68 bytes");
+        assert_eq!(&b[60..64], b"data", "data chunk must sit at 60");
+        let riff = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as u64;
+        let data = u32::from_le_bytes([b[64], b[65], b[66], b[67]]) as u64;
+        assert_eq!(
+            riff,
+            len - 8,
+            "RIFF size is the file minus its first 8 bytes"
+        );
+        assert_eq!(data, pcm.len() as u64, "data size is the payload");
+    }
+
+    /// Two channels with a non-default mask is extensible too, and the mask is not passed
+    /// to the patch-up pass: `finish()` rebuilt the header with `mask: None`, got a 44-byte
+    /// layout, and wrote the data size over the SubFormat GUID while leaving the real data
+    /// size at zero.
+    #[test]
+    fn a_custom_mask_on_two_channels_keeps_its_guid_and_sizes() {
+        let p = tmp("2ch-mask.wav");
+        let pcm = vec![0x11u8; 512 * 2 * 2];
+        let mut w = WavWriter::create(&p, 48000, 2, 16, false, Some(0x4)).unwrap();
+        w.write(&pcm).unwrap();
+        w.finish().unwrap();
+        let b = std::fs::read(&p).unwrap();
+        assert_eq!(&b[60..64], b"data", "header stayed extensible");
+        assert_eq!(
+            &b[44..50],
+            &SUBTYPE_PCM[0..6],
+            "the SubFormat GUID must survive the size patch"
+        );
+        let riff = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as u64;
+        assert_eq!(riff, b.len() as u64 - 8);
+        let data = u32::from_le_bytes([b[64], b[65], b[66], b[67]]) as u64;
+        assert_eq!(data, pcm.len() as u64, "the real data size, not zero");
+        let (info, off) = read_info(&p).unwrap();
+        assert_eq!(info.mask, Some(0x4));
+        assert_eq!(info.frames(), 512);
+        assert_eq!(off as usize + pcm.len(), b.len());
+    }
+
+    /// A `data` chunk before any `fmt ` describes nothing. Returned as a valid file it
+    /// becomes a stream with 0 channels and 0 Hz, and the frame count is a division that
+    /// only a `checked_div` keeps out of trouble.
+    #[test]
+    fn data_before_fmt_is_refused_not_trusted() {
+        let p = tmp("data-first.wav");
+        let mut b: Vec<u8> = b"RIFF".to_vec();
+        b.extend_from_slice(&36u32.to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&p, &b).unwrap();
+        let e = read_info(&p).unwrap_err();
+        assert!(
+            e.to_string().contains("fmt"),
+            "the error has to name what is missing: {e}"
+        );
+    }
+
+    /// A 4 GiB `fmt ` size in a 44-byte file must be refused by looking at the number.
+    /// Allocating first means a corrupt or hostile header asks for 4 GiB of RAM before
+    /// anything notices the file is shorter than its own chunk.
+    #[test]
+    fn an_absurd_fmt_size_is_refused_before_it_is_allocated() {
+        let p = tmp("huge-fmt.wav");
+        let mut b: Vec<u8> = b"RIFF".to_vec();
+        b.extend_from_slice(&400u32.to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&p, &b).unwrap();
+        let e = read_info(&p).unwrap_err();
+        assert!(e.to_string().contains("fmt"), "got: {e}");
     }
 
     #[test]

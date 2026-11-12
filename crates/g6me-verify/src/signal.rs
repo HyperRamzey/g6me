@@ -234,7 +234,11 @@ impl Diff {
     /// Signal-to-difference ratio in dB, `None` when the difference is zero
     /// (which is not "infinite quality", it is "identical").
     pub fn snr_db(&self) -> Option<f64> {
-        if self.differing == 0 {
+        // Two streams that differ only in the sign of zero differ by nothing measurable:
+        // `differing` counts them, `max_abs` is still 0.0, and -20·log10(0) is +inf — an
+        // "infinite" entry in a column that means dB of difference. Identical-but-signed
+        // is not infinite quality, it is no difference, and the honest answer is no number.
+        if self.differing == 0 || self.max_abs == 0.0 {
             return None;
         }
         Some(-20.0 * self.max_abs.log10())

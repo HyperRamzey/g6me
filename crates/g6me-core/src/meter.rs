@@ -75,7 +75,15 @@ impl Meters {
 
     fn hold(&self, index: usize, peak: f32) {
         let prev = f32::from_bits(self.values[index].load(AtomicOrd::Relaxed));
-        let fall = prev * self.decay();
+        // A non-finite previous value is decayed to silence rather than multiplied: inf ×
+        // 0.99 is inf, so one bad sample used to latch the bar at full scale for the rest
+        // of the session, and only reset() would free it.
+        let fall = if prev.is_finite() {
+            prev * self.decay()
+        } else {
+            0.0
+        };
+        let peak = if peak.is_finite() { peak } else { f32::MAX };
         let v = if peak > fall { peak } else { fall };
         self.values[index].store(v.to_bits(), AtomicOrd::Relaxed);
     }
@@ -85,7 +93,12 @@ impl Meters {
     fn peak_of<T: Real>(buf: &[T], n: usize) -> f32 {
         let mut peak = 0.0f32;
         for &x in buf.iter().take(n) {
-            let v = x.to_f64().abs() as f32;
+            // Clamped, not cast. The plugin this reproduces stored the peak in a float too,
+            // but its samples came from a float buffer, so it could not meet an f64 above
+            // f32::MAX; a bare `as f32` of one yields +inf, which [`Self::hold`] would then
+            // latch. `f64::min` returns the other operand when one is NaN, so a NaN sample
+            // is skipped rather than becoming the peak.
+            let v = x.to_f64().abs().min(f64::from(f32::MAX)) as f32;
             if v > peak {
                 peak = v;
             }
@@ -169,8 +182,15 @@ impl Meters {
 /// Only the meter scale changed. Nothing in [`crate::dsp`] is adjusted this way:
 /// reproducing the module's transfer function is the point of the port.
 pub fn level_to_param(v: f32) -> f32 {
-    if v <= 0.001 {
-        return 0.0; // at or below the -60 dBFS floor
+    // Written as a failed `>` rather than `<=` so that NaN takes this branch: both
+    // comparisons with NaN are false, and a NaN reaching egui's geometry panics on the
+    // first Rect built from it. A meter has no honest answer for NaN; the floor is the
+    // safe one, and the value is still visible in the numeric report.
+    // NaN has no ordering, and `partial_cmp` says so instead of quietly answering `false`
+    // twice. A meter has no honest reading for NaN; the floor is the safe one, and the
+    // value is still visible in the numeric report.
+    if v.partial_cmp(&0.001).is_none_or(|o| o.is_le()) {
+        return 0.0; // at or below the -60 dBFS floor, and anything unmeasurable
     }
     if v >= 1.0 {
         return 1.0; // full scale and above

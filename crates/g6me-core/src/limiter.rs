@@ -91,6 +91,26 @@ pub const MAX_CEILING_DB: f64 = 0.0;
 /// Shortest gain ramp that is a ramp rather than a step, in frames.
 pub const MIN_RAMP_FRAMES: usize = 2;
 
+/// How close a one-pole follower has to be to its target before it is told to arrive.
+///
+/// `v += (target - v) * k` converges in real arithmetic and does not in IEEE 754: once
+/// `target - v` is small enough that the product rounds below half an ULP of `v`, `v +`
+/// that product is `v` again, exactly, forever. At 48 kHz with a 900 ms release that
+/// stall lands at 0.99999999999760192 — 2.1e-11 dB below unity, inaudible in the audio and
+/// fatal to any test that asks whether the gain came back.
+///
+/// The dead band is written as a difference rather than as a floor on the increment
+/// because its job is to say "this is the target, for every purpose this processor has".
+pub const GAIN_DEADBAND: f64 = 1e-9;
+
+/// Smallest gain reduction that counts as the limiter working.
+///
+/// `engaged_frames` and `release_frames` are counts of frames the processor changed the
+/// signal on, and a frame changed by 1e-11 dB was not changed in any sense a listener, a
+/// diff, or a second render would agree on. Without this the counters answer the question
+/// "has a peak ever happened" — which stays true for the rest of the file.
+pub const ENGAGED_EPS: f64 = 1e-4; // ~0.001 dB
+
 /// Smallest lookahead the UI and CLI offer, in ms.
 pub const MIN_LOOKAHEAD_MS: f64 = 0.2;
 
@@ -449,7 +469,12 @@ impl Report {
 ///    scaled by the gain of its own frame;
 /// 3. **backward ramp pass** `g[j] = min(g_a[j], g[j + 1] + slope)`, which is what
 ///    makes the gain *arrive* at the required depth instead of stepping there, and is
-///    the reason no overshoot is possible rather than merely unlikely.
+///    the reason no overshoot is possible rather than merely unlikely. It is evaluated
+///    at emission as its closed form over the ramp horizon,
+///    `g[j] = min over r in 0..=ramp of (g_a[j + r] + r * slope)`, because the frames that
+///    constrain `g[j]` are ahead of it and are finalised one frame per input frame — a
+///    running accumulator inside the scheduler could not see them. See
+///    [`Limiter::schedule_to`] for what that cost when it was tried the other way.
 ///
 /// A one-pole release follower runs forward at emission, and only ever pulls the gain
 /// *down* toward the schedule, so it cannot break the ceiling.
@@ -506,6 +531,11 @@ pub struct Limiter {
     peaks: Vec<f64>,
     /// Fastest gain change allowed per frame, in linear terms.
     slope: f64,
+    /// Frames the ramp above is allowed to reach forward over. Kept next to the slope it
+    /// is the reciprocal of, so the two cannot disagree about how long the ramp is.
+    ramp: usize,
+    /// Per channel: the ramped schedule target for the frame being emitted.
+    ramp_target: Vec<f64>,
     /// Amplitude the gain aims at — the ceiling less [`Cfg::guard_db`].
     ceiling_lin: f64,
     report: Report,
@@ -545,6 +575,8 @@ impl Limiter {
             delta: 0,
             ring_len: 0,
             scratch: Vec::new(),
+            ramp: 0,
+            ramp_target: Vec::new(),
             req_ring: Vec::new(),
             sched_ring: Vec::new(),
             gr_ring: Vec::new(),
@@ -611,6 +643,8 @@ impl Limiter {
             // One-pole return to unity for the fast stage: g += (1 - g) * (1 - coef).
             release_coef: cfg.coef(TRANSIENT_RELEASE_MS, rate),
             slope: 1.0 / ramp as f64,
+            ramp,
+            ramp_target: vec![1.0; channels.max(1)],
             ceiling_lin: 10f64.powf((cfg.ceiling_db - cfg.guard_db()) / 20.0),
             report: Report {
                 ceiling_db: cfg.ceiling_db,
@@ -694,15 +728,7 @@ impl Limiter {
             return;
         }
         let delta = self.delta as u64;
-        let slope = self.slope;
-        // Seed with "the future demands nothing", which is exact for every frame this
-        // routine is allowed to finalise: a demand further away than the ramp can
-        // travel is worth at least 1.0 by the time it arrives, and 1.0 is no limiting
-        // at all. Reading the slot at `limit` instead would read an index that was
-        // never written, which is the ring-buffer mistake to make here.
         for c in 0..self.req_ring.len() {
-            // Seeded per channel: each channel ramps to its own demand.
-            let mut acc = 1.0f64;
             for m in (self.scheduled..limit).rev() {
                 // Pass 2: the gain has to sit at the required depth across the whole
                 // neighbourhood the peak is built from, not just at its own frame.
@@ -714,12 +740,18 @@ impl Limiter {
                         ga = v;
                     }
                 }
-                // Pass 3: arrive at that depth no faster than `slope` per frame.
-                acc = ga.min(acc + slope).clamp(0.0, 1.0);
+                // This is pass 2's answer, stored as the demand for the frame. The slope
+                // is NOT applied here: this routine is called once per input frame and
+                // finalises exactly one frame per call, so a running `acc` seeded at 1.0 on
+                // entry could only ever compare the demand against `1.0 + slope` — which
+                // every demand in [0, 1] loses to, and the pass silently became the identity
+                // while still writing a value that looked like a ramp. The ramp is applied
+                // where it has to be: at emission, looking forward into the schedule, in
+                // [`Limiter::advance_gain`]'s caller.
                 let slot = self.slot(m);
-                self.sched_ring[c][slot] = acc;
-                if acc < 1.0 {
-                    let gr = -20.0 * acc.max(f64::MIN_POSITIVE).log10();
+                self.sched_ring[c][slot] = ga;
+                if ga < 1.0 - ENGAGED_EPS {
+                    let gr = -20.0 * ga.max(f64::MIN_POSITIVE).log10();
                     if gr > self.report.transient_reduction_db {
                         self.report.transient_reduction_db = gr;
                     }
@@ -731,12 +763,58 @@ impl Limiter {
 
     /// The release follower: fall instantly onto the schedule (which is itself
     /// slope-limited, so this is not a step), rise one-pole toward unity.
+    /// Pass 3: the ramped schedule target for the frame about to be emitted.
+    ///
+    /// The gain at frame `j` may not fall faster than `slope` per frame, and the only values
+    /// that know that are the demands at `j+1 … j+ramp`: a depth three frames ahead has to
+    /// be arrived at from behind, one slope at a time. Reading forward is legal because of
+    /// an inequality the config proves rather than hopes — `latency = lookahead + report
+    /// delay`, and the ramp is what the lookahead has left after the delay
+    /// ([`Cfg::ramp_frames`]) — so every slot reached here was finalised by
+    /// [`Self::schedule_to`] some frames ago.
+    ///
+    /// A demand past the last finalised frame is "nothing", which is what it means at end of
+    /// file: there is no input left to protect. Deepening the gain for a future that never
+    /// arrives is the mistake that closes.
+    fn ramp_schedule(&mut self, j: u64, live: bool) {
+        let ramp = self.ramp as u64;
+        let slope = self.slope;
+        let ring_len = self.ring_len as u64;
+        let scheduled = self.scheduled;
+        for c in 0..self.ramp_target.len() {
+            let mut target = 1.0f64;
+            if live {
+                for r in 0..=ramp {
+                    let m = j + r;
+                    let demand = if m < scheduled {
+                        self.sched_ring[c][(m % ring_len) as usize]
+                    } else {
+                        1.0
+                    };
+                    let v = demand + (r as f64) * slope;
+                    if v < target {
+                        target = v;
+                    }
+                }
+            }
+            self.ramp_target[c] = target.clamp(0.0, 1.0);
+        }
+    }
+
     fn advance_gain(&mut self, c: usize, target: f64) {
         let g = self.gain[c];
-        self.gain[c] = if target < g {
+        if target < g {
+            self.gain[c] = target;
+            return;
+        }
+        let next = (g + (1.0 - g) * (1.0 - self.release_coef)).min(target);
+        // Same arrival rule as the slow stage: a release that creeps to within 2e-11 dB of
+        // unity and stops there is a release that never ended, and every counter downstream
+        // of it says "still limiting" for the rest of the file.
+        self.gain[c] = if target - next < GAIN_DEADBAND {
             target
         } else {
-            (g + (1.0 - g) * (1.0 - self.release_coef)).min(target)
+            next
         };
     }
 
@@ -803,18 +881,31 @@ impl Limiter {
         for c in 0..nch {
             let t = self.g_target[c];
             let g = self.g_rel[c];
-            self.g_rel[c] = if t < g {
+            let next = if t < g {
                 g + (t - g) * atk
             } else {
                 g + (t - g) * rel
             };
+            // Snap on arrival — see [`GAIN_DEADBAND`]. Applied to the follower and not to
+            // the arithmetic it converges towards, so a target the follower is merely
+            // approaching is untouched.
+            self.g_rel[c] = if (t - next).abs() < GAIN_DEADBAND {
+                t
+            } else {
+                next
+            };
         }
         let tg = self.g_target_group;
         let gg = self.g_rel_group;
-        self.g_rel_group = if tg < gg {
+        let next = if tg < gg {
             gg + (tg - gg) * atk
         } else {
             gg + (tg - gg) * rel
+        };
+        self.g_rel_group = if (tg - next).abs() < GAIN_DEADBAND {
+            tg
+        } else {
+            next
         };
         let mut slow_min = 1.0f64;
         for c in 0..nch {
@@ -824,7 +915,7 @@ impl Limiter {
                 slow_min = gr;
             }
         }
-        if slow_min < 1.0 {
+        if slow_min < 1.0 - ENGAGED_EPS {
             self.report.release_frames += 1;
             let db = -20.0 * slow_min.max(f64::MIN_POSITIVE).log10();
             if db > self.report.release_reduction_db {
@@ -874,13 +965,24 @@ impl Limiter {
         let j = self.fed.saturating_sub(latency as u64 + 1);
         let jslot = self.slot(j);
         let live = self.fed > latency as u64;
+        // Pass 3, the backward ramp, evaluated here. The gain at frame j may not fall
+        // faster than `slope` per frame, and the only values that know that are the demands
+        // at j+1 … j+ramp: a depth two frames ahead has to be arrived at from behind, one
+        // slope at a time. Reading forward is legal because of an inequality the config
+        // proves rather than hopes — `latency = lookahead + report delay`, and the ramp is
+        // what the lookahead has left after the delay ([`Cfg::ramp_frames`]), so every slot
+        // reached here has already been finalised by `schedule_to`.
+        //
+        // A demand beyond the last finalised frame is treated as "nothing", which is what
+        // it means at end of file: there is no input left to protect. Deepening the gain
+        // for a future that never arrives is the mistake this closes.
+        self.ramp_schedule(j, live);
         for c in 0..nch {
-            let target = if live {
-                self.sched_ring[c][jslot].clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            self.advance_gain(c, target);
+            // Read into a local first: the value is Copy, and holding a borrow of the
+            // vector across `advance_gain` would make the two halves of this loop fight
+            // over `self` for no reason at all.
+            let t = self.ramp_target[c];
+            self.advance_gain(c, t);
         }
         let slot = self.pos;
         let mut deepest = 1.0f64;
@@ -906,7 +1008,7 @@ impl Limiter {
                 deepest = g;
             }
         }
-        if deepest < 1.0 {
+        if deepest < 1.0 - ENGAGED_EPS {
             if !self.engaged {
                 self.engaged = true;
             }
@@ -1187,6 +1289,61 @@ mod tests {
             1.0 / ramp
         );
         assert!(steps >= 2, "gain moved in {steps} step, not a ramp");
+    }
+
+    /// The ramp where a ramp is actually visible: under signal.
+    ///
+    /// The test above feeds silence and then a block of 1.0, so the gain is free to fall
+    /// while there is nothing to fall on — the descent happens across zeros and the output
+    /// looks identical whether the schedule ramps or steps. That is how a pass that had
+    /// become the identity survived a green suite. Here the material in front of the
+    /// transient is a held 0.2, well under the ceiling so the slow stage keeps its hands
+    /// off, and the output across the descent *is* the gain times 0.2.
+    #[test]
+    fn the_ramp_is_real_when_there_is_signal_under_it() {
+        let c = cfg(-6.0, Ratio::X4, 2.0);
+        let ramp = c.ramp_frames(48_000);
+        let mut x = vec![0.2f64; 2048];
+        for v in x.iter_mut().skip(1024) {
+            *v = 1.0;
+        }
+        let (out, r) = run(c, &[x], 256);
+        assert!(r.max_gain_reduction_db > 3.0, "{r:?}");
+        assert!(r.post_dbtp <= -6.0, "post {} over the ceiling", r.post_dbtp);
+        let o = &out[0];
+        let began = o
+            .iter()
+            .position(|&v| v.abs() > 1e-9 && v < 0.2 * 0.999)
+            .expect("the gain never moved before the transient");
+        // The window the ramp is supposed to occupy. Measured before the input step at 1024,
+        // because that step is the signal's, not the gain's.
+        // Up to the frame the input step lands on and no further: that jump belongs to the
+        // signal, not to the gain. The descent itself is shorter than the ramp whenever the
+        // required depth is shallower than the schedule's full travel — 1.0 down to 0.44 at
+        // a slope of 1/24 is 14 frames, not 24 — so the window has to end at the step rather
+        // than be measured from where the descent started.
+        let stop = c.latency_samples(48_000) + 1024;
+        assert!(
+            stop > began + 3,
+            "descent starts at {began}, step lands at {stop}"
+        );
+        let span = &o[began..stop];
+        let mut biggest = 0.0f64;
+        let mut steps = 0usize;
+        for w in span.windows(2) {
+            let d = (w[1] - w[0]).abs();
+            if d > 1e-12 {
+                steps += 1;
+            }
+            biggest = biggest.max(d);
+        }
+        assert!(steps >= 3, "gain moved in {steps} frames, not a ramp");
+        assert!(
+            biggest <= 0.2 / ramp as f64 + 1e-9,
+            "gain stepped {biggest} in one frame under a 0.2 signal; the slope allows {} \
+             and a step there is a click in the file",
+            0.2 / ramp as f64
+        );
     }
 
     /// Below the floor the request is raised, reported as raised, and never silently

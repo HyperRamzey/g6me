@@ -85,7 +85,12 @@ pub fn replace_extension(p: &Path, ext: &str) -> std::path::PathBuf {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "output".to_string());
     if let Some(dot) = name.rfind('.') {
-        name.truncate(dot);
+        // A dot at position 0 is the name itself, not an extension. Truncating there turns
+        // ".profile" into "" and the output into ".flac": a hidden file with no stem, which
+        // the filesystem happily accepts and nobody finds in a listing.
+        if dot > 0 {
+            name.truncate(dot);
+        }
     }
     let mut out = p.parent().unwrap_or(Path::new("")).to_path_buf();
     out.push(format!("{name}.{ext}"));
