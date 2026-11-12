@@ -733,9 +733,25 @@ impl Limiter {
                 // Pass 2: the gain has to sit at the required depth across the whole
                 // neighbourhood the peak is built from, not just at its own frame.
                 let lo = m.saturating_sub(delta);
+                // The slow gain at this frame, against which every neighbour's demand is
+                // re-based. See the comment on the loop below.
+                let gr_m = self.gr_ring[c][self.slot(m)].max(f64::MIN_POSITIVE);
                 let mut ga = 1.0f64;
                 for k in lo..=(m + delta) {
-                    let v = self.req_ring[c][self.slot(k)];
+                    let kslot = self.slot(k);
+                    // A crest is not one frame. The reading at `m` is built from the samples
+                    // in `[m-delta, m+delta]`, and each of those samples is multiplied by
+                    // *its own frame's* combined gain, so a demand computed against frame `k`
+                    // only protects `k` if every neighbour is scaled no harder than `m` is.
+                    // Where the slow stage is higher than it is at `k` — earlier frames during
+                    // a fast attack, later ones during a fast release — the fast stage has to
+                    // make up the difference itself, by exactly this ratio. At the 1 ms attack
+                    // this module accepts the slow stage can travel 3.27 dB across the window,
+                    // which no guard band worth having would cover; widening the guard instead
+                    // would tax every file, including the ones where the envelope barely
+                    // moves, and this costs 0.00 dB when the ratio is 1.
+                    let scale = (self.gr_ring[c][kslot] / gr_m).min(1.0);
+                    let v = self.req_ring[c][kslot] * scale;
                     if v < ga {
                         ga = v;
                     }
@@ -1162,6 +1178,77 @@ mod tests {
         }
         let r = lim.report();
         (out, r)
+    }
+
+    /// Materials that move the slow stage hard.
+    ///
+    /// The slew that #15 is about only exists while the release envelope is climbing, so the
+    /// fixtures are a level step with crests arriving *through* the climb, not a steady
+    /// level. A file at one loudness gives the slow stage nothing to move, which is how a
+    /// worst case of 3.27 dB across the kernel window can sit in a green suite.
+    fn probe_materials() -> Vec<Vec<f64>> {
+        // Loud, then quiet with a full-scale crest every 8 frames: the release is letting
+        // gain back exactly when the crests arrive.
+        let mut step_down = vec![0.9f64; 2000];
+        step_down.extend(std::iter::repeat_n(0.0, 2600));
+        for i in (2000..2600).step_by(8) {
+            step_down[i] = 1.0;
+        }
+        // The other direction: silence, then level with crests on top of it, so the attack
+        // is digging while the same crests are being scheduled.
+        let mut step_up = vec![0.0f64; 4096];
+        for s in step_up.iter_mut().skip(2000) {
+            *s = 0.9;
+        }
+        for i in (2000..2600).step_by(8) {
+            step_up[i] = 1.0;
+        }
+        vec![worst_case(4096), step_down, step_up]
+    }
+
+    /// The fastest attack and release the interface accepts still hold the ceiling.
+    ///
+    /// A crest is not one sample: the interpolated value at frame `m` is built from the
+    /// samples in `[m-delta, m+delta]`, and each of those samples is multiplied by *its own
+    /// frame's* combined gain. So the slow stage only has to be steady across about 26 frames
+    /// for the ceiling to mean anything — and at the 1 ms attack and 10 ms release this module
+    /// accepts, it travels 3.27 dB in that window, which is more than any guard band worth
+    /// having. The fix is not a wider guard: that taxes every file, including the ones where
+    /// the slow stage barely moves. The demand for a frame is scaled by the slow gain of the
+    /// frames around it, which costs nothing when they are equal and exactly what is needed
+    /// when they are not.
+    #[test]
+    fn the_fastest_envelope_the_interface_allows_still_holds_the_ceiling() {
+        for &(at, rel) in &[
+            (MIN_ATTACK_MS, MIN_RELEASE_MS),
+            (MIN_ATTACK_MS, DEFAULT_RELEASE_MS),
+            (DEFAULT_ATTACK_MS, MIN_RELEASE_MS),
+        ] {
+            let mut c = cfg(-3.0, Ratio::X8, MIN_LOOKAHEAD_MS);
+            c.attack_ms = at;
+            c.release_ms = rel;
+            let mut worst = (f64::NEG_INFINITY, 0.0f64, 0.0f64);
+            for x in probe_materials() {
+                let (_, r) = run(c, &[x], 333);
+                if r.post_dbtp > worst.0 {
+                    worst = (
+                        r.post_dbtp,
+                        r.release_reduction_db,
+                        r.transient_reduction_db,
+                    );
+                }
+            }
+            assert!(
+                worst.0 <= -3.0,
+                "attack {at} ms / release {rel} ms delivered a file measuring {:+.3} dBTP \
+                 against a -3.00 dBTP ceiling (slow stage held {} dB, transient {} dB): the \
+                 slow stage moved inside the window the crest is built from, and nothing \
+                 compensated for it",
+                worst.0,
+                worst.1,
+                worst.2,
+            );
+        }
     }
 
     /// A peak that arrives in the first frames of a file still cannot beat the ceiling.

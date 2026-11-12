@@ -1029,6 +1029,40 @@ mod tests {
     /// `f_norm` 0.5. Judged against 1.0 this test failed for x2 by 0.28 dB, which is
     /// inside x2's 3.01 dB budget and is exactly why x2 exists only for sources
     /// already at a high sample rate.
+    /// Where an impulse is read, not merely whether it is read — which is the position
+    /// observable a maximum can never show.
+    ///
+    /// `push` returns the reading for one input sample, and everything it describes is the
+    /// waveform at the centre of the bank. A Dirac impulse pins that down: at frame 0 the
+    /// impulse has only just entered the far edge of the window, 25 taps from the centre, so
+    /// the honest reading is near zero. A floor taken off the newest input reports full scale
+    /// on that first sample instead — the same number, 25 frames early, which is the error a
+    /// limiter acts on.
+    #[test]
+    fn an_impulse_is_read_where_the_filter_says_it_is() {
+        let mut d = Detector::new(Ratio::X8);
+        let first = d.push(1.0);
+        let delay = Ratio::X8.group_delay().round() as usize;
+        assert!(
+            first < 0.01,
+            "the impulse read {first:.4} on the frame it entered, where the filter's own \
+             output for it is nothing: the sample floor is being taken off the newest input \
+             instead of the centre tap it is a floor for ({delay} frames early)",
+        );
+        let mut arrives = None;
+        for i in 1..80 {
+            if d.push(0.0) >= 1.0 - 1e-9 {
+                arrives = Some(i);
+                break;
+            }
+        }
+        assert_eq!(
+            arrives,
+            Some(delay),
+            "the impulse should reach the centre of the bank at frame {delay}"
+        );
+    }
+
     #[test]
     fn crest_between_samples_is_read_by_every_ratio() {
         for &r in Ratio::ALL.iter() {

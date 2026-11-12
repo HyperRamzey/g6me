@@ -81,7 +81,11 @@ g6me --dry-run -o out --rate 44100 concert.mka
 ```
 
 Inputs are files **and folders**, as many as you like; folders are scanned
-recursively and the tree is mirrored under `-o`. Without `-o`, each output lands
+recursively and the tree is mirrored under `-o`. Give it **two or more** folders and each
+one keeps its own folder name under `-o`, because mirroring both against their own root puts
+`AlbumA/01.mka` and `AlbumB/01.mka` on the same `out/01.flac` — and that collision is silent,
+since the second file is skipped as already rendered. A folder reached twice, or a symlink
+pointing back at an ancestor, is visited once. Without `-o`, each output lands
 next to its input. Existing outputs are skipped, not overwritten (`-y` to force —
 and `--force` will still never truncate an input file).
 
