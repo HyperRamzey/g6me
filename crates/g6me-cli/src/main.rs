@@ -69,8 +69,9 @@ pub struct Cli {
     #[arg(long, allow_negative_numbers = true, value_parser = parse_ceiling_db)]
     pub setpoint: Option<f64>,
 
-    /// Gain staging alone: a constant gain on every sample, in dB, before the limiter.
-    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_ceiling_db)]
+    /// Gain staging alone: a constant gain on every sample, in dB (-24 ..= 0), before the
+    /// limiter.
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_gain_db)]
     pub gain: f64,
 
     /// Leave the limiter off: a true-peak meter reading and nothing else. The default is
@@ -197,7 +198,7 @@ pub struct Cli {
     /// Force the interleaved channel order, e.g. FL,FR,FC,LFE,BL,BR,SL,SR.
     /// Only needed for a container that mislabels its layout.
     #[arg(long, value_parser = parse_order)]
-    pub order: Option<Vec<Slot>>,
+    pub order: Option<Order>,
 
     /// Which audio stream to take, 0-based.
     #[arg(long, default_value_t = 0)]
@@ -319,7 +320,12 @@ fn parse_gtype(s: &str) -> Result<Gtype, String> {
     })
 }
 
-fn parse_order(s: &str) -> Result<Vec<Slot>, String> {
+/// One `--order` value. A newtype, because clap reads `Option<Vec<T>>` as "repeatable
+/// option, one `T` per value" and then panics when the parser hands back a whole `Vec`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Order(pub Vec<Slot>);
+
+fn parse_order(s: &str) -> Result<Order, String> {
     let mut out = Vec::new();
     for part in s.split([',', ' ', '+']) {
         if part.trim().is_empty() {
@@ -339,7 +345,7 @@ fn parse_order(s: &str) -> Result<Vec<Slot>, String> {
     if out.is_empty() {
         return Err("--order needs at least one channel".into());
     }
-    Ok(out)
+    Ok(Order(out))
 }
 
 /// A bounded integer argument with a message that says which bound was missed.
@@ -384,11 +390,15 @@ fn parse_release_ms(s: &str) -> Result<f64, String> {
     parse_span(s, "release time in ms", MIN_RELEASE_MS, MAX_RELEASE_MS)
 }
 
-/// Linking as a percentage, because that is what a limiter panel shows. `0.5` is refused
-/// rather than quietly read as half a percent: the ambiguous reading is the one that
-/// surprises, so the range says which of the two it wants.
+/// Linking as a percentage, because that is what a limiter panel shows: `0.5` is half a
+/// percent, not half.
 fn parse_link_pct(s: &str) -> Result<f64, String> {
     parse_span(s, "channel linking in percent (0..=100)", 0.0, 100.0)
+}
+
+/// Same range as the ceiling, which it is usually set against, but its own message.
+fn parse_gain_db(s: &str) -> Result<f64, String> {
+    parse_span(s, "gain in dB", MIN_CEILING_DB, MAX_CEILING_DB)
 }
 
 fn parse_precision_bits(s: &str) -> Result<f64, String> {
@@ -497,7 +507,7 @@ impl Cli {
             minp: self.ir_minp.unwrap_or(4096),
             maxp: self.ir_maxp.unwrap_or(4096),
         };
-        Ok(RenderCfg {
+        let mut cfg = RenderCfg {
             resample: g6me_core::stages::ResampleCfg {
                 enable: self.rate.is_some(),
                 rate: self.rate.unwrap_or(48000),
@@ -520,8 +530,8 @@ impl Cli {
                 overwrite: self.force,
                 filter_threads: None,
             },
-            order: self.order.clone(),
-            output_gain_db: self.setpoint.unwrap_or(self.gain),
+            order: self.order.as_ref().map(|o| o.0.clone()),
+            output_gain_db: self.gain,
             dc_block: self.dc_block,
             true_peak: self.true_peak,
             limiter: LimiterCfg {
@@ -540,7 +550,12 @@ impl Cli {
             queue_blocks: self.queue,
             stream: self.stream,
             sha256: self.sha256,
-        })
+        };
+        // Both halves at once, through the one function that defines what a setpoint is.
+        if let Some(sp) = self.setpoint {
+            cfg.apply_setpoint(sp);
+        }
+        Ok(cfg)
     }
 
     pub fn threads(&self) -> usize {
@@ -751,17 +766,6 @@ fn render_batch(cli: &Cli, cfg: BatchCfg, tools: &Tools, caps: &Caps) -> ExitCod
     }
 
     let ui = Arc::new(Ui::new(cli.quiet, cli.json));
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let cancel = cancel.clone();
-        let _ = ctrlc::set_handler(move || {
-            if !cancel.swap(true, Ordering::SeqCst) {
-                eprintln!("\ncancelling — finishing the current block, then cleaning up");
-            }
-        });
-    }
-    let ui2 = ui.clone();
-    let progress: Progress = Arc::new(move |_i: usize, item: &Item| ui2.item(item));
 
     eprintln!(
         "{} file(s), {} worker(s), {}",
@@ -771,22 +775,39 @@ fn render_batch(cli: &Cli, cfg: BatchCfg, tools: &Tools, caps: &Caps) -> ExitCod
     );
     ui.line(&format!("loss chain: {}", cfg.render.loss_summary()));
 
+    let ui2 = ui.clone();
+    let progress: Progress = Arc::new(move |_i: usize, item: &Item| ui2.item(item));
     let started = Instant::now();
     let batch = Batch::start(items, &cfg, tools.clone(), caps.clone(), Some(progress));
+    // The batch's own flag: the workers and every render poll this one. A separate flag
+    // that only the status line read is how Ctrl-C used to print "cancelling" and then
+    // render the rest of the queue.
+    let cancel = batch.cancel.clone();
+    {
+        let cancel = cancel.clone();
+        let _ = ctrlc::set_handler(move || {
+            if !cancel.swap(true, Ordering::SeqCst) {
+                eprintln!("\ncancelling — finishing the current block, then cleaning up");
+            }
+        });
+    }
     // Watch the batch's own counters through Arc clones: `finish` consumes the
-    // batch, so the watcher must not borrow it.
+    // batch, so the watcher must not borrow it. It keeps drawing while a cancel
+    // drains, and stops when `finish` has returned.
     let counters = batch.counters.clone();
-    let cancel_watch = cancel.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_watch = finished.clone();
     let ui_watch = ui.clone();
     let watcher = std::thread::spawn(move || loop {
         let c = counters.snapshot();
-        if c.remaining() == 0 || cancel_watch.load(Ordering::Relaxed) {
+        if c.remaining() == 0 || finished_watch.load(Ordering::Relaxed) {
             break;
         }
-        ui_watch.status(c, cancel_watch.load(Ordering::Relaxed));
+        ui_watch.status(c, cancel.load(Ordering::Relaxed));
         std::thread::sleep(Duration::from_millis(120));
     });
     let outcome = batch.finish();
+    finished.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     ui.clear_status();
 
@@ -820,6 +841,10 @@ fn print_summary(cli: &Cli, cfg: &BatchCfg, outcome: &batch::Outcome, elapsed: D
 
 /// Print exactly what would happen to each file, including the real command lines.
 fn dry_run(cli: &Cli, items: &[Item], cfg: &RenderCfg, tools: &Tools, caps: &Caps) -> ExitCode {
+    let mut items = items.to_vec();
+    if cfg.out.overwrite {
+        batch::refuse_overwriting_inputs(&mut items);
+    }
     let mut bad = 0usize;
     for (i, item) in items.iter().enumerate() {
         println!(
@@ -829,6 +854,11 @@ fn dry_run(cli: &Cli, items: &[Item], cfg: &RenderCfg, tools: &Tools, caps: &Cap
             item.src.display(),
             item.dst.display()
         );
+        if let Some(e) = item.error.as_ref().filter(|_| item.phase == Phase::Failed) {
+            bad += 1;
+            println!("  would FAIL: {e}");
+            continue;
+        }
         match pipeline::plan_file(&item.src, &item.dst, cfg, tools, caps) {
             Ok(plan) => {
                 println_plan(&plan, cli.json);
@@ -1098,7 +1128,9 @@ impl LossSummary for RenderCfg {
     }
 
     fn loss_summary(&self) -> String {
-        let mut v = vec!["decode".into(), "float64".into(), "downmix".into()];
+        // In the order the samples meet them: rate and IR act on the source, before the
+        // downmix.
+        let mut v = vec!["decode".into(), "float64".into()];
         if self.resample.enable {
             v.push(format!(
                 "soxr {} Hz/{}",
@@ -1112,6 +1144,7 @@ impl LossSummary for RenderCfg {
                 self.ir.file.as_deref().unwrap_or(Path::new("?"))
             ));
         }
+        v.push("downmix".into());
         v.push(match &self.out.format {
             OutFormat::Flac { level } => format!("FLAC {} @ level {level}", self.depth_label()),
             OutFormat::Wav => format!("WAV {}", self.depth_label()),
@@ -1174,12 +1207,57 @@ mod tests {
 
     #[test]
     fn order_parsing_accepts_the_usual_spellings() {
-        let o = parse_order("FL,FR,FC,LFE,BL,BR,SL,SR").unwrap();
+        let o = parse_order("FL,FR,FC,LFE,BL,BR,SL,SR").unwrap().0;
         assert_eq!(o.len(), 8);
         assert_eq!(g6me_core::mask::mask_of(&o), 0x063f);
-        assert_eq!(parse_order("fl fr fc lfe bl br sl sr").unwrap().len(), 8);
+        assert_eq!(parse_order("fl fr fc lfe bl br sl sr").unwrap().0.len(), 8);
         assert!(parse_order("FL,FR,BOGUS").is_str_err());
         assert!(parse_order("").is_str_err());
+    }
+
+    /// Through clap, not just the parser: the field type is what used to panic.
+    #[test]
+    fn order_flag_reaches_the_render_config() {
+        let c = Cli::try_parse_from(["g6me", "--order", "FL,FR,FC,LFE,SL,SR", "x.mka"]).unwrap();
+        let cfg = c.render_cfg().unwrap();
+        assert_eq!(
+            cfg.order,
+            Some(vec![
+                Slot::Fl,
+                Slot::Fr,
+                Slot::Fc,
+                Slot::Lfe,
+                Slot::Sl,
+                Slot::Sr
+            ])
+        );
+    }
+
+    #[test]
+    fn setpoint_sets_both_the_trim_and_the_ceiling() {
+        let c = Cli::try_parse_from(["g6me", "--setpoint", "-6", "x.mka"]).unwrap();
+        let cfg = c.render_cfg().unwrap();
+        assert_eq!(cfg.output_gain_db, -6.0);
+        assert_eq!(cfg.limiter.ceiling_db, -6.0);
+        assert!(cfg.limiter.enable);
+
+        let c = Cli::try_parse_from(["g6me", "--gain", "-2", "x.mka"]).unwrap();
+        let cfg = c.render_cfg().unwrap();
+        assert_eq!(
+            (cfg.output_gain_db, cfg.limiter.ceiling_db),
+            (-2.0, DEFAULT_CEILING_DB)
+        );
+        let e = Cli::try_parse_from(["g6me", "--gain", "3", "x.mka"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("gain in dB"), "{e}");
+    }
+
+    #[test]
+    fn banner_lists_input_stages_before_the_downmix() {
+        let c = Cli::try_parse_from(["g6me", "-r", "44100", "x.mka"]).unwrap();
+        let s = c.render_cfg().unwrap().loss_summary();
+        assert!(s.find("soxr").unwrap() < s.find("downmix").unwrap(), "{s}");
     }
 
     #[test]

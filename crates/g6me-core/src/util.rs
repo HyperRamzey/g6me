@@ -54,6 +54,19 @@ pub fn human_time(s: f64) -> String {
     }
 }
 
+/// A path as an ffmpeg/ffprobe argument.
+///
+/// A bare relative name is read as an option when it starts with `-`, and as a protocol
+/// (`Live:` in `Live:Tokyo.flac`) when it has a colon, so relative paths get an explicit
+/// `./` in front.
+pub fn ffmpeg_arg(p: &Path) -> String {
+    if p.is_relative() && !p.as_os_str().is_empty() {
+        Path::new(".").join(p).display().to_string()
+    } else {
+        p.display().to_string()
+    }
+}
+
 /// Safe filename for an output derived from an input.
 /// Logical CPUs available to this process.
 ///
@@ -95,6 +108,21 @@ pub fn replace_extension(p: &Path, ext: &str) -> std::path::PathBuf {
     let mut out = p.parent().unwrap_or(Path::new("")).to_path_buf();
     out.push(format!("{name}.{ext}"));
     out
+}
+
+#[cfg(test)]
+mod ffmpeg_arg_tests {
+    use super::*;
+
+    #[test]
+    fn relative_names_cannot_read_as_options_or_protocols() {
+        let a = ffmpeg_arg(Path::new("-dash.flac"));
+        assert!(!a.starts_with('-'), "{a}");
+        let a = ffmpeg_arg(Path::new("Live:Tokyo.flac"));
+        assert!(a.starts_with('.'), "{a}");
+        let abs = std::env::temp_dir().join("x.flac");
+        assert_eq!(ffmpeg_arg(&abs), abs.display().to_string());
+    }
 }
 
 #[cfg(test)]
