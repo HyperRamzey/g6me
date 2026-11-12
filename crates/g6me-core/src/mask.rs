@@ -189,24 +189,44 @@ pub fn order_from_layout(layout: Option<&str>, channels: usize) -> Option<Vec<Sl
         ("6.0", &[Fl, Fr, Fc, Bl, Br, Bc]),
         ("6.0(front)", &[Fl, Fr, Fc, Flc, Frc, Bc]),
         ("hexagonal", &[Fl, Fr, Fc, Bl, Br, Bc]),
-        ("6.1", &[Fl, Fr, Fc, Lfe, Bl, Bc, Br]),
-        ("6.1(back)", &[Fl, Fr, Fc, Lfe, Bl, Bc, Br]),
-        ("6.1(front)", &[Fl, Fr, Fc, Lfe, Flc, Bc, Frc]),
+        // Ascending slot-bit order, because that is the order the decoder hands the planes
+        // over. These five were written in the order the layout reads in prose ("BL BC BR")
+        // rather than the order it is stored, which put the sixth plane of a 6.1 file on
+        // rear-centre when it is rear-right, and vice versa.
+        ("6.1", &[Fl, Fr, Fc, Lfe, Bl, Br, Bc]),
+        ("6.1(back)", &[Fl, Fr, Fc, Lfe, Bl, Br, Bc]),
+        ("6.1(front)", &[Fl, Fr, Fc, Lfe, Flc, Frc, Bc]),
         ("7.0", &[Fl, Fr, Fc, Bl, Br, Sl, Sr]),
-        ("7.0(front)", &[Fl, Fr, Fc, Flc, Frc, Bl, Br]),
+        ("7.0(front)", &[Fl, Fr, Fc, Bl, Br, Flc, Frc]),
         ("7.1", &[Fl, Fr, Fc, Lfe, Bl, Br, Sl, Sr]),
+        // The name ffmpeg's own parser accepts for the same layout, and the one some
+        // taggers write. Refusing it would refuse real 8-channel files over a synonym.
+        ("7.1(side)", &[Fl, Fr, Fc, Lfe, Bl, Br, Sl, Sr]),
         ("7.1(wide)", &[Fl, Fr, Fc, Lfe, Bl, Br, Flc, Frc]),
         ("7.1(wide-side)", &[Fl, Fr, Fc, Lfe, Bl, Br, Sl, Sr]),
-        ("octal", &[Fl, Fr, Fc, Bc, Bl, Br, Flc, Frc]),
-        ("octagon", &[Fl, Fr, Fc, Bc, Bl, Br, Flc, Frc]),
+        ("octal", &[Fl, Fr, Fc, Bl, Br, Flc, Frc, Bc]),
+        ("octagon", &[Fl, Fr, Fc, Bl, Br, Flc, Frc, Bc]),
     ];
 
     if let Some(l) = layout {
         let key = l.trim().to_ascii_lowercase();
         if let Some((_, slots)) = named.iter().find(|(n, _)| *n == key) {
-            return Some(slots.to_vec());
+            // The name and the channel count have to agree. Returning the table's two slots
+            // for a header that names `stereo` and declares eight channels hands the caller a
+            // two-plane order for an eight-plane stream, and the six planes that never made
+            // it into the order are simply not in the output. Contradictory metadata gets an
+            // error, not a preference.
+            return (slots.len() == channels).then(|| slots.to_vec());
         }
-        // "unknown"/"undefined" and anything unlisted fall through.
+        // A name that exists but is not in the table is refused rather than guessed
+        // from the channel count. "The container says octagon" and "the container says
+        // nothing" are different statements, and answering the first one with the 8ch
+        // convention is how a rear-centre ends up in a side-surround — the guess would
+        // be right for the common cases and wrong in exactly the cases that got us here.
+        // Junk names are not statements at all, so they keep falling through.
+        if !key.is_empty() && key != "unknown" && key != "undefined" {
+            return None;
+        }
     }
 
     match channels {
@@ -250,6 +270,86 @@ mod tests {
         assert_eq!(order_from_layout(Some("unknown"), 8).unwrap().len(), 8);
         assert!(order_from_layout(Some("unknown"), 14).is_none());
         assert_eq!(order_from_layout(None, 6).unwrap().len(), 6);
+    }
+
+    /// Every named layout must be listed in the order the decoder actually emits it.
+    ///
+    /// ffmpeg stores a native layout's channels in ascending channel-id order, and the ids
+    /// here are the WAVEFORMATEXTENSIBLE bit positions (`Slot::ALL`). A table entry whose
+    /// slots are not ascending assigns a sample plane to the wrong speaker: `6.1` written
+    /// as `FL FR FC LFE BL BC BR` reads rear-centre out of the rear-right plane and
+    /// rear-right out of rear-centre, and nothing downstream can tell, because the matrix
+    /// receives a plausibly-shaped order and folds it into the wrong ear.
+    ///
+    /// Checked through the public entry point rather than against the table, so it still
+    /// bites if a name moves to a different lookup on the way there.
+    #[test]
+    fn named_layouts_are_in_the_order_the_decoder_emits_them() {
+        // (ffmpeg's name, channel count)
+        let names = [
+            ("mono", 1),
+            ("stereo", 2),
+            ("2.1", 3),
+            ("3.0", 3),
+            ("3.0(back)", 3),
+            ("quad", 4),
+            ("4.0", 4),
+            ("4.0(front)", 4),
+            ("quad(side)", 4),
+            ("5.0", 5),
+            ("5.0(side)", 5),
+            ("5.1", 6),
+            ("5.1(side)", 6),
+            ("6.0", 6),
+            ("6.0(front)", 6),
+            ("hexagonal", 6),
+            ("6.1", 7),
+            ("6.1(back)", 7),
+            ("6.1(front)", 7),
+            ("7.0", 7),
+            ("7.0(front)", 7),
+            ("7.1", 8),
+            ("7.1(wide)", 8),
+            ("7.1(wide-side)", 8),
+            ("octal", 8),
+            ("octagon", 8),
+        ];
+        for (name, want) in names {
+            let got = order_from_layout(Some(name), want)
+                .unwrap_or_else(|| panic!("{name} stopped being supported"));
+            assert_eq!(got.len(), want, "{name} lost or gained a channel");
+            let bits: Vec<u32> = got.iter().map(|s| s.bit()).collect();
+            let mut sorted = bits.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                bits, sorted,
+                "{name} is listed as {bits:?}; the decoder emits {sorted:?}"
+            );
+            assert_eq!(
+                sorted.len(),
+                sorted
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                "{name} lists one slot twice: {bits:?}"
+            );
+        }
+
+        // A name we recognise as absent is refused, not guessed. Before, any unlisted name
+        // fell through to the channel-count convention, so a header claiming `stereo` while
+        // declaring eight channels was read as a 7.1 file: the metadata contradicts itself
+        // and the guess picks a side. Refused, the caller says "give me an explicit --order",
+        // which is the only honest answer to a self-contradictory header.
+        assert!(
+            order_from_layout(Some("stereo"), 8).is_none(),
+            "a layout name we know, disagreeing with the channel count, was guessed anyway"
+        );
+        assert!(order_from_layout(Some("5.1(side)"), 8).is_none());
+        // Junk names carry no information, so those still resolve by count — Atmos beds
+        // report 7.1 or nothing at all, and refusing them would refuse real renders.
+        assert_eq!(order_from_layout(Some("unknown"), 8).unwrap().len(), 8);
+        assert_eq!(order_from_layout(Some(""), 6).unwrap().len(), 6);
+        assert_eq!(order_from_layout(None, 8).unwrap().len(), 8);
     }
 
     #[test]
