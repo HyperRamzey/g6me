@@ -248,8 +248,13 @@ impl MeterRow {
             list(&r.sample_peak_dbfs),
             list(&r.rms_dbfs)
         );
-        let hot =
-            r.true_peak_dbtp > -0.05 || r.limiter.as_ref().is_some_and(|l| !l.within_ceiling());
+        let hot = r.true_peak_dbtp > -0.05
+            || r.limiter.as_ref().is_some_and(|l| !l.within_ceiling())
+            // A file whose own decoded measurement disagrees with the stream is as urgent
+            // as one that overhangs the ceiling: the headline number is not the number on
+            // disk, and the row that says "-3.61 dBTP" about a file that clamped to zero is
+            // the row nobody should have to read closely to distrust.
+            || r.delivered_note.is_some();
         Self {
             levels,
             text: format!("{}\n{}", name, r.peak_line()),
@@ -898,6 +903,22 @@ impl App {
              no output bytes.",
             Ratio::X2.worst_underread_db()
         ));
+        ui.add_space(6.0);
+        // Above the limiter, and above its early return, because DC does not care whether
+        // limiting is on: an offset ships in the file either way. It earns its keep under a
+        // limiter too, since a limiter reads an offset as level and will hold gain down for
+        // a signal that never clips. Every render reports the file's own `dc_offset`, so the
+        // box gets ticked from a measurement rather than from a hunch.
+        ui.checkbox(&mut self.settings.dc_block, "block DC (5 Hz high-pass)")
+            .on_hover_text(
+                "Removes DC before the gain trim and the limiter: exactly zero at DC, \
+                 exactly unity at Nyquist, so the top octave is left alone. Off is the \
+                 bit-exact path -- the downmixer contributes a settled +4e-10, which is \
+                 not the reason to press this. What is: a 7.1 matrix carries an input \
+                 offset at +5.18 on the left, and real recordings arrive with 1e-4 of it. \
+                 The meter history shows each file's measured dc_offset. Turning this on \
+                 changes every byte, so every hash changes with it.",
+            );
         ui.add_space(6.0);
         ui.checkbox(&mut self.settings.limiter, "limit the true peak");
         if !self.settings.limiter {
@@ -1867,4 +1888,79 @@ fn main() -> eframe::Result {
         opts,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real report from a real render, decoded back.
+    ///
+    /// A fixture rather than a literal, for two reasons: `Report` has thirty fields and a
+    /// hand-written one would be all noise, and this way a field that stops reaching the
+    /// panel — a rename that drops DC, or the decoded-back pass going unreported — fails a
+    /// test instead of quietly vanishing from the copy text.
+    fn rendered() -> Report {
+        let raw = include_str!("../testdata/clamped.json");
+        match serde_json::from_str::<Report>(raw) {
+            Ok(r) => r,
+            Err(e) => panic!("the fixture no longer matches Report: {e}"),
+        }
+    }
+
+    /// The meters decay to rest inside a third of a second. What a finished file is
+    /// remembered by has to be the numbers, not the memory of a bar.
+    #[test]
+    fn a_finished_file_keeps_its_numbers_after_the_render() {
+        let r = rendered();
+        assert!(r.delivered.is_some(), "fixture must carry the decode-back");
+        let row = MeterRow::from_report(&r);
+        for want in ["tp ", "dBTP", "peak ", "rms "] {
+            assert!(
+                row.levels.contains(want),
+                "the row lost {want}: {}",
+                row.levels
+            );
+        }
+        assert!(
+            row.levels.contains(".wav"),
+            "a row with no file: {}",
+            row.levels
+        );
+        // The full text is what "copy all" hands to a log or a delivery note, so it carries
+        // the parts that make a number checkable: the detector ratio, the DC, and the file's
+        // own measurement next to the stream's.
+        for want in ["@x4", "dc:", "file on disk", "WARNING"] {
+            assert!(row.text.contains(want), "the copy text lost {want}");
+        }
+    }
+
+    /// A row that reads calm about a file whose own decoded measurement disagrees with its
+    /// report is a row that will be trusted anyway.
+    #[test]
+    fn a_file_disagreeing_with_its_own_report_shows_as_hot() {
+        let r = rendered();
+        assert!(r.delivered_note.is_some(), "fixture must disagree");
+        assert!(
+            MeterRow::from_report(&r).hot,
+            "a clamped file is listed as calm"
+        );
+
+        let mut calm = r.clone();
+        calm.delivered_note = None;
+        calm.true_peak_dbtp = -20.0;
+        calm.limiter = None;
+        assert!(
+            !MeterRow::from_report(&calm).hot,
+            "a cold file is flagged hot, which trains the colour to be ignored"
+        );
+    }
+
+    /// The dB figure with no logarithm still has to print as itself.
+    #[test]
+    fn db_prints_the_value_that_has_no_logarithm() {
+        assert_eq!(db(f64::NEG_INFINITY), "\u{2212}inf");
+        assert_eq!(db(f64::NAN), "n/a");
+        assert_eq!(db(-3.0), "-3.00");
+    }
 }

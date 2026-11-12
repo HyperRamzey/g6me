@@ -26,6 +26,13 @@ egui = "0.31"
 # platform dialogs for people who want the native look.
 rfd = { version = "0.15", optional = true }
 
+[dev-dependencies]
+# The meter-history tests decode a real render's report instead of hand-writing thirty
+# fields. A fixture from an actual clamped s16 render also keeps these tests honest about
+# the shape of `Report`: a rename that drops DC or the decoded-back pass from the panel has
+# to fail here rather than quietly disappear from the copy text.
+serde_json.workspace = true
+
 [features]
 # No `monitor` feature here on purpose: this app never opens an audio device. The
 # levels come from taps on the render itself, which needs no cpal, no device and

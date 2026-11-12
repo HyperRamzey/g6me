@@ -95,6 +95,15 @@ pub struct Settings {
     /// Ratio the limiter's own detector runs at. `None` = the meter's ratio, which is
     /// also the cheap case: one measurement serves both jobs.
     pub limit_ratio: Option<Ratio>,
+    /// Strip DC before the trim and the limiter, with a 5 Hz first-order blocker.
+    ///
+    /// Off by default, which is the bit-exact path: the downmixer's own contribution is a
+    /// settled +4e-10 and reaching for it would mean editing the port. What this is for is
+    /// DC that came in with the source — every render reports `dc_offset`, so the decision
+    /// is made from the file's own number rather than from a guess. It belongs beside the
+    /// limiter rather than inside it because it earns its keep with the limiter off too:
+    /// an offset ships in the file either way.
+    pub dc_block: bool,
 
     // ---- resample ----------------------------------------------------------
     pub resample: bool,
@@ -160,6 +169,7 @@ impl Default for Settings {
             link_transient_pct: default_link_transient(),
             link_release_pct: default_link_release(),
             limit_ratio: None,
+            dc_block: false,
             resample: false,
             rate: 48000,
             resample_depth: BitDepth::S32,
@@ -246,8 +256,7 @@ impl Settings {
             maxp: self.ir_maxp,
         };
         RenderCfg {
-            // The panel has no DC control: the panel is where the bit-exact default lives.
-            dc_block: false,
+            dc_block: self.dc_block,
             resample: g6me_core::stages::ResampleCfg {
                 enable: self.resample,
                 rate: self.rate,
@@ -583,6 +592,41 @@ mod tests {
             lavfi: true,
             ..Default::default()
         }
+    }
+
+    /// The panel's DC control has to reach the pipeline, and its default has to be the
+    /// bit-exact one.
+    ///
+    /// Tested at the boundary rather than trusting the field: `render_cfg` is the only path
+    /// from a ticked box to a rendered byte, and a control that sets a field nobody reads is
+    /// indistinguishable from no control at all.
+    #[test]
+    fn dc_block_defaults_off_and_reaches_the_render_config() {
+        let s = Settings::default();
+        assert!(!s.dc_block, "DC blocking must be off by default");
+        assert!(
+            !s.render_cfg().dc_block,
+            "the default render must stay bit-exact"
+        );
+
+        let on = Settings {
+            dc_block: true,
+            ..Settings::default()
+        };
+        assert!(on.render_cfg().dc_block, "the ticked box never arrived");
+        // Blocking DC is a DSP step of its own: it has to survive with the limiter off,
+        // because an offset ships in the file whether or not anything is holding peaks.
+        let no_limit = Settings {
+            dc_block: true,
+            limiter: false,
+            ..Settings::default()
+        };
+        let cfg = no_limit.render_cfg();
+        assert!(cfg.dc_block, "DC blocking vanished with the limiter off");
+        assert!(
+            !cfg.limiter.enable,
+            "the limiter stopped being opt-out-able"
+        );
     }
 
     #[test]

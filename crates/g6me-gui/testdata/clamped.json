@@ -1,0 +1,84 @@
+{
+ "chain": [],
+ "dc_offset": [
+  0.00018897566427844388,
+  0.00018040700293107286
+ ],
+ "delivered": {
+  "dc_offset": [
+   0.0001889704838036261,
+   0.0001804114110590111
+  ],
+  "per_channel_true_peak_dbtp": [
+   0.08362731718787965,
+   -0.15337752156520082
+  ],
+  "rms_dbfs": [
+   -14.579213548698835,
+   -15.066307730669696
+  ],
+  "sample_peak_dbfs": [
+   -0.00026507636037961915,
+   -0.1937931807926468
+  ],
+  "true_peak_dbtp": 0.08362731718787965
+ },
+ "delivered_note": "the delivered file is not the signal that was metered (true peak moved -0.149 dB: +0.233 dBTP in the metered stream, +0.084 dBTP in the file). Something after the meter changed it: a resampler, the sample format's own ceiling, or dither.",
+ "encode_cmd": [],
+ "encoder": "ffmpeg WAV",
+ "file_sha256": null,
+ "frames": 4210520,
+ "input_cmd": [],
+ "input_stage": "decode only",
+ "ir": null,
+ "limiter": null,
+ "mask": 1599,
+ "order": [
+  "Fl",
+  "Fr",
+  "Fc",
+  "Lfe",
+  "Bl",
+  "Br",
+  "Sl",
+  "Sr"
+ ],
+ "output": "/out/810.wav",
+ "output_bytes": 16842158,
+ "output_gain_db": 0.0,
+ "output_rate": 48000,
+ "per_channel_true_peak_dbtp": [
+  0.2329321638068816,
+  -0.15333026063163885
+ ],
+ "pipe_bytes_in": 269473280,
+ "realtime_factor": 6.172358516709923,
+ "rms_dbfs": [
+  -14.579211768411596,
+  -15.066308045557104
+ ],
+ "sample_peak_dbfs": [
+  0.2088771602245229,
+  -0.19375265649436846
+ ],
+ "seconds": 87.71916666666667,
+ "sha256": null,
+ "source": "/in/810.mka",
+ "source_info": {
+  "bits": 24,
+  "channels": 8,
+  "codec_name": "truehd",
+  "duration": 87.719156,
+  "layout": "7.1",
+  "profile": "Dolby TrueHD + Dolby Atmos",
+  "sample_rate": 48000,
+  "stream_index": 0
+ },
+ "true_peak_dbtp": 0.2329321638068816,
+ "true_peak_ratio": "x4",
+ "wall_ms": 14211,
+ "warnings": [
+  "the delivered file is not the signal that was metered (true peak moved -0.149 dB: +0.233 dBTP in the metered stream, +0.084 dBTP in the file). Something after the meter changed it: a resampler, the sample format's own ceiling, or dither."
+ ],
+ "working_rate": 48000
+}

@@ -389,7 +389,9 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
   level as far as a limiter is concerned — it will spend gain reduction holding an offset
   that never clips, and report a true peak no transient caused.
 
-  `--dc-block` inserts a 5 Hz first-order blocker (`H(z) = g(1-z⁻¹)/(1-Rz⁻¹)`, exactly
+  `--dc-block` — or the "block DC" box on the panel's True peak tab, which is deliberately
+  above the limiter's own controls, since an offset ships in the file whether or not
+  anything is holding peaks — inserts a 5 Hz first-order blocker (`H(z) = g(1-z⁻¹)/(1-Rz⁻¹)`, exactly
   zero at DC, exactly unity at Nyquist) before the trim and the limiter: on that file the
   reported mean falls from 1.89e-4 to 4.9e-9. It is opt-in and the default path stays
   bit-exact, so turning it on changes every hash. What it leaves behind is the blocker's
