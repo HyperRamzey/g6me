@@ -67,8 +67,26 @@ pub struct Settings {
     /// number only, never a byte of output.
     pub tp_ratio: Ratio,
     /// Hold the delivered file under a true-peak ceiling. The last stage before the
-    /// encoder, so this is the real ceiling on the file.
+    /// encoder, so this is the real ceiling on the file. On by default: a file that leaves
+    /// here over 0 dBTP is a file that clips somewhere downstream, and the limiter is what
+    /// makes the reported ceiling true.
     pub limiter: bool,
+    /// One number doing two jobs: the file is trimmed by this much and capped here. The
+    /// cheap way to hold a level, because a constant gain does the work on every sample and
+    /// the limiter only ever sees the peaks that survive the trim. `None` leaves the gain
+    /// and the ceiling to their own fields.
+    pub setpoint_db: Option<f64>,
+    /// Gain staging on its own, dB, applied before the limiter.
+    pub gain_db: f64,
+    /// How fast the slow stage's reduction arrives, ms.
+    pub attack_ms: f64,
+    /// How fast the slow stage lets go, ms.
+    pub release_ms: f64,
+    /// Channel linking of the transient stage, percent.
+    pub link_transient_pct: f64,
+    /// Channel linking of the slow stage, percent. Lower than the transient one by
+    /// default: a slow shared gain move is what pulls a stereo image about.
+    pub link_release_pct: f64,
     /// Ceiling in dBTP.
     pub ceiling_db: f64,
     /// Lookahead the limiter may ask for, ms; the effective value is reported per file
@@ -129,10 +147,18 @@ impl Default for Settings {
             // x4 is what BS.1770 measures at, so a reported dBTP is comparable with any
             // other tool's without the user knowing it.
             tp_ratio: Ratio::X4,
-            // Off: nothing happens to a file unless it was asked for.
-            limiter: false,
-            ceiling_db: -1.0,
-            lookahead_ms: 1.0,
+            // On: a file that leaves here above the ceiling is a file that clips somewhere
+            // downstream, and the ceiling in the report would be a claim rather than a
+            // fact. Turning it off is `--no-limit`'s job, or this checkbox's.
+            limiter: true,
+            setpoint_db: None,
+            gain_db: 0.0,
+            ceiling_db: g6me_core::limiter::DEFAULT_CEILING_DB,
+            lookahead_ms: g6me_core::limiter::DEFAULT_LOOKAHEAD_MS,
+            attack_ms: default_attack_ms(),
+            release_ms: default_release_ms(),
+            link_transient_pct: default_link_transient(),
+            link_release_pct: default_link_release(),
             limit_ratio: None,
             resample: false,
             rate: 48000,
@@ -162,6 +188,24 @@ impl Default for Settings {
             stream: 0,
         }
     }
+}
+
+/// Settings keep linking as percent because that is what the panel shows; core takes a
+/// fraction. These are the boundary, so a default cannot be written twice in two units.
+fn default_attack_ms() -> f64 {
+    g6me_core::limiter::DEFAULT_ATTACK_MS
+}
+
+fn default_release_ms() -> f64 {
+    g6me_core::limiter::DEFAULT_RELEASE_MS
+}
+
+fn default_link_transient() -> f64 {
+    g6me_core::limiter::DEFAULT_LINK_TRANSIENT * 100.0
+}
+
+fn default_link_release() -> f64 {
+    g6me_core::limiter::DEFAULT_LINK_RELEASE * 100.0
 }
 
 impl Settings {
@@ -224,11 +268,16 @@ impl Settings {
             },
             order: self.order.clone(),
             true_peak: self.tp_ratio,
+            output_gain_db: self.setpoint_db.unwrap_or(self.gain_db),
             limiter: g6me_core::limiter::Cfg {
                 enable: self.limiter,
-                ceiling_db: self.ceiling_db,
-                ratio: self.limit_ratio.unwrap_or(self.tp_ratio),
+                ceiling_db: self.setpoint_db.unwrap_or(self.ceiling_db),
+                ratio: self.limit_ratio.unwrap_or_default(),
                 lookahead_ms: self.lookahead_ms,
+                attack_ms: self.attack_ms,
+                release_ms: self.release_ms,
+                link_transient: self.link_transient_pct / 100.0,
+                link_release: self.link_release_pct / 100.0,
             },
             block: self.block as usize,
             queue_blocks: self.queue_blocks as usize,

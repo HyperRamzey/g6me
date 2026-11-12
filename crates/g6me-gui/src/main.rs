@@ -907,10 +907,46 @@ impl App {
         let st = &mut self.settings;
         let mut cfg = LCfg {
             enable: true,
-            ceiling_db: st.ceiling_db,
-            ratio: st.limit_ratio.unwrap_or(st.tp_ratio),
+            ceiling_db: st.setpoint_db.unwrap_or(st.ceiling_db),
+            ratio: st.limit_ratio.unwrap_or_default(),
             lookahead_ms: st.lookahead_ms,
+            attack_ms: st.attack_ms,
+            release_ms: st.release_ms,
+            link_transient: st.link_transient_pct / 100.0,
+            link_release: st.link_release_pct / 100.0,
         };
+        // One field, two effects: the trim and the ceiling. It is the first control here
+        // because it is the one that decides what the others are for — with a setpoint in
+        // play the limiter is only ever catching peaks, since the level came down as a
+        // constant gain on the way in.
+        ui.horizontal(|ui| {
+            ui.label("setpoint");
+            let mut sp = st.setpoint_db.unwrap_or(st.ceiling_db);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut sp)
+                        .range(-24.0..=0.0)
+                        .speed(0.05)
+                        .suffix(" dBTP"),
+                )
+                .changed()
+            {
+                st.setpoint_db = Some(sp.clamp(-24.0, 0.0));
+            }
+            if st.setpoint_db.is_some() {
+                ui.label(format!(
+                    "(- trim, - cap{}; clear it to set the two apart)",
+                    if st.gain_db != 0.0 {
+                        format!(", plus your own {:+.2} dB gain", st.gain_db)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            if ui.button("separate").clicked() {
+                st.setpoint_db = None;
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("ceiling");
             let mut c = st.ceiling_db;
@@ -954,12 +990,83 @@ impl App {
                     }
                 });
         });
-        cfg.ceiling_db = st.ceiling_db;
-        cfg.ratio = st.limit_ratio.unwrap_or(st.tp_ratio);
+        // The slow stage's shape and how much of it the channels share. Both linking
+        // controls live here rather than behind a menu, because the damage they prevent
+        // (a stereo image that pumps) is only noticed after a render, and the fix is two
+        // numbers.
+        ui.horizontal(|ui| {
+            ui.label("attack");
+            let mut a = st.attack_ms;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut a)
+                        .range(
+                            g6me_core::limiter::MIN_ATTACK_MS..=g6me_core::limiter::MAX_ATTACK_MS,
+                        )
+                        .speed(0.5)
+                        .suffix(" ms"),
+                )
+                .changed()
+            {
+                st.attack_ms = a;
+            }
+            ui.label("release");
+            let mut r = st.release_ms;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut r)
+                        .range(
+                            g6me_core::limiter::MIN_RELEASE_MS..=g6me_core::limiter::MAX_RELEASE_MS,
+                        )
+                        .speed(2.0)
+                        .suffix(" ms"),
+                )
+                .changed()
+            {
+                st.release_ms = r;
+            }
+            ui.label("link");
+            let mut lt = st.link_transient_pct;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut lt)
+                        .range(0.0..=100.0)
+                        .speed(1.0)
+                        .suffix("% transient"),
+                )
+                .changed()
+            {
+                st.link_transient_pct = lt;
+            }
+            let mut lr = st.link_release_pct;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut lr)
+                        .range(0.0..=100.0)
+                        .speed(1.0)
+                        .suffix("% release"),
+                )
+                .changed()
+            {
+                st.link_release_pct = lr;
+            }
+        });
+        cfg.ceiling_db = st.setpoint_db.unwrap_or(st.ceiling_db);
+        cfg.ratio = st.limit_ratio.unwrap_or_default();
         cfg.lookahead_ms = st.lookahead_ms;
+        cfg.attack_ms = st.attack_ms;
+        cfg.release_ms = st.release_ms;
+        cfg.link_transient = st.link_transient_pct / 100.0;
+        cfg.link_release = st.link_release_pct / 100.0;
         let lat = cfg.latency_samples(rate);
         let asked = cfg.lookahead_ms;
         let used = cfg.effective_lookahead_ms(rate);
+        ui.weak(format!(
+            "two stages: the lookahead one catches peaks, then a level one with a {:.0} ms \
+             attack and {:.0} ms release rides under it. Peaks are ducked in both channels \
+             {:.0}% together, level {:.0}%.",
+            cfg.attack_ms, cfg.release_ms, st.link_transient_pct, st.link_release_pct
+        ));
         ui.weak(format!(
             "aims {:.2} dB below the ceiling ({:.2} dB the meter cannot see + {:.2} dB of \
              gain slew), so a -1.00 dBTP ceiling lands near {:.2} dBTP.",

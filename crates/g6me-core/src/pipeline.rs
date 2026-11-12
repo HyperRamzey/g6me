@@ -117,6 +117,10 @@ pub struct Report {
     /// Which detector produced the two numbers above, because a dBTP without its ratio
     /// is not a comparable number.
     pub true_peak_ratio: Ratio,
+    /// Output gain staging applied to every sample, in dB. 0.0 means the render added no
+    /// level change of its own.
+    #[serde(default)]
+    pub output_gain_db: f64,
     /// What the limiter did, when it was asked to do anything.
     pub limiter: Option<LimiterReport>,
     /// Sample peak per channel of the delivered output, dBFS. Distinguished from the
@@ -186,6 +190,16 @@ impl Report {
             self.true_peak_ratio.label(),
             chans
         );
+        if self.output_gain_db != 0.0 {
+            // Undoing a constant gain is exact, so the reading from before the trim is not
+            // a second measurement — it is this one with the trim taken back off.
+            let after = self.limiter.map_or(self.true_peak_dbtp, |l| l.pre_dbtp);
+            s.push_str(&format!(
+                "  | gain staging {:+.2} dB, so {:+.2} dBTP before it",
+                self.output_gain_db,
+                after - self.output_gain_db
+            ));
+        }
         if let Some(l) = &self.limiter {
             s.push_str(&format!(
                 "\nlimiter: ceiling {:+.2} dBTP @{}; aims {:.2} dB low ({:.2} dB meter + {:.2} dB gain slew)",
@@ -275,6 +289,9 @@ struct PeakStage {
     limiter: Option<Limiter>,
     /// The limiter's own post-limiter measurement is the file's measurement.
     shared: bool,
+    /// Output gain staging in force: applied to every sample, before the limiter, as one
+    /// constant multiplier.
+    gain: f64,
     /// Per channel: held sample peak, running sum of squares, frames seen.
     accum: [Accum; 2],
 }
@@ -333,12 +350,28 @@ impl PeakStage {
             tp: TruePeak::new(cfg.true_peak, 2),
             shared: cfg.limiter.enable && cfg.limiter.ratio == cfg.true_peak,
             limiter,
+            gain: 10f64.powf(cfg.output_gain_db / 20.0),
             accum: std::array::from_fn(|_| Accum::default()),
         }
     }
 
-    /// Limit, then measure, in that order. Stereo, in place.
+    /// Stage the level, limit, then measure, in that order. Stereo, in place.
+    ///
+    /// The trim goes first so the limiter sees the level the file will carry: a ceiling
+    /// applied before the gain that follows it is not a ceiling, and a meter reading taken
+    /// before it is not a measurement of the output.
     fn process(&mut self, left: &mut [f64], right: &mut [f64]) {
+        if self.gain != 1.0 {
+            // One multiply per sample, and nothing else: a constant gain is the one DSP
+            // step that is exactly reproducible, since there is no accumulation order to
+            // disagree about. The limiter is fed the scaled values, so its own pre/post
+            // readings are in the units the file is in.
+            for buf in [&mut *left, &mut *right] {
+                for x in buf.iter_mut() {
+                    *x *= self.gain;
+                }
+            }
+        }
         if let Some(l) = self.limiter.as_mut() {
             let mut chans: [&mut [f64]; 2] = [left, right];
             l.process(&mut chans);
@@ -692,6 +725,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         true_peak_dbtp: peak_summary.true_peak_dbtp,
         per_channel_true_peak_dbtp: peak_summary.per_channel_true_peak_dbtp,
         true_peak_ratio: cfg.true_peak,
+        output_gain_db: cfg.output_gain_db,
         limiter: peak_summary.limiter,
         sample_peak_dbfs: peak_summary.sample_peak_dbfs,
         rms_dbfs: peak_summary.rms_dbfs,
@@ -1264,7 +1298,12 @@ mod tests {
 
         let out = dir.join("swap.flac");
         let opts = RenderOpts::new(&tools, &caps);
-        render_file(&w, &out, &RenderCfg::with_defaults(), &opts).unwrap();
+        // This one is about which port a source lands on, so the limiter is off: it is
+        // late by design, and a test that read the impulse's frame number with it on
+        // would be measuring latency rather than routing.
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.limiter.enable = false;
+        render_file(&w, &out, &cfg, &opts).unwrap();
 
         let back = ffmpeg_to_f64(&tools, &out);
         let peak_frame = |c: usize| {
@@ -1540,6 +1579,7 @@ mod tests {
     /// exercises cpal, the tap, the pacing and the meters **without making a sound**.
     /// On a machine with no discard device (CI) it skips; it never falls back to a
     /// device anybody could hear.
+    #[cfg(feature = "monitor")]
     #[test]
     fn monitor_plays_a_render_to_a_discard_device() {
         let Some((_, info)) = crate::monitor::quiet_device() else {
@@ -1605,6 +1645,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(feature = "monitor")]
     fn is_discard_sink(d: &crate::monitor::DeviceInfo) -> bool {
         crate::monitor::is_discard(d)
     }
@@ -1694,13 +1735,11 @@ mod tests {
         let w = dir.join("imp.wav");
         impulse_wav(&w, 2, 48000);
         let opts = RenderOpts::new(&tools, &caps);
-        let r = render_file(
-            &w,
-            &dir.join("imp.flac"),
-            &RenderCfg::with_defaults(),
-            &opts,
-        )
-        .unwrap();
+        // Asked for no limiter on purpose: the point below is that the reported true peak
+        // is the impulse's own level, which is only true of a render nothing limited.
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.limiter.enable = false;
+        let r = render_file(&w, &dir.join("imp.flac"), &cfg, &opts).unwrap();
         // Nothing limited it, so the file's true peak is the impulse's own level.
         assert!(
             (r.true_peak_dbtp - impulse_dbfs()).abs() < 0.05,
@@ -1710,10 +1749,7 @@ mod tests {
         );
         assert_eq!(r.per_channel_true_peak_dbtp.len(), 2);
         assert_eq!(r.true_peak_ratio, Ratio::X4);
-        assert!(
-            r.limiter.is_none(),
-            "a default render must not report a limiter"
-        );
+        assert!(r.limiter.is_none(), "this render asked for no limiter");
         assert!(r.one_line().contains("tp "), "{}", r.one_line());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1729,9 +1765,10 @@ mod tests {
         let w = dir.join("tone.wav");
         tone_wav(&w, 2, 48000, 0.05);
         let opts = RenderOpts::new(&tools, &caps);
+        let ratios = [Ratio::X2, Ratio::X4, Ratio::X32];
         let mut bytes: Vec<Vec<u8>> = Vec::new();
         let mut read: Vec<f64> = Vec::new();
-        for ratio in [Ratio::X2, Ratio::X4, Ratio::X32] {
+        for &ratio in &ratios {
             let mut cfg = RenderCfg::with_defaults();
             cfg.true_peak = ratio;
             let out = dir.join(format!("x{}.flac", ratio.n()));
@@ -1741,13 +1778,21 @@ mod tests {
         }
         assert_eq!(bytes[0], bytes[1], "x2 and x4 wrote different files");
         assert_eq!(bytes[1], bytes[2], "x4 and x32 wrote different files");
-        // The whole point of the ratio knob: x2 must under-read where x32 does not.
-        assert!(
-            read[0] <= read[2] + 1e-9,
-            "x2 read {:+.2} above x32's {:+.2}",
-            read[0],
-            read[2]
-        );
+        // The gap this test used to assert — x2 reading below x32 — was coarse-grid
+        // error, and peak refinement removes it, so the ratios now agree instead of
+        // disagreeing in a known direction. What still separates them is the guard band
+        // and the latency, which is the honest difference. Checked against the deepest
+        // reading on the same bytes, within the error both ratios claim.
+        let best = read[2];
+        let best_err = Ratio::X32.worst_underread_db() + Ratio::X32.worst_overread_db();
+        for (&ratio, &got) in ratios.iter().zip(&read) {
+            let budget = ratio.worst_underread_db() + ratio.worst_overread_db() + best_err;
+            assert!(
+                (got - best).abs() <= budget + 1e-9,
+                "{ratio} read {got:+.4} dBTP against x32's {best:+.4}, more than the \
+                 {budget:.2} dB the two ratios together allow"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1769,6 +1814,7 @@ mod tests {
             ceiling_db: -6.0,
             ratio: Ratio::X4,
             lookahead_ms: 1.0,
+            ..crate::limiter::Cfg::default()
         };
         let out = dir.join("limited.wav");
         let r = render_file(&w, &out, &cfg, &opts).unwrap();
@@ -1794,8 +1840,11 @@ mod tests {
         );
 
         // Delayed output is longer output, and the report has to say so.
+        // The comparison has to be against a render with nothing added, and "nothing
+        // added" is no longer what the defaults mean.
         let mut plain = RenderCfg::with_defaults();
         plain.true_peak = Ratio::X4;
+        plain.limiter.enable = false;
         let r0 = render_file(&w, &dir.join("plain.wav"), &plain, &opts).unwrap();
         assert_eq!(
             r.frames,

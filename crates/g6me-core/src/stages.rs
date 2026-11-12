@@ -309,6 +309,14 @@ pub struct RenderCfg {
     /// is not a ceiling.
     #[serde(default)]
     pub limiter: LimiterCfg,
+    /// Gain staging: one constant multiplier applied to every sample, in dB, before the
+    /// limiter and the encoder.
+    ///
+    /// This is the level half of a setpoint. It is a separate step from the ceiling on
+    /// purpose: a constant gain costs nothing and changes no shape, while a ceiling does
+    /// both, so the level work belongs here and the limiter keeps only the peaks.
+    #[serde(default)]
+    pub output_gain_db: f64,
     /// Hash every finished output, twice over: the samples handed to the encoder
     /// (container-independent, so a WAV and a FLAC of one render agree) and the file on
     /// disk (what `sha256sum` prints, so the number is checkable with a tool the user
@@ -322,6 +330,21 @@ impl RenderCfg {
             block: 4096,
             ..Default::default()
         }
+    }
+
+    /// One number, two effects: the file is trimmed by `db` and the true-peak ceiling is
+    /// set to `db` dBTP.
+    ///
+    /// This is what the panel's setpoint means. -4 leaves the file 4 dB quieter and puts
+    /// nothing above -4 dBTP, and it is two mechanisms doing it: a constant gain takes the
+    /// level off every sample, which costs nothing and bends nothing, and the limiter is
+    /// left with only the peaks that survive the trim. Asking a ceiling to do the level
+    /// work as well is how a limiter ends up riding gain through 94 % of a file rather than
+    /// catching peaks in it.
+    pub fn apply_setpoint(&mut self, db: f64) {
+        self.output_gain_db = db;
+        self.limiter.ceiling_db = db;
+        self.limiter.enable = true;
     }
 }
 
@@ -653,16 +676,21 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
     // would leave `--dry-run` unable to explain the number in the report.
     let la = cfg.limiter;
     let work_rate = effective_input_rate(cfg, info);
+    let trim = if cfg.output_gain_db == 0.0 {
+        String::new()
+    } else {
+        format!("output gain {:+.2} dB, ", cfg.output_gain_db)
+    };
     v.push(if !la.enable {
         format!(
-            "5. true-peak: meter at {}x ({}), limiter off",
+            "5. {trim}true-peak: meter at {}x ({}), limiter off",
             cfg.true_peak.n(),
             cfg.true_peak.chain()
         )
     } else {
         format!(
-            "5. true-peak: limit to {:.2} dBTP at {}x ({}), lookahead {:.2} ms -> {:.2} ms \
-             effective, +{} samples latency, aims {:.2} dB low ({}x meter)",
+            "5. {trim}true-peak: limit to {:.2} dBTP at {}x ({}), lookahead {:.2} ms -> \
+             {:.2} ms effective, +{} samples latency, aims {:.2} dB low ({}x meter)",
             la.ceiling_db,
             la.ratio.n(),
             la.ratio.chain(),
@@ -900,7 +928,12 @@ mod tests {
 
     #[test]
     fn loss_chain_says_off_when_off() {
-        let lines = loss_chain(&RenderCfg::with_defaults(), &info(), crate::dsp::MASK_7_1);
+        // "Off when off" needs a config with the limiter off, which is no longer what the
+        // defaults are. What the defaults say is checked just below, so neither the off
+        // text nor the on text can drift unnoticed.
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.limiter.enable = false;
+        let lines = loss_chain(&cfg, &info(), crate::dsp::MASK_7_1);
         assert_eq!(lines.len(), 6);
         assert!(lines[1].contains("off"), "{}", lines[1]);
         assert!(lines[2].contains("off"), "{}", lines[2]);
@@ -913,6 +946,20 @@ mod tests {
         assert!(lines[4].contains("limiter off"), "{}", lines[4]);
         assert!(lines[4].contains("meter at 4x"), "{}", lines[4]);
         assert!(lines[5].contains("FLAC"), "{}", lines[5]);
+    }
+
+    /// The default render limits, and the chain has to say so rather than let a limited
+    /// file look like a port. There is no "silent by default" in this table.
+    #[test]
+    fn loss_chain_names_the_default_limiter() {
+        let lines = loss_chain(&RenderCfg::with_defaults(), &info(), crate::dsp::MASK_7_1);
+        assert_eq!(lines.len(), 6);
+        let tp = &lines[4];
+        assert!(tp.contains("limit to -3.00 dBTP"), "{tp}");
+        assert!(tp.contains("at 8x"), "{tp}");
+        assert!(tp.contains("lookahead 2.00 ms"), "{tp}");
+        assert!(tp.contains("(4x meter)"), "{tp}");
+        assert!(!tp.contains("limiter off"), "{tp}");
     }
 
     #[test]

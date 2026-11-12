@@ -42,34 +42,44 @@
 //! 0.136 / 0.169 for 8x, 0.060 / 0.075 for 12x, 0.034 / 0.042 for 16x,
 //! 0.008 / 0.010 for 32x.
 //!
-//! So the ratios here are a **cascade**: the Recommendation's own filter first, then
-//! 2x half-band interpolators, the narrowest filters that can double a rate.
+//! That formula is the error of a **perfect** filter whose grid is too coarse. It is
+//! therefore two separate errors that earlier versions of this file treated as one:
 //!
-//! | ratio | chain |
-//! |---|---|
-//! | x2 | half-band |
-//! | x4 | ITU 4-phase |
-//! | x8 | ITU 4-phase, half-band |
-//! | x16 | ITU 4-phase, half-band x2 |
-//! | x32 | ITU 4-phase, half-band x3 |
+//! 1. **Grid error**, `20·log10(cos(pi·f/n))`: a crest between two grid points. Longer
+//!    filters cannot reduce it; only more points or *interpolating the grid* can. The
+//!    derived ratios fit a parabola through the largest grid point and its neighbours
+//!    ([`Detector::push`]), which removes nearly all of it at the cost of three
+//!    multiplies per local maximum.
+//! 2. **Filter error**: a finite low-pass cannot both pass 0.5 fs and reject its image.
+//!    The derived banks are Kaiser designs with an explicit transition band and the
+//!    stated accuracy applies to content up to [`BAND_EDGE`].
 //!
-//! Every ratio above 4x therefore measures the Recommendation's filter as its first
-//! stage. x2 is the one ratio the Recommendation has no filter for — our half-band
-//! alone, coarse in exactly the way its own bound implies (3.01 dB at f_norm 0.5,
-//! against which it measures 2.3 dB better). It exists for the case Annex 2 names:
-//! *"for an incoming signal at 96 kHz sample rate a 2x over-sampling would be
-//! sufficient"*.
+//! Measured against an exact FFT reconstruction (`tp::tests::accuracy`), not against
+//! another filter, the worst under-read for band-limited content is:
 //!
-//! The bound is a floor, not a target: Annex 2's filter *over*-reads on some
-//! material because its passband is not flat. `worst_case_underread_meets_the_bs1770_bound`
-//! sweeps frequency and phase and asserts the measured worst case sits at or above
-//! the bound for every ratio offered.
+//! | ratio | design | worst under-read, <= 0.45 fs | full-band noise |
+//! |---|---|---|---|
+//! | x2  | Kaiser 51 taps + refinement | 0.30 dB (measured 0.22) | 1.00 dB (measured 0.81) |
+//! | x4  | printed ITU 12 taps | 0.60 dB (measured 0.28; the standard allows 0.554 at 0.45) | 1.50 dB (measured 1.30) |
+//! | x8  | Kaiser 51 taps + refinement | 0.02 dB (measured 0.001) | 0.90 dB (measured 0.77) |
+//! | x16, x32 | same filter, more phases | 0.02 dB | 0.90 dB |
+//!
+//! x16 and x32 are kept for compatibility; they cost 2-4x x8 and read the same.
+//! **x8 is the ratio to enforce a ceiling with. x4 is the ratio to report with**, because
+//! it is the one every other BS.1770 tool uses.
+//!
+//! A component at exactly fs/2 whose samples all land on zero crossings has a true peak
+//! the samples do not determine, so *no* meter bounds the error there. The `fullband`
+//! column is what a Kaiser filter with a 0.1 fs transition band does to noise that
+//! reaches it, and the limiter reports it as a caveat rather than claiming otherwise.
+//! (Measured over 16 seeds of 2048-sample noise; `tp::accuracy::table` reprints it.)
 //!
 //! ## Conventions
 //!
 //! Tap arrays are **oldest to newest**, matching the Recommendation's printed row
 //! order. A [`Stage`]'s shift register uses the same order, so a phase's dot product
 //! is a plain elementwise multiply with no index flip — the single place a tap-order
+//! inversion could creep in.
 //! inversion could creep in.
 
 use std::str::FromStr;
@@ -145,87 +155,102 @@ pub const ITU_PHASES: [[f64; ITU_TAPS]; 4] = [
     ],
 ];
 
-/// Taps per phase for a ratio G6ME derives itself (everything except x4).
+/// Highest frequency, in cycles per input sample, that the derived banks are designed to
+/// read within their stated error: 0.45 x fs, i.e. 21.6 kHz at 48 kHz and 19.8 kHz at
+/// 44.1 kHz. It is also the upper f_norm Annex 2 Attachment 1 tabulates a bound for.
 ///
-/// **More phases do not make the reading more accurate.** The error of an
-/// interpolating peak filter is set by how closely its kernel approximates a sinc,
-/// which is a property of the tap count alone; the phase count only decides how many
-/// points per input interval get looked at. So each ratio carries the tap count its
-/// own BS.1770-5 bound needs, measured with [`tests`](mod@self) in this file:
-///
-/// | ratio | taps/phase | MAC per input sample | worst under-read | BS.1770-5 bound at f_norm 0.5 |
-/// |-------|-----------|----------------------|------------------|-------------------------------|
-/// | x2    | 12        | 24                   | -0.29 dB         | -3.010 dB                     |
-/// | x4    | 12 (ITU)  | 48                   | -0.79 dB         | -0.688 dB (see [`Ratio::X4`]) |
-/// | x8    | 24        | 192                  | -0.07 dB         | -0.169 dB                     |
-/// | x16   | 64        | 1024                 | -0.03 dB         | -0.042 dB                     |
-/// | x32   | 96        | 3072                 | -0.01 dB         | -0.010 dB                     |
-///
-/// x32 costs 64 times what x4 costs to gain well under a decibel of metering accuracy. It is
-/// offered because it is the only way to honour the 0.01 dB bound, and the cost is
-/// printed in `--help` for the same reason.
+/// It exists because an interpolator that must pass everything up to fs/2 has no room
+/// for a transition band: the images of a component at `f` sit at `fs - f`, so a
+/// component at 0.49 fs has an image at 0.51 fs and no finite filter can keep one and
+/// reject the other. The previous bank put its cutoff exactly at fs/2 with a 12-96 tap
+/// Blackman window, whose transition band is several tenths of fs wide, and so
+/// under-read broadband material by 0.8-2.3 dB without anyone having *said* where it
+/// stopped being accurate. This constant says it, and the transition band is placed
+/// explicitly: passband to `BAND_EDGE`, stop band from `1 - BAND_EDGE`.
+pub const BAND_EDGE: f64 = 0.45;
+
+/// Stop-band attenuation of the derived banks, dB. Images that leak through at this level
+/// move a reading by a few ten-thousandths of a dB.
+pub const STOPBAND_DB: f64 = 80.0;
+
+/// Modified Bessel function of the first kind, order zero, by its power series.
 #[must_use]
-pub const fn derived_taps(upsample: usize) -> usize {
-    match upsample {
-        2 => 12,
-        8 => 24,
-        16 => 64,
-        32 => 96,
-        // Anything else: the length the Recommendation itself chose.
-        _ => ITU_TAPS,
+pub fn bessel_i0(x: f64) -> f64 {
+    let q = x * x / 4.0;
+    let mut term = 1.0f64;
+    let mut sum = 1.0f64;
+    let mut k = 1.0f64;
+    while term > 1e-18 * sum {
+        term *= q / (k * k);
+        sum += term;
+        k += 1.0;
+    }
+    sum
+}
+
+/// Kaiser's window shape parameter for a stop-band attenuation of `att_db` (Kaiser 1974,
+/// as given in Oppenheim & Schafer, *Discrete-Time Signal Processing*, section 7.5).
+#[must_use]
+pub fn kaiser_beta(att_db: f64) -> f64 {
+    if att_db > 50.0 {
+        0.1102 * (att_db - 8.7)
+    } else if att_db >= 21.0 {
+        0.5842 * (att_db - 21.0).powf(0.4) + 0.07886 * (att_db - 21.0)
+    } else {
+        0.0
     }
 }
 
-/// A polyphase interpolator for `upsample` phases, derived here and nowhere else.
+/// Taps per phase of a derived bank.
+///
+/// Kaiser's length estimate `N = (A - 7.95) / (14.36 * df)` for a prototype of `N = taps *
+/// upsample` coefficients, with `df = (1 - 2 * BAND_EDGE) / upsample` the transition width
+/// in cycles per output sample. The `upsample` cancels, which is the point that earlier
+/// notes in this file made in prose: **the phase count does not buy accuracy, the tap
+/// count does**. A bank needs about 51 taps per phase to have a 0.1 fs transition band
+/// and an 80 dB stop band, whether it has 2 phases or 32.
+#[must_use]
+pub fn derived_taps(_upsample: usize) -> usize {
+    ((STOPBAND_DB - 7.95) / (14.36 * (1.0 - 2.0 * BAND_EDGE))).ceil() as usize
+}
+
+/// A polyphase interpolator for `upsample` phases: a Kaiser-windowed sinc low-pass with
+/// its cutoff at fs/2, a pass band to [`BAND_EDGE`] and a stop band from `1 - BAND_EDGE`.
 ///
 /// Phase `p` estimates the waveform at `p / upsample` of an input interval past the
 /// current one, so its taps are that fractional delay's sinc, windowed and truncated
 /// to `taps`:
 ///
 /// ```text
-/// h_p[j] = sinc(j - (taps-1)/2 + (p - (upsample-1)/2) / upsample) * blackman[j]
+/// h_p[j] = sinc(d) * I0(beta * sqrt(1 - (d / half)^2)) / I0(beta),   d = j - (taps-1)/2 + (p - (upsample-1)/2) / upsample
 /// ```
 ///
-/// Three things about this are load-bearing and each is checked by a test:
+/// where `half = (taps-1)/2 + (upsample-1)/(2 upsample)` is the furthest tap of any phase.
+/// Properties that matter, each pinned by a test:
 ///
-/// * **One stage, not a cascade.** An earlier version reached x8 and above by chaining
-///   half-band doublers after the ITU filter. Each doubler's transition band is wide
-///   (it runs from the passband edge up to the images), so it passes the *previous*
-///   stage's imperfectly cancelled images instead of removing them, and the peak
-///   reading inflates: measured +1.2 dB at x8 and +2.5 dB at x32 on a full-scale
-///   tone. A reading that is high is not a conservative reading, it is a wrong one —
-///   the limiter would attenuate 2.5 dB of programme that needed nothing. A single
-///   L-phase stage has no such seam: its images land in its own stopband.
-/// * **No per-phase renormalisation.** Dividing each branch by its own sum looks like
-///   the right way to make a DC input pass through unity, and it does — but it raises
-///   the passband near Nyquist, turning the error positive: +0.22 dB at x8, +0.26 dB
-///   at x32. The truncation error the normalisation removes is smaller than the
-///   droop it introduces.
-/// * **Blackman, not rectangular.** A rectangular window leaves Gibbs ripple that
-///   reads +1.4 dB high on a tone near 0.41 cycles/sample. Blackman's -31.5 dB
-///   sidelobes cost a slightly wider transition and remove that entirely.
-///
-/// The phase offsets are centred on the middle of the grid rather than running `0`,
-/// `1/L`, `2/L` … That is a delay of `(L-1)/(2L)` of an interval — acoustically
-/// irrelevant, and it is what makes the bank exactly symmetric: with centred offsets
-/// `h_p[j] == h_{L-1-p}[taps-1-j]` holds to the last bit, and every phase then shares
-/// one group delay by construction. Without it the identity only holds to within a
-/// one-tap shift, which is the kind of near-miss that turns into a mystery later.
-///
-/// The branches mirror each other, which is what
-/// makes the whole bank linear phase: every phase is delayed by the same
-/// [`Ratio::group_delay`], so the peak is found at a known time and a limiter can act
-/// on it ahead of the sample that caused it.
+/// * **One stage, not a cascade.** Chained half-band doublers pass the previous stage's
+///   imperfectly cancelled images (+1.2 dB at x8, +2.5 dB at x32 on a full-scale tone).
+///   A single L-phase stage has no such seam.
+/// * **No per-phase renormalisation.** Dividing each branch by its own sum lifts the
+///   passband near Nyquist and turns a small under-read into an over-read. With 51 taps
+///   the DC error it would remove is below 0.01 dB anyway.
+/// * **Kaiser, not Blackman.** The window's `beta` sets the stop band directly and the
+///   length follows from the transition width ([`derived_taps`]), instead of a fixed
+///   window whose transition band is whatever it happens to be.
+/// * **Centred phase offsets** make the bank exactly symmetric, `h_p[j] == h_{L-1-p}[taps-1-j]`
+///   to the last bit, so every phase shares one group delay of `(taps-1)/2` and a limiter
+///   can act on a peak at a known time.
 #[must_use]
 pub fn derived_branches(upsample: usize, taps: usize) -> Vec<Vec<f64>> {
+    let l = upsample as f64;
     let centre = (taps - 1) as f64 / 2.0;
+    let half = centre + (l - 1.0) / (2.0 * l);
+    let beta = kaiser_beta(STOPBAND_DB);
+    let i0_beta = bessel_i0(beta);
     (0..upsample)
         .map(|p| {
-            // Centred, not 0, 1/L, 2/L …: a delay of (L-1)/(2L) of an interval, which is
-            // what makes `h_p[j] == h_{L-1-p}[taps-1-j]` hold exactly and every phase
-            // share one group delay. See the note above.
-            let offset = (p as f64 - (upsample as f64 - 1.0) / 2.0) / upsample as f64;
-            let mut branch: Vec<f64> = (0..taps)
+            let offset = (p as f64 - (l - 1.0) / 2.0) / l;
+            (0..taps)
                 .map(|j| {
                     let d = j as f64 - centre + offset;
                     // sinc(d) = sin(pi d) / (pi d), with the removable singularity at the
@@ -236,25 +261,11 @@ pub fn derived_branches(upsample: usize, taps: usize) -> Vec<Vec<f64>> {
                         let x = std::f64::consts::PI * d;
                         x.sin() / x
                     };
-                    let w = 0.42
-                        - 0.5 * (2.0 * std::f64::consts::PI * j as f64 / (taps - 1) as f64).cos()
-                        + 0.08 * (4.0 * std::f64::consts::PI * j as f64 / (taps - 1) as f64).cos();
+                    let r = d / half;
+                    let w = bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / i0_beta;
                     s * w
                 })
-                .collect();
-            // Divide through by the branch's own sum, so a constant in gives a constant
-            // out at every phase. An infinite sinc does this exactly; a 12-tap truncation
-            // of it is short by up to 3.3% at the half-sample offset, which is 0.29 dB of
-            // under-read at DC and most of what these banks under-read at low frequency.
-            // The trade is not free: it lifts the branch across the whole band, so near
-            // Nyquist a small under-read becomes a +0.003 dB over-read. Giving up a
-            // rounding error in the safe direction to remove an error in the unsafe one
-            // is the right way round when the number gates a ceiling.
-            let sum: f64 = branch.iter().sum();
-            for t in branch.iter_mut() {
-                *t /= sum;
-            }
-            branch
+                .collect()
         })
         .collect()
 }
@@ -367,58 +378,74 @@ impl Ratio {
         }
     }
 
-    /// Worst under-read this ratio's filter actually has, measured over the band by the
-    /// sweep in this file's tests, which asserts the numbers below are not optimistic.
+    /// Worst under-read of this ratio **for content at or below [`BAND_EDGE`]**
+    /// (0.45 x the sample rate), in dB, measured against an exact band-limited
+    /// reconstruction (`tp::tests::accuracy`), not against another filter.
     ///
-    /// x4 is the Recommendation's own filter and is the worst of the set: in the last
-    /// few percent of the band it reads up to 0.79 dB low, which is past the 0.688 dB
-    /// that Attachment 1 allows at f_norm 0.5. That is a property of the printed
-    /// coefficients, not of this implementation, and it is why [`Ratio::X8`] is the
-    /// honest choice for a limiter side chain even though x4 is the honest choice for a
-    /// *reported* number — every other tool on a delivery bench is measuring with this
-    /// same 0.79 dB of optimism.
+    /// * x2, x8, x16, x32 are the derived Kaiser banks with peak refinement.
+    /// * x4 is the printed ITU bank, which has no refinement and 12 taps: its figure is
+    ///   Annex 2 Attachment 1's own allowance (0.554 dB at f_norm 0.45) plus the printed
+    ///   filter's droop. That is not a defect of this implementation; every compliant
+    ///   x4 meter reads that low on a crest that falls between grid points.
     ///
-    /// [`crate::limiter`] turns this number into its ceiling guard band, so a meter
-    /// that reads low cannot put a file over its declared ceiling.
+    /// [`crate::limiter`] turns this number into its ceiling guard band.
     #[must_use]
     pub fn worst_underread_db(self) -> f64 {
         match self {
-            Ratio::X2 => 0.70,
-            Ratio::X4 => 0.12,
-            Ratio::X8 => 0.12,
-            Ratio::X16 => 0.03,
-            Ratio::X32 => 0.01,
+            Ratio::X2 => 0.30,
+            Ratio::X4 => 0.60,
+            Ratio::X8 | Ratio::X16 | Ratio::X32 => 0.02,
         }
     }
 
-    /// Worst steady-state over-read this bank has, measured the same way. Over-read is
-    /// safe for a ceiling — the limiter gives up loudness it did not have to — but it is
-    /// still a false number on a meter, and the Recommendation's filter has +0.22 dB of it
-    /// at f_norm 0.08, which is how it reads a file louder than it is.
+    /// Worst under-read for **full-band** programme, noise that reaches fs/2.
     ///
-    /// Steady state only. Turning a full-scale signal on rings any of these filters by
-    /// dB, not hundredths of a dB (+1.5 dB at x4 and +2.3 dB at x8 on a Nyquist square
-    /// wave), and a meter reporting the max over a file includes that. It is in the safe
-    /// direction, so nothing here tries to bound it; it is why a true-peak number on a
-    /// file with a hard onset at the top of the band reads high no matter whose filter
-    /// you use.
+    /// Between [`BAND_EDGE`] and fs/2 every finite interpolator is in its transition band,
+    /// and exactly at fs/2 the samples do not determine the peak at all, so this figure
+    /// is not a design target but a measured property of the information available. It is
+    /// what a ceiling can be wrong by when the material is not band-limited, and the
+    /// limiter reports it next to the ceiling instead of hiding it.
+    #[must_use]
+    pub fn fullband_underread_db(self) -> f64 {
+        match self {
+            Ratio::X2 => 1.00,
+            Ratio::X4 => 1.50,
+            Ratio::X8 | Ratio::X16 | Ratio::X32 => 0.90,
+        }
+    }
+
+    /// Worst steady-state over-read, dB. An over-read is safe for a ceiling — the limiter
+    /// gives up loudness it did not have to — but it is still a false number on a meter.
+    /// The printed bank has +0.22 dB of passband ripple at f_norm 0.08, which is how a
+    /// BS.1770 meter can read a file *louder* than its true peak.
     #[must_use]
     pub fn worst_overread_db(self) -> f64 {
         match self {
-            Ratio::X2 => 0.01,
             Ratio::X4 => 0.25,
-            Ratio::X8 => 0.01,
-            Ratio::X16 => 0.01,
-            Ratio::X32 => 0.01,
+            _ => 0.10,
         }
+    }
+
+    /// Whether the detector refines peaks between grid points. Everything but the
+    /// printed ITU bank does.
+    #[must_use]
+    pub fn refines(self) -> bool {
+        self != Ratio::X4
+    }
+
+    /// Frames after an input frame before the detector's report about it is final:
+    /// the filter's group delay rounded up, plus one frame when refinement has to wait
+    /// for a neighbouring grid point.
+    #[must_use]
+    pub fn report_delay(self) -> usize {
+        self.group_delay().ceil() as usize + usize::from(self.refines())
     }
 
     /// Minimum lookahead, in input samples, for a limiter to use this ratio: the
     /// point at which a peak is known before the sample that caused it is emitted.
-    /// [`Ratio::group_delay`] rounded up.
     #[must_use]
     pub fn min_lookahead_samples(self) -> usize {
-        self.group_delay().ceil() as usize
+        self.report_delay()
     }
 
     /// Worst-case under-read BS.1770-5 Annex 2 Attachment 1 allows a proper meter at
@@ -440,11 +467,11 @@ impl Ratio {
     #[must_use]
     pub fn chain(self) -> &'static str {
         match self {
-            Ratio::X2 => "2-phase derived polyphase (12 taps/phase)",
+            Ratio::X2 => "2-phase Kaiser polyphase (51 taps/phase) + peak refinement",
             Ratio::X4 => "ITU-R BS.1770-5 4-phase, printed coefficients",
-            Ratio::X8 => "8-phase derived polyphase (24 taps/phase)",
-            Ratio::X16 => "16-phase derived polyphase (64 taps/phase)",
-            Ratio::X32 => "32-phase derived polyphase (96 taps/phase)",
+            Ratio::X8 => "8-phase Kaiser polyphase (51 taps/phase) + peak refinement",
+            Ratio::X16 => "16-phase Kaiser polyphase (51 taps/phase) + peak refinement",
+            Ratio::X32 => "32-phase Kaiser polyphase (51 taps/phase) + peak refinement",
         }
     }
 }
@@ -530,51 +557,84 @@ impl Stage {
     }
 }
 
-/// Longest chain we offer (x32 = 4 stages, 32 outputs per input sample).
+/// Largest number of phases any bank has, i.e. the most outputs one input sample makes.
 const MAX_STREAM: usize = 32;
+
+/// Value of the parabola through three adjacent magnitudes at its vertex, when the
+/// middle one is a local maximum; the middle one itself otherwise.
+///
+/// This is what closes the *grid* error. A peak that falls between two points of the
+/// over-sampled grid is read low by up to `20·log10(cos(pi·f/n))` however good the
+/// filter is: 0.55 dB at x4 and f = 0.45 fs, 0.14 dB at x8. No filter can fix that
+/// because the filter was never wrong; the grid is simply too coarse to contain the
+/// crest. Fitting a parabola through the grid point and its two neighbours puts the
+/// crest back to within a few thousandths of a dB at x4 (see `tp::tests::accuracy`).
+/// It can only ever raise the reading (`den < 0` and the vertex of a downward parabola
+/// is at least its middle sample), and over-reads by at most ~0.1 dB on broadband noise.
+#[inline]
+fn vertex(a: f64, b: f64, c: f64) -> f64 {
+    if b >= a && b >= c {
+        let den = a - 2.0 * b + c;
+        if den < 0.0 {
+            return b - (c - a) * (c - a) / (8.0 * den);
+        }
+    }
+    b
+}
 
 /// Streaming true-peak detector for one channel.
 ///
-/// The only state is the per-stage shift registers, so feeding one block, many
-/// blocks, or one sample at a time gives identical readings: chunk-size invariance
-/// falls out of the structure instead of being a special case that has to be tested
-/// into existence.
+/// The only state is the filter's shift register plus the last two interpolated
+/// magnitudes (needed by the peak refinement), so feeding one block, many blocks, or one
+/// sample at a time gives identical readings: chunk-size invariance falls out of the
+/// structure instead of being a special case that has to be tested into existence.
 pub struct Detector {
-    stages: Vec<Stage>,
+    stage: Stage,
     peak: f64,
     ratio: Ratio,
+    /// Parabolic peak refinement on the over-sampled grid. Off for the printed ITU bank
+    /// (x4), which stays exactly what Annex 2 describes so that its number is the one
+    /// other BS.1770 tools print.
+    refine: bool,
+    /// The two most recent interpolated magnitudes in time order. The newest has no
+    /// successor yet, so it cannot be refined and waits for the next output.
+    older: f64,
+    newest: f64,
 }
 
 impl Detector {
     #[must_use]
     pub fn new(ratio: Ratio) -> Self {
         Self {
-            // Exactly one stage: see the note on cascades in [`derived_branches`].
-            stages: vec![Stage::new(ratio)],
+            stage: Stage::new(ratio),
             peak: 0.0,
             ratio,
+            refine: ratio.refines(),
+            older: 0.0,
+            newest: 0.0,
         }
     }
 
-    /// Highest absolute interpolated value so far, linear.
+    /// Highest absolute interpolated value so far, linear. Includes the newest output,
+    /// unrefined, so the last point of a stream is never dropped.
     #[must_use]
     pub fn peak(&self) -> f64 {
-        self.peak
+        self.peak.max(self.newest)
     }
 
     /// True peak in dBTP; `-inf` for silence.
     #[must_use]
     pub fn dbtp(&self) -> f64 {
-        db_from_peak(self.peak)
+        db_from_peak(self.peak())
     }
 
     /// Clear the filter state as well as the reading. Only used by the accuracy
     /// sweep, which needs independent runs through the same allocation.
     pub fn clear(&mut self) {
-        for st in &mut self.stages {
-            st.hist.fill(0.0);
-        }
+        self.stage.hist.fill(0.0);
         self.peak = 0.0;
+        self.older = 0.0;
+        self.newest = 0.0;
     }
 
     /// Clear the reading but keep the filter state. Meters that report per group
@@ -584,55 +644,47 @@ impl Detector {
         self.peak = 0.0;
     }
 
-    /// Feed one input sample and return the largest interpolated output it produced.
+    /// Feed one input sample and return the largest value it finalised.
+    ///
     /// The limiter needs the per-sample peak to schedule gain; the meter only calls
-    /// [`Detector::push_block`].
+    /// [`Detector::push_block`]. With refinement the newest grid point cannot be refined
+    /// until its successor exists, so the value returned lags the waveform by one grid
+    /// step (`1/n` of an input sample), which [`Ratio::report_delay`] accounts for.
     ///
-    /// The reading is the max over the **last** stage, i.e. over the interpolated
-    /// signal at the full ratio — the same set of values the batch reference in the
-    /// tests computes. Intermediate stages are intermediate representations, not
-    /// estimates of the waveform.
-    ///
-    /// It is then floored at `|x|`, the sample itself. That floor is not a courtesy:
-    /// an interpolating lowpass has its passband edge at the Nyquist frequency, so a
-    /// component *at* Nyquist sits in its transition band and can be attenuated to
+    /// The reading is then floored at `|x|`, the sample itself. That floor is not a
+    /// courtesy: an interpolating lowpass has its passband edge at the Nyquist frequency,
+    /// so a component *at* Nyquist sits in its transition band and can be attenuated to
     /// nothing. The Recommendation's own printed coefficients do exactly that — measured
     /// below -200 dB at f_norm 0.5, where the truth is 0 dBFS. That is harmless for a
-    /// loudness readout and disqualifying for a ceiling, because a full-scale Nyquist
-    /// component would sail through a limiter that could not see it. The floor costs one
-    /// `max` per sample and cannot inflate anything: the ideal reconstruction passes
-    /// through every sample exactly, so the true peak is always at least the sample peak.
-    /// The reading stays a lower bound on the true analogue peak, just a better one.
+    /// loudness readout and disqualifying for a ceiling. The floor costs one `max` per
+    /// sample and cannot inflate anything: the ideal reconstruction passes through every
+    /// sample exactly, so the true peak is always at least the sample peak.
+    ///
+    /// **What it cannot do:** a component at *exactly* fs/2 with a phase that puts every
+    /// sample at a zero crossing has all-zero samples and a true peak of anything. No meter
+    /// can recover it from the samples; that is why the derived banks state a band edge
+    /// ([`BAND_EDGE`]) instead of claiming to be accurate up to Nyquist.
     #[inline]
     pub fn push(&mut self, x: f64) -> f64 {
-        let mut a = [0.0f64; MAX_STREAM];
-        let mut b = [0.0f64; MAX_STREAM];
-        a[0] = x;
-        let mut count = 1usize;
+        let mut out = [0.0f64; MAX_STREAM];
+        let n = self.stage.n_phases;
+        let raw = self.stage.push(x, &mut out[..n]);
         let mut peak = 0.0f64;
-        let last = self.stages.len() - 1;
-        for (i, st) in self.stages.iter_mut().enumerate() {
-            let even = i % 2 == 0;
-            let is_last = i == last;
-            let n_ph = st.n_phases;
-            let mut m = 0usize;
-            let mut sp = 0.0f64;
-            for s in 0..count {
-                let v = if even { a[s] } else { b[s] };
-                let pk = if even {
-                    st.push(v, &mut b[m..m + n_ph])
-                } else {
-                    st.push(v, &mut a[m..m + n_ph])
-                };
-                m += n_ph;
-                if is_last && pk > sp {
-                    sp = pk;
+        if self.refine {
+            // The derived banks centre their phase grid, and phase `p` samples the
+            // waveform `p/n` of an interval *earlier* than phase 0, so ascending time is
+            // descending `p`.
+            for p in (0..n).rev() {
+                let c = out[p].abs();
+                let v = vertex(self.older, self.newest, c);
+                if v > peak {
+                    peak = v;
                 }
+                self.older = self.newest;
+                self.newest = c;
             }
-            count = m;
-            if is_last {
-                peak = sp;
-            }
+        } else {
+            peak = raw;
         }
         let xs = x.abs();
         if xs > peak {
@@ -650,7 +702,7 @@ impl Detector {
         for &x in block {
             self.push(x);
         }
-        self.peak
+        self.peak()
     }
 
     #[must_use]
@@ -771,8 +823,37 @@ mod tests {
         // reference that proves the streaming shift registers are wired right, so it
         // must not grow a second structure of its own.
         let cur = poly(x, &ratio.branches());
-        cur.iter()
-            .fold(0.0f64, |a, &v| a.max(if v < 0.0 { -v } else { v }))
+        if !ratio.refines() {
+            return cur
+                .iter()
+                .fold(0.0f64, |a, &v| a.max(if v < 0.0 { -v } else { v }));
+        }
+        // Refining ratios: outputs in time order (descending phase within a frame), every
+        // output but the last refined against its neighbours, the last taken raw. Written
+        // on materialised buffers so it shares no code with the streaming detector.
+        let n = ratio.n();
+        let mut seq = Vec::with_capacity(cur.len());
+        for i in 0..x.len() {
+            for p in (0..n).rev() {
+                seq.push(cur[n * i + p].abs());
+            }
+        }
+        let mut best = 0.0f64;
+        for k in 0..seq.len() {
+            let v = if k + 1 < seq.len() {
+                let a = if k > 0 { seq[k - 1] } else { 0.0 };
+                let (b, c) = (seq[k], seq[k + 1]);
+                if b >= a && b >= c && a - 2.0 * b + c < 0.0 {
+                    b - (c - a) * (c - a) / (8.0 * (a - 2.0 * b + c))
+                } else {
+                    b
+                }
+            } else {
+                seq[k]
+            };
+            best = best.max(v);
+        }
+        best
     }
 
     fn sine(f: f64, amp: f64, n: usize, phase: f64) -> Vec<f64> {
@@ -981,7 +1062,14 @@ mod tests {
             // Not 0.5: a sine at exactly Nyquist sampled at integers is sin(pi*i), which
             // is zero everywhere, so the sweep would "measure" the noise floor of sin().
             // A true Nyquist tone is an alternating sequence and has its own test.
-            while fnorm <= 0.4901 {
+            // The derived banks are designed and stated for content up to BAND_EDGE; the
+            // printed bank is swept to the top of the band as before.
+            let top = if r == Ratio::X4 {
+                0.4901
+            } else {
+                BAND_EDGE + 1e-4
+            };
+            while fnorm <= top {
                 for k in 0..offsets {
                     let phase = std::f64::consts::PI * 2.0 * k as f64 / offsets as f64;
                     let x = sine(fnorm * FS, 1.0, 4096, phase);
@@ -1335,22 +1423,26 @@ mod tests {
         );
         // Cost is the argument for the default, so it has to be right.
         assert_eq!(Ratio::X4.mac_per_sample(), 4 * ITU_TAPS);
-        assert_eq!(Ratio::X32.mac_per_sample(), 32 * 96);
-        assert!(Ratio::X32.mac_per_sample() > 40 * Ratio::X4.mac_per_sample());
+        assert_eq!(Ratio::X32.mac_per_sample(), 32 * derived_taps(32));
+        assert!(Ratio::X32.mac_per_sample() > 30 * Ratio::X4.mac_per_sample());
         for &r in Ratio::ALL.iter() {
             assert!(!r.chain().is_empty());
             assert_eq!(r.to_string(), r.label());
         }
         // Half the kernel, except for the printed bank, whose phases fan out from the
         // current sample and so carry the extra fraction of an interval.
-        assert!((Ratio::X2.group_delay() - 5.5).abs() < 1e-12);
         assert!((Ratio::X4.group_delay() - 5.875).abs() < 1e-12);
-        assert!((Ratio::X8.group_delay() - 11.5).abs() < 1e-12);
-        assert!((Ratio::X16.group_delay() - 31.5).abs() < 1e-12);
-        assert!((Ratio::X32.group_delay() - 47.5).abs() < 1e-12);
-        // Accuracy is bought: the delay grows faster than the reading improves, and a
-        // limiter pays the difference in lookahead.
-        assert!(Ratio::X32.group_delay() > 5.0 * Ratio::X4.group_delay());
+        let half = (derived_taps(2) - 1) as f64 / 2.0;
+        for r in [Ratio::X2, Ratio::X8, Ratio::X16, Ratio::X32] {
+            assert!((r.group_delay() - half).abs() < 1e-12, "{r}");
+        }
+        // Refinement waits one grid point, which costs a frame of lookahead.
+        assert_eq!(Ratio::X4.report_delay(), 6);
+        assert_eq!(Ratio::X8.report_delay(), half as usize + 1);
+        // Accuracy is bought: a narrow transition band needs a long filter, and a
+        // limiter pays for it in lookahead.
+        assert!(Ratio::X8.group_delay() > 4.0 * Ratio::X4.group_delay());
+        assert_eq!(derived_taps(8), 51);
     }
 
     #[test]
@@ -1387,127 +1479,235 @@ mod tests {
 }
 
 #[cfg(test)]
-mod reference {
+mod accuracy {
+    //! Accuracy of every ratio against an **exact** reference.
+    //!
+    //! The reference is not another filter. For a periodic block with its Nyquist bin
+    //! zeroed, padding the spectrum with zeros and transforming back is the ideal
+    //! band-limited reconstruction: no taps, no window, no transition band. An earlier
+    //! version of these tests judged each detector against a 48-tap Blackman sinc, which
+    //! has the same family of error as the detectors it was grading and so under-stated
+    //! theirs; the tone-derived guard band that resulted was off by up to 0.8 dB on
+    //! broadband material.
     use super::*;
+    use std::f64::consts::PI;
 
-    /// A near-exact interpolator: 128 phases of a 48-tap Blackman-windowed sinc,
-    /// 6 144 MAC/sample. Slow enough to be a test-only instrument, good enough that its
-    /// own error (a few thousandths of a dB) is far below the errors being measured.
-    fn reference_branches(oversample: usize, taps: usize) -> Vec<Vec<f64>> {
-        derived_branches(oversample, taps)
-    }
-
-    fn reference_peak(block: &[f64]) -> f64 {
-        let bank = reference_branches(128, 48);
-        let mut peak = block.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
-        let t = bank[0].len();
-        let mut hist = vec![0.0f64; t];
-        for &x in block {
-            hist.copy_within(1.., 0);
-            hist[t - 1] = x;
-            for b in &bank {
-                let mut acc = 0.0;
-                for (h, c) in hist.iter().zip(b) {
-                    acc += h * c;
-                }
-                if acc.abs() > peak {
-                    peak = acc.abs();
-                }
+    /// In-place iterative radix-2 FFT; `inverse` also scales by `1/n`.
+    fn fft(re: &mut [f64], im: &mut [f64], inverse: bool) {
+        let n = re.len();
+        assert!(n.is_power_of_two() && im.len() == n);
+        let mut j = 0usize;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j ^= bit;
+            if i < j {
+                re.swap(i, j);
+                im.swap(i, j);
             }
         }
-        peak
-    }
-
-    /// Program-like material, the kinds of crest a real render produces.
-    fn cases() -> Vec<(&'static str, Vec<f64>)> {
-        let n = 4096;
-        let mut out: Vec<(&'static str, Vec<f64>)> = Vec::new();
-
-        // Two tones beating near Nyquist: the crest lands between samples.
-        let a: Vec<f64> = (0..n)
-            .map(|i| {
-                0.62 * (2.0 * std::f64::consts::PI * 0.47 * i as f64 / 4.0).sin()
-                    + 0.62 * (2.0 * std::f64::consts::PI * 0.43 * i as f64 / 4.0).sin()
-            })
-            .collect();
-        out.push(("two tones near nyquist", a));
-
-        // A near-Nyquist tone amplitude-modulated to a crest.
-        let b: Vec<f64> = (0..n)
-            .map(|i| {
-                let e = (-(i as f64 - 2048.0).powi(2) / (2.0 * 3.0f64.powi(2))).exp();
-                e * (2.0 * std::f64::consts::PI * 0.49 * i as f64 / 4.0).sin()
-            })
-            .collect();
-        out.push(("nyquist burst", b));
-
-        // Dense impulses: each one's crest is at its own sample, the neighbours ring.
-        let mut c = vec![0.0f64; n];
-        for i in (0..n).step_by(37) {
-            c[i] = 0.9;
-        }
-        out.push(("impulse train", c));
-
-        // White noise: worst-case peak statistics, every phase exercised.
-        let mut state = 0x2545F491u64;
-        let d: Vec<f64> = (0..n)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state >> 40) as f64 / (1u64 << 24) as f64 * 2.0 - 1.0
-            })
-            .collect();
-        out.push(("white noise", d));
-        out
-    }
-
-    /// Diagnostic: how far each ratio sits below the reference on program material.
-    #[test]
-    #[ignore = "diagnostic; run with --nocapture to print the table"]
-    fn error_against_a_reference_interpolator() {
-        println!(
-            "case                    x2       x4       x8      x16      x32   (dB vs reference)"
-        );
-        for (name, block) in cases() {
-            let r = reference_peak(&block);
-            let mut row = String::new();
-            for ratio in [Ratio::X2, Ratio::X4, Ratio::X8, Ratio::X16, Ratio::X32] {
-                let mut d = Detector::new(ratio);
-                d.push_block(&block);
-                row.push_str(&format!(
-                    "{:+8.3} ",
-                    db_from_peak(d.peak()) - db_from_peak(r)
-                ));
+        let mut len = 2;
+        while len <= n {
+            let ang = 2.0 * PI / len as f64 * if inverse { 1.0 } else { -1.0 };
+            let (wr, wi) = (ang.cos(), ang.sin());
+            for start in (0..n).step_by(len) {
+                let (mut cr, mut ci) = (1.0f64, 0.0f64);
+                for k in 0..len / 2 {
+                    let a = start + k;
+                    let b = a + len / 2;
+                    let tr = re[b] * cr - im[b] * ci;
+                    let ti = re[b] * ci + im[b] * cr;
+                    re[b] = re[a] - tr;
+                    im[b] = im[a] - ti;
+                    re[a] += tr;
+                    im[a] += ti;
+                    let ncr = cr * wr - ci * wi;
+                    ci = cr * wi + ci * wr;
+                    cr = ncr;
+                }
             }
-            println!("{name:22}{row}");
+            len <<= 1;
+        }
+        if inverse {
+            let s = 1.0 / n as f64;
+            re.iter_mut().for_each(|v| *v *= s);
+            im.iter_mut().for_each(|v| *v *= s);
         }
     }
 
-    /// The same measurement, as a gate: no ratio may under-read the reference by more
-    /// than the figure the limiter's guard band is built from.
+    /// Exact true peak of a periodic block with no energy at fs/2, read on an `l`x grid
+    /// (`l` = 32 puts the grid error of the *reference* below 0.0004 dB).
+    fn exact_peak(x: &[f64], l: usize) -> f64 {
+        let n = x.len();
+        let m = n * l;
+        let mut re = x.to_vec();
+        let mut im = vec![0.0; n];
+        fft(&mut re, &mut im, false);
+        let mut yr = vec![0.0; m];
+        let mut yi = vec![0.0; m];
+        yr[..n / 2].copy_from_slice(&re[..n / 2]);
+        yi[..n / 2].copy_from_slice(&im[..n / 2]);
+        for k in 1..n / 2 {
+            yr[m - k] = re[n - k];
+            yi[m - k] = im[n - k];
+        }
+        fft(&mut yr, &mut yi, true);
+        yr.iter().fold(0.0f64, |a, &v| a.max((v * l as f64).abs()))
+    }
+
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+    }
+
+    /// Gaussian-ish noise (sum of uniforms) with a flat spectrum up to `fmax` cycles per
+    /// sample, nothing above, and nothing at Nyquist, peak-normalised to 0.9.
+    fn band_noise(n: usize, fmax: f64, seed: u64) -> Vec<f64> {
+        let mut st = 0x9E3779B97F4A7C15u64 ^ seed.wrapping_mul(0xD1B54A32D192ED03);
+        let mut re: Vec<f64> = (0..n)
+            .map(|_| (0..4).map(|_| lcg(&mut st)).sum::<f64>())
+            .collect();
+        let mut im = vec![0.0; n];
+        fft(&mut re, &mut im, false);
+        for k in 0..n {
+            let f = k.min(n - k) as f64 / n as f64;
+            if f > fmax || k == n / 2 {
+                re[k] = 0.0;
+                im[k] = 0.0;
+            }
+        }
+        fft(&mut re, &mut im, true);
+        let pk = re.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        re.iter().map(|v| v * 0.9 / pk).collect()
+    }
+
+    /// A detector's reading of a periodic block: one period to settle the filter, then
+    /// the peak over a second.
+    fn read(x: &[f64], ratio: Ratio) -> f64 {
+        let mut d = Detector::new(ratio);
+        d.push_block(x);
+        d.reset_peak();
+        d.push_block(x);
+        d.peak()
+    }
+
+    fn db(v: f64) -> f64 {
+        20.0 * v.log10()
+    }
+
+    /// Worst (under, over) reading in dB against the exact peak. Under is positive when
+    /// the detector reads low.
+    fn noise_error(ratio: Ratio, fmax: f64, seeds: u64) -> (f64, f64) {
+        let mut under = f64::NEG_INFINITY;
+        let mut over = f64::NEG_INFINITY;
+        for seed in 0..seeds {
+            let x = band_noise(2048, fmax, seed);
+            let truth = exact_peak(&x, 32);
+            let e = db(truth) - db(read(&x, ratio));
+            under = under.max(e);
+            over = over.max(-e);
+        }
+        (under, over)
+    }
+
     #[test]
-    fn no_ratio_underreads_the_reference_by_more_than_its_stated_error() {
-        for ratio in [Ratio::X2, Ratio::X4, Ratio::X8, Ratio::X16, Ratio::X32] {
-            let mut worst = 0.0f64;
-            let mut where_worst = "";
-            for (name, block) in cases() {
-                let r = reference_peak(&block);
-                let mut d = Detector::new(ratio);
-                d.push_block(&block);
-                let err = db_from_peak(r) - db_from_peak(d.peak());
-                if err > worst {
-                    worst = err;
-                    where_worst = name;
+    fn exact_reference_is_exact_on_a_tone() {
+        // A tone whose crest falls between samples: truth is 1.0, samples read 0.707.
+        let x: Vec<f64> = (0..256)
+            .map(|i| (2.0 * PI * 32.0 * i as f64 / 256.0 + PI / 4.0).sin())
+            .collect();
+        let p = exact_peak(&x, 32);
+        assert!((p - 1.0).abs() < 1e-6, "reference read {p} for a unit tone");
+    }
+
+    /// The headline gate: content up to [`BAND_EDGE`] is read within the figure the
+    /// limiter's guard band is built from, for every ratio, against the exact reference.
+    #[test]
+    fn band_limited_noise_is_read_within_the_stated_error() {
+        for ratio in Ratio::ALL {
+            for fmax in [0.45, 0.40, 0.25] {
+                let (under, over) = noise_error(ratio, fmax, 8);
+                assert!(
+                    under <= ratio.worst_underread_db() + 1e-9,
+                    "{ratio} under-read noise limited to {fmax} fs by {under:.3} dB, more \
+                     than the {} dB its guard band assumes",
+                    ratio.worst_underread_db()
+                );
+                assert!(
+                    over <= ratio.worst_overread_db() + 1e-9,
+                    "{ratio} over-read noise limited to {fmax} fs by {over:.3} dB, more \
+                     than the {} dB it claims",
+                    ratio.worst_overread_db()
+                );
+            }
+        }
+    }
+
+    /// Noise that reaches fs/2 is outside every design's pass band. The figure is a
+    /// caveat, not a target, and this keeps it from drifting.
+    #[test]
+    fn full_band_noise_stays_inside_the_stated_caveat() {
+        for ratio in Ratio::ALL {
+            let (under, _) = noise_error(ratio, 0.5, 8);
+            assert!(
+                under <= ratio.fullband_underread_db() + 1e-9,
+                "{ratio} under-read full-band noise by {under:.3} dB, more than the {} dB \
+                 the limiter reports as its band caveat",
+                ratio.fullband_underread_db()
+            );
+        }
+    }
+
+    /// Tones at rational frequencies close to the band edge, where a crest lands at the
+    /// worst offset from the grid on every cycle. Truth is exactly 1.0.
+    #[test]
+    fn tones_between_grid_points_are_read_within_the_stated_error() {
+        let freqs = [(1, 4), (1, 3), (2, 5), (5, 12), (4, 9), (9, 20), (23, 50)];
+        for ratio in Ratio::ALL {
+            let mut worst = (0.0f64, 0.0f64);
+            for (num, den) in freqs {
+                let n = den * 128usize.div_ceil(den);
+                let k = num * (n / den);
+                for step in 0..45 {
+                    let phase = PI * step as f64 / 45.0;
+                    let x: Vec<f64> = (0..n)
+                        .map(|i| (2.0 * PI * k as f64 * i as f64 / n as f64 + phase).cos())
+                        .collect();
+                    let under = -db(read(&x, ratio));
+                    if under > worst.0 {
+                        worst = (under, num as f64 / den as f64);
+                    }
                 }
             }
             assert!(
-                worst <= ratio.worst_underread_db() + 1e-9,
-                "{} under-read the reference by {worst:.3} dB on {where_worst}, more than \
-                 the {} dB it claims (the limiter's guard band is built from that figure)",
-                ratio.label(),
+                worst.0 <= ratio.worst_underread_db() + 1e-9,
+                "{ratio} under-read a unit tone by {:.3} dB at f_norm {:.3}, more than the \
+                 {} dB its guard band assumes",
+                worst.0,
+                worst.1,
                 ratio.worst_underread_db()
             );
+        }
+    }
+
+    /// Diagnostic table for `docs`: `cargo test -p g6me-core accuracy::table -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic; prints the table the constants in Ratio were set from"]
+    fn table() {
+        println!("under-read in dB vs exact reconstruction (positive = reads low)");
+        println!("band       x2      x4      x8     x16     x32");
+        for fmax in [0.5, 0.45, 0.40] {
+            let mut row = format!("{fmax:<8.2}");
+            for ratio in Ratio::ALL {
+                let (u, _) = noise_error(ratio, fmax, 16);
+                row.push_str(&format!(" {u:+7.3}"));
+            }
+            println!("{row}");
         }
     }
 }

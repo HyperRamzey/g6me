@@ -9,7 +9,9 @@
 use clap::Parser;
 use g6me_core::batch::{self, Batch, BatchCfg, Item, Phase, Progress};
 use g6me_core::limiter::{
-    Cfg as LimiterCfg, MAX_CEILING_DB, MAX_LOOKAHEAD_MS, MIN_CEILING_DB, MIN_LOOKAHEAD_MS,
+    Cfg as LimiterCfg, DEFAULT_ATTACK_MS, DEFAULT_CEILING_DB, DEFAULT_LOOKAHEAD_MS,
+    DEFAULT_RELEASE_MS, MAX_ATTACK_MS, MAX_CEILING_DB, MAX_LOOKAHEAD_MS, MAX_RELEASE_MS,
+    MIN_ATTACK_MS, MIN_CEILING_DB, MIN_LOOKAHEAD_MS, MIN_RELEASE_MS,
 };
 use g6me_core::mask::Slot;
 use g6me_core::meter::Meters;
@@ -59,24 +61,63 @@ pub struct Cli {
     #[arg(long = "true-peak", default_value = "4", value_parser = parse_ratio)]
     pub true_peak: Ratio,
 
-    /// Limit the true peak instead of only reporting it. The last stage before the
-    /// encoder: it holds the real ceiling on the delivered file.
+    /// Setpoint: one number, two effects. The file is trimmed by this many dB and nothing
+    /// in it is left above this many dBTP, so -4 leaves the file 4 dB quieter with a -4
+    /// dBTP ceiling. The trim is a constant gain on every sample; the limiter is then left
+    /// with only the peaks that survive it, which is the cheap way to hold a ceiling.
+    /// Conflicts with --gain and --ceiling, which set the two halves separately.
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_ceiling_db)]
+    pub setpoint: Option<f64>,
+
+    /// Gain staging alone: a constant gain on every sample, in dB, before the limiter.
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_ceiling_db)]
+    pub gain: f64,
+
+    /// Leave the limiter off: a true-peak meter reading and nothing else. The default is
+    /// on, so this is the opt-out rather than the opt-in, and it is the only way to get a
+    /// render that adds neither latency nor level management to the source.
+    #[arg(long)]
+    pub no_limit: bool,
+
+    /// Limit the true peak. On by default now; kept so an existing command line still
+    /// means what it says.
     #[arg(long)]
     pub limit: bool,
 
-    /// Ceiling for --limit, in dBTP (-24 ..= 0).
+    /// True-peak ceiling, in dBTP (-24 ..= 0). Defaults to -3.
     // `allow_negative_numbers` because `--ceiling -1` is how it is typed, and without it
     // clap reads the -1 as a flag and refuses the whole command line.
-    #[arg(long, allow_negative_numbers = true, default_value_t = -1.0, value_parser = parse_ceiling_db)]
-    pub ceiling: f64,
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_ceiling_db)]
+    pub ceiling: Option<f64>,
 
-    /// Lookahead --limit may use, in ms (0.2 ..= 2.0). A deeper filter needs more; what
-    /// was actually used is reported, because a deep filter cannot honour a shallow ask.
-    #[arg(long, default_value_t = 1.0, value_parser = parse_lookahead_ms)]
+    /// Lookahead the transient stage may use, in ms (0.2 ..= 2.0). A deeper filter needs
+    /// more; what was actually used is reported, because a deep filter cannot honour a
+    /// shallow ask and the report says so instead of showing the number you typed.
+    #[arg(long, default_value_t = DEFAULT_LOOKAHEAD_MS, value_parser = parse_lookahead_ms)]
     pub lookahead: f64,
 
-    /// Over-sampling ratio the limiter runs at. Defaults to --true-peak, and lowering it
-    /// widens the guard band the ceiling aims below.
+    /// How fast the slow stage's gain reduction arrives, in ms (1 ..= 200).
+    #[arg(long, default_value_t = DEFAULT_ATTACK_MS, value_parser = parse_attack_ms)]
+    pub attack: f64,
+
+    /// How fast the slow stage lets go, in ms (10 ..= 5000).
+    #[arg(long, default_value_t = DEFAULT_RELEASE_MS, value_parser = parse_release_ms)]
+    pub release: f64,
+
+    /// Channel linking of the transient stage, percent (0 ..= 100). At 100 a peak in one
+    /// channel ducks both; turned down, a short peak is removed only where it is.
+    #[arg(long, default_value_t = 100.0, value_parser = parse_link_pct)]
+    pub link_transient: f64,
+
+    /// Channel linking of the slow stage, percent (0 ..= 100). Worth turning down before
+    /// the transient one: the slow stage moves level over tenths of a second, and a shared
+    /// movement of that length is what pulls a stereo image about.
+    #[arg(long, default_value_t = 75.0, value_parser = parse_link_pct)]
+    pub link_release: f64,
+
+    /// Over-sampling ratio the limiter runs at. Defaults to 8, which is deeper than the
+    /// meter's 4 on purpose: the printed ITU bank reads up to 0.6 dB low on a crest
+    /// between grid points, and a ceiling cannot be held with a meter that low.
     #[arg(long, value_parser = parse_ratio)]
     pub limit_ratio: Option<Ratio>,
 
@@ -317,6 +358,30 @@ int_arg!(parse_part, u32, 256, 65_536, "convolver FFT partition size");
 int_arg!(parse_block, usize, 64, 1_048_576, "block size (--block)");
 int_arg!(parse_queue, usize, 1, 1_024, "queue depth (--queue)");
 
+/// A dB or millisecond value on a stated range, with the range in the message.
+fn parse_span(s: &str, what: &str, lo: f64, hi: f64) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("'{s}' is not a {what}"))?;
+    if !v.is_finite() || !(lo..=hi).contains(&v) {
+        return Err(format!("{what} must be {lo}..={hi}, got {v}"));
+    }
+    Ok(v)
+}
+
+fn parse_attack_ms(s: &str) -> Result<f64, String> {
+    parse_span(s, "attack time in ms", MIN_ATTACK_MS, MAX_ATTACK_MS)
+}
+
+fn parse_release_ms(s: &str) -> Result<f64, String> {
+    parse_span(s, "release time in ms", MIN_RELEASE_MS, MAX_RELEASE_MS)
+}
+
+/// Linking as a percentage, because that is what a limiter panel shows. `0.5` is refused
+/// rather than quietly read as half a percent: the ambiguous reading is the one that
+/// surprises, so the range says which of the two it wants.
+fn parse_link_pct(s: &str) -> Result<f64, String> {
+    parse_span(s, "channel linking in percent (0..=100)", 0.0, 100.0)
+}
+
 fn parse_precision_bits(s: &str) -> Result<f64, String> {
     let v: f64 = s
         .parse()
@@ -387,6 +452,22 @@ fn parse_threads(s: &str) -> Result<usize, String> {
 impl Cli {
     /// Translate the command line into the render configuration.
     pub fn render_cfg(&self) -> Result<RenderCfg, String> {
+        // One number meaning two things cannot also be argued with. `--setpoint -4` says
+        // "trim by 4 and cap at 4"; if either half is also spelled out, the command line
+        // has two opinions about the same file, so it fails rather than picking one.
+        if let Some(sp) = self.setpoint {
+            if self.ceiling.is_some() || self.gain != 0.0 {
+                return Err(format!(
+                    "--setpoint {sp:+.2} already sets both the gain and the ceiling; \
+                     drop it, or drop --gain/--ceiling and set the two halves separately"
+                ));
+            }
+        }
+        if self.no_limit && (self.limit || self.setpoint.is_some()) {
+            return Err(
+                "--no-limit cannot be combined with --limit or --setpoint, which both ask for a limiter".into(),
+            );
+        }
         let format = match self.format.as_str() {
             "wav" => OutFormat::Wav,
             _ => OutFormat::Flac { level: self.level },
@@ -431,12 +512,17 @@ impl Cli {
                 filter_threads: None,
             },
             order: self.order.clone(),
+            output_gain_db: self.setpoint.unwrap_or(self.gain),
             true_peak: self.true_peak,
             limiter: LimiterCfg {
-                enable: self.limit,
-                ceiling_db: self.ceiling,
-                ratio: self.limit_ratio.unwrap_or(self.true_peak),
+                enable: !self.no_limit,
+                ceiling_db: self.ceiling.unwrap_or(DEFAULT_CEILING_DB),
+                ratio: self.limit_ratio.unwrap_or_default(),
                 lookahead_ms: self.lookahead,
+                attack_ms: self.attack,
+                release_ms: self.release,
+                link_transient: self.link_transient / 100.0,
+                link_release: self.link_release / 100.0,
             },
             block: self.block,
             queue_blocks: self.queue,

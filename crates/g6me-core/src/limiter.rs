@@ -44,9 +44,10 @@
 //!
 //! [`Cfg::lookahead_samples`] applies that floor, and [`Cfg::effective_lookahead_ms`]
 //! reports what was actually used: a request below the floor is raised, never
-//! silently honoured short. At 48 kHz and x4 the floor is 0.24 ms, so the whole
-//! 0.2–2.0 ms range is available on the common settings; at 8 kHz with x32 it rises
-//! to 1.05 ms and the report says so.
+//! silently honoured short. At 48 kHz and x8 (the default) the floor is 29 samples,
+//! 0.60 ms, so the 1 ms default fits and a 0.2 ms request is raised to 0.60 ms; the
+//! Kaiser banks have a 25-sample group delay because their transition band is narrow
+//! (see [`crate::tp::BAND_EDGE`]). The report says so whenever it happens.
 //!
 //! ## When it is off
 //!
@@ -97,6 +98,52 @@ pub const MIN_LOOKAHEAD_MS: f64 = 0.2;
 /// the gain envelope rather than as protection.
 pub const MAX_LOOKAHEAD_MS: f64 = 2.0;
 
+/// Lookahead the UI and CLI start with. Two ms is the top of the range on purpose:
+/// with a 26-frame-deep x8 side chain there is nothing to gain from less, and the
+/// slower the arrival, the less the gain movement itself makes new inter-sample peaks.
+pub const DEFAULT_LOOKAHEAD_MS: f64 = 2.0;
+
+/// Ceiling the UI and CLI start with, dBTP.
+pub const DEFAULT_CEILING_DB: f64 = -3.0;
+
+/// Shortest attack for the slow stage. Below about this the "slow" stage is catching
+/// peaks, which is the fast stage's job, and the two stop meaning anything.
+pub const MIN_ATTACK_MS: f64 = 1.0;
+/// Longest attack for the slow stage.
+pub const MAX_ATTACK_MS: f64 = 200.0;
+/// Attack the UI and CLI start with, ms.
+pub const DEFAULT_ATTACK_MS: f64 = 60.0;
+/// Shortest release for the slow stage, ms.
+pub const MIN_RELEASE_MS: f64 = 10.0;
+/// Longest release for the slow stage, ms.
+pub const MAX_RELEASE_MS: f64 = 5_000.0;
+/// Release the UI and CLI start with, ms.
+pub const DEFAULT_RELEASE_MS: f64 = 900.0;
+/// Channel linking of the fast stage at the default. Full linking means a short peak
+/// in one channel ducks both; the honest reason to turn it down is that a peak only in
+/// one channel is nearly inaudible if it is removed only in that channel.
+pub const DEFAULT_LINK_TRANSIENT: f64 = 1.0;
+/// Channel linking of the slow stage at the default. The slow stage moves level over
+/// seconds, so it is the one that can wreck a stereo image, and 75 % leaves a little of
+/// each channel's own dynamics standing.
+pub const DEFAULT_LINK_RELEASE: f64 = 0.75;
+
+/// Window the slow stage measures its level over, in ms, and not a control.
+///
+/// It is what separates "a peak" from "a level": below this the slow stage is a second
+/// peak limiter, above it the stage starts arriving late to the thing it is meant to be
+/// smoothing. Exposing it would let the user set attack and release against a reference
+/// that also moves, so it is fixed and stated here.
+pub const RELEASE_WINDOW_MS: f64 = 5.0;
+
+/// How fast the fast stage is allowed to let go, in ms.
+///
+/// The scheduler already decides *when* the gain has to be back up; this is only what
+/// stops that return from being a step. It is short because the slow stage exists: level
+/// recovery is no longer this stage's job, so holding on for 120 ms after every peak
+/// would be the slow stage's behaviour charged twice.
+pub const TRANSIENT_RELEASE_MS: f64 = 25.0;
+
 /// Settings for the true-peak limiter.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cfg {
@@ -107,18 +154,51 @@ pub struct Cfg {
     /// Over-sampling ratio of the side chain and of the post-limiter measurement.
     pub ratio: Ratio,
     /// Requested lookahead in ms, clamped to [`MIN_LOOKAHEAD_MS`]..=[`MAX_LOOKAHEAD_MS`].
+    ///
+    /// This is the *transient* stage's lookahead, and only its: a peak is not protected by
+    /// the slow stage no matter how long its attack is.
     pub lookahead_ms: f64,
+    /// How fast the slow stage's gain reduction arrives, ms.
+    ///
+    /// Short attack means the slow stage sets in sooner and takes more of the level; long
+    /// attack means it arrives after the thing it was reacting to, which is another way of
+    /// saying it does less. Nothing about this protects a peak — see [`Cfg::lookahead_ms`].
+    pub attack_ms: f64,
+    /// How fast the slow stage lets go, ms.
+    pub release_ms: f64,
+    /// Channel linking of the transient stage, 0.0 to 1.0.
+    ///
+    /// 1.0 is one gain for every channel, 0.0 is each channel for itself. Between the two
+    /// the two gains are mixed in the dB domain, so the control does what it says at every
+    /// value rather than only at the ends.
+    pub link_transient: f64,
+    /// Channel linking of the slow stage, 0.0 to 1.0. Same blending as
+    /// [`Cfg::link_transient`], and the one worth turning down first, because a slow gain
+    /// movement shared across the image moves the image.
+    pub link_release: f64,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
         Self {
-            enable: false,
-            // -1 dBTP: the value a delivery spec asks for when it asks for anything,
-            // and far enough below 0 that a consumer's own 4x resampler cannot clip.
-            ceiling_db: -1.0,
-            ratio: Ratio::X4,
-            lookahead_ms: 1.0,
+            // On by default, unlike every other stage in here, because a limiter with a
+            // ceiling below full scale cannot make a file louder than it was and the
+            // default output is a delivery. The cost is stated in the README: a default
+            // render is not bit-transparent, and it is `latency_samples` longer than the
+            // source. `enable: false` still gives the bit-exact path, hash and all.
+            enable: true,
+            // -3 dBTP: below the -1 that a delivery spec asks for, with room for the
+            // ~0.1 dB of new inter-sample peak that the gain movement itself creates.
+            ceiling_db: DEFAULT_CEILING_DB,
+            // x8, not the meter's x4: the printed ITU bank has no transition band and no
+            // peak refinement, and reads up to 0.6 dB low on a crest between grid points.
+            // See the table in `crate::tp`.
+            ratio: Ratio::X8,
+            lookahead_ms: DEFAULT_LOOKAHEAD_MS,
+            attack_ms: DEFAULT_ATTACK_MS,
+            release_ms: DEFAULT_RELEASE_MS,
+            link_transient: DEFAULT_LINK_TRANSIENT,
+            link_release: DEFAULT_LINK_RELEASE,
         }
     }
 }
@@ -149,7 +229,41 @@ impl Cfg {
                 self = self.lookahead_ms
             ));
         }
+        for (name, v, lo, hi) in [
+            ("attack", self.attack_ms, MIN_ATTACK_MS, MAX_ATTACK_MS),
+            ("release", self.release_ms, MIN_RELEASE_MS, MAX_RELEASE_MS),
+        ] {
+            if !(v.is_finite() && v >= lo && v <= hi) {
+                return Err(format!("{name} must be between {lo} and {hi} ms (got {v})"));
+            }
+        }
+        for (name, v) in [
+            ("transient link", self.link_transient),
+            ("release link", self.link_release),
+        ] {
+            if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                return Err(format!(
+                    "{name} must be between 0 and 1 (got {v}; it is a fraction, so 75 % is 0.75)"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// One-pole coefficient for a time constant of `ms` at `rate`.
+    ///
+    /// Written as `exp(-1/tau_samples)` and applied as `v += (target - v) * (1 - coef)`,
+    /// which is the form that reaches `target` instead of creeping towards it, and whose
+    /// step response is the stated time constant rather than something near it.
+    #[must_use]
+    pub fn coef(&self, ms: f64, rate: u32) -> f64 {
+        (-1.0 / (ms * 1e-3 * rate as f64)).exp()
+    }
+
+    /// Frames of the [`RELEASE_WINDOW_MS`] peak-hold the slow stage measures over.
+    #[must_use]
+    pub fn release_window(&self, rate: u32) -> usize {
+        (RELEASE_WINDOW_MS * 1e-3 * rate as f64).round() as usize
     }
 
     /// Lookahead in samples before the floor is applied.
@@ -174,7 +288,7 @@ impl Cfg {
     /// rests on, not a hope.
     #[must_use]
     pub fn min_lookahead_samples(&self) -> usize {
-        self.ratio.group_delay().ceil() as usize + MIN_RAMP_FRAMES + 1
+        self.ratio.report_delay() + MIN_RAMP_FRAMES + 1
     }
 
     /// Lookahead actually used, after the floor.
@@ -193,6 +307,21 @@ impl Cfg {
         self.ratio.worst_underread_db() + GAIN_SLEW_GUARD_DB
     }
 
+    /// How much further past the ceiling a file can land when its content is **not**
+    /// band-limited to [`crate::tp::BAND_EDGE`]: the full-band under-read minus the part
+    /// [`Cfg::guard_db`] already covers.
+    ///
+    /// The guard is built from the error measured for content up to 0.45 fs, which is all
+    /// of real programme material (a 48 kHz file with energy above 21.6 kHz is noise or a
+    /// test signal). Between 0.45 fs and fs/2 no finite meter is accurate, and at fs/2
+    /// the samples do not determine the peak, so a ceiling is honest only as
+    /// `ceiling (+ caveat for such content)`. The report states the number rather than
+    /// letting `post_dbtp <= ceiling` imply more than it can know.
+    #[must_use]
+    pub fn band_caveat_db(&self) -> f64 {
+        (self.ratio.fullband_underread_db() - self.ratio.worst_underread_db()).max(0.0)
+    }
+
     /// Frames over which the gain is allowed to fall, and the reason lookahead is
     /// audible: the ramp is whatever the lookahead can spare after the interpolator's
     /// memory, capped at [`ATTACK_MS`].
@@ -208,7 +337,7 @@ impl Cfg {
         // neighbourhood value that can still deepen it is already known, and that
         // leaves `lookahead - delta - 1` frames of ramp.
         let room = la
-            .saturating_sub(self.ratio.group_delay().ceil() as usize)
+            .saturating_sub(self.ratio.report_delay())
             .saturating_sub(1);
         let preferred = (ATTACK_MS * 1e-3 * rate as f64).round() as usize;
         room.max(MIN_RAMP_FRAMES)
@@ -233,7 +362,7 @@ impl Cfg {
     /// because the gain for a sample comes from a peak the detector emits late.
     #[must_use]
     pub fn latency_samples(&self, rate: u32) -> usize {
-        self.lookahead_samples(rate) + self.ratio.group_delay().ceil() as usize
+        self.lookahead_samples(rate) + self.ratio.report_delay()
     }
 }
 
@@ -262,15 +391,45 @@ pub struct Report {
     pub latency_samples: usize,
     /// Frames the gain ramp takes in force.
     pub ramp_frames: usize,
+    /// Slow stage attack in force, ms.
+    #[serde(default)]
+    pub attack_ms: f64,
+    /// Slow stage release in force, ms.
+    #[serde(default)]
+    pub release_ms: f64,
+    /// Transient stage channel linking in force, 0..=1.
+    #[serde(default)]
+    pub link_transient: f64,
+    /// Slow stage channel linking in force, 0..=1.
+    #[serde(default)]
+    pub link_release: f64,
+    /// Largest reduction taken by the fast stage on its own, dB.
+    #[serde(default)]
+    pub transient_reduction_db: f64,
+    /// Largest reduction taken by the slow stage on its own, dB.
+    #[serde(default)]
+    pub release_reduction_db: f64,
+    /// Frames the slow stage was holding gain below unity — the number that says how
+    /// much of this file was level-managed rather than peak-protected.
+    #[serde(default)]
+    pub release_frames: u64,
     /// Side-chain ratio.
     pub ratio: Ratio,
     /// Frames of gain history observed (0 when the limiter never engaged).
     pub engaged_frames: u64,
+    /// Extra dB by which full-band content (energy above 0.45 fs) can exceed the ceiling.
+    /// See [`Cfg::band_caveat_db`].
+    #[serde(default)]
+    pub band_caveat_db: f64,
 }
 
 impl Report {
-    /// Did the output respect the ceiling? Tolerance covers the meter's own
-    /// quantisation, not a real overshoot.
+    /// Did the limiter's **own detector** read its output at or below the ceiling?
+    ///
+    /// This is the control loop grading itself: the gain was chosen with this detector and
+    /// `post_dbtp` is measured with it, so a `true` here can only confirm the limiter's
+    /// belief. It is a unit-test oracle and a sanity check, not evidence. The delivered
+    /// file is checked by an independent meter in `pipeline::Report::verified`.
     #[must_use]
     pub fn within_ceiling(&self) -> bool {
         self.post_dbtp <= self.ceiling_db
@@ -311,16 +470,40 @@ pub struct Limiter {
     delta: usize,
     /// Frames per slot ring.
     ring_len: usize,
-    /// Required gain per input frame, and the scheduled gain, on the same ring.
-    req_ring: Vec<f64>,
-    sched_ring: Vec<f64>,
+    /// One frame of scratch, reused so `process` allocates nothing per block.
+    scratch: Vec<f64>,
+    /// Required transient gain per input frame per channel, and the scheduled gain, on
+    /// the same ring.
+    req_ring: Vec<Vec<f64>>,
+    sched_ring: Vec<Vec<f64>>,
+    /// Slow stage gain per input frame, on the same ring, so the frame that is emitted
+    /// gets the slow gain that belonged to it rather than the one in force now.
+    gr_ring: Vec<Vec<f64>>,
     /// Frames fed to the side chain, and the first input frame not yet scheduled.
     fed: u64,
     scheduled: u64,
-    /// Gain in force after the release follower.
-    gain: f64,
-    /// One-pole release coefficient.
+    /// Per-channel transient gain, after the return-to-unity follower.
+    gain: Vec<f64>,
+    /// Per-channel slow gain, following its own attack and release.
+    g_rel: Vec<f64>,
+    /// Slow gain for the group, before linking.
+    g_rel_group: f64,
+    /// Slow stage level detector: the peak-hold, and frames left in its window.
+    hold: Vec<f64>,
+    hold_left: usize,
+    /// What the level detector demands of the slow stage, before attack and release.
+    g_target: Vec<f64>,
+    g_target_group: f64,
+    /// Linked slow gain of the frame being fed, reused so the step allocates nothing.
+    gr_now: Vec<f64>,
+    /// One-pole coefficient for the transient stage's return to unity.
     release_coef: f64,
+    /// Slow stage coefficients, and the hold window length.
+    atk_coef: f64,
+    slow_rel_coef: f64,
+    release_window: usize,
+    /// Scratch for the per-frame peaks, reused so the step allocates nothing.
+    peaks: Vec<f64>,
     /// Fastest gain change allowed per frame, in linear terms.
     slope: f64,
     /// Amplitude the gain aims at — the ceiling less [`Cfg::guard_db`].
@@ -329,13 +512,30 @@ pub struct Limiter {
     engaged: bool,
 }
 
+/// Mix two gains in the dB domain: `w` of `b`, the remainder of `a`.
+///
+/// Mixed in the log domain so that 0.5 means half the *reduction* rather than half the
+/// amplitude, and so that 1.0 is exactly `b` with no residue of `a` left in it. Both
+/// inputs are at most 1.0, so the result never asks for a boost.
+fn blend(a: f64, b: f64, w: f64) -> f64 {
+    let la = a.max(f64::MIN_POSITIVE).ln();
+    let lb = b.max(f64::MIN_POSITIVE).ln();
+    (la + (lb - la) * w).exp()
+}
+
 impl Limiter {
     /// A limiter that does nothing and adds no delay. Cheaper than configuring one
     /// off, and it is what the pipeline uses when `enable` is false.
     #[must_use]
     pub fn disabled() -> Self {
         Self {
-            cfg: Cfg::default(),
+            // Explicitly off, not `Cfg::default()`: the default is on now, and a limiter
+            // built to do nothing has to say so in its own config too, because `process`
+            // and `flush` both read `enable` before they touch state that was never sized.
+            cfg: Cfg {
+                enable: false,
+                ..Cfg::default()
+            },
             rate: 48_000,
             side: Vec::new(),
             out_meter: TruePeak::new(Ratio::X4, 0),
@@ -344,11 +544,24 @@ impl Limiter {
             latency: 0,
             delta: 0,
             ring_len: 0,
+            scratch: Vec::new(),
             req_ring: Vec::new(),
             sched_ring: Vec::new(),
+            gr_ring: Vec::new(),
             fed: 0,
             scheduled: 0,
-            gain: 1.0,
+            gain: Vec::new(),
+            g_rel: Vec::new(),
+            g_rel_group: 1.0,
+            hold: Vec::new(),
+            hold_left: 0,
+            g_target: Vec::new(),
+            g_target_group: 1.0,
+            gr_now: Vec::new(),
+            peaks: Vec::new(),
+            atk_coef: 0.5,
+            slow_rel_coef: 0.5,
+            release_window: 1,
             release_coef: 1.0,
             slope: 1.0,
             ceiling_lin: 1.0,
@@ -359,7 +572,7 @@ impl Limiter {
 
     #[must_use]
     pub fn enabled(cfg: Cfg, rate: u32, channels: usize) -> Self {
-        let delta = cfg.ratio.group_delay().ceil() as usize;
+        let delta = cfg.ratio.report_delay();
         let _lookahead = cfg.lookahead_samples(rate);
         let latency = cfg.latency_samples(rate);
         let ramp = cfg.ramp_frames(rate);
@@ -377,14 +590,26 @@ impl Limiter {
             latency,
             delta,
             ring_len,
-            req_ring: vec![1.0; ring_len],
-            sched_ring: vec![1.0; ring_len],
+            scratch: Vec::with_capacity(channels),
+            req_ring: vec![vec![1.0; ring_len]; channels.max(1)],
+            sched_ring: vec![vec![1.0; ring_len]; channels.max(1)],
+            gr_ring: vec![vec![1.0; ring_len]; channels.max(1)],
             fed: 0,
             scheduled: 0,
-            gain: 1.0,
-            // One-pole release: g += (1 - g) * (1 - coef), so the gain returns to
-            // unity without a step.
-            release_coef: (-1.0 / (RELEASE_MS * 1e-3 * rate as f64)).exp(),
+            gain: vec![1.0; channels.max(1)],
+            g_rel: vec![1.0; channels.max(1)],
+            g_rel_group: 1.0,
+            hold: vec![0.0; channels.max(1)],
+            hold_left: cfg.release_window(rate).max(1),
+            g_target: vec![1.0; channels.max(1)],
+            g_target_group: 1.0,
+            gr_now: vec![1.0; channels.max(1)],
+            peaks: vec![0.0; channels.max(1)],
+            atk_coef: cfg.coef(cfg.attack_ms, rate),
+            slow_rel_coef: cfg.coef(cfg.release_ms, rate),
+            release_window: cfg.release_window(rate).max(1),
+            // One-pole return to unity for the fast stage: g += (1 - g) * (1 - coef).
+            release_coef: cfg.coef(TRANSIENT_RELEASE_MS, rate),
             slope: 1.0 / ramp as f64,
             ceiling_lin: 10f64.powf((cfg.ceiling_db - cfg.guard_db()) / 20.0),
             report: Report {
@@ -395,11 +620,19 @@ impl Limiter {
                 latency_ms: latency as f64 / rate as f64 * 1e3,
                 latency_samples: latency,
                 ramp_frames: ramp,
+                attack_ms: cfg.attack_ms,
+                release_ms: cfg.release_ms,
+                link_transient: cfg.link_transient,
+                link_release: cfg.link_release,
                 ratio: cfg.ratio,
                 pre_dbtp: f64::NEG_INFINITY,
                 post_dbtp: f64::NEG_INFINITY,
                 max_gain_reduction_db: 0.0,
+                transient_reduction_db: 0.0,
+                release_reduction_db: 0.0,
+                release_frames: 0,
                 engaged_frames: 0,
+                band_caveat_db: cfg.band_caveat_db(),
             },
             engaged: false,
         }
@@ -467,29 +700,29 @@ impl Limiter {
         // travel is worth at least 1.0 by the time it arrives, and 1.0 is no limiting
         // at all. Reading the slot at `limit` instead would read an index that was
         // never written, which is the ring-buffer mistake to make here.
-        let mut acc = 1.0f64;
-        for m in (self.scheduled..limit).rev() {
-            // Pass 2: the gain has to sit at the required depth across the whole
-            // neighbourhood the peak is built from, not just at its own frame.
-            let lo = m.saturating_sub(delta);
-            let mut ga = 1.0f64;
-            for k in lo..=(m + delta) {
-                let v = self.req_ring[self.slot(k)];
-                if v < ga {
-                    ga = v;
+        for c in 0..self.req_ring.len() {
+            // Seeded per channel: each channel ramps to its own demand.
+            let mut acc = 1.0f64;
+            for m in (self.scheduled..limit).rev() {
+                // Pass 2: the gain has to sit at the required depth across the whole
+                // neighbourhood the peak is built from, not just at its own frame.
+                let lo = m.saturating_sub(delta);
+                let mut ga = 1.0f64;
+                for k in lo..=(m + delta) {
+                    let v = self.req_ring[c][self.slot(k)];
+                    if v < ga {
+                        ga = v;
+                    }
                 }
-            }
-            // Pass 3: arrive at that depth no faster than `slope` per frame.
-            acc = ga.min(acc + slope).clamp(0.0, 1.0);
-            let slot = self.slot(m);
-            self.sched_ring[slot] = acc;
-            if acc < 1.0 {
-                if !self.engaged {
-                    self.engaged = true;
-                }
-                let gr = -20.0 * acc.max(f64::MIN_POSITIVE).log10();
-                if gr > self.report.max_gain_reduction_db {
-                    self.report.max_gain_reduction_db = gr;
+                // Pass 3: arrive at that depth no faster than `slope` per frame.
+                acc = ga.min(acc + slope).clamp(0.0, 1.0);
+                let slot = self.slot(m);
+                self.sched_ring[c][slot] = acc;
+                if acc < 1.0 {
+                    let gr = -20.0 * acc.max(f64::MIN_POSITIVE).log10();
+                    if gr > self.report.transient_reduction_db {
+                        self.report.transient_reduction_db = gr;
+                    }
                 }
             }
         }
@@ -498,21 +731,200 @@ impl Limiter {
 
     /// The release follower: fall instantly onto the schedule (which is itself
     /// slope-limited, so this is not a step), rise one-pole toward unity.
-    fn advance_gain(&mut self, target: f64) {
-        let g = self.gain;
-        self.gain = if target < g {
+    fn advance_gain(&mut self, c: usize, target: f64) {
+        let g = self.gain[c];
+        self.gain[c] = if target < g {
             target
         } else {
             (g + (1.0 - g) * (1.0 - self.release_coef)).min(target)
         };
-        if self.gain < 1.0 {
-            self.report.engaged_frames += 1;
+    }
+
+    /// One frame in, one (delayed) frame out. `frame` holds one input sample per channel
+    /// and is overwritten with the output sample per channel.
+    ///
+    /// This is the whole per-frame algorithm. [`Limiter::process`] calls it once per input
+    /// frame and [`Limiter::flush`] calls it once per frame of tail with a zero input, so
+    /// the end of a file takes exactly the path the middle of it does. The previous
+    /// `flush` re-implemented the delay line by hand and never pushed the last `delta`
+    /// input frames through the side chain, so a peak in the final few milliseconds was
+    /// never scheduled for and could leave the file above the ceiling.
+    /// One frame through the side chain and the delay line.
+    ///
+    /// Two stages, as every serious limiter has: a fast one that has to be at depth by the
+    /// time a peak arrives, and a slow one that responds to level over tenths of a second.
+    /// They multiply, and the fast one is handed the *residual* need — what the slow stage
+    /// has not already taken — so a loud passage is managed once instead of twice.
+    fn step(&mut self, frame: &mut [f64]) {
+        let nch = frame.len();
+        let latency = self.latency;
+
+        // --- pass 1: per-channel true peak of the frame the side chain reports ---------
+        // Measured per channel, because the two link controls exist to decide how much of
+        // one channel's trouble becomes the others'.
+        for (side, (peak, x)) in self
+            .side
+            .iter_mut()
+            .zip(self.peaks.iter_mut().zip(frame.iter()))
+        {
+            *peak = side.push(*x);
         }
+        self.fed += 1;
+
+        // --- slow stage: a peak-hold window, then attack and release on the gain -------
+        // The window is what makes this a level detector rather than a second peak
+        // detector. The followers run every frame and not once per window, so the time
+        // constants on the panel are the time constants rather than those divided by the
+        // window length.
+        for c in 0..nch {
+            if self.peaks[c] > self.hold[c] {
+                self.hold[c] = self.peaks[c];
+            }
+        }
+        self.hold_left = self.hold_left.saturating_sub(1);
+        if self.hold_left == 0 {
+            self.hold_left = self.release_window.max(1);
+            let aim_db = 20.0 * self.ceiling_lin.max(f64::MIN_POSITIVE).log10();
+            let mut group = f64::NEG_INFINITY;
+            for c in 0..nch {
+                let lvl = 20.0 * self.hold[c].max(f64::MIN_POSITIVE).log10();
+                if lvl > group {
+                    group = lvl;
+                }
+                // Reduction the level demands, never a boost: the ceiling is a limit, and
+                // a slow stage that could raise the level is an expander wearing its clothes.
+                self.g_target[c] = 10f64.powf((aim_db - lvl).min(0.0) / 20.0);
+                self.hold[c] = 0.0;
+            }
+            self.g_target_group = 10f64.powf((aim_db - group).min(0.0) / 20.0);
+        }
+        let atk = 1.0 - self.atk_coef;
+        let rel = 1.0 - self.slow_rel_coef;
+        for c in 0..nch {
+            let t = self.g_target[c];
+            let g = self.g_rel[c];
+            self.g_rel[c] = if t < g {
+                g + (t - g) * atk
+            } else {
+                g + (t - g) * rel
+            };
+        }
+        let tg = self.g_target_group;
+        let gg = self.g_rel_group;
+        self.g_rel_group = if tg < gg {
+            gg + (tg - gg) * atk
+        } else {
+            gg + (tg - gg) * rel
+        };
+        let mut slow_min = 1.0f64;
+        for c in 0..nch {
+            let gr = blend(self.g_rel[c], self.g_rel_group, self.cfg.link_release);
+            self.gr_now[c] = gr;
+            if gr < slow_min {
+                slow_min = gr;
+            }
+        }
+        if slow_min < 1.0 {
+            self.report.release_frames += 1;
+            let db = -20.0 * slow_min.max(f64::MIN_POSITIVE).log10();
+            if db > self.report.release_reduction_db {
+                self.report.release_reduction_db = db;
+            }
+        }
+
+        // --- required transient gain, on the frame the peaks actually describe ----------
+        // The detector reports a peak `delta` frames after the input frame it describes,
+        // and the first `delta` feeds describe nothing yet. Computed *after* the slow
+        // stage and against what is left of the peak once that stage has had it.
+        if self.fed > self.delta as u64 {
+            let m = self.fed - 1 - self.delta as u64;
+            let slot = self.slot(m);
+            let mut group = 1.0f64;
+            for c in 0..nch {
+                let after = (self.peaks[c] * self.gr_now[c]).max(f64::MIN_POSITIVE);
+                let req = if after > self.ceiling_lin {
+                    self.ceiling_lin / after
+                } else {
+                    1.0
+                };
+                self.req_ring[c][slot] = req;
+                self.gr_ring[c][slot] = self.gr_now[c];
+                if req < group {
+                    group = req;
+                }
+            }
+            if self.cfg.link_transient > 0.0 {
+                for c in 0..nch {
+                    let own = self.req_ring[c][slot];
+                    self.req_ring[c][slot] = blend(own, group, self.cfg.link_transient);
+                }
+            }
+        }
+
+        // A frame's schedule can still be deepened by input arriving up to `2 * delta`
+        // frames later (its own neighbourhood reaches `delta` ahead, and the peak it
+        // protects is reported `delta` late), so it is final only once that input is in.
+        let limit = self.fed.saturating_sub(self.delta as u64 * 2);
+        self.schedule_to(limit);
+
+        // --- emit one frame: the delay line, scaled by transient gain times slow gain ---
+        // The frame coming out is input frame `fed - 1 - latency`, and its schedule is
+        // already final because the scheduling cursor trails the feed by `2 * delta` while
+        // the emission cursor trails it by `latency`, larger by construction.
+        let j = self.fed.saturating_sub(latency as u64 + 1);
+        let jslot = self.slot(j);
+        let live = self.fed > latency as u64;
+        for c in 0..nch {
+            let target = if live {
+                self.sched_ring[c][jslot].clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            self.advance_gain(c, target);
+        }
+        let slot = self.pos;
+        let mut deepest = 1.0f64;
+        // Zipped rather than indexed, but still strictly ascending in channel order: the
+        // order is not an optimisation detail here, it is how the linked gains were
+        // combined a few lines above, and the two have to agree.
+        let Self {
+            gain,
+            gr_ring,
+            lines,
+            ..
+        } = self;
+        for ((g, ring), (line, buf)) in gain
+            .iter()
+            .zip(gr_ring.iter())
+            .zip(lines.iter_mut().zip(frame.iter_mut()))
+        {
+            let g = *g * ring[jslot];
+            let old = line[slot];
+            line[slot] = *buf;
+            *buf = old * g;
+            if g < deepest {
+                deepest = g;
+            }
+        }
+        if deepest < 1.0 {
+            if !self.engaged {
+                self.engaged = true;
+            }
+            self.report.engaged_frames += 1;
+            let db = -20.0 * deepest.max(f64::MIN_POSITIVE).log10();
+            if db > self.report.max_gain_reduction_db {
+                self.report.max_gain_reduction_db = db;
+            }
+        }
+        self.pos = if slot + 1 >= latency.max(1) {
+            0
+        } else {
+            slot + 1
+        };
     }
 
     /// Process one block of planar samples in place. Every channel in `planar` must be
     /// the same length.
-    /// # Input
     ///
     /// One mutable slice per channel, all the same length, processed in place. Slices
     /// rather than `Vec`s because the render loop hands over a window of buffers it
@@ -528,63 +940,22 @@ impl Limiter {
             "ragged block into the limiter"
         );
         let nch = self.side.len().min(planar.len());
-        let latency = self.latency;
+        let mut frame = std::mem::take(&mut self.scratch);
+        frame.clear();
+        frame.resize(nch, 0.0);
         for i in 0..n {
-            // --- pass 1: linked required gain for the frame the side chain reports --
-            let mut peak = 0.0f64;
-            for (det, buf) in self.side[..nch].iter_mut().zip(planar.iter()) {
-                let p = det.push(buf[i]);
-                if p > peak {
-                    peak = p;
-                }
+            for (f, buf) in frame.iter_mut().zip(planar.iter()) {
+                *f = buf[i];
             }
-            self.fed += 1;
-            // The detector reports a peak `delta` frames after the input frame it
-            // describes; the first `delta` feeds describe nothing yet.
-            if self.fed > self.delta as u64 {
-                let m = self.fed - 1 - self.delta as u64;
-                let req = if peak > self.ceiling_lin {
-                    self.ceiling_lin / peak
-                } else {
-                    1.0
-                };
-                let slot = self.slot(m);
-                self.req_ring[slot] = req;
+            self.step(&mut frame);
+            for (f, buf) in frame.iter().zip(planar.iter_mut()) {
+                buf[i] = *f;
             }
-
-            // A frame's schedule can still be deepened by input arriving up to
-            // `2 * delta` frames later (its own neighbourhood reaches `delta` ahead,
-            // and the peak it protects is reported `delta` late), so it is final only
-            // once that input has been fed.
-            let limit = self.fed.saturating_sub(self.delta as u64 * 2);
-            self.schedule_to(limit);
-
-            // --- emit one frame: the delay line, scaled by the follower's gain --
-            // The frame coming out is input frame `fed - 1 - latency`, and its
-            // schedule is already final because the scheduling cursor trails the feed
-            // by `2 * delta` while the emission cursor trails it by `latency`, which
-            // is larger by construction (Cfg::min_lookahead_samples).
-            let j = self.fed.saturating_sub(latency as u64 + 1);
-            let target = if self.fed > latency as u64 {
-                self.sched_ring[self.slot(j)].clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            self.advance_gain(target);
-            let g = self.gain;
-            let slot = self.pos;
-            for (line, buf) in self.lines[..nch].iter_mut().zip(planar.iter_mut()) {
-                let old = line[slot];
-                line[slot] = buf[i];
-                buf[i] = old * g;
-            }
-            self.pos = if slot + 1 >= latency.max(1) {
-                0
-            } else {
-                slot + 1
-            };
         }
-        // Measure what came out, with the detector the ceiling was judged by.
+        self.scratch = frame;
+        // Measure what came out, with the detector the ceiling was judged by. This is the
+        // control loop's own belief about its output; the pipeline measures the delivered
+        // stream with a different instrument (see `pipeline::PeakStage`).
         for (c, buf) in planar[..nch].iter().enumerate() {
             self.out_meter.push_ch(c, &buf[..n]);
         }
@@ -593,47 +964,26 @@ impl Limiter {
     /// Drain the delay line at end of file, returning the trailing frames. They are
     /// real output — the last `latency` samples of a limited file live here — and
     /// dropping them would shorten every limited render.
+    ///
+    /// Runs [`Limiter::step`] on silence for `latency` frames, which pushes the last real
+    /// frames through the side chain (so their peaks are scheduled for) and emits them
+    /// through the same delay line and gain follower as every other frame.
     pub fn flush(&mut self) -> Vec<Vec<f64>> {
         if !self.cfg.enable {
             return Vec::new();
         }
         let nch = self.lines.len().min(self.side.len());
-        let latency = self.latency;
-        // After the last sample the signal is silence: say so on the ring, or the
-        // slots the tail reads are whatever was there `ring_len` frames ago.
-        for m in self.fed..(self.fed + self.delta as u64 * 2 + latency as u64 + 2) {
-            let slot = self.slot(m);
-            self.req_ring[slot] = 1.0;
-        }
-        self.schedule_to(self.fed + self.delta as u64 * 2 + latency as u64 + 1);
-        let mut out = vec![Vec::new(); nch];
-        for _ in 0..latency {
-            let j = self.fed.saturating_sub(latency as u64 + 1);
-            let target = if self.fed > latency as u64 {
-                self.sched_ring[self.slot(j)].clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            self.advance_gain(target);
-            self.fed += 1;
-            let slot = self.pos;
-            for (line, o) in self.lines[..nch].iter_mut().zip(out.iter_mut()) {
-                let old = line[slot];
-                line[slot] = 0.0;
-                o.push(old * self.gain);
+        let mut frame = vec![0.0f64; nch];
+        let mut out = vec![Vec::with_capacity(self.latency); nch];
+        for _ in 0..self.latency {
+            frame.fill(0.0);
+            self.step(&mut frame);
+            for (o, &v) in out.iter_mut().zip(frame.iter()) {
+                o.push(v);
             }
-            self.pos = if slot + 1 >= latency.max(1) {
-                0
-            } else {
-                slot + 1
-            };
         }
-        // The tail is programme, not debris: it is the last `latency` frames of the
-        // file, delayed, and a peak can absolutely live in it. Measuring only what
-        // `process` emitted would report the post-limiter true peak of everything
-        // except the end of the file, which is exactly where a limiter's own report has
-        // to be right — so the tail goes through the same detector the ceiling was
-        // judged by before the report is allowed to be read.
+        // The tail is programme, not debris: a peak can absolutely live in it, so it goes
+        // through the same detector before the report is allowed to be read.
         for (c, buf) in out.iter().enumerate() {
             self.out_meter.push_ch(c, buf);
         }
@@ -653,6 +1003,7 @@ mod tests {
             ceiling_db: ceiling,
             ratio,
             lookahead_ms: lookahead,
+            ..Cfg::default()
         }
     }
 
@@ -884,26 +1235,111 @@ mod tests {
             }
         }
         // Which ratios can honour the bottom of the range at a normal rate, and which
-        // cannot. This is the honest shape of the control: x2 and x4 are shallow enough
-        // that 0.2 ms is real, x8 and up are not, and the UI has to say so rather than
-        // pretend the slider reaches 0.2 ms for every setting.
+        // cannot. This is the honest shape of the control, and it is set by filter depth:
+        // the printed 12-tap x4 bank is 5.875 samples deep, so 0.2 ms (9 frames at
+        // 48 kHz) is real for it, while every derived Kaiser bank is 51 taps and 25
+        // samples deep, so its floor is 0.52 ms at 48 kHz and the UI has to say so rather
+        // than pretend the slider reaches 0.2 ms for every setting. Depth is what bought
+        // the accuracy in `tp::accuracy`; it is paid for here.
         let min_at_48k = |r: Ratio| cfg(-1.0, r, MIN_LOOKAHEAD_MS).lookahead_was_raised(48_000);
-        assert!(
-            !min_at_48k(Ratio::X2),
-            "x2 should fit in {} ms",
-            MIN_LOOKAHEAD_MS
-        );
         assert!(
             !min_at_48k(Ratio::X4),
             "x4 should fit in {} ms",
             MIN_LOOKAHEAD_MS
         );
-        assert!(min_at_48k(Ratio::X8), "x8 is deeper than its memory");
-        assert!(min_at_48k(Ratio::X16), "x16 is deeper than its memory");
-        assert!(min_at_48k(Ratio::X32), "x32 is deeper than its memory");
+        for r in [Ratio::X2, Ratio::X8, Ratio::X16, Ratio::X32] {
+            assert!(min_at_48k(r), "{r} is deeper than its memory");
+            // The number that decides it is the bank's own depth, and the delay line is
+            // that plus whatever lookahead was asked for. Peak refinement costs one more
+            // frame, because the parabola needs the sample after the crest.
+            assert_eq!(
+                r.report_delay(),
+                r.group_delay().ceil() as usize + usize::from(r.refines()),
+                "{r} should report the Kaiser bank's own depth plus its refinement"
+            );
+            assert!(
+                r.report_delay() > (MIN_LOOKAHEAD_MS * 48.0) as usize,
+                "{r} at 48 kHz: {} frames of filter, {} frames for {} ms",
+                r.report_delay(),
+                (MIN_LOOKAHEAD_MS * 48.0) as usize,
+                MIN_LOOKAHEAD_MS
+            );
+            let k = cfg(-1.0, r, MIN_LOOKAHEAD_MS);
+            assert_eq!(
+                k.latency_samples(48_000),
+                k.lookahead_samples(48_000) + r.report_delay(),
+                "{r} should delay by the lookahead it got plus the meter's reporting lag"
+            );
+        }
+        assert_eq!(Ratio::X4.report_delay(), 6, "the printed bank is 5.875");
         // The top of the range stays usable where the sample rate is normal.
+        assert!(!cfg(-1.0, Ratio::X2, MAX_LOOKAHEAD_MS).lookahead_was_raised(48_000));
         assert!(!cfg(-1.0, Ratio::X4, MAX_LOOKAHEAD_MS).lookahead_was_raised(192_000));
         assert!(!cfg(-1.0, Ratio::X32, MAX_LOOKAHEAD_MS).lookahead_was_raised(192_000));
+    }
+
+    /// A burst whose crest is in the file's last frames must still be inside the
+    /// ceiling. Those frames leave through `flush()`, and `flush()` used to pop the delay
+    /// line without feeding the side chain, so the gain schedule for the tail was never
+    /// finalised and the last `latency` frames went out at whatever gain was current when
+    /// the file ended. The bug is invisible to `report()`, because the same unfinalised
+    /// schedule decides what the limiter believes it delivered, so the check is done with
+    /// a x32 instrument on the emitted bytes instead.
+    #[test]
+    fn a_burst_that_ends_the_file_is_limited_not_escaped() {
+        const PI: f64 = std::f64::consts::PI;
+        const TAU: f64 = std::f64::consts::TAU;
+        let c = cfg(-1.0, Ratio::X4, 1.0);
+        let n = 4_000usize;
+        let onset = n - 300;
+        let mut l = vec![0.0f64; n];
+        let mut r = vec![0.0f64; n];
+        for i in 0..n {
+            // A quiet bed and then a hot tone, faded in over 100 frames so the onset is
+            // programme rather than a step, running to the file's very last frame.
+            let env = if i < onset {
+                0.0
+            } else {
+                let k = ((i - onset) as f64 / 100.0).min(1.0);
+                0.5 * (1.0 - (PI * (1.0 - k)).cos())
+            };
+            let t = i as f64;
+            l[i] = env * (TAU * 0.3 * t).sin();
+            r[i] = env * (TAU * 0.3 * (t - 0.25)).sin();
+        }
+        let pre = {
+            let mut d = Detector::new(Ratio::X32);
+            d.push_block(&l);
+            d.push_block(&r);
+            d.dbtp()
+        };
+        assert!(pre > 0.0, "the fixture needs to start above the ceiling");
+
+        let (out, rep) = run(c, &[l, r], 777);
+        let mut d = Detector::new(Ratio::X32);
+        for ch in &out {
+            d.push_block(ch);
+        }
+        let measured = d.dbtp();
+        // 0.10 of tolerance on a -1.0 dBTP ceiling: x4 aims 0.62 dB low by its own
+        // stated error, so a correct limiter lands near -1.6 and this cannot pass by
+        // luck, while the escaped tail this test exists for reads about -0.9.
+        assert!(
+            measured <= -1.0 + 0.10,
+            "delivered file measures {measured:+.3} dBTP against a -1.0 dBTP ceiling \
+             (pre-limiter {pre:+.3}, limiter's own report {:+.3})",
+            rep.post_dbtp
+        );
+        // And it limited rather than flattening: a whole-file gain of 1.0 would leave the
+        // quiet bed untouched, so the tone has to be the thing that came down.
+        let bed: Vec<f64> = out[0].iter().take(onset).copied().collect();
+        let mut bd = Detector::new(Ratio::X32);
+        bd.push_block(&bed);
+        assert!(
+            bd.dbtp() < -30.0,
+            "the quiet bed should have passed through, measures {:+.1} dBTP",
+            bd.dbtp()
+        );
     }
 
     /// Two runs must produce identical bytes.

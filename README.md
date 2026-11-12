@@ -1,5 +1,10 @@
 # G6ME — G6 Media Encoder
 
+> **Disclaimer:** This is an independent research and interoperability project. It is not
+> affiliated with, endorsed by, or sponsored by Creative Technology Ltd. Sound Blaster and
+> Sound BlasterX are trademarks of Creative Technology Ltd. No proprietary firmware or
+> driver binaries are distributed in this repository.
+
 Batch renderer for the **G6 Creative MatrixEncoder** binaural downmixer: takes
 7.1 / 5.1 / Dolby-Atmos-12 (overheads are nulled, use DME\EE first) multichannel audio and writes the same 2-channel
 sum-and-biquad matrix the original plugin produces, as FLAC or WAV, from a
