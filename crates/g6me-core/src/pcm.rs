@@ -77,12 +77,89 @@ impl BitDepth {
         }
     }
 
-    /// Why 24-bit is quantized by the encoder and not by a filter: libswresample
-    /// has no `s24` sample format (`S24` maps to `s32` above), so a "24-bit"
-    /// render is produced by the encoder's own `pcm_s24le` conversion, with
-    /// dither still requested from `aresample` upstream of it.
+    /// Why 24-bit is quantized here and not by a filter: libswresample has no `s24`
+    /// sample format (`S24` maps to `s32` above), and ffmpeg's 24-bit encoders keep the
+    /// top 24 bits of that `s32` -- a floor, half an LSB low on average, dither
+    /// included. [`Grid24`] rounds onto the 24-bit grid first, so the encoder's
+    /// truncation drops only zeros.
     pub fn quantize_note() -> &'static str {
-        "24-bit is quantized by the encoder (pcm_s24le); libswresample has no s24 sample format"
+        "24-bit is rounded (and dithered) by g6me before the encoder; ffmpeg's own s32->s24 \
+         step truncates"
+    }
+}
+
+/// Rounds a stereo stream onto the 24-bit grid, optionally with dither, before it
+/// reaches an encoder that would otherwise truncate it (see [`BitDepth::quantize_note`]).
+///
+/// Only the plain dithers are offered: ffmpeg's noise-shaped methods are not
+/// reproduced here, and at 24 bits its own versions diverge.
+#[derive(Clone, Debug)]
+pub struct Grid24 {
+    dither: Dither,
+    rng: u64,
+    /// Previous uniform draw per channel, for the high-passed triangular dither.
+    prev: [f64; 2],
+}
+
+impl Grid24 {
+    const SCALE: f64 = 8_388_608.0; // 2^23
+    const MAX: f64 = 8_388_607.0;
+
+    /// Dithers this quantizer can apply at 24 bits.
+    pub fn supports(d: Dither) -> bool {
+        matches!(
+            d,
+            Dither::None | Dither::Rectangular | Dither::Triangular | Dither::TriangularHp
+        )
+    }
+
+    /// `None` for a dither [`Grid24::supports`] refuses.
+    pub fn new(dither: Dither) -> Option<Self> {
+        Self::supports(dither).then_some(Self {
+            dither,
+            // Fixed seed: two renders of one file stay byte-identical.
+            rng: 0x9E37_79B9_7F4A_7C15,
+            prev: [0.0; 2],
+        })
+    }
+
+    /// Uniform in [-0.5, 0.5), xorshift64*.
+    fn uniform(&mut self) -> f64 {
+        self.rng ^= self.rng >> 12;
+        self.rng ^= self.rng << 25;
+        self.rng ^= self.rng >> 27;
+        let v = self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (v >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    }
+
+    fn noise(&mut self, ch: usize) -> f64 {
+        match self.dither {
+            Dither::Rectangular => self.uniform(),
+            Dither::Triangular => self.uniform() + self.uniform(),
+            Dither::TriangularHp => {
+                let u = self.uniform();
+                let n = u - self.prev[ch];
+                self.prev[ch] = u;
+                n
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Quantize both channels in place, frame by frame.
+    pub fn process(&mut self, l: &mut [f64], r: &mut [f64]) {
+        for (a, b) in l.iter_mut().zip(r.iter_mut()) {
+            let (da, db) = (self.noise(0), self.noise(1));
+            *a = Self::snap(*a, da);
+            *b = Self::snap(*b, db);
+        }
+    }
+
+    fn snap(x: f64, noise: f64) -> f64 {
+        (x * Self::SCALE + noise)
+            .round_ties_even()
+            .clamp(-Self::SCALE, Self::MAX)
+            / Self::SCALE
     }
 }
 
