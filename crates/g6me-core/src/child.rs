@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 const TAIL_BYTES: usize = 6 * 1024;
 
@@ -22,22 +23,20 @@ pub struct Proc {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     err: Arc<Mutex<Vec<u8>>>,
+    err_reader: Option<JoinHandle<()>>,
     done: bool,
 }
 
 /// Drain a child's stderr on a helper thread into a bounded tail.
 ///
-/// Public within the crate because the 24-bit FLAC pump owns a bare `Child` and
-/// has the same requirement [`Proc`] has: stderr must be read *while the child
-/// runs*, or a chatty child fills a 64 KiB pipe and stalls itself mid-encode.
+/// The handle is joined once the child has exited: the thread may still be copying the
+/// last bytes, and those are the error message.
 pub(crate) fn spawn_stderr_reader(
     name: &'static str,
     child: &mut Child,
     err: &Arc<Mutex<Vec<u8>>>,
-) {
-    let Some(pipe) = child.stderr.take() else {
-        return;
-    };
+) -> Option<JoinHandle<()>> {
+    let pipe = child.stderr.take()?;
     let sink = err.clone();
     let what = name;
     std::thread::Builder::new()
@@ -60,7 +59,25 @@ pub(crate) fn spawn_stderr_reader(
                 }
             }
         })
-        .ok();
+        .ok()
+}
+
+/// Keep a terminal's Ctrl-C away from the ffmpeg children. It reaches the whole
+/// foreground process group, so the children used to die mid-write and the file failed
+/// with a broken pipe, while g6me itself is the one that knows how to stop: between
+/// blocks, killing its children and removing the partial output.
+fn detach_from_console_signals(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
 }
 
 impl Proc {
@@ -105,6 +122,7 @@ impl Proc {
         // A stray FFREPORT in the environment would make ffmpeg write a report
         // file next to whatever it touches.
         cmd.env_remove("FFREPORT");
+        detach_from_console_signals(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| {
             Error::msg(format!(
                 "could not start {} ({}) — install ffmpeg or set $G6ME_FFMPEG: {e}",
@@ -113,7 +131,7 @@ impl Proc {
             ))
         })?;
         let err = Arc::new(Mutex::new(Vec::new()));
-        spawn_stderr_reader(name, &mut child, &err);
+        let err_reader = spawn_stderr_reader(name, &mut child, &err);
         let stdout = if out { child.stdout.take() } else { None };
         let stdin = if inp { child.stdin.take() } else { None };
         Ok(Self {
@@ -122,6 +140,7 @@ impl Proc {
             stdin,
             stdout,
             err,
+            err_reader,
             done: false,
         })
     }
@@ -158,6 +177,7 @@ impl Proc {
         let _ = self.stdout.take();
         let status = self.child.wait().map_err(Error::Io)?;
         self.done = true;
+        self.join_err_reader();
         if status.success() {
             return Ok(());
         }
@@ -197,6 +217,14 @@ impl Proc {
             let _ = self.child.kill();
             let _ = self.child.wait();
             self.done = true;
+            self.join_err_reader();
+        }
+    }
+
+    /// The child has exited, so its stderr reaches EOF and the reader returns.
+    fn join_err_reader(&mut self) {
+        if let Some(h) = self.err_reader.take() {
+            let _ = h.join();
         }
     }
 }
