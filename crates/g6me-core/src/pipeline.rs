@@ -654,6 +654,25 @@ fn staging_path(dst: &Path) -> PathBuf {
     dst.parent().unwrap_or(Path::new("")).join(s)
 }
 
+/// Delete a staging file, letting go of the handle before letting go of the name.
+///
+/// Windows reports a sharing violation for a file whose writer has been reaped but not yet
+/// finished releasing, so one unlink attempt on the abort path fails routinely rather than
+/// fatally. Retrying for about a tenth of a second costs nothing on a render that has already
+/// failed, and the alternative is the silence that used to follow `let _ = remove_file(...)`,
+/// which is how a cancelled batch littered an album directory and only showed up on the
+/// platform that told the truth about it.
+fn discard_staged(path: &Path) {
+    for _ in 0..16 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return,
+            // Already gone is the outcome we wanted, not an error to report.
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
 pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -> Result<Report> {
     let started = Instant::now();
     let mut warnings = Vec::new();
@@ -781,10 +800,9 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             let _ = rd.result;
             let _ = wr.result;
             if to_disk {
-                // Best effort by design: this is a staging file with a name nothing else
-                // will ever open, so a failed unlink costs a stray file in a directory the
-                // user never asked us to keep tidy -- not a half-written album track.
-                let _ = std::fs::remove_file(&staged);
+                // Retried, not trusted: the child was killed and waited on, which is the
+                // precondition, and the operating system still needs its moment on Windows.
+                discard_staged(&staged);
             }
             return Err($err);
         }};
@@ -840,7 +858,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
                 join_stages(reader, writer).1
             };
             if to_disk {
-                let _ = std::fs::remove_file(&staged);
+                discard_staged(&staged);
             }
             return Err(wr
                 .result
@@ -884,7 +902,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             (None, None) => "no audio samples were produced".to_string(),
         };
         if to_disk {
-            let _ = std::fs::remove_file(&staged);
+            discard_staged(&staged);
         }
         return Err(Error::ChildFailed {
             stage: "decode",
@@ -899,13 +917,13 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     // The DSP stage has no error of its own left to report; the children do.
     if let Some(e) = wr.result.err() {
         if to_disk {
-            let _ = std::fs::remove_file(&staged);
+            discard_staged(&staged);
         }
         return Err(e);
     }
     if let Some(e) = rd.result.err() {
         if to_disk {
-            let _ = std::fs::remove_file(&staged);
+            discard_staged(&staged);
         }
         return Err(e);
     }
@@ -983,11 +1001,11 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     // happened and someone else may have written the name in the meantime.
     if to_disk {
         if dst.exists() && !cfg.out.overwrite {
-            let _ = std::fs::remove_file(&staged);
+            discard_staged(&staged);
             return Err(Error::Exists(dst.to_path_buf()));
         }
         std::fs::rename(&staged, dst).map_err(|e| {
-            let _ = std::fs::remove_file(&staged);
+            discard_staged(&staged);
             Error::msg(format!(
                 "rendered {} but could not put it in place as {}: {e}",
                 staged.display(),
