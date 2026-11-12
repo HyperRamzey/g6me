@@ -69,8 +69,9 @@ pub struct Cli {
     #[arg(long, allow_negative_numbers = true, value_parser = parse_ceiling_db)]
     pub setpoint: Option<f64>,
 
-    /// Gain staging alone: a constant gain on every sample, in dB, before the limiter.
-    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_ceiling_db)]
+    /// Gain staging alone: a constant gain on every sample, in dB (-24 ..= 0), before the
+    /// limiter.
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_gain_db)]
     pub gain: f64,
 
     /// Leave the limiter off: a true-peak meter reading and nothing else. The default is
@@ -197,7 +198,7 @@ pub struct Cli {
     /// Force the interleaved channel order, e.g. FL,FR,FC,LFE,BL,BR,SL,SR.
     /// Only needed for a container that mislabels its layout.
     #[arg(long, value_parser = parse_order)]
-    pub order: Option<Vec<Slot>>,
+    pub order: Option<Order>,
 
     /// Which audio stream to take, 0-based.
     #[arg(long, default_value_t = 0)]
@@ -319,7 +320,12 @@ fn parse_gtype(s: &str) -> Result<Gtype, String> {
     })
 }
 
-fn parse_order(s: &str) -> Result<Vec<Slot>, String> {
+/// One `--order` value. A newtype, because clap reads `Option<Vec<T>>` as "repeatable
+/// option, one `T` per value" and then panics when the parser hands back a whole `Vec`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Order(pub Vec<Slot>);
+
+fn parse_order(s: &str) -> Result<Order, String> {
     let mut out = Vec::new();
     for part in s.split([',', ' ', '+']) {
         if part.trim().is_empty() {
@@ -339,7 +345,7 @@ fn parse_order(s: &str) -> Result<Vec<Slot>, String> {
     if out.is_empty() {
         return Err("--order needs at least one channel".into());
     }
-    Ok(out)
+    Ok(Order(out))
 }
 
 /// A bounded integer argument with a message that says which bound was missed.
@@ -384,11 +390,15 @@ fn parse_release_ms(s: &str) -> Result<f64, String> {
     parse_span(s, "release time in ms", MIN_RELEASE_MS, MAX_RELEASE_MS)
 }
 
-/// Linking as a percentage, because that is what a limiter panel shows. `0.5` is refused
-/// rather than quietly read as half a percent: the ambiguous reading is the one that
-/// surprises, so the range says which of the two it wants.
+/// Linking as a percentage, because that is what a limiter panel shows: `0.5` is half a
+/// percent, not half.
 fn parse_link_pct(s: &str) -> Result<f64, String> {
     parse_span(s, "channel linking in percent (0..=100)", 0.0, 100.0)
+}
+
+/// Same range as the ceiling, which it is usually set against, but its own message.
+fn parse_gain_db(s: &str) -> Result<f64, String> {
+    parse_span(s, "gain in dB", MIN_CEILING_DB, MAX_CEILING_DB)
 }
 
 fn parse_precision_bits(s: &str) -> Result<f64, String> {
