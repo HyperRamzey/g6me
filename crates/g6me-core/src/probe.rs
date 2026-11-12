@@ -588,10 +588,15 @@ pub(crate) fn probe_dir(tag: &str) -> std::result::Result<PathBuf, String> {
 pub(crate) fn tail(bytes: &[u8], max: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     if s.len() <= max {
-        s.into_owned()
-    } else {
-        s[s.len() - max..].to_string()
+        return s.into_owned();
     }
+    // A byte offset can land inside a multi-byte character (any non-ASCII path in an
+    // ffmpeg message), and slicing there panics.
+    let mut cut = s.len() - max;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s[cut..].to_string()
 }
 
 #[cfg(test)]
