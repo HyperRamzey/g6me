@@ -484,14 +484,25 @@ const SKIP_FS_PREFIX: [&str; 3] = ["fuse.portal", "fuse.snapfuse", "fuse.gvfs"];
 
 #[cfg(any(target_os = "linux", test))]
 /// Mount points that are never interesting, whatever is under them.
-const SKIP_UNDER: [&str; 6] = [
+const SKIP_UNDER: [&str; 9] = [
     "/snap/",
     "/var/lib/docker/",
     "/var/lib/snapd/",
     "/var/lib/flatpak/",
     "/proc/",
     "/sys/",
+    "/boot/",
+    "/tmp/",
+    "/var/tmp/",
 ];
+
+/// The same idea as [`SKIP_UNDER`], for the mount point itself rather than what hangs
+/// under it. These are skipped by name and not by filesystem type because a machine is
+/// free to format `/boot` as vfat and `/tmp` as ext4 — which is exactly when they stop
+/// looking like plumbing and start looking like drives worth a button. A boot partition
+/// holds kernels and an initramfs and a scratch filesystem is emptied before the next
+/// login; neither holds a library, and typing the path still works if anyone disagrees.
+const SKIP_POINTS: [&str; 3] = ["/boot", "/tmp", "/var/tmp"];
 
 #[cfg(any(target_os = "linux", test))]
 /// Where removable and network media turns up.
@@ -511,7 +522,7 @@ fn show_mount(fstype: &str, point: &str) -> bool {
     if point == "/" {
         return true;
     }
-    if SKIP_UNDER.iter().any(|p| point.starts_with(p)) {
+    if SKIP_POINTS.contains(&point) || SKIP_UNDER.iter().any(|p| point.starts_with(p)) {
         return false;
     }
     if SKIP_FS.contains(&fstype) {
@@ -697,6 +708,46 @@ struct Click {
 }
 
 /// A small in-app browser: current path, entry list, selection.
+/// What the picker orders a folder by.
+///
+/// Dates, because a library grows at the end: someone looking for the file they ripped
+/// yesterday should not have to scroll past a decade of names to find it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sort {
+    #[default]
+    Name,
+    Modified,
+    Created,
+}
+
+impl Sort {
+    pub const ALL: [Sort; 3] = [Sort::Name, Sort::Modified, Sort::Created];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "name",
+            Sort::Modified => "modified",
+            Sort::Created => "created",
+        }
+    }
+}
+
+/// One folder entry, with the dates the sort needs kept beside it.
+///
+/// Cached because the picker redraws every frame and a folder of a thousand files should
+/// not be stat'd a thousand times a second to answer "which of these is newest".
+#[derive(Clone, Debug)]
+struct Entry {
+    path: PathBuf,
+    /// Lowercased file name, for the tie-break. Precomputed because a comparator runs it
+    /// on every compare and `to_lowercase()` allocates each time.
+    fold: String,
+    is_dir: bool,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Browser {
     pub path: PathBuf,
@@ -716,6 +767,12 @@ pub struct Browser {
     pub message: Option<String>,
     entries: Vec<PathBuf>,
     entries_for: PathBuf,
+    /// What the list is ordered by. Session state, like the path and "audio only": the
+    /// panel keeps no settings file, so there is nothing to persist this into.
+    pub sort: Sort,
+    listing: Vec<Entry>,
+    /// The order `entries` is actually in, so a sort change reorders without a re-read.
+    sorted_with: Option<Sort>,
 }
 
 impl Default for Browser {
@@ -732,6 +789,9 @@ impl Default for Browser {
             message: None,
             entries: Vec::new(),
             entries_for: PathBuf::new(),
+            sort: Sort::default(),
+            listing: Vec::new(),
+            sorted_with: None,
         }
     }
 }
@@ -756,35 +816,79 @@ impl Browser {
             self.message = Some(format!("cannot read {}", self.path.display()));
             return;
         };
-        let mut dirs = Vec::new();
-        let mut files = Vec::new();
+        let mut dirs: Vec<Entry> = Vec::new();
+        let mut files: Vec<Entry> = Vec::new();
         for e in rd.flatten() {
             let p = e.path();
-            let is_dir = p.is_dir();
+            // One stat per entry, reused for the folder test and for both dates. Sorting
+            // by name alone never needed the clock; this does, so the metadata is taken
+            // once instead of once per question.
+            let md = e.metadata().ok();
+            let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
             if is_dir {
                 // Skip the noisy hidden and special entries; a library tree has
-                // enough of them, and `..` has its own button.
-                let name = p.file_name().map(|n| n.to_string_lossy().to_string());
-                if matches!(name.as_deref(), Some("..") | Some(".")) {
+                // enough of them, and `..` has its own button. Files are not skipped
+                // for starting with a dot, which is how they have always behaved here.
+                if name == ".." || name == "." || name.starts_with('.') {
                     continue;
                 }
-                if let Some(n) = &name {
-                    if n.starts_with('.') {
-                        continue;
-                    }
-                }
-                dirs.push(p);
+            }
+            let entry = Entry {
+                fold: name.to_lowercase(),
+                modified: md.as_ref().and_then(|m| m.modified().ok()),
+
+                // Birth time is the one the filesystem may refuse: it is absent on
+                // anything without a crtime, and on those the picker says so instead of
+                // showing a column of identical values.
+                created: md.as_ref().and_then(|m| m.created().ok()),
+                path: p,
+                is_dir,
+            };
+            if is_dir {
+                dirs.push(entry);
             } else if self.filter_audio && self.mode != Mode::Dir {
-                if batch::looks_like_audio(&p) {
-                    files.push(p);
+                if batch::looks_like_audio(&entry.path) {
+                    files.push(entry);
                 }
             } else {
-                files.push(p);
+                files.push(entry);
             }
         }
-        dirs.sort();
-        files.sort();
-        self.entries = dirs.into_iter().chain(files).collect();
+        dirs.extend(files);
+        self.listing = dirs;
+        self.resort();
+    }
+
+    /// Reorder the cached listing into `entries`, the order the list actually draws.
+    fn resort(&mut self) {
+        let sort = self.sort;
+        let mut list = std::mem::take(&mut self.listing);
+        list.sort_by(|a, b| {
+            // Folders first, whatever the key. This list is also how somebody walks a
+            // tree, and a folder that drifts into the middle of a date order is a folder
+            // they walk past on the way to the file they came for.
+            b.is_dir
+                .cmp(&a.is_dir)
+                // Newest first: comparing the *other* entry's key is what reverses it.
+                // A missing date compares below every real one, so an entry the
+                // filesystem would not date lands at the end rather than posing as
+                // ancient — which matters because "no date" is a fact about the
+                // filesystem, not about the file.
+                .then_with(|| match sort {
+                    Sort::Name => std::cmp::Ordering::Equal,
+                    Sort::Modified => b.modified.cmp(&a.modified),
+                    Sort::Created => b.created.or(b.modified).cmp(&a.created.or(a.modified)),
+                })
+                // And a name to tie-break, so the order of two files written in the same
+                // second is the same on two renders of the same folder.
+                .then_with(|| a.fold.cmp(&b.fold))
+        });
+        self.entries = list.iter().map(|e| e.path.clone()).collect();
+        self.listing = list;
+        self.sorted_with = Some(sort);
     }
 
     /// Draw the browser. `on_pick` receives the confirmed paths — one on a
@@ -792,10 +896,18 @@ impl Browser {
     /// decides what they mean.
     pub fn ui(&mut self, ui: &mut egui::Ui, mut on_pick: impl FnMut(Vec<PathBuf>)) {
         self.refresh();
+        if self.sorted_with != Some(self.sort) {
+            self.resort();
+        }
         if self.mounts.is_empty() {
             self.mounts = mounts();
         }
         self.drive_bar(ui);
+        if self.sort == Sort::Created && !self.listing.iter().any(|e| e.created.is_some()) {
+            // Better than a column of the same date: this filesystem has no birth time
+            // to show, and "created" is quietly answering with "modified".
+            ui.weak("nothing in this folder reports a creation time — showing the modified date");
+        }
         if self.path_bar(ui) {
             let want = PathBuf::from(self.path_text.trim());
             if want.is_dir() {
@@ -914,6 +1026,22 @@ impl Browser {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let before = self.sort;
+                let cb = egui::ComboBox::from_id_salt("browser-sort")
+                    .selected_text(format!("sort: {}", self.sort.label()))
+                    .show_ui(ui, |ui| {
+                        for s in Sort::ALL {
+                            ui.selectable_value(&mut self.sort, s, s.label());
+                        }
+                    });
+                cb.response.on_hover_text(
+                    "Newest first, folders first, ties broken by name. \"created\" is the \
+                     birth time where the filesystem records it; where it does not, the \
+                     modified date is used and the picker says so above the list.",
+                );
+                if before != self.sort {
+                    self.resort();
+                }
                 ui.checkbox(&mut self.filter_audio, "audio only");
             });
         });
@@ -1205,6 +1333,94 @@ mod tests {
         assert_eq!(unescape_mount("/x\\999y"), "/x\\999y");
     }
 
+    /// The boot partition and the scratch filesystems are not places a library lives.
+    ///
+    /// Written as mountinfo rather than as calls to `show_mount` because the point is the
+    /// list a person sees: `/boot` as vfat and `/tmp` as ext4 pass every filesystem test
+    /// there is, which is how they ended up as buttons on a real machine.
+    #[test]
+    fn the_scratch_mounts_are_not_shortcuts() {
+        let text = "\
+1 1 0:1 / / rw,relatime - f2fs /dev/sda1
+2 1 0:2 / /boot rw,relatime - vfat /dev/nvme0n1p1
+3 1 0:3 / /boot/efi rw,relatime - vfat /dev/nvme0n1p12
+4 1 0:4 / /tmp rw,relatime - ext4 /dev/sda3
+5 1 0:5 / /tmp/build rw,relatime - ext4 /dev/sda3
+6 1 0:6 / /var/tmp rw,relatime - ext4 /dev/sda4
+7 1 0:7 / /run/media/sanjxz/data rw,relatime - f2fs /dev/sdb1
+8 1 0:8 / /mnt/aosp rw,relatime - ext4 /dev/sdc1
+";
+        let mut got: Vec<String> = parse_mountinfo_with(text, |_| true)
+            .into_iter()
+            .map(|m| m.path.display().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            ["/", "/mnt/aosp", "/run/media/sanjxz/data"],
+            "a scratch mount is still taking a button"
+        );
+    }
+
+    /// The order the picker draws, without a filesystem to write timestamps onto.
+    #[test]
+    fn the_picker_sorts_by_date_and_keeps_folders_first() {
+        use std::time::Duration;
+        let older = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let newer = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(9_000);
+        let entry = |n: &str,
+                     is_dir: bool,
+                     modified: Option<std::time::SystemTime>,
+                     created: Option<std::time::SystemTime>| Entry {
+            path: PathBuf::from(n),
+            fold: n.to_lowercase(),
+            is_dir,
+            modified,
+            created,
+        };
+        let mut b = Browser {
+            sort: Sort::Modified,
+            listing: vec![
+                entry("old.mp3", false, Some(older), Some(older)),
+                entry("new.mp3", false, Some(newer), Some(newer)),
+                entry("zoo", true, Some(newer), Some(newer)),
+                entry("nodate.mp3", false, None, None),
+            ],
+            ..Browser::default()
+        };
+        let names = |b: &Browser| -> Vec<String> {
+            b.entries
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+                .collect()
+        };
+
+        // Folders first, then newest to oldest, and an entry the filesystem would not
+        // date last rather than first: "no date" is a fact about the filesystem.
+        b.sort = Sort::Modified;
+        b.resort();
+        assert_eq!(names(&b), ["zoo", "new.mp3", "old.mp3", "nodate.mp3"]);
+
+        // Birth time where there is one; the modified date is the honest answer where
+        // there is not, and the order must not shuffle when that happens.
+        for e in b.listing.iter_mut() {
+            e.created = None;
+        }
+        b.sort = Sort::Created;
+        b.resort();
+        assert_eq!(names(&b), ["zoo", "new.mp3", "old.mp3", "nodate.mp3"]);
+
+        // And the name order is the one the list had before dates existed: folders first,
+        // then A to Z.
+        b.sort = Sort::Name;
+        b.resort();
+        assert_eq!(
+            names(&b),
+            ["zoo", "new.mp3", "nodate.mp3", "old.mp3"],
+            "the default order changed"
+        );
+    }
+
     #[test]
     fn mount_labels_name_volumes_not_paths() {
         assert_eq!(mount_label("/run/media/sanjxz/SANDISK"), "SANDISK");
@@ -1236,10 +1452,13 @@ mod tests {
         let got = parse_mountinfo_with(text, |p| p.to_string_lossy() != "/mnt/gone");
         let labels: Vec<&str> = got.iter().map(|m| m.label.as_str()).collect();
         // Alphabetical and case-insensitive, because buttons that reorder themselves
-        // between clicks are unreadable.
+        // between clicks are unreadable. `/boot` used to be in this list on the reasoning
+        // that a real partition on a real disk deserves a shortcut; it does not. It holds
+        // kernels and an initramfs, it is the first button a person who is looking for
+        // music has to ignore, and the path is still typeable.
         assert_eq!(
             labels,
-            vec!["boot", "My Music", "nas · music", "root", "SANDISK"],
+            vec!["My Music", "nas · music", "root", "SANDISK"],
             "got {got:?}"
         );
         // Root is named usefully, the escaped path survived, and the network share

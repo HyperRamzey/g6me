@@ -240,7 +240,7 @@ impl MeterRow {
                 v.iter().map(|x| db(*x)).collect::<Vec<_>>().join("/")
             }
         };
-        let levels = format!(
+        let mut levels = format!(
             "{} — tp {} dBTP @{} · peak {} dBFS · rms {} dBFS",
             name,
             db(r.true_peak_dbtp),
@@ -248,6 +248,13 @@ impl MeterRow {
             list(&r.sample_peak_dbfs),
             list(&r.rms_dbfs)
         );
+        // DC follows the rule the CLI headline uses: measured on every file, printed in the
+        // full copy text on every file, and on the row a person scans only when some channel
+        // is over the threshold where an offset is a finding instead of a floor.
+        if let Some(n) = Report::dc_notice(&r.dc_offset) {
+            levels.push_str(" · ");
+            levels.push_str(&n);
+        }
         let hot = r.true_peak_dbtp > -0.05
             || r.limiter.as_ref().is_some_and(|l| !l.within_ceiling())
             // A file whose own decoded measurement disagrees with the stream is as urgent
@@ -1943,6 +1950,13 @@ mod tests {
         for want in ["@x4", "dc:", "file on disk", "WARNING"] {
             assert!(row.text.contains(want), "the copy text lost {want}");
         }
+        // …and the compact row stays quiet about an offset this file does not have: 1.9e-4
+        // is measured, reported in the text above, and not a finding.
+        assert!(
+            !row.levels.contains("dc "),
+            "an immaterial offset took the compact row: {}",
+            row.levels
+        );
     }
 
     /// A row that reads calm about a file whose own decoded measurement disagrees with its

@@ -194,7 +194,39 @@ impl Report {
                 s.push_str(&format!("  file {:+.2} dBTP", d.true_peak_dbtp));
             }
         }
+        // Same argument as the file's dBTP above: a number on every line is a number no
+        // one reads. DC is measured on every render and printed in the full report on
+        // every render; it joins the headline only when it is large enough to be the
+        // finding rather than the noise floor.
+        if let Some(n) = Self::dc_notice(&self.dc_offset) {
+            s.push_str("  ");
+            s.push_str(&n);
+        }
         s
+    }
+
+    /// A DC offset big enough to belong on a line a person scans.
+    ///
+    /// 0.001 of full scale is about -60 dBFS: still far too small to eat a decible of
+    /// headroom, but a hundred thousand times the +4e-10 the downmixer contributes, and the
+    /// point where a recording has a real offset rather than a rounding one. `810.mka`, at
+    /// 1.9e-4, is under it and stays off the headline: that offset is real, measured, and
+    /// immaterial, and it is in the full report either way.
+    pub const DC_NOTICE_FS: f64 = 1e-3;
+
+    /// The per-channel DC figures, formatted, when some channel is over
+    /// [`Self::DC_NOTICE_FS`] — and nothing when they are all under it.
+    ///
+    /// Every channel is printed once one of them crosses, because "the left is off by
+    /// 0.02 and the right is not" is the finding, and printing only the offender hides the
+    /// half of it that is fine.
+    #[must_use]
+    pub fn dc_notice(dc: &[f64]) -> Option<String> {
+        if !dc.iter().any(|d| d.abs() >= Self::DC_NOTICE_FS) {
+            return None;
+        }
+        let v: Vec<String> = dc.iter().map(|d| format!("{d:+.2e}")).collect();
+        Some(format!("dc {}", v.join(" ")))
     }
 
     /// The whole true-peak story for one file, as text, for the log and for the GUI's
@@ -1789,6 +1821,31 @@ mod tests {
     /// A DC blocker is allowed exactly two behaviours: nothing at DC, everything at
     /// Nyquist. Anything else is a lowpass with a DC blocker's label on it, quietly
     /// spending the top octave of every file it is pointed at.
+    /// Which DC offsets are worth a human's attention on a scanned line.
+    #[test]
+    fn a_dc_worth_reading_is_the_one_that_shouts() {
+        assert!(
+            Report::dc_notice(&[]).is_none(),
+            "no channels is not a zero"
+        );
+        assert!(
+            Report::dc_notice(&[1.9e-4, -1.8e-4]).is_none(),
+            "810.mka's immaterial offset took the headline line"
+        );
+        assert!(Report::dc_notice(&[0.0, 0.0]).is_none());
+        // The boundary is inclusive: 0.001 is the definition of the finding, not below it.
+        assert!(
+            Report::dc_notice(&[-Report::DC_NOTICE_FS]).is_some(),
+            "the threshold itself was treated as below itself"
+        );
+        let big = Report::dc_notice(&[1.9e-4, -2.0e-2]).expect("a real offset stayed off");
+        assert!(big.contains("-2.00e-2"), "{big}");
+        assert!(
+            big.contains("+1.90e-4"),
+            "the channel beside the offender vanished: {big}"
+        );
+    }
+
     #[test]
     fn the_dc_blocker_kills_dc_and_leaves_nyquist_alone() {
         // Long enough that the blocker's own settling is gone by the measurement window:

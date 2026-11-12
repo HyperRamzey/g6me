@@ -117,7 +117,15 @@ SHA-256 — plus:
   for a range, double-click to commit. Selected count is shown before you commit.
 * **Drive and volume shortcuts**, read from the mount table (Linux), the drive letters
   (Windows) or `/Volumes` (macOS), filtered to things worth visiting — no `/proc`,
-  no `tmpfs`, no squashfs snaps, and `/run/media/<you>/…` does appear.
+  no `tmpfs`, no squashfs snaps, and `/run/media/<you>/…` does appear. `/boot` and `/tmp`
+  are filtered by path rather than by filesystem type, because a machine is free to format
+  them as ordinary vfat and ext4 — which is exactly when they stop looking like plumbing
+  and start taking buttons. A path that is not listed is still typeable.
+* **Sort the picker by name, modified or created.** Newest first, folders always first
+  (the list is also how you walk a tree), ties broken by name, and an entry the filesystem
+  would not date at the end rather than the start. "Created" is birth time where the
+  filesystem records one; where it does not, the modified date is used and the picker says
+  so above the list instead of showing a column of identical values.
 * **Per-file meters.** Every file being rendered gets its own card: the plugin's eight
   input slots plus the two outputs, sample peak, peak-hold, decay, with the same
   0.30 s fall-off the VST2 meter used. Cards keep their last frame after the file
@@ -399,7 +407,10 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
 * **DC is metered, and removed only on request.** Every render reports `dc_offset`
   per channel — in full-scale units, because an offset carries a sign and is compared
   against a quantisation step — for the stream and again for the finished file decoded
-  back. The downmixer's own contribution is measured rather than assumed: its all-pass
+  back. It joins the one-line completion summary only when some channel passes 1e-3 of full
+  scale (−60 dBFS), because a number on every line is a number nobody reads: `810.mka` at
+  1.9e-4 is a real, measured, immaterial offset and stays in the full report, while a file
+  carrying 0.02 prints `dc +2.00e-2 +2.00e-2` where a batch log can be grepped for it. The downmixer's own contribution is measured rather than assumed: its all-pass
   cascade has `H(1) = (b0+b1+1)/(1+a1+a2) = 1` exactly, since each section's numerator is
   its denominator reversed, so it carries the vendor module's anti-denormal bias to the
   output at unity — a settled `+4 * EPSILON` on the left (+4.0e-10, −188 dBFS, 0.0034 of
