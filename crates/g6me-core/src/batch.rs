@@ -302,6 +302,19 @@ pub fn discover(
         // and a cancelled run's remaining files all disagreed with the listing the user read.
         // Walking in reverse puts the pop order back to ascending.
         for p in names.iter().rev() {
+            // A render writes to a staging sibling and renames it into place, so a name with
+            // that prefix is an unfinished render, not a track. It should not exist at all --
+            // that is the point of the rename -- and the case for recognising it is the hard
+            // kill and the power cut, where an orphan is exactly what is left on disk.
+            if p.file_name()
+                .map(|n| {
+                    n.to_string_lossy()
+                        .starts_with(crate::pipeline::STAGING_PREFIX)
+                })
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if p.is_dir() {
                 if !recursive {
                     continue;
@@ -1019,6 +1032,100 @@ mod tests {
                 assert!(meta.len() > 100, "suspiciously small output {:?}", p);
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The point of staging: cancelling does not leave a destination to be sorry about.
+    ///
+    /// The test above asks every file that survives a cancel to be a complete render, which
+    /// is a heuristic over file size, and it passed on Linux while Windows left a 46-byte
+    /// FLAC holding nothing but a stream header. This one asks the stronger question -- a
+    /// render that did not finish never got a name -- and it also checks that the staging
+    /// siblings themselves are gone, because a guarantee that litters is a guarantee people
+    /// route around.
+    #[test]
+    fn a_cancelled_render_never_took_the_destination() {
+        let Some((tools, caps)) = tools_and_caps() else {
+            return;
+        };
+        let dir = tmp("cancel-atomic");
+        for i in 0..12 {
+            crate::wav::write_pcm_s32(
+                &dir.join(format!("k{i}.wav")),
+                48000,
+                8,
+                &vec![3u8; 48000 * 8 * 4],
+            )
+            .unwrap();
+        }
+        let cfg = failing_cfg(dir.clone(), 4);
+        let items = discover(&cfg.inputs, None, "flac", cfg.recursive);
+        let b = Batch::start(items, &cfg, tools.clone(), caps.clone(), None);
+        std::thread::sleep(Duration::from_millis(120));
+        b.cancel();
+        let o = b.finish();
+        assert!(o.cancelled);
+        assert!(o.done < 12, "cancel landed after everything finished");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            assert!(
+                !name.starts_with(crate::pipeline::STAGING_PREFIX),
+                "a staging file survived the batch: {name}"
+            );
+            if name.ends_with(".flac") {
+                // Whatever is here was renamed into place, so it is a finished render, and
+                // "finished" is checked by decoding it rather than by weighing it: the 46-byte
+                // file Windows left behind had a perfectly good stream header in it, and a
+                // header whose total-samples field was never rewritten decodes to nothing.
+                let info = crate::probe::probe_audio(&tools, &p, 0)
+                    .unwrap_or_else(|e| panic!("{name} is not readable audio: {e}"));
+                assert!(
+                    info.duration > 0.5,
+                    "{name} decodes to {} s of audio: a header and nothing else",
+                    info.duration
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The publish step is on the path, and this is the case that shows it.
+    ///
+    /// A directory sitting on the destination name is the one failure a staged render hits
+    /// *after* the encode: the encoder never touches the real name, so the encode succeeds
+    /// and only the rename fails. Written straight to the destination, the same case dies
+    /// inside ffmpeg and the message talks about muxers and codecs. The wording is not the
+    /// point -- the point is that the real name is touched once, by the last step, and that
+    /// nothing before it can leave anything behind under it.
+    #[test]
+    fn a_destination_that_cannot_be_replaced_fails_at_the_publish() {
+        let Some((tools, caps)) = tools_and_caps() else {
+            return;
+        };
+        let dir = tmp("publish-blocked");
+        crate::wav::write_pcm_s32(&dir.join("p.wav"), 48000, 2, &vec![3u8; 48000 * 2 * 4]).unwrap();
+        std::fs::create_dir(dir.join("p.flac")).unwrap();
+        let cfg = failing_cfg(dir.clone(), 1);
+        let items = discover(&cfg.inputs, None, "flac", cfg.recursive);
+        assert_eq!(items.len(), 1, "a directory must not be queued as input");
+        let o = Batch::run(items, &cfg, tools, caps, None);
+        assert_eq!(o.failed, 1);
+        let err = o.items[0].error.clone().unwrap_or_default();
+        assert!(
+            err.contains("could not put it in place"),
+            "expected the failure at the publish step, got: {err}"
+        );
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(crate::pipeline::STAGING_PREFIX))
+            .collect();
+        assert!(left.is_empty(), "the aborted publish left {left:?} behind");
         std::fs::remove_dir_all(&dir).ok();
     }
 

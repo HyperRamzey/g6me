@@ -625,6 +625,35 @@ impl PeakStage {
     }
 }
 
+/// Prefix for the sibling a render is written to before it is renamed into place. Named as
+/// a constant because [`crate::batch`] has to recognise it too: a file carrying it is an
+/// unfinished render, never somebody's input.
+pub const STAGING_PREFIX: &str = ".g6me-";
+
+/// A sibling of `dst` that nobody asked for and nothing else will open.
+///
+/// Unique per worker (pid plus a counter, so two threads staging the same name cannot
+/// collide), hidden by the leading dot, and in the same directory as the destination so
+/// publishing it at the end is a rename rather than a copy that can run out of filesystem
+/// halfway through.
+fn staging_path(dst: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = dst
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let mut s = std::ffi::OsString::from(STAGING_PREFIX);
+    s.push(std::process::id().to_string());
+    s.push("-");
+    s.push(
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    s.push("-");
+    s.push(name);
+    dst.parent().unwrap_or(Path::new("")).join(s)
+}
+
 pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -> Result<Report> {
     let started = Instant::now();
     let mut warnings = Vec::new();
@@ -646,7 +675,20 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         }
     }
 
-    let plan = plan_file(src, dst, cfg, opts.tools, opts.caps)?;
+    // Everything below writes to a staging sibling and the destination appears only at the
+    // end, once. Writing the destination directly meant a cancelled or failed render had to
+    // be *undone* by deleting it, and that delete races the operating system: on Windows a
+    // cancelled batch left a 46-byte FLAC in the output directory -- `fLaC`, one STREAMINFO,
+    // no audio -- where the identical code looked clean on Linux, because an unlink that
+    // arrives while the killed child's file is still being released does not do what it says.
+    // A path that was never created cannot be left behind, and pressing stop returns the
+    // directory to exactly the state it was in.
+    let staged = if to_disk {
+        staging_path(dst)
+    } else {
+        dst.to_path_buf()
+    };
+    let plan = plan_file(src, &staged, cfg, opts.tools, opts.caps)?;
     cfg.out.validate(opts.caps)?;
     if let Some(t) = &opts.tap {
         t.will_render(plan.working_rate);
@@ -739,9 +781,10 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             let _ = rd.result;
             let _ = wr.result;
             if to_disk {
-                // Only now, with both children confirmed gone: deleting the file
-                // while an encoder still holds it open just makes it recreate it.
-                let _ = std::fs::remove_file(dst);
+                // Best effort by design: this is a staging file with a name nothing else
+                // will ever open, so a failed unlink costs a stray file in a directory the
+                // user never asked us to keep tidy -- not a half-written album track.
+                let _ = std::fs::remove_file(&staged);
             }
             return Err($err);
         }};
@@ -797,7 +840,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
                 join_stages(reader, writer).1
             };
             if to_disk {
-                let _ = std::fs::remove_file(dst);
+                let _ = std::fs::remove_file(&staged);
             }
             return Err(wr
                 .result
@@ -841,7 +884,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             (None, None) => "no audio samples were produced".to_string(),
         };
         if to_disk {
-            let _ = std::fs::remove_file(dst);
+            let _ = std::fs::remove_file(&staged);
         }
         return Err(Error::ChildFailed {
             stage: "decode",
@@ -856,19 +899,19 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     // The DSP stage has no error of its own left to report; the children do.
     if let Some(e) = wr.result.err() {
         if to_disk {
-            let _ = std::fs::remove_file(dst);
+            let _ = std::fs::remove_file(&staged);
         }
         return Err(e);
     }
     if let Some(e) = rd.result.err() {
         if to_disk {
-            let _ = std::fs::remove_file(dst);
+            let _ = std::fs::remove_file(&staged);
         }
         return Err(e);
     }
 
     let output_bytes = if to_disk {
-        std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
@@ -877,7 +920,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     // Hashed here, after the encoder child has been waited on and its file closed,
     // because a hash of a half-written file is worse than no hash: it looks like evidence.
     let file_sha256 = if cfg.sha256 && to_disk {
-        hash_file(dst).ok()
+        hash_file(&staged).ok()
     } else {
         None
     };
@@ -892,7 +935,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     let delivered = if to_disk {
         measure_delivered(
             opts.tools,
-            dst,
+            &staged,
             cfg.true_peak,
             peak_summary.sample_peak_dbfs.len(),
         )
@@ -932,6 +975,25 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     // a field name a reader has to know about is how a false reading survives review.
     if let Some(n) = &delivered_note {
         warnings.push(n.clone());
+    }
+
+    // Every measurement above is of these exact bytes, so publish now and nothing can move
+    // under the report. The no-clobber promise is re-checked here rather than trusted from
+    // the check at the top of this function, because between those two points a whole render
+    // happened and someone else may have written the name in the meantime.
+    if to_disk {
+        if dst.exists() && !cfg.out.overwrite {
+            let _ = std::fs::remove_file(&staged);
+            return Err(Error::Exists(dst.to_path_buf()));
+        }
+        std::fs::rename(&staged, dst).map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            Error::msg(format!(
+                "rendered {} but could not put it in place as {}: {e}",
+                staged.display(),
+                dst.display()
+            ))
+        })?;
     }
 
     let wall = started.elapsed();
@@ -1844,6 +1906,30 @@ mod tests {
             big.contains("+1.90e-4"),
             "the channel beside the offender vanished: {big}"
         );
+    }
+
+    #[test]
+    fn staging_files_are_siblings_and_never_share_a_name() {
+        let d = std::path::Path::new("/music/album/track.flac");
+        let a = staging_path(d);
+        let b = staging_path(d);
+        assert_eq!(
+            a.parent(),
+            d.parent(),
+            "a staging file in another directory makes the publish a copy across filesystems"
+        );
+        assert_ne!(
+            a, b,
+            "two workers staging one name would overwrite each other"
+        );
+        for p in [&a, &b] {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(n.starts_with(STAGING_PREFIX), "{n} is not hidden");
+            assert!(
+                n.ends_with(".flac"),
+                "{n} dropped the extension ffmpeg chooses the muxer from"
+            );
+        }
     }
 
     #[test]

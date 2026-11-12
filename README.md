@@ -30,6 +30,7 @@ multichannel file ──ffmpeg decode──► f64 samples ──► Dsp (f64) �
 | **No FMA, no fast-math, ever** | Contraction changes IIR state, and IIR state is phase. `g6me-verify` disassembles the shipped DSP and the reference builds and fails if a fused multiply-add appears; it also builds a deliberate `-ffp-contract=fast` counter-example and requires that it *does* diverge, so the guard is known to have teeth. |
 | **Resampleless by default** | Nothing touches the sample rate, bit depth or timing unless you ask. The default path is decode → f64 → downmix → encode. |
 | **Deterministic** | Same input, same flags, same bytes. Repeat a run with `--sha256` and compare. |
+| **A render that does not finish leaves nothing** | Output is written to a sibling of the destination and renamed into place as the last step, so a cancelled or failed render never creates the name you asked for. Writing the destination directly meant every failure had to be undone by a delete, and a delete can lose a race with the operating system: a cancelled batch on Windows once left a 46-byte FLAC — a header, no audio — in an album directory that looked fine on Linux. |
 | **No half-written output** | A cancelled or failed file leaves no playable partial file behind. |
 | **DSP is single-threaded per file** | One contiguous block sequence through the filters. Parallelism is *between* files; decode / DSP / encode overlap per file through bounded queues, so the memory ceiling is explicit (`--queue`). |
 
@@ -414,6 +415,12 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
 ```
 
 ## Known gaps
+
+* **A hard kill can orphan a staging file.** Renders are written to a hidden sibling
+  (`.g6me-<pid>-<n>-<name>`) and renamed into place, so `SIGKILL`, a power cut or a crash
+  mid-encode can leave one behind. It is inert — never queued as input, never mistaken for
+  your file, and safe to delete — but the guarantee is about *your* filenames, not about a
+  spotless temp directory.
 
 * **The headline dBTP is the stream; the file's own number is `delivered`.** The
   true-peak stage sees the signal before the encoder, and things still stand between
