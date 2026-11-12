@@ -17,15 +17,16 @@
 //!
 //! ## Channel identity
 //!
-//! Every input chain starts with `aformat=channel_layouts=<mask hex>`, which
-//! *declares* the layout of the decoded stream instead of letting swresample
-//! guess it. `crate::tests::channel_identity` proves with an impulse per channel
-//! that this neither reorders nor folds any channel.
+//! Every input chain starts with `channelmap=channel_layout=<mask hex>`, which
+//! *relabels* the decoded planes in place instead of letting swresample convert
+//! between layouts. `aformat=channel_layouts=` would remix whenever the container's
+//! label differs from the order g6me resolved (an explicit `--order`, or a layout
+//! name read differently), folding a surround channel into the wrong slot.
 
 use crate::error::{Error, Result};
 use crate::limiter::Cfg as LimiterCfg;
 use crate::mask::format_mask_hex;
-use crate::pcm::{BitDepth, Dither};
+use crate::pcm::{BitDepth, Dither, Grid24};
 use crate::probe::{AudioInfo, Caps};
 use crate::tp::Ratio;
 use serde::{Deserialize, Serialize};
@@ -226,10 +227,27 @@ impl Default for OutCfg {
 }
 
 impl OutCfg {
+    /// True when g6me rounds the stream onto the 24-bit grid itself ([`Grid24`]), so the
+    /// encoder gets no dither filter of its own. An output resampler would move the
+    /// samples off the grid again, so that case is left to ffmpeg.
+    pub fn grid24(&self, work_rate: u32) -> bool {
+        self.depth == BitDepth::S24
+            && !self.format.is_null()
+            && !self.resample.is_some_and(|r| r != work_rate)
+    }
+
     /// Validate a format/depth pair against what is actually available.
     pub fn validate(&self, caps: &Caps) -> Result<()> {
         if self.format.is_null() {
             return Ok(());
+        }
+        if self.depth == BitDepth::S24 && !Grid24::supports(self.dither) {
+            return Err(Error::msg(format!(
+                "dither '{}' is not available for 24-bit output: ffmpeg's noise-shaped \
+                 dithers go unstable at 24 bits. Use none, rectangular, triangular or \
+                 triangular_hp, or 16-bit output for noise shaping.",
+                self.dither.ffmpeg_name()
+            )));
         }
         if let OutFormat::Flac { level } = &self.format {
             if self.depth.is_float() {
@@ -414,12 +432,18 @@ pub fn input_stage(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> (InputStage,
     };
 
     // Declared identity of the decoded stream; first so every later filter sees a
-    // known layout instead of inferring one.
-    let mut steps = vec![format!("aformat=channel_layouts={}", format_mask_hex(mask))];
+    // known layout. A relabel, never a conversion: see the module docs.
+    let mut steps = vec![format!(
+        "channelmap=channel_layout={}",
+        format_mask_hex(mask)
+    )];
 
     match stage {
         InputStage::Passthrough | InputStage::Noop => {}
         InputStage::Soxr | InputStage::SoxrAndDepth => {
+            // Without this, an integer source reaches soxr as float32 and the
+            // precision asked for below is not the one delivered.
+            steps.push("aformat=sample_fmts=dbl".into());
             let mut s = format!(
                 "aresample={}:resampler=soxr:precision={}:dither_method={}",
                 cfg.resample.rate,
@@ -496,16 +520,15 @@ pub fn input_args(
         args.push(t.to_string());
     }
     args.push("-i".into());
-    args.push(src.display().to_string());
+    args.push(crate::util::ffmpeg_arg(src));
 
     if cfg.ir.enable {
         let ir_path = cfg
             .ir
             .file
             .as_ref()
-            .ok_or_else(|| Error::msg("IR calibration is enabled but no IR file is set"))?
-            .display()
-            .to_string();
+            .map(|p| crate::util::ffmpeg_arg(p))
+            .ok_or_else(|| Error::msg("IR calibration is enabled but no IR file is set"))?;
         args.push("-i".into());
         args.push(ir_path);
 
@@ -542,6 +565,10 @@ pub fn input_args(
         // expect instead of letting the muxer guess.
         args.push("-af".into());
         args.push(steps.join(","));
+        // The stream that was probed, not whichever one ffmpeg would pick: the
+        // layout above is only true of that one.
+        args.push("-map".into());
+        args.push(format!("0:a:{}", cfg.stream));
     }
 
     args.push("-f".into());
@@ -593,11 +620,12 @@ pub fn output_args(
     if o.copy_metadata {
         // Second input, read for its header/tags only.
         args.push("-i".into());
-        args.push(src.display().to_string());
+        args.push(crate::util::ffmpeg_arg(src));
     }
 
     let need_resample = o.resample.is_some_and(|r| r != work_rate);
-    let need_dither = o.dither != Dither::None;
+    // At 24 bits the dither is applied in-app with the rounding (`OutCfg::grid24`).
+    let need_dither = o.dither != Dither::None && !o.grid24(work_rate);
     if need_resample || need_dither {
         let rate = o.resample.unwrap_or(work_rate);
         let mut s = if need_resample {
@@ -637,12 +665,16 @@ pub fn output_args(
             // genuinely 24-bit rather than a widened one.
             args.push("-sample_fmt".into());
             args.push(o.depth.swr_fmt().into());
-            args.push(out_path.display().to_string());
+            args.push(crate::util::ffmpeg_arg(out_path));
         }
         OutFormat::Wav => {
             args.push("-c:a".into());
             args.push(o.depth.codec().into());
-            args.push(out_path.display().to_string());
+            // A plain RIFF header tops out at 4 GiB; past that ffmpeg writes a broken
+            // one and still exits 0. RF64 is used only when needed.
+            args.push("-rf64".into());
+            args.push("auto".into());
+            args.push(crate::util::ffmpeg_arg(out_path));
         }
         OutFormat::Null => unreachable!("handled above"),
     }
@@ -727,8 +759,16 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
         }
         _ => "no resample".to_string(),
     };
+    let grid = if o.grid24(work_rate) {
+        format!(
+            " (rounded to the 24-bit grid by g6me, dither {})",
+            o.dither.label()
+        )
+    } else {
+        String::new()
+    };
     v.push(format!(
-        "6. encode {} {}{}",
+        "6. encode {} {}{grid}{}",
         o.format.label(),
         o.depth.label(),
         if rate == "no resample" {
@@ -791,8 +831,71 @@ mod tests {
         let (stage, steps) = input_stage(&cfg, &info(), crate::dsp::MASK_7_1);
         assert_eq!(stage, InputStage::Passthrough);
         // only the layout declaration, no aresample anywhere
-        assert_eq!(steps, vec!["aformat=channel_layouts=0x63f".to_string()]);
+        assert_eq!(steps, vec!["channelmap=channel_layout=0x63f".to_string()]);
         assert!(!steps.join(",").contains("aresample"));
+    }
+
+    #[test]
+    fn decode_maps_the_probed_stream_and_relabels_instead_of_remixing() {
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.stream = 2;
+        let (args, _, _) = input_args(
+            &cfg,
+            &info(),
+            crate::dsp::MASK_7_1,
+            Path::new("/x/i.mka"),
+            None,
+        )
+        .unwrap();
+        let j = args.join(" ");
+        assert!(j.contains("-map 0:a:2"), "{j}");
+        assert!(!j.contains("aformat=channel_layouts"), "{j}");
+    }
+
+    #[test]
+    fn wav_output_switches_to_rf64_past_4_gib() {
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.out.format = OutFormat::Wav;
+        let args = output_args(
+            &cfg,
+            48000,
+            Path::new("/tmp/o.wav"),
+            Path::new("/tmp/i.mka"),
+            &caps_flac24(),
+        )
+        .unwrap();
+        assert!(args.join(" ").contains("-rf64 auto"), "{args:?}");
+    }
+
+    #[test]
+    fn dither_at_24_bit_is_done_in_app_and_noise_shaping_is_refused() {
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.out.dither = Dither::Triangular;
+        let args = output_args(
+            &cfg,
+            48000,
+            Path::new("/tmp/o.flac"),
+            Path::new("/tmp/i.mka"),
+            &caps_flac24(),
+        )
+        .unwrap();
+        assert!(!args.join(" ").contains("dither"), "{args:?}");
+        assert!(cfg.out.grid24(48000));
+
+        cfg.out.depth = BitDepth::S16;
+        let args = output_args(
+            &cfg,
+            48000,
+            Path::new("/tmp/o.flac"),
+            Path::new("/tmp/i.mka"),
+            &caps_flac24(),
+        )
+        .unwrap();
+        assert!(args.join(" ").contains("dither_method=triangular"), "{args:?}");
+
+        cfg.out.depth = BitDepth::S24;
+        cfg.out.dither = Dither::Shibata;
+        assert!(cfg.out.validate(&caps_flac24()).is_err());
     }
 
     #[test]
@@ -859,7 +962,7 @@ mod tests {
         let joined = steps.join(",");
         assert_eq!(
             joined,
-            "aformat=channel_layouts=0x63f,aresample=44100:resampler=soxr:precision=33:dither_method=low_shibata"
+            "channelmap=channel_layout=0x63f,aformat=sample_fmts=dbl,aresample=44100:resampler=soxr:precision=33:dither_method=low_shibata"
         );
         assert_eq!(joined.matches("aresample").count(), 1);
     }
