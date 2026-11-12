@@ -53,6 +53,22 @@ done
 
 say() { printf '\n== %s\n' "$*"; }
 
+# ---------------------------------------------------------------- lint ----------
+# This script checked the numerics for every flavour it ships and the lints for none, which
+# is how a constant read only by the Linux mount parser got as far as CI and failed the
+# Windows job: `cargo build` does not enforce the dead-code lint, and a host clippy cannot
+# see code behind a cfg the host compiles away. Lint each target before staging anything, so
+# a tag is never the first place a target-specific warning is read.
+say "lint every target we ship"
+cargo fmt --check --all
+cargo clippy --locked --workspace --all-targets -- -D warnings
+if rustup target list --installed 2>/dev/null | grep -qx x86_64-pc-windows-gnu; then
+  cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+else
+  printf 'WARN  x86_64-pc-windows-gnu std is not installed; the Windows lint is CI-only\n'
+  printf '      rustup target add x86_64-pc-windows-gnu\n'
+fi
+
 # ---------------------------------------------------------------- linux ---------
 say "linux x86-64-v3"
 CARGO_TARGET_DIR=target-rel cargo build --release --locked "${CARGO_CFG[@]}" --workspace

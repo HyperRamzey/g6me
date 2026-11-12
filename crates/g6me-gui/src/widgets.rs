@@ -496,6 +496,7 @@ const SKIP_UNDER: [&str; 9] = [
     "/var/tmp/",
 ];
 
+#[cfg(any(target_os = "linux", test))]
 /// The same idea as [`SKIP_UNDER`], for the mount point itself rather than what hangs
 /// under it. These are skipped by name and not by filesystem type because a machine is
 /// free to format `/boot` as vfat and `/tmp` as ext4 — which is exactly when they stop
