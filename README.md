@@ -124,6 +124,78 @@ SHA-256 — plus:
   and the exact ffmpeg command lines.
 * **Four themes**: system, dark, light, and a true `#000000` OLED black.
 
+## True peak
+
+Every render reports the true peak of what it wrote, in dBTP, **with the ratio it was
+measured at** — `tp +0.23 dBTP @x4`. A dBTP number without a ratio is not comparable to
+anyone else's number, so the ratio is part of the measurement rather than a footnote.
+Alongside it: per-channel true peak, sample peak and RMS, all taken after the limiter and
+before the encoder, so they describe the signal the file is made of.
+
+**How it is measured.** ITU-R BS.1770-5 Annex 2 order-48, 4-phase, 12-tap polyphase FIR for
+4x — the Recommendation's own printed coefficients, in canonical oldest→newest order, with
+none of the 12.04 dB pre-attenuation (every stage here is f64). BS.1770 tabulates 4x only,
+so 2x/8x/16x/32x are designed in this repo: centred Kaiser-windowed polyphase banks, 51
+taps per phase, 80 dB stopband, a stated band edge at 0.45·fs, each phase DC-normalised,
+plus parabolic refinement of the crest between grid points and a floor at the sample peak
+(no interpolating lowpass can read above its own transition band at Nyquist). Accuracy
+gates in `tp.rs` compare against an **exact periodic FFT reconstruction**, and every offered
+ratio must land inside its stated error.
+
+What that reference is *not*: ffmpeg's `soxr`. Measured on a single tone, soxr at 4x reports
+−17.6 dB at 21.6 kHz and −33.6 dB at 23.52 kHz — it guts the top of the band, so using it as
+ground truth for 16x/32x made our filters look like they over-read by half a dB when it was
+the reference under-reading. Cross-checks with it are still shown, labelled as such.
+
+**Limits, stated.** The printed 4x bank reads up to about 0.6 dB low on a crest landing
+between grid points, which is why the limiter defaults to 8x while the meter stays at 4x: a
+ceiling cannot be held by a meter that low. Content above 0.45·fs carries a separate
+bandwidth caveat (`band_caveat_db`) rather than being folded into the number above it.
+
+**The limiter** is the last stage before ffmpeg receives bytes — before any quantisation or
+clipping — so it is the real ceiling on the delivered file, not an intention. Two stages,
+both on the true-peak side chain:
+
+* **Transient.** Keeps a lookahead schedule: it sees a peak before the sample grid does and
+  ramps the gain in ahead of it. Returns in 25 ms. Linked 100 % by default — a peak in one
+  channel is still a peak in the file.
+* **Release.** A peak-hold window with a 60 ms attack and a 900 ms release: it answers level
+  rather than isolated crests. Linked 75 % by default, because a gain move lasting a third of
+  a second is long enough to pull a stereo image about.
+
+Emission multiplies the two, and the transient stage's demand is computed against the peak
+as the release stage left it, so they never spend the same dB twice. The ceiling is aimed
+`guard_db` low — the part the meter cannot see plus what the gain slew can still overshoot —
+and the latency it adds is appended to the file and reported, never hidden.
+
+**One setpoint, two effects.** `--setpoint -3` trims the whole file by 3 dB *and* caps it at
+−3 dBTP. A constant gain does the level work at no cost and bends nothing; the limiter is
+left with only the peaks that survive the trim. `--gain` and `--ceiling` set the two halves
+separately, and `--setpoint` refuses to be combined with either, because a command line with
+two opinions about one level is not a command line. On `810.mka`, whose true peak is
++0.23 dBTP:
+
+| | max reduction | limiter engaged | delivered TP |
+|---|---|---|---|
+| `--ceiling -3` alone | 3.85 dB | 99.6 % of frames | −3.57 dBTP |
+| `--setpoint -3` | 0.85 dB | 87 % of frames | −3.62 dBTP |
+
+That table is the argument. A ceiling asked to do level work holds the file by riding gain
+through nearly all of it; a setpoint takes the level off as gain and leaves the limiter to
+catch peaks. ffmpeg's own peak meter agrees on the delivered file (−3.4 dBFS against our
+−3.62 dBTP @x4, both under the −3 ceiling).
+
+**Defaults**: limiter on, −3 dBTP, 2 ms lookahead, 60/900 ms, 100 %/75 % linking, 8x on a 4x
+meter. On is a deliberate change of default behaviour — a file leaving here above 0 dBTP
+clips somewhere downstream, and a ceiling that nothing enforces is a claim. The off path is
+the contract, and it is proven rather than asserted: `--no-limit` on `810.mka` still writes
+`0c3d30cdaff5dffc5db24360b353bca9d1a8393a664a1e13a085540434a2eb9a`.
+
+**Two hashes, two scopes**, both from `--sha256`: `sha256` is the sample stream (container
+independent, so FLAC and WAV of the same render agree), `file_sha256` is the file as
+`sha256sum` sees it. The old field is neither of the two and does not survive a container
+change.
+
 ## Verification
 
 `g6me-verify` is the reason this project is trustworthy rather than plausible. It
@@ -275,10 +347,17 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
 
 ## Known gaps
 
-* **True-peak metering is not in yet.** The meters show sample peak. Inter-sample
-  peak (EBU Tech 3341 / BS.1770-4) is planned next; sample peak alone under-reports
-  up to ~3 dB for material near full scale, which matters exactly when you are
-  closest to clipping.
+* **`--resample` runs after the limiter.** Output resampling and any output dither
+  happen inside ffmpeg, downstream of the true-peak stage, so with `--resample` on,
+  the reported dBTP describes the stream handed to ffmpeg rather than provably the
+  file. Lossless paths at native rate (the default) have no gap between the two. The
+  fix is a delivered-file re-measure, and until it exists the combination is unverified
+  rather than believed.
+* **DC offset is not measured or removed.** The downmixer's biquads, the IR
+  convolution and a resampler can each leave a DC component, nothing reports it, and
+  a limiter treats DC as level. A file with real DC therefore reads a deeper true
+  peak than its AC content warrants. No claim is made either way until it is measured
+  per stage.
 * **FLAC stops at 24 bits.** That is the container and the encoder, not a choice:
   ffmpeg's FLAC encoder writes `bps=24` and, fed 32-bit PCM, drops the low byte of
   every sample. G6ME therefore refuses `--format flac --depth 32` instead of shipping
