@@ -663,12 +663,22 @@ fn staging_path(dst: &Path) -> PathBuf {
 /// which is how a cancelled batch littered an album directory and only showed up on the
 /// platform that told the truth about it.
 fn discard_staged(path: &Path) {
-    for _ in 0..16 {
+    // A window, not a count, because the lock has no fixed length: whatever is holding the
+    // file on a Windows runner -- Defender, the search indexer, the child's own handle being
+    // released late -- can take longer than any number of fast retries would cover, and this
+    // is a render that has already been cancelled, so a couple of seconds here is free.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
         match std::fs::remove_file(path) {
             Ok(()) => return,
             // Already gone is the outcome we wanted, not an error to report.
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => {
+                if std::time::Instant::now() >= until {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }
     }
 }
