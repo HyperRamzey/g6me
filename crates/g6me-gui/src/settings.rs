@@ -240,6 +240,19 @@ impl Settings {
     }
 
     /// Mirror of the CLI's translation. Keep the two in step.
+    /// The side-chain ratio, with the limiter's own default behind it.
+    ///
+    /// One accessor rather than a fallback written at each call site: the panel built its
+    /// `Cfg` twice, both times with `unwrap_or_default()`, and `Ratio::default` is the *meter's*
+    /// x4. So the limiter ran a step shallower than `Cfg::default`, the CLI help and the
+    /// README each said it did, and the prose under the controls printed the 0.62 dB guard
+    /// that goes with 4x while the box offered 8x.
+    #[must_use]
+    pub fn limiter_ratio(&self) -> Ratio {
+        self.limit_ratio
+            .unwrap_or(g6me_core::limiter::DEFAULT_RATIO)
+    }
+
     pub fn render_cfg(&self) -> RenderCfg {
         let ir = IrCfg {
             enable: self.ir,
@@ -283,7 +296,7 @@ impl Settings {
             limiter: g6me_core::limiter::Cfg {
                 enable: self.limiter,
                 ceiling_db: self.setpoint_db.unwrap_or(self.ceiling_db),
-                ratio: self.limit_ratio.unwrap_or_default(),
+                ratio: self.limiter_ratio(),
                 lookahead_ms: self.lookahead_ms,
                 attack_ms: self.attack_ms,
                 release_ms: self.release_ms,
@@ -600,6 +613,34 @@ mod tests {
     /// Tested at the boundary rather than trusting the field: `render_cfg` is the only path
     /// from a ticked box to a rendered byte, and a control that sets a field nobody reads is
     /// indistinguishable from no control at all.
+    /// The panel's fallback has to be the limiter's ratio, not the meter's.
+    ///
+    /// The same slip the CLI had: `unwrap_or_default()` reads as "the default", and
+    /// `Ratio::default` is x4 because that is where metering starts. A limiter at x4 aims
+    /// 0.62 dB below its ceiling instead of 0.04 dB, so every file landed half a dB lower
+    /// than the number in the box said.
+    #[test]
+    fn the_limiter_ratio_default_is_the_limiters_not_the_meters() {
+        assert_eq!(Ratio::default(), Ratio::X4, "the meter's default moved");
+        assert_eq!(g6me_core::limiter::DEFAULT_RATIO, Ratio::X8);
+        assert_eq!(
+            Settings::default().limiter_ratio(),
+            g6me_core::limiter::DEFAULT_RATIO,
+            "the panel fell back to the meter's x4"
+        );
+        assert_eq!(
+            Settings::default().render_cfg().limiter.ratio,
+            g6me_core::limiter::DEFAULT_RATIO,
+            "the accessor and the render config disagree about the default"
+        );
+        let s = Settings {
+            limit_ratio: Some(Ratio::X16),
+            ..Settings::default()
+        };
+        assert_eq!(s.limiter_ratio(), Ratio::X16);
+        assert_eq!(s.render_cfg().limiter.ratio, Ratio::X16);
+    }
+
     #[test]
     fn dc_block_defaults_off_and_reaches_the_render_config() {
         let s = Settings::default();

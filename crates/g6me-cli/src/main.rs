@@ -9,7 +9,7 @@
 use clap::Parser;
 use g6me_core::batch::{self, Batch, BatchCfg, Item, Phase, Progress};
 use g6me_core::limiter::{
-    Cfg as LimiterCfg, DEFAULT_ATTACK_MS, DEFAULT_CEILING_DB, DEFAULT_LOOKAHEAD_MS,
+    Cfg as LimiterCfg, DEFAULT_ATTACK_MS, DEFAULT_CEILING_DB, DEFAULT_LOOKAHEAD_MS, DEFAULT_RATIO,
     DEFAULT_RELEASE_MS, MAX_ATTACK_MS, MAX_CEILING_DB, MAX_LOOKAHEAD_MS, MAX_RELEASE_MS,
     MIN_ATTACK_MS, MIN_CEILING_DB, MIN_LOOKAHEAD_MS, MIN_RELEASE_MS,
 };
@@ -527,7 +527,9 @@ impl Cli {
             limiter: LimiterCfg {
                 enable: !self.no_limit,
                 ceiling_db: self.ceiling.unwrap_or(DEFAULT_CEILING_DB),
-                ratio: self.limit_ratio.unwrap_or_default(),
+                // The limiter's own default, not `Ratio::default()`: that one is the
+                // meter's x4, and the help text below promises 8.
+                ratio: self.limit_ratio.unwrap_or(DEFAULT_RATIO),
                 lookahead_ms: self.lookahead,
                 attack_ms: self.attack,
                 release_ms: self.release,
@@ -1217,6 +1219,26 @@ mod tests {
             cfg.out.resample, None,
             "resampling happens before the downmix only"
         );
+    }
+
+    /// The help text promises "Defaults to 8". This is the test that makes it true.
+    ///
+    /// Both frontends used `unwrap_or_default()` for the limiter's ratio, and `Ratio::default`
+    /// is the meter's x4, so every shipped render ran the side chain a whole step shallower
+    /// than the manual, the code comment and `Cfg::default` each claimed. `guard_db` went
+    /// from 0.04 dB to 0.62 dB, which is most of the 0.6 dB a -3 dBTP ceiling undershot by.
+    #[test]
+    fn the_limiter_ratio_default_is_the_limiters_not_the_meters() {
+        assert_eq!(Ratio::default(), Ratio::X4, "the meter's default moved");
+        assert_eq!(DEFAULT_RATIO, Ratio::X8);
+        let c = Cli::try_parse_from(["g6me", "x.mka"]).unwrap();
+        assert_eq!(
+            c.render_cfg().unwrap().limiter.ratio,
+            DEFAULT_RATIO,
+            "the CLI fell back to the meter's ratio, so its own help text is lying"
+        );
+        let c = Cli::try_parse_from(["g6me", "--limit-ratio", "16", "x.mka"]).unwrap();
+        assert_eq!(c.render_cfg().unwrap().limiter.ratio, Ratio::X16);
     }
 
     #[test]

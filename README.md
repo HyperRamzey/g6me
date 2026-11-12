@@ -160,17 +160,35 @@ bandwidth caveat (`band_caveat_db`) rather than being folded into the number abo
 clipping — so it is the real ceiling on the delivered file, not an intention. Two stages,
 both on the true-peak side chain:
 
-* **Transient.** Keeps a lookahead schedule: it sees a peak before the sample grid does and
-  ramps the gain in ahead of it. Returns in 25 ms. Linked 100 % by default — a peak in one
-  channel is still a peak in the file.
-* **Release.** A peak-hold window with a 60 ms attack and a 900 ms release: it answers level
-  rather than isolated crests. Linked 75 % by default, because a gain move lasting a third of
-  a second is long enough to pull a stereo image about.
+* **Transient.** The lookahead stage: it sees a peak before the sample grid does and ramps
+  the gain in ahead of it, so the crest is already ducked by the time the sample that caused
+  it is emitted. Returns in 25 ms. Linked 100 % by default — peaks are ducked in both
+  channels together, because a peak in one channel is still a peak in the file.
+* **Level.** A peak-hold window with a 60 ms attack and a 900 ms release, riding under the
+  transient stage: it answers level rather than isolated crests. Linked 75 % by default —
+  level is shared three-quarters, not wholly, because a gain move lasting a third of a second
+  is long enough to pull a stereo image about.
 
 Emission multiplies the two, and the transient stage's demand is computed against the peak
-as the release stage left it, so they never spend the same dB twice. The ceiling is aimed
-`guard_db` low — the part the meter cannot see plus what the gain slew can still overshoot —
-and the latency it adds is appended to the file and reported, never hidden.
+as the level stage left it, so they never spend the same dB twice.
+
+**Where the gain aims.** The gain targets `guard_db` *below* the requested ceiling: what the
+side chain's filter cannot see, plus what the gain slew can still overshoot on the way down.
+At the default 8x that is 0.02 dB + 0.02 dB = **0.04 dB**, so a −3.00 dBTP ceiling measures
+−3.04 dBTP and a −1.00 dBTP ceiling measures −1.04 dBTP — the ceiling is where it was asked
+to be, minus a guard that is stated rather than assumed. Ask for the meter's 4x instead and
+the same expression is 0.62 dB (0.60 + 0.02), and the same −3.00 ceiling lands near −3.62:
+half a dB of level handed back on every file, which is what the 4x bank's 0.60 dB of
+under-read on a crest between grid points costs. That is why the limiter's ratio and the
+meter's are different constants, and why a `--limit-ratio 4` render prints a `guard_db` of
+0.62 rather than quietly keeping the old number.
+
+**Latency.** Lookahead plus the interpolator's own delay, both appended to the end of the
+file and reported, never hidden. At the defaults that is 96 samples of lookahead — **2.00 ms
+at 48 kHz, honoured as asked** — plus 26 samples of filter delay: **122 samples, 2.542 ms**,
+so a rendered file is 122 frames longer than its source and `810.mka` goes from 4210520
+frames to 4210642. A `--lookahead` shorter than the side chain's floor is raised to the floor
+and says so, `requested_lookahead_ms` beside `effective_lookahead_ms`.
 
 **One setpoint, two effects.** `--setpoint -3` trims the whole file by 3 dB *and* caps it at
 −3 dBTP. A constant gain does the level work at no cost and bends nothing; the limiter is
@@ -181,22 +199,31 @@ two opinions about one level is not a command line. On `810.mka`, whose true pea
 
 | | max reduction | limiter engaged | delivered TP |
 |---|---|---|---|
-| `--ceiling -3` alone | 3.85 dB | 99.6 % of frames | −3.61 dBTP |
-| `--setpoint -3` | 0.85 dB | 17.1 % of frames | −3.62 dBTP |
+| `--ceiling -3` alone | 3.28 dB | 98.2 % of frames | −3.04 dBTP |
+| `--setpoint -3` | 0.28 dB | 3.3 % of frames | −3.04 dBTP |
 
 That table is the argument. A ceiling asked to do level work holds the file by riding gain
-through nearly all of it — and that 99.6 % is the processor genuinely holding a reduction of
-0.75 dB through the file, not a stuck counter; the same file trimmed by a setpoint is touched
-on 17.1 % of its frames instead. (`engaged_frames` used to latch: a one-pole release
+through nearly all of it — and that 98.2 % is the processor genuinely holding a reduction of
+0.57 dB through the file, not a stuck counter; the same file trimmed by a setpoint is touched
+on 3.3 % of its frames instead. Both rows land at the same −3.04 because the aim is the same;
+what differs is how much of the file had to be held there to get it. (`engaged_frames` used
+to latch: a one-pole release
 converges to within 2.1e-11 dB of unity and then stops in IEEE 754, so `gain < 1.0` stayed
 true for the rest of the file after the first peak. The follower is now told to arrive, and
 the counters ask for a reduction of at least 0.001 dB. Both numbers above are post-fix
-measurements; the 87 % this table first claimed for the setpoint row was the latch, not the
-limiter.) ffmpeg's own peak meter agrees on the delivered file (−3.4 dBFS against our
-−3.62 dBTP @x4, both under the −3 ceiling).
+measurements at the default 8x; the 87 % this table first claimed for the setpoint row was
+the latch, not the limiter, and the 17.1 % before it was measured at 4x. Outside cross-check:
+ffmpeg's own `astats` reads −3.040000 dBFS sample peak on the delivered file against our
+−3.0397 dBTP @x8 — a sample peak just under a true peak, which is the shape of a file held
+by true peak rather than by samples.)
 
-**Defaults**: limiter on, −3 dBTP, 2 ms lookahead, 60/900 ms, 100 %/75 % linking, 8x on a 4x
-meter. On is a deliberate change of default behaviour — a file leaving here above 0 dBTP
+**Defaults**: limiter on, −3 dBTP, 2 ms lookahead, 60/900 ms, 100 %/75 % linking, 8x side
+chain on a 4x meter. The 8x only became true in this release: both front ends fell back to
+`Ratio::default()`, which is the *meter's* 4x, so the side chain ran a step shallower than
+this document, the CLI's own help text and `Cfg::default` each claimed, `guard_db` was 0.62
+not 0.04, and every limited file sat about 0.58 dB below the ceiling it was set to. The
+fallback is `limiter::DEFAULT_RATIO` now, with a test in each front end asserting it.
+On is a deliberate change of default behaviour — a file leaving here above 0 dBTP
 clips somewhere downstream, and a ceiling that nothing enforces is a claim. The off path is
 the contract, and it is proven rather than asserted: `--no-limit` on `810.mka` still writes
 `0c3d30cdaff5dffc5db24360b353bca9d1a8393a664a1e13a085540434a2eb9a`.

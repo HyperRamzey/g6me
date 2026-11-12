@@ -929,7 +929,7 @@ impl App {
         let mut cfg = LCfg {
             enable: true,
             ceiling_db: st.setpoint_db.unwrap_or(st.ceiling_db),
-            ratio: st.limit_ratio.unwrap_or_default(),
+            ratio: st.limiter_ratio(),
             lookahead_ms: st.lookahead_ms,
             attack_ms: st.attack_ms,
             release_ms: st.release_ms,
@@ -999,13 +999,17 @@ impl App {
                 st.lookahead_ms = la;
             }
             ui.label("limit at");
+            // The label used to read "same as meter", which is how a fallback to the meter's x4
+            // passed for a design decision for as long as it did. The two defaults are different
+            // numbers on purpose, so the label says which one it is, derived from the constant.
+            let default_label = format!("default ({})", g6me_core::limiter::DEFAULT_RATIO.label());
             egui::ComboBox::from_id_salt("limit-ratio")
                 .selected_text(match st.limit_ratio {
-                    None => "same as meter".to_string(),
+                    None => default_label.clone(),
                     Some(r) => r.label().to_string(),
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut st.limit_ratio, None, "same as meter");
+                    ui.selectable_value(&mut st.limit_ratio, None, default_label.as_str());
                     for r in Ratio::ALL {
                         ui.selectable_value(&mut st.limit_ratio, Some(r), r.label());
                     }
@@ -1073,7 +1077,7 @@ impl App {
             }
         });
         cfg.ceiling_db = st.setpoint_db.unwrap_or(st.ceiling_db);
-        cfg.ratio = st.limit_ratio.unwrap_or_default();
+        cfg.ratio = st.limiter_ratio();
         cfg.lookahead_ms = st.lookahead_ms;
         cfg.attack_ms = st.attack_ms;
         cfg.release_ms = st.release_ms;
@@ -1088,13 +1092,19 @@ impl App {
              {:.0}% together, level {:.0}%.",
             cfg.attack_ms, cfg.release_ms, st.link_transient_pct, st.link_release_pct
         ));
+        // The ceiling named in this sentence has to be the one the box is set to. It used to
+        // print a literal "-1.00 dBTP" beside a number calculated from the actual ceiling, so
+        // at the default -3.00 it read "a -1.00 dBTP ceiling lands near -3.62 dBTP" — one
+        // claim, two ceilings, and a shortfall that belonged to the meter's 4x rather than to
+        // the 8x on offer. Everything here is now read off the config the render will use.
         ui.weak(format!(
             "aims {:.2} dB below the ceiling ({:.2} dB the meter cannot see + {:.2} dB of \
-             gain slew), so a -1.00 dBTP ceiling lands near {:.2} dBTP.",
+             gain slew), so the {:.2} dBTP ceiling set above lands near {:.2} dBTP.",
             cfg.guard_db(),
             cfg.ratio.worst_underread_db(),
             cfg.guard_db() - cfg.ratio.worst_underread_db(),
-            st.ceiling_db - cfg.guard_db()
+            cfg.ceiling_db,
+            cfg.ceiling_db - cfg.guard_db()
         ));
         ui.weak(format!(
             "latency {} samples ({:.3} ms) at {} Hz, added to the end of the file. {}",

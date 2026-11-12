@@ -126,6 +126,16 @@ pub const DEFAULT_LOOKAHEAD_MS: f64 = 2.0;
 /// Ceiling the UI and CLI start with, dBTP.
 pub const DEFAULT_CEILING_DB: f64 = -3.0;
 
+/// Side-chain over-sampling ratio the UI and CLI start with.
+///
+/// This is deliberately *not* [`Ratio::default()`], which is x4 and belongs to the meter.
+/// A limiter that runs at the meter's ratio gives away 0.60 dB of its own ceiling — the
+/// printed ITU bank reads up to that much low on a crest landing between grid points — and
+/// `guard_db` has to be paid back out of the headroom the user asked to keep. Both frontends
+/// used to say `unwrap_or_default()` and so silently meant x4, while `Cfg::default`, the CLI
+/// help and the README all said 8x.
+pub const DEFAULT_RATIO: Ratio = Ratio::X8;
+
 /// Shortest attack for the slow stage. Below about this the "slow" stage is catching
 /// peaks, which is the fast stage's job, and the two stop meaning anything.
 pub const MIN_ATTACK_MS: f64 = 1.0;
@@ -213,7 +223,7 @@ impl Default for Cfg {
             // x8, not the meter's x4: the printed ITU bank has no transition band and no
             // peak refinement, and reads up to 0.6 dB low on a crest between grid points.
             // See the table in `crate::tp`.
-            ratio: Ratio::X8,
+            ratio: DEFAULT_RATIO,
             lookahead_ms: DEFAULT_LOOKAHEAD_MS,
             attack_ms: DEFAULT_ATTACK_MS,
             release_ms: DEFAULT_RELEASE_MS,
@@ -1217,6 +1227,28 @@ mod tests {
     /// the slow stage barely moves. The demand for a frame is scaled by the slow gain of the
     /// frames around it, which costs nothing when they are equal and exactly what is needed
     /// when they are not.
+    /// The meter and the limiter start at different ratios on purpose, and nothing may
+    /// quietly make them the same again: the difference is 0.58 dB of ceiling.
+    #[test]
+    fn the_default_side_chain_is_deeper_than_the_default_meter() {
+        assert_eq!(Ratio::default(), Ratio::X4, "the meter's default moved");
+        assert_eq!(DEFAULT_RATIO, Ratio::X8);
+        assert_eq!(Cfg::default().ratio, DEFAULT_RATIO);
+
+        // 0.02 dB the meter cannot see at 8x, plus 0.02 dB of gain slew. At the meter's 4x
+        // the same expression is 0.62 dB, and a file limited to -3 dBTP would land near
+        // -3.62 instead of -3.04: the same ceiling, asked for, half a dB further down.
+        let g = Cfg::default().guard_db();
+        assert!(
+            (g - 0.04).abs() < 1e-12,
+            "the default guard is {g} dB, not 0.04 — the README quotes that number"
+        );
+
+        let lat = Cfg::default().latency_samples(48_000);
+        assert_eq!(lat, 96 + Ratio::X8.report_delay());
+        assert!(lat > 96, "the interpolator's own delay went missing");
+    }
+
     #[test]
     fn the_fastest_envelope_the_interface_allows_still_holds_the_ceiling() {
         for &(at, rel) in &[
