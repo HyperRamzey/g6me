@@ -652,6 +652,74 @@ mod tests {
     /// window grows, which is how to tell the two apart — real DC does not care how
     /// long you listen.
     ///
+    /// The matrix's own output, pinned as bytes, on every platform we ship.
+    ///
+    /// The comparison this project rests on is compiled from `g6ct.c` by gcc, so it can only
+    /// run where gcc and the vendored objects are — which leaves the Windows binary's
+    /// arithmetic asserted by nobody. This closes that gap at the level actually under our
+    /// control. What the file finally holds is ffmpeg's encoder's business; these numbers are
+    /// ours, produced by `+ - * /` on IEEE-64 with no fused multiply-add anywhere in the path,
+    /// so there is no legitimate platform excuse for a single bit of them to move. Pinned from
+    /// a Linux run: if another target disagrees, that disagreement is the finding.
+    #[test]
+    fn the_matrix_output_is_the_same_bytes_on_every_platform() {
+        use crate::pcm::Sha256;
+        const N: usize = 4096;
+        let mask = CH_FL | CH_FR | CH_FC | CH_LFE | CH_BL | CH_BR | CH_SL | CH_SR;
+        let mut dsp = Dsp::new(mask);
+        assert!(
+            !dsp.is_bypass(),
+            "this mask must reach the filters, not the wire"
+        );
+
+        // Deterministic programme-like material: one linear congruential run per channel,
+        // offset so no two branches see the same sequence, scaled to a level that exercises
+        // the filters without pinning against full scale.
+        let chans: Vec<Vec<f64>> = (0..8)
+            .map(|c| {
+                let mut s = 0x1234_5678_u64 ^ (c as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                (0..N)
+                    .map(|_| {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        ((s >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.6
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Slots are WAVEFORMATEXTENSIBLE bit positions, so 7.1 is not the first eight: slots
+        // 6, 7 and 8 are FLC, FRC and BC, and feeding a 7.1 file into them is the mistake this
+        // file's own history contains.
+        const SLOTS_7_1: [usize; 8] = [0, 1, 2, 3, 4, 5, 9, 10];
+        let mut ch: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        for (i, slot) in SLOTS_7_1.iter().enumerate() {
+            ch[*slot] = Some(&chans[i]);
+        }
+
+        let mut l = vec![0.0f64; N];
+        let mut r = vec![0.0f64; N];
+        dsp.process(&ch, &mut l, &mut r, N);
+        assert!(dsp.is_finite(), "the recursion went non-finite");
+        // The tail matters as much as the head: the state carried between blocks is the part
+        // most likely to differ if anything ever contracts or reassociates.
+        for v in l.iter().chain(r.iter()) {
+            assert!(v.is_finite());
+        }
+
+        let mut h = Sha256::new();
+        h.update(dsp.precision().as_bytes());
+        for v in l.iter().chain(r.iter()) {
+            h.update(&v.to_le_bytes());
+        }
+        assert_eq!(
+            h.finish_hex(),
+            "1a3858ad6bb9cb458ba405a1a84e5d8db2bf99b23d9ab553ab71bfa8aeb44570",
+            "the matrix's output is not the bytes the reference platform produced"
+        );
+    }
+
     /// What is left is the denormal guard. Every section input gets `+EPSILON`
     /// (`coefs.inc`, the DLL's own anti-denormal bias), and each all-pass section has
     /// `H(1) = (b0+b1+1)/(1+a1+a2) = 1` exactly, because its numerator is its
