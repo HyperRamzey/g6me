@@ -105,6 +105,16 @@ pub struct Report {
     /// share it), while `file_sha256` covers the bytes on disk and is what an evidence
     /// log or a dedupe pass needs. Only the second is reproducible with an external tool.
     pub file_sha256: Option<String>,
+    /// What the finished file contains, measured by decoding it back.
+    ///
+    /// The numbers above are taken from the stream the pipeline handed the encoder, which is
+    /// the file whenever nothing stands between them — but a resampler can run *after* the
+    /// limiter, and an encoder can clamp, and dither can move a crest. A ceiling claim about
+    /// a stream is not a ceiling claim about a file, so both sets are printed and a note
+    /// appears when they disagree.
+    pub delivered: Option<Delivered>,
+    /// Why the delivered file and the metered stream disagree, when they do.
+    pub delivered_note: Option<String>,
     pub warnings: Vec<String>,
     pub input_cmd: Vec<String>,
     pub encode_cmd: Vec<String>,
@@ -703,8 +713,52 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     } else {
         None
     };
-
+    // Summarised here, before the second pass, because the comparison below is between the
+    // metered stream and the file, and the meter has to have finished first.
     let peak_summary = peak.summarize();
+
+    // Decode the file that was actually written and measure it, because every number above
+    // was taken from the stream handed to the encoder. With `--resample` that resampler runs
+    // *after* the limiter, so the stream and the file are different signals by construction;
+    // an encoder clamping to the sample format does it without being asked.
+    let delivered = if to_disk {
+        measure_delivered(
+            opts.tools,
+            dst,
+            cfg.true_peak,
+            peak_summary.sample_peak_dbfs.len(),
+        )
+    } else {
+        None
+    };
+    let delivered_note = delivered.as_ref().and_then(|d| {
+        let mut why: Vec<String> = Vec::new();
+        let moved = d.true_peak_dbtp - peak_summary.true_peak_dbtp;
+        if moved.abs() > DELIVERED_TOLERANCE_DB {
+            why.push(format!(
+                "true peak moved {moved:+.3} dB: {:+.3} dBTP in the metered stream, {:+.3} dBTP \
+                 in the file",
+                peak_summary.true_peak_dbtp, d.true_peak_dbtp
+            ));
+        }
+        let level = d
+            .rms_dbfs
+            .iter()
+            .zip(peak_summary.rms_dbfs.iter())
+            .fold(0.0f64, |m, (&a, &b)| m.max((a - b).abs()));
+        if level > DELIVERED_TOLERANCE_DB {
+            why.push(format!(
+                "level moved by up to {level:.3} dB between the two"
+            ));
+        }
+        (!why.is_empty()).then(|| {
+            format!(
+                "the delivered file is not the signal that was metered ({}). Something after \
+                 the meter changed it: a resampler, the sample format's own ceiling, or dither.",
+                why.join("; ")
+            )
+        })
+    });
 
     let wall = started.elapsed();
     let seconds = frames as f64 / work_rate as f64;
@@ -746,6 +800,8 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         encoder: encoder_name,
         sha256,
         file_sha256,
+        delivered,
+        delivered_note,
         warnings,
         input_cmd: in_args,
         encode_cmd: enc_args,
@@ -900,6 +956,146 @@ struct EncoderDone {
 ///
 /// Running this on its own thread is what keeps the ffmpeg child busy while the
 /// DSP is working, instead of letting its stdout pipe fill and stall it.
+/// What decoding a finished file measures.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Delivered {
+    pub true_peak_dbtp: f64,
+    pub per_channel_true_peak_dbtp: Vec<f64>,
+    pub sample_peak_dbfs: Vec<f64>,
+    pub rms_dbfs: Vec<f64>,
+}
+
+/// How far the file may sit from the metered stream before the report says so.
+///
+/// 0.05 dB is four orders of magnitude above what 24-bit quantization can do to a crest, and
+/// far below what a clamp, a resampler after the limiter, or a dither can do to one, so it
+/// separates "the encoder rounded" from "the encoder changed the answer".
+pub const DELIVERED_TOLERANCE_DB: f64 = 0.05;
+
+/// Move up to `max` whole frames out of `carry` into the meter.
+///
+/// Streaming, because the alternative is holding a decoded file in RAM: a 90-minute 7.1 render
+/// decoded to f64 is 14 GB, and a measurement that needs more memory than the render is not a
+/// measurement anybody can run.
+fn drain_frames(
+    carry: &mut Vec<u8>,
+    cols: &mut [Vec<f64>],
+    tp: &mut TruePeak,
+    acc: &mut [Accum],
+    max: usize,
+) -> usize {
+    let stride = cols.len();
+    let bytes = stride * 8;
+    let n = (carry.len() / bytes).min(max);
+    if n == 0 {
+        return 0;
+    }
+    for c in cols.iter_mut() {
+        c.clear();
+    }
+    for f in 0..n {
+        // Ascending channel order, same deinterleave the indexed form did.
+        for (c, col) in cols.iter_mut().enumerate() {
+            let at = (f * stride + c) * 8;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&carry[at..at + 8]);
+            col.push(f64::from_le_bytes(a));
+        }
+    }
+    carry.drain(..n * bytes);
+    for (c, (col, a)) in cols.iter().zip(acc.iter_mut()).enumerate() {
+        tp.push_ch(c, col);
+        a.push(col);
+    }
+    n
+}
+
+/// Decode a finished file and meter it, so a report can describe what was written.
+///
+/// `None` if the second pass cannot be run or read: a failed measurement is reported as
+/// absent, never as a zero, and it must never fail a render that already succeeded.
+fn measure_delivered(
+    tools: &Tools,
+    path: &Path,
+    ratio: Ratio,
+    channels: usize,
+) -> Option<Delivered> {
+    let stride = channels.max(1);
+    let mut args = vec![
+        "-v".to_string(),
+        "error".into(),
+        "-nostdin".into(),
+        "-i".into(),
+        path.display().to_string(),
+    ];
+    args.extend(
+        [
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-f",
+            "f64le",
+            "-c:a",
+            "pcm_f64le",
+            "-",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    let mut p = Proc::spawn_reader("delivered", &tools.ffmpeg, &args).ok()?;
+    let block = 8192usize;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut cols: Vec<Vec<f64>> = vec![Vec::with_capacity(block); stride];
+    let mut tp = TruePeak::new(ratio, stride);
+    let mut acc: Vec<Accum> = (0..stride).map(|_| Accum::default()).collect();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut total = 0usize;
+    let mut ok = true;
+    loop {
+        match p.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => carry.extend_from_slice(&buf[..n]),
+            Err(_) => {
+                ok = false;
+                break;
+            }
+        }
+        loop {
+            let n = drain_frames(&mut carry, &mut cols, &mut tp, &mut acc, block);
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+    }
+    if p.finish().is_err() {
+        ok = false;
+    }
+    loop {
+        let n = drain_frames(&mut carry, &mut cols, &mut tp, &mut acc, usize::MAX);
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    if !ok {
+        return None;
+    }
+    // Whatever could not be split into whole frames is padding, not audio; the meter still
+    // has to be told input has stopped, or its last crest stays in the filter.
+    tp.drain();
+    if total == 0 {
+        // Nothing decoded is not silence, it is a failed measurement: absent, not zero.
+        return None;
+    }
+    Some(Delivered {
+        true_peak_dbtp: tp.dbtp(),
+        per_channel_true_peak_dbtp: tp.per_channel_dbtp(),
+        sample_peak_dbfs: acc.iter().map(Accum::peak_db).collect(),
+        rms_dbfs: acc.iter().map(Accum::rms_db).collect(),
+    })
+}
+
 fn decode_stage(
     producer: &mut Proc,
     tx: &crate::stage::Tx<Decoded>,
@@ -1367,6 +1563,60 @@ mod tests {
                 f64::from_le_bytes(a)
             })
             .collect()
+    }
+
+    /// A file that cannot hold what it was given says so, instead of borrowing the stream's
+    /// true peak.
+    ///
+    /// The meter reads the signal before the encoder, and an s16 encoder cannot write a sample
+    /// above full scale: it clamps. Without the second pass the report claims a crest the file
+    /// does not contain, which is the worst kind of wrong number — it looks like evidence and
+    /// agrees with itself. Measured on real material: a hot 7.1 render metered +0.233 dBTP
+    /// arrived as an s16 WAV at +0.084 dBTP with sample peaks parked at -0.0003 dBFS.
+    #[test]
+    fn a_file_that_clamps_says_so_instead_of_borrowing_the_streams_number() {
+        let Some((tools, caps)) = tools_ok() else {
+            return;
+        };
+        let dir = workdir("delivered");
+        let w = dir.join("hot.wav");
+        impulse_wav(&w, 2, 48000);
+        let opts = RenderOpts::new(&tools, &caps);
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.limiter.enable = false;
+        cfg.output_gain_db = 12.0; // overhang full scale on purpose
+        cfg.out.format = OutFormat::Wav;
+        cfg.out.depth = BitDepth::S16;
+        let r = render_file(&w, &dir.join("hot16.wav"), &cfg, &opts).unwrap();
+        assert!(
+            r.true_peak_dbtp > 0.0,
+            "the fixture must overhang full scale, metered {:+.2} dBTP",
+            r.true_peak_dbtp
+        );
+        let d = r
+            .delivered
+            .expect("the file was written, so it can be measured");
+        let over = d
+            .sample_peak_dbfs
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        assert!(
+            over <= 0.001,
+            "s16 cannot hold a sample above full scale, measured {over:+.3} dBFS"
+        );
+        assert!(
+            r.true_peak_dbtp - d.true_peak_dbtp > DELIVERED_TOLERANCE_DB,
+            "the clamp is {:.3} dB deep and nothing noticed",
+            r.true_peak_dbtp - d.true_peak_dbtp
+        );
+        let note = r
+            .delivered_note
+            .expect("a clamped file must be reported, not implied");
+        assert!(
+            note.contains("true peak moved"),
+            "the note names the wrong thing: {note}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn ffmpeg_to_f64(tools: &Tools, path: &Path) -> Vec<f64> {

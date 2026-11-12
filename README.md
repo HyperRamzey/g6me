@@ -357,12 +357,18 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
 
 ## Known gaps
 
-* **`--resample` runs after the limiter.** Output resampling and any output dither
-  happen inside ffmpeg, downstream of the true-peak stage, so with `--resample` on,
-  the reported dBTP describes the stream handed to ffmpeg rather than provably the
-  file. Lossless paths at native rate (the default) have no gap between the two. The
-  fix is a delivered-file re-measure, and until it exists the combination is unverified
-  rather than believed.
+* **The headline dBTP is the stream; the file's own number is `delivered`.** The
+  true-peak stage sees the signal before the encoder, and things still stand between
+  that point and the bytes: output resampling and output dither run inside ffmpeg,
+  downstream of the meter, and an encoder clamps to its own sample format. So every
+  render now decodes the finished file and reports it as `delivered` next to the
+  metered numbers, with a note when the two disagree by more than 0.05 dB. On real
+  material: a hot 7.1 render metered **+0.233 dBTP** arrived as an s16 WAV at
+  **+0.084 dBTP** with sample peaks parked at −0.0003 dBFS — the encoder clamped, and
+  the report says so instead of quoting a crest the file cannot hold. On the default
+  lossless path the two agree to four decimal places. The cost is one extra decode
+  pass per file: an 8 s render becomes about 14 s. (`-r/--rate` is input-side, before
+  the downmix, so it is not what this is about; the output-side resampler is.)
 * **DC offset is not measured or removed.** The downmixer's biquads, the IR
   convolution and a resampler can each leave a DC component, nothing reports it, and
   a limiter treats DC as level. A file with real DC therefore reads a deeper true
