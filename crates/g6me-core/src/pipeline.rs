@@ -16,7 +16,7 @@ use crate::dsp::{Dsp, SLOTS};
 use crate::error::{Error, Result};
 use crate::limiter::{Limiter, Report as LimiterReport};
 use crate::mask::{format_order, is_downmixable, mask_of, order_from_layout, Slot};
-use crate::pcm::Sha256;
+use crate::pcm::{Grid24, Sha256};
 use crate::probe::{probe_audio, AudioInfo, Caps, Tools};
 use crate::stages::{
     effective_input_rate, input_args, input_stage, loss_chain, output_args, InputStage, RenderCfg,
@@ -794,6 +794,13 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     let mut out_r = vec![0f64; block];
     let mut frames: u64 = 0;
     let mut pipe_bytes_in: u64 = 0;
+    // Rounds onto the 24-bit grid after the meter, where the encoder's own s32->s24
+    // step would otherwise truncate (`OutCfg::grid24`).
+    let mut grid = if cfg.out.grid24(work_rate) {
+        Grid24::new(cfg.out.dither)
+    } else {
+        None
+    };
     // Which slot each interleaved column belongs to.
     let slots: Vec<usize> = order.iter().map(|s| s.index()).collect();
 
@@ -857,6 +864,9 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         if let Some(t) = &opts.tap {
             t.tap(&refs, &out_l[..n], &out_r[..n], n);
         }
+        if let Some(g) = grid.as_mut() {
+            g.process(&mut out_l[..n], &mut out_r[..n]);
+        }
 
         let mut out_buf = Vec::with_capacity(n * 16);
         interleave_f64(&out_l[..n], &out_r[..n], &mut out_buf);
@@ -887,13 +897,22 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     // that lost its tail would be audibly truncated at exactly the point where the
     // limiter added delay. If the encoder has already died the send fails quietly and the
     // join below reports its error, which is the informative one.
-    let tail = peak.finish_input();
-    if let (Some(tl), Some(tr)) = (tail.first(), tail.get(1)) {
-        if !tl.is_empty() {
-            frames += tl.len() as u64;
-            let mut tb = Vec::with_capacity(tl.len() * 4);
-            interleave_f64(tl, tr, &mut tb);
-            let _ = enc_tx.send(Encoded { bytes: tb });
+    let decoded = frames;
+    let mut tail = peak.finish_input();
+    // No source samples means no programme to hold back: the tail would be `latency`
+    // frames of silence, and shipping them turned an empty decode into a "successful"
+    // 122-frame file.
+    if decoded > 0 {
+        if let [tl, tr, ..] = tail.as_mut_slice() {
+            if !tl.is_empty() {
+                if let Some(g) = grid.as_mut() {
+                    g.process(tl, tr);
+                }
+                frames += tl.len() as u64;
+                let mut tb = Vec::with_capacity(tl.len() * 4);
+                interleave_f64(tl, tr, &mut tb);
+                let _ = enc_tx.send(Encoded { bytes: tb });
+            }
         }
     }
 
@@ -903,7 +922,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     enc_tx.close();
     let (rd, wr) = join_stages(reader, writer);
 
-    if frames == 0 {
+    if decoded == 0 {
         // An empty result nearly always means the decode child died and printed
         // why; surface its message instead of shipping a silent file.
         let why = match (rd.result.err(), wr.result.err()) {
@@ -937,6 +956,11 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         }
         return Err(e);
     }
+    warnings.extend(decode_warnings(
+        &rd.stderr,
+        decoded as f64 / work_rate as f64,
+        info.duration,
+    ));
 
     let output_bytes = if to_disk {
         std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0)
@@ -972,7 +996,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     };
     let delivered_note = delivered.as_ref().and_then(|d| {
         let mut why: Vec<String> = Vec::new();
-        let moved = d.true_peak_dbtp - peak_summary.true_peak_dbtp;
+        let moved = delivered_gap_db(peak_summary.true_peak_dbtp, d.true_peak_dbtp);
         if moved.abs() > DELIVERED_TOLERANCE_DB {
             why.push(format!(
                 "true peak moved {moved:+.3} dB: {:+.3} dBTP in the metered stream, {:+.3} dBTP \
@@ -984,7 +1008,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             .rms_dbfs
             .iter()
             .zip(peak_summary.rms_dbfs.iter())
-            .fold(0.0f64, |m, (&a, &b)| m.max((a - b).abs()));
+            .fold(0.0f64, |m, (&a, &b)| m.max(delivered_gap_db(b, a).abs()));
         if level > DELIVERED_TOLERANCE_DB {
             why.push(format!(
                 "level moved by up to {level:.3} dB between the two"
@@ -1207,6 +1231,17 @@ struct Encoded {
 /// Result of the decode stage.
 struct DecodeDone {
     result: Result<()>,
+    /// Tail of the decoder's stderr (`-v error`), empty for a clean decode.
+    stderr: String,
+}
+
+impl DecodeDone {
+    fn failed(e: Error) -> Self {
+        Self {
+            result: Err(e),
+            stderr: String::new(),
+        }
+    }
 }
 
 /// Result of the encode stage, including the things only it knows: which encoder
@@ -1242,6 +1277,47 @@ pub struct Delivered {
 /// far below what a clamp, a resampler after the limiter, or a dither can do to one, so it
 /// separates "the encoder rounded" from "the encoder changed the answer".
 pub const DELIVERED_TOLERANCE_DB: f64 = 0.05;
+
+/// Below this both readings are silence as far as any delivery format can tell, and a
+/// silent channel reads -187 dBTP in the stream (the downmixer's 1e-10 guard) but
+/// -inf once quantized. Comparing them would report a difference of infinity.
+const DELIVERED_FLOOR_DB: f64 = -120.0;
+
+fn delivered_gap_db(stream: f64, file: f64) -> f64 {
+    if stream < DELIVERED_FLOOR_DB && file < DELIVERED_FLOOR_DB {
+        0.0
+    } else {
+        file - stream
+    }
+}
+
+/// A decode that ffmpeg finishes with exit status 0 can still have skipped a damaged
+/// stretch or stopped at a truncation. Its stderr and the decoded length against the
+/// container's duration are the only evidence, so both become warnings.
+fn decode_warnings(stderr: &str, decoded_s: f64, probed_s: f64) -> Vec<String> {
+    let mut w = Vec::new();
+    let msg = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
+    if let Some(last) = msg.last() {
+        w.push(format!(
+            "the decoder reported {} error line(s) and carried on, so part of the source \
+             may be missing from the output; last: {last}",
+            msg.len()
+        ));
+    }
+    // Container durations are rounded and include codec padding; a quarter second plus
+    // half a percent is well outside that and well inside any real truncation.
+    if probed_s > 0.0 && decoded_s + 0.25 + probed_s * 0.005 < probed_s {
+        w.push(format!(
+            "decoded {decoded_s:.2} s of a source the container says is {probed_s:.2} s long; \
+             the source looks truncated"
+        ));
+    }
+    w
+}
 
 /// Move up to `max` whole frames out of `carry` into the meter.
 ///
@@ -1297,7 +1373,7 @@ fn measure_delivered(
         "error".into(),
         "-nostdin".into(),
         "-i".into(),
-        path.display().to_string(),
+        crate::util::ffmpeg_arg(path),
     ];
     args.extend(
         [
@@ -1382,9 +1458,7 @@ fn decode_stage(
         if let Some(c) = &cancel {
             if c.load(Ordering::Relaxed) {
                 producer.kill();
-                return DecodeDone {
-                    result: Err(Error::Cancelled),
-                };
+                return DecodeDone::failed(Error::Cancelled);
             }
         }
         raw.resize(size, 0);
@@ -1392,7 +1466,7 @@ fn decode_stage(
             Ok(n) => n,
             Err(e) => {
                 producer.kill();
-                return DecodeDone { result: Err(e) };
+                return DecodeDone::failed(e);
             }
         };
         if raw_bytes == 0 {
@@ -1400,11 +1474,9 @@ fn decode_stage(
         }
         if raw_bytes % stride != 0 {
             producer.kill();
-            return DecodeDone {
-                result: Err(Error::msg(format!(
-                    "decode produced a partial frame ({raw_bytes} bytes, not a multiple of {stride})"
-                ))),
-            };
+            return DecodeDone::failed(Error::msg(format!(
+                "decode produced a partial frame ({raw_bytes} bytes, not a multiple of {stride})"
+            )));
         }
         raw.truncate(raw_bytes);
         if !tx.send(Decoded {
@@ -1413,16 +1485,18 @@ fn decode_stage(
         }) {
             // Downstream gave up; stop reading and take the child with us.
             producer.kill();
-            return DecodeDone {
-                result: Err(Error::Cancelled),
-            };
+            return DecodeDone::failed(Error::Cancelled);
         }
         // `send` moved the buffer; allocate the next one. The queue is bounded, so
         // at most `queue_blocks + 1` of these exist at any moment.
         raw = Vec::new();
     }
+    let result = producer.finish();
     DecodeDone {
-        result: producer.finish(),
+        result,
+        // Kept on success too: ffmpeg exits 0 after skipping a corrupt or truncated
+        // stretch, and this is the only trace of it.
+        stderr: producer.err_tail(),
     }
 }
 
@@ -1501,9 +1575,9 @@ fn join_stages(
     reader: std::thread::JoinHandle<DecodeDone>,
     writer: std::thread::JoinHandle<EncoderDone>,
 ) -> (DecodeDone, EncoderDone) {
-    let rd = reader.join().unwrap_or_else(|_| DecodeDone {
-        result: Err(Error::msg("decode stage panicked")),
-    });
+    let rd = reader
+        .join()
+        .unwrap_or_else(|_| DecodeDone::failed(Error::msg("decode stage panicked")));
     let wr = writer.join().unwrap_or_else(|_| EncoderDone {
         result: Err(Error::msg("encode stage panicked")),
         encoder: String::new(),
