@@ -289,6 +289,16 @@ pub struct RenderCfg {
     /// a scheduler hiccup, shallow enough that cancelling does not wait for a
     /// queue to drain.
     pub queue_blocks: usize,
+    /// Strip DC before the gain trim and the limiter, with a 5 Hz first-order blocker.
+    ///
+    /// Off by default, and off is the bit-exact path. `Dsp` is the vendor port: its
+    /// all-pass cascade has `H(1) = 1` exactly and adds the module's anti-denormal bias,
+    /// a settled +188 dBFS-below-full-scale `+4 * EPSILON` on the left and zero on the
+    /// right, which is 0.0034 of one 24-bit step and not worth disturbing. What is worth
+    /// catching is DC that came in from the source or from an IR that was not mean-free:
+    /// the 7.1 matrix sums eight channels into two, and carries an input offset at +5.179
+    /// on the left, where it reads to the limiter as level.
+    pub dc_block: bool,
     /// Which audio stream to take, 0-based.
     pub stream: usize,
     /// Over-sampling ratio the true peak is measured at, for every render.

@@ -78,6 +78,15 @@ pub struct Cli {
     /// render that adds neither latency nor level management to the source.
     #[arg(long)]
     pub no_limit: bool,
+    /// Remove DC before the gain trim and the limiter, with a 5 Hz first-order blocker
+    /// (exactly zero at DC, exactly unity at Nyquist).
+    ///
+    /// Off by default: the downmixer's own contribution is a settled +4e-10 on the left
+    /// and cannot be reached without breaking bit-exactness with the reference. Ask for
+    /// this when the *source* carries DC, or an impulse response does, since the 7.1 matrix
+    /// carries an input offset to +5.18 on the left, where the limiter reads it as level.
+    #[arg(long)]
+    pub dc_block: bool,
 
     /// Limit the true peak. On by default now; kept so an existing command line still
     /// means what it says.
@@ -513,6 +522,7 @@ impl Cli {
             },
             order: self.order.clone(),
             output_gain_db: self.setpoint.unwrap_or(self.gain),
+            dc_block: self.dc_block,
             true_peak: self.true_peak,
             limiter: LimiterCfg {
                 enable: !self.no_limit,

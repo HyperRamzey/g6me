@@ -600,3 +600,135 @@ impl<T: Real> Dsp<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stereo mask is the DLL's bypass branch, so a DC test on it measures a wire.
+    ///
+    /// This is the fact that made an earlier version of this test worthless: it passed,
+    /// and it proved nothing, because `mask == FL|FR` skips the whole all-pass cascade
+    /// (`Dsp::process`, "Stereo bypass, verified against the DLL"). Anything that claims
+    /// to measure what the filters do has to use a mask that reaches them.
+    #[test]
+    fn the_stereo_mask_is_a_wire_not_a_filter_chain() {
+        let n = 4096;
+        let sig: Vec<f64> = (0..n)
+            .map(|k| 0.5 * (2.0 * std::f64::consts::PI * k as f64 / 512.0).sin() + 0.25)
+            .collect();
+        let mut ch: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        ch[0] = Some(&sig);
+        ch[1] = Some(&sig);
+        let mut l = vec![0.0f64; n];
+        let mut r = vec![0.0f64; n];
+        let mut d = Dsp::<f64>::new(MASK_STEREO);
+        assert!(d.is_bypass(), "FL|FR must select the bypass branch");
+        d.process(&ch, &mut l, &mut r, n);
+        assert_eq!(l, sig, "the bypass branch changed the left channel");
+        assert_eq!(r, sig, "the bypass branch changed the right channel");
+    }
+
+    /// The filtered path's DC, measured where it is actually settled.
+    ///
+    /// Three things had to be true before any of these numbers meant anything.
+    ///
+    /// *The mask has to reach the filters.* `MASK_7_1`, not the stereo bypass.
+    ///
+    /// *The slots have to be the ones the mask names.* `SLOTS` is indexed by
+    /// `WAVEFORMATEXTENSIBLE` bit position, so 7.1 is FL(0) FR(1) FC(2) LFE(3) BL(4)
+    /// BR(5) SL(9) SR(10) — slots 6..8 are FLC/FRC/BC and are not in the mask. Filling
+    /// `[0..8]` drives two channels the file does not have and leaves two it does
+    /// silent, which is how a first attempt here measured a matrix gain of 0.955 where
+    /// the real one is 1.2948.
+    ///
+    /// *The window has to start after the transient and span whole periods.* The slowest
+    /// pole in the cascade is section A's at p = 0.99485016, tau = 193.7 samples, so
+    /// 16_384 samples is 85 tau — the cold-start response is long gone — and
+    /// `N - START` is 96 whole periods of the 512-sample test tone, so the tone
+    /// contributes exactly nothing to a mean taken there. Measured from sample 0,
+    /// instead, the same file reads +2.29e-4: not DC, the fixed area of the response
+    /// that a cold start never emits, divided by the window length. It shrinks as the
+    /// window grows, which is how to tell the two apart — real DC does not care how
+    /// long you listen.
+    ///
+    /// What is left is the denormal guard. Every section input gets `+EPSILON`
+    /// (`coefs.inc`, the DLL's own anti-denormal bias), and each all-pass section has
+    /// `H(1) = (b0+b1+1)/(1+a1+a2) = 1` exactly, because its numerator is its
+    /// denominator reversed: the all-pass zeros at 1/p cancel any DC rise its poles
+    /// would give. So the guard is carried to the output at unity — two sections per
+    /// branch, front and surround, summed for left and differenced for right:
+    /// left gets `+4*EPSILON` (−188 dBFS, 0.0034 of a 24-bit step) and right cancels to
+    /// exactly zero. Nothing in the port accumulates DC; a x4 oversampled true-peak
+    /// reading is not going to drift up a file's baseline over its length.
+    ///
+    /// Real input DC is a different matter, and this measures that too: it passes at the
+    /// matrix's DC sums, `1 + 2*k707` for the front pair and `k786 + k619 + k875 + k485`
+    /// for the surround — 5.179 on left, -0.351 on right. A quarter of DC in arrives as
+    /// +1.295 on left, which is +14.3 dB of *offset*, and the limiter downstream cannot
+    /// tell that from level. That is the reason DC is metered now, and the reason a
+    /// blocker exists as an opt-in rather than a rewrite of this file: `Dsp` is the
+    /// bit-exact port and must stay that way.
+    #[test]
+    fn filtered_path_dc_steady_state_and_matrix_dc_gain() {
+        const SLOTS_7_1: [usize; 8] = [0, 1, 2, 3, 4, 5, 9, 10];
+        const PERIOD: usize = 512;
+        const W: f64 = 2.0 * std::f64::consts::PI / (PERIOD as f64);
+        const START: usize = 16_384;
+        const N: usize = 65_536;
+
+        fn run_7_1(gen: fn(usize) -> f64) -> (f64, f64) {
+            let sig: Vec<f64> = (0..N).map(gen).collect();
+            let mut ch: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+            for &slot in &SLOTS_7_1 {
+                ch[slot] = Some(&sig);
+            }
+            let mut l = vec![0.0f64; N];
+            let mut r = vec![0.0f64; N];
+            let mut dsp = Dsp::<f64>::new(MASK_7_1);
+            assert!(!dsp.is_bypass(), "MASK_7_1 must reach the all-pass cascade");
+            dsp.process(&ch, &mut l, &mut r, N);
+            let win = (N - START) as f64;
+            (
+                l[START..].iter().sum::<f64>() / win,
+                r[START..].iter().sum::<f64>() / win,
+            )
+        }
+
+        let eps = f64::from_f32_bits(EPSILON);
+        for (name, gen) in [
+            ("sin", (|k| 0.5 * (W * k as f64).sin()) as fn(usize) -> f64),
+            ("cos", (|k| 0.5 * (W * k as f64).cos()) as fn(usize) -> f64),
+        ] {
+            let (ml, mr) = run_7_1(gen);
+            assert!(
+                (ml - 4.0 * eps).abs() < 1e-12,
+                "{name}: settled left mean should be 4*EPSILON ({:+.6e}), got {:+.6e}",
+                4.0 * eps,
+                ml
+            );
+            assert!(
+                mr.abs() < 1e-12,
+                "{name}: settled right mean should cancel to 0, got {:+.6e}",
+                mr
+            );
+        }
+
+        let front = 1.0 + 2.0 * f64::from_f32_bits(K_707);
+        let sur = f64::from_f32_bits(K_786)
+            + f64::from_f32_bits(K_619)
+            + f64::from_f32_bits(K_875)
+            + f64::from_f32_bits(K_485);
+        let want_l = 0.25 * (front + sur) + 4.0 * eps;
+        let want_r = 0.25 * (front - sur);
+        let (ml, mr) = run_7_1(|k| 0.5 * (W * k as f64).sin() + 0.25);
+        assert!(
+            (ml - want_l).abs() < 1e-11,
+            "left DC gain: want {want_l:.9}, got {ml:.9}"
+        );
+        assert!(
+            (mr - want_r).abs() < 1e-11,
+            "right DC gain: want {want_r:.9}, got {mr:.9}"
+        );
+    }
+}

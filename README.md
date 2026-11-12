@@ -369,11 +369,33 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
   lossless path the two agree to four decimal places. The cost is one extra decode
   pass per file: an 8 s render becomes about 14 s. (`-r/--rate` is input-side, before
   the downmix, so it is not what this is about; the output-side resampler is.)
-* **DC offset is not measured or removed.** The downmixer's biquads, the IR
-  convolution and a resampler can each leave a DC component, nothing reports it, and
-  a limiter treats DC as level. A file with real DC therefore reads a deeper true
-  peak than its AC content warrants. No claim is made either way until it is measured
-  per stage.
+* **DC is metered, and removed only on request.** Every render reports `dc_offset`
+  per channel — in full-scale units, because an offset carries a sign and is compared
+  against a quantisation step — for the stream and again for the finished file decoded
+  back. The downmixer's own contribution is measured rather than assumed: its all-pass
+  cascade has `H(1) = (b0+b1+1)/(1+a1+a2) = 1` exactly, since each section's numerator is
+  its denominator reversed, so it carries the vendor module's anti-denormal bias to the
+  output at unity — a settled `+4 * EPSILON` on the left (+4.0e-10, −188 dBFS, 0.0034 of
+  one 24-bit step) and exactly zero on the right, where the front and surround branches
+  difference out. That is left alone deliberately: erasing it would mean editing the
+  bit-exact port for an offset four orders of magnitude below one LSB.
+
+  What is worth catching arrives from outside, and on real material it arrives in
+  quantity. `810.mka` measures **+1.89e-4 / +1.80e-4** at the output — −74 dBFS, about
+  1590 LSBs of 24-bit — and ffmpeg's `astats` reads +1.94e-4 / +1.76e-4 on the source's
+  own front pair, so the offset belongs to the recording, not to the port. The 7.1 matrix
+  is why it matters: eight channels sum into two, carrying input DC at **+5.179** on the
+  left and **−0.351** on the right, so a quarter of DC in arrives as 1.29 out, which is
+  level as far as a limiter is concerned — it will spend gain reduction holding an offset
+  that never clips, and report a true peak no transient caused.
+
+  `--dc-block` inserts a 5 Hz first-order blocker (`H(z) = g(1-z⁻¹)/(1-Rz⁻¹)`, exactly
+  zero at DC, exactly unity at Nyquist) before the trim and the limiter: on that file the
+  reported mean falls from 1.89e-4 to 4.9e-9. It is opt-in and the default path stays
+  bit-exact, so turning it on changes every hash. What it leaves behind is the blocker's
+  own settling spread over the file — which is the reason a DC figure is only meaningful
+  with the window it was measured over, and why the tests here drain the limiter's
+  lookahead and skip the filter's transient before they claim a number.
 * **FLAC stops at 24 bits.** That is the container and the encoder, not a choice:
   ffmpeg's FLAC encoder writes `bps=24` and, fed 32-bit PCM, drops the low byte of
   every sample. G6ME therefore refuses `--format flac --depth 32` instead of shipping

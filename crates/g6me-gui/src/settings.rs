@@ -246,6 +246,8 @@ impl Settings {
             maxp: self.ir_maxp,
         };
         RenderCfg {
+            // The panel has no DC control: the panel is where the bit-exact default lives.
+            dc_block: false,
             resample: g6me_core::stages::ResampleCfg {
                 enable: self.resample,
                 rate: self.rate,

@@ -127,6 +127,15 @@ pub struct Report {
     /// Which detector produced the two numbers above, because a dBTP without its ratio
     /// is not a comparable number.
     pub true_peak_ratio: Ratio,
+    /// Per-channel DC offset of the samples handed to the encoder, in full-scale units
+    /// (`1.0` is 0 dBFS), not dB: an offset carries a sign and is compared against a
+    /// quantisation step, both of which are linear.
+    ///
+    /// Measured always. `Dsp` contributes a settled `+4 * EPSILON` on the left (the
+    /// vendor module's anti-denormal bias, −188 dBFS) and exactly zero on the right, and
+    /// that is not worth touching; what this is here to catch is DC that came in from
+    /// outside and left through the matrix at up to +5.179 on the left.
+    pub dc_offset: Vec<f64>,
     /// Output gain staging applied to every sample, in dB. 0.0 means the render added no
     /// level change of its own.
     #[serde(default)]
@@ -209,6 +218,15 @@ impl Report {
             self.true_peak_ratio.label(),
             chans
         );
+        // Printed whether or not a blocker is in use: the number is the reason to ask for
+        // the blocker, and an offset that is never shown is an offset that is never found.
+        let join = |v: &[f64]| {
+            v.iter()
+                .map(|x| format!("{x:+.2e}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        s.push_str(&format!("  dc: {}", join(&self.dc_offset)));
         if self.output_gain_db != 0.0 {
             // Undoing a constant gain is exact, so the reading from before the trim is not
             // a second measurement — it is this one with the trim taken back off.
@@ -314,6 +332,7 @@ struct PeakSummary {
     per_channel_true_peak_dbtp: Vec<f64>,
     sample_peak_dbfs: Vec<f64>,
     rms_dbfs: Vec<f64>,
+    dc_offset: Vec<f64>,
     limiter: Option<LimiterReport>,
 }
 
@@ -331,7 +350,9 @@ struct PeakStage {
     /// Output gain staging in force: applied to every sample, before the limiter, as one
     /// constant multiplier.
     gain: f64,
-    /// Per channel: held sample peak, running sum of squares, frames seen.
+    /// DC blocker, when asked for. `None` is the default and the bit-exact path.
+    dc: Option<[DcBlocker; 2]>,
+    /// Per channel: held sample peak, running sum of squares, mean, frames seen.
     accum: [Accum; 2],
 }
 
@@ -344,6 +365,7 @@ struct PeakStage {
 struct Accum {
     peak: f64,
     sum_sq: f64,
+    sum: f64,
     frames: u64,
 }
 
@@ -351,6 +373,7 @@ impl Accum {
     fn push(&mut self, buf: &[f64]) {
         let mut p = self.peak;
         let mut ss = self.sum_sq;
+        let mut s = self.sum;
         // Written as an explicit loop, in this order, because the sum is a reduction:
         // it must not be reassociated or contracted into an FMA any more than the
         // filters are. It is a meter, but a meter that moves between runs is a meter
@@ -361,9 +384,11 @@ impl Accum {
                 p = a;
             }
             ss += x * x;
+            s += x;
         }
         self.peak = p;
         self.sum_sq = ss;
+        self.sum = s;
         self.frames += buf.len() as u64;
     }
 
@@ -377,6 +402,76 @@ impl Accum {
         }
         db_from_peak((self.sum_sq / self.frames as f64).sqrt())
     }
+
+    /// Arithmetic mean: the DC offset, in full-scale units, not in dB.
+    ///
+    /// Linear on purpose. DC is compared against a quantisation step and against a
+    /// limiter's idea of level, both of which are linear quantities, and a dB figure for a
+    /// mean that is free to change sign is a figure that cannot be averaged or compared.
+    /// The mean is also the one DC measurement that survives a long file: a one-pole's
+    /// charge-up and a cold-start boundary term both wash out over a whole file, while a
+    /// real offset stays exactly where it was.
+    fn dc(&self) -> f64 {
+        if self.frames == 0 {
+            return 0.0;
+        }
+        self.sum / self.frames as f64
+    }
+}
+
+/// A first-order DC blocker: `H(z) = g (1 - z^-1) / (1 - R z^-1)`, `g = (1 + R) / 2`.
+///
+/// Exactly zero at DC and exactly unity at Nyquist, so it removes the offset and leaves
+/// the top octave alone: at 48 kHz the corner is 5 Hz and the droop at 20 Hz is 0.26 dB,
+/// which is why this shape rather than a `y = x - x1` difference, which would halve the
+/// bass and cost 6 dB at 20 Hz on the way to the same DC null.
+///
+/// It is opt-in, and that is not timidity. `Dsp` is the bit-exact port of the vendor
+/// module, and the vendor module passes DC through its all-pass cascade at `H(1) = 1`
+/// while adding its anti-denormal bias — a measured `+4 * EPSILON` on the left channel,
+/// −188 dBFS, and exactly zero on the right. Filtering that away would break bit-exactness
+/// with `vendor/g6ct` for an offset four orders of magnitude below one 24-bit step. What
+/// *is* worth removing is DC that arrived from outside: the source, or an IR that was not
+/// mean-free. The 7.1 matrix sums eight channels into two, so it carries input DC at
+/// +5.179 on the left and −0.351 on the right — a quarter of DC in arrives as 1.29 on the
+/// left, which the limiter downstream cannot tell apart from level, and which spends
+/// headroom and moves a dBTP before one transient has been limited.
+#[derive(Clone, Copy, Debug, Default)]
+struct DcBlocker {
+    r: f64,
+    g: f64,
+    x1: f64,
+    y1: f64,
+}
+
+impl DcBlocker {
+    /// Corner at 5 Hz: below the lowest note any delivery format carries, above nothing.
+    fn new(rate: u32) -> Self {
+        let r = (-2.0 * std::f64::consts::PI * 5.0 / f64::from(rate.max(1))).exp();
+        Self {
+            r,
+            g: 0.5 * (1.0 + r),
+            x1: 0.0,
+            y1: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, buf: &mut [f64]) {
+        let (r, g) = (self.r, self.g);
+        let (mut x1, mut y1) = (self.x1, self.y1);
+        for x in buf.iter_mut() {
+            let inp = *x;
+            // Parenthesised as written, not folded: the recurrence is the definition, and
+            // a contracted `g * (inp - x1) + r * y1` is a different number.
+            let y = g * (inp - x1) + r * y1;
+            x1 = inp;
+            y1 = y;
+            *x = y;
+        }
+        self.x1 = x1;
+        self.y1 = y1;
+    }
 }
 
 impl PeakStage {
@@ -385,21 +480,32 @@ impl PeakStage {
             .limiter
             .enable
             .then(|| Limiter::enabled(cfg.limiter, rate, 2));
+        let dc = cfg
+            .dc_block
+            .then(|| [DcBlocker::new(rate), DcBlocker::new(rate)]);
         Self {
             tp: TruePeak::new(cfg.true_peak, 2),
             shared: cfg.limiter.enable && cfg.limiter.ratio == cfg.true_peak,
             limiter,
             gain: 10f64.powf(cfg.output_gain_db / 20.0),
+            dc,
             accum: std::array::from_fn(|_| Accum::default()),
         }
     }
 
-    /// Stage the level, limit, then measure, in that order. Stereo, in place.
+    /// Block DC, stage the level, limit, then measure, in that order. Stereo, in place.
     ///
-    /// The trim goes first so the limiter sees the level the file will carry: a ceiling
-    /// applied before the gain that follows it is not a ceiling, and a meter reading taken
-    /// before it is not a measurement of the output.
+    /// The trim goes after the blocker and before the limiter so that both see the level
+    /// the file will carry: a ceiling applied before the gain that follows it is not a
+    /// ceiling, and a meter reading taken before it is not a measurement of the output.
+    /// The blocker goes first because its whole job is to keep an offset out of the other
+    /// two — a limiter that reads DC as level will spend gain reduction on a signal that
+    /// never clips, and a dBTP that includes an offset is not a peak.
     fn process(&mut self, left: &mut [f64], right: &mut [f64]) {
+        if let Some([dl, dr]) = self.dc.as_mut() {
+            dl.process(left);
+            dr.process(right);
+        }
         if self.gain != 1.0 {
             // One multiply per sample, and nothing else: a constant gain is the one DSP
             // step that is exactly reproducible, since there is no accumulation order to
@@ -481,6 +587,7 @@ impl PeakStage {
             per_channel_true_peak_dbtp,
             sample_peak_dbfs: self.accum.iter().map(Accum::peak_db).collect(),
             rms_dbfs: self.accum.iter().map(Accum::rms_db).collect(),
+            dc_offset: self.accum.iter().map(Accum::dc).collect(),
             limiter: report,
         }
     }
@@ -848,6 +955,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         limiter: peak_summary.limiter,
         sample_peak_dbfs: peak_summary.sample_peak_dbfs,
         rms_dbfs: peak_summary.rms_dbfs,
+        dc_offset: peak_summary.dc_offset,
     })
 }
 
@@ -998,6 +1106,12 @@ pub struct Delivered {
     pub per_channel_true_peak_dbtp: Vec<f64>,
     pub sample_peak_dbfs: Vec<f64>,
     pub rms_dbfs: Vec<f64>,
+    /// Per-channel DC offset of the finished file, decoded back, in full-scale units.
+    ///
+    /// Quantisation is what makes this worth its own measurement on a lossy or truncated
+    /// path: noise shaping and dither can leave a small residual mean in the file that the
+    /// stream never had.
+    pub dc_offset: Vec<f64>,
 }
 
 /// How far the file may sit from the metered stream before the report says so.
@@ -1128,6 +1242,7 @@ fn measure_delivered(
         per_channel_true_peak_dbtp: tp.per_channel_dbtp(),
         sample_peak_dbfs: acc.iter().map(Accum::peak_db).collect(),
         rms_dbfs: acc.iter().map(Accum::rms_db).collect(),
+        dc_offset: acc.iter().map(Accum::dc).collect(),
     })
 }
 
@@ -1667,6 +1782,160 @@ mod tests {
             r.warnings
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The blocker's own shape, measured at the two ends that define it.
+    ///
+    /// A DC blocker is allowed exactly two behaviours: nothing at DC, everything at
+    /// Nyquist. Anything else is a lowpass with a DC blocker's label on it, quietly
+    /// spending the top octave of every file it is pointed at.
+    #[test]
+    fn the_dc_blocker_kills_dc_and_leaves_nyquist_alone() {
+        // Long enough that the blocker's own settling is gone by the measurement window:
+        // r^n at 5 Hz over half of 2^18 samples is e^-86, far below any tolerance below.
+        const N: usize = 1 << 18;
+        const HALF: usize = N / 2;
+
+        let mut y = vec![0.25; N];
+        let mut b = DcBlocker::new(48_000);
+        b.process(&mut y);
+        let standing = y[HALF..].iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(
+            standing < 1e-12,
+            "DC still standing at {standing:.3e} after {N} samples"
+        );
+
+        let mut s: Vec<f64> = (0..N)
+            .map(|k| if k % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let mut b = DcBlocker::new(48_000);
+        b.process(&mut s);
+        let gain = s[HALF..].iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(
+            (gain - 1.0).abs() < 1e-9,
+            "Nyquist comes out at {gain} — the blocker is eating the top of the band"
+        );
+    }
+
+    /// DC is metered on every render, and the opt-in blocker keeps an offset out of the
+    /// limiter.
+    ///
+    /// The case worth building a control for is not the port's own +4e-10, which is
+    /// nowhere near anything. It is an offset that arrives from a source or an IR and
+    /// leaves the 7.1 matrix at up to +5.18, because a limiter cannot tell an offset from
+    /// level: it will spend gain reduction holding a DC value that never clips, and the
+    /// dBTP it reports will include a peak that is not a transient.
+    #[test]
+    fn dc_is_metered_by_default_and_the_blocker_keeps_it_out_of_the_limiter() {
+        const RATE: u32 = 48_000;
+        const N: usize = 1 << 16;
+        const SETTLE: usize = 1 << 15;
+        // 750 Hz: a 64-sample period, which divides both windows exactly, so the tone
+        // contributes nothing at all to a mean and every figure below is the offset's.
+        const W: f64 = 2.0 * std::f64::consts::PI / 64.0;
+        let pair = || {
+            (
+                (0..N)
+                    .map(|k| 0.5 * (W * k as f64).sin() + 0.25)
+                    .collect::<Vec<f64>>(),
+                (0..N)
+                    .map(|k| 0.5 * (W * k as f64).cos() - 0.125)
+                    .collect::<Vec<f64>>(),
+            )
+        };
+
+        // Metered, limiter out of the way, blocker off: the number has to be right before
+        // anything is allowed to act on it.
+        let (mut l, mut r) = pair();
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.limiter.enable = false;
+        let mut stage = PeakStage::new(&cfg, RATE);
+        stage.process(&mut l, &mut r);
+        let s = stage.summarize();
+        assert!(
+            (s.dc_offset[0] - 0.25).abs() < 1e-12,
+            "left offset read {:?}",
+            s.dc_offset
+        );
+        assert!(
+            (s.dc_offset[1] + 0.125).abs() < 1e-12,
+            "right offset read {:?}",
+            s.dc_offset
+        );
+
+        // The same signal under a -4 dBTP ceiling, unblocked. The tone alone peaks at
+        // -6.02 dBFS and would never be touched; the offset lifts it to -2.5 dBFS and the
+        // limiter works for it.
+        let (mut l, mut r) = pair();
+        cfg.limiter.enable = true;
+        cfg.limiter.ceiling_db = -4.0;
+        let mut stage = PeakStage::new(&cfg, RATE);
+        stage.process(&mut l, &mut r);
+        let gr = stage
+            .summarize()
+            .limiter
+            .expect("a ceiling was set")
+            .max_gain_reduction_db;
+        assert!(
+            gr > 0.2,
+            "+0.25 of DC put the peak under a -4 dBTP ceiling and the limiter took only {gr:.3} dB"
+        );
+
+        // Blocked over the whole file, then metered only from where the blocker has
+        // settled: tau is 1528 samples, so 32768 is 21 of them. The window is what is
+        // shortened, not the filtering — a mean taken over a span that includes a
+        // filter's own settling measures the settling rather than the file, and would
+        // report this working or broken either way.
+        let (mut l, mut r) = pair();
+        let mut dcs = [DcBlocker::new(RATE), DcBlocker::new(RATE)];
+        dcs[0].process(&mut l);
+        dcs[1].process(&mut r);
+        let mut tail_l = l[SETTLE..].to_vec();
+        let mut tail_r = r[SETTLE..].to_vec();
+        // Drain the lookahead, which is what a render does at end of file and a bare
+        // `process` call does not. Without this the mean is taken with 122 samples — 96 of
+        // lookahead, 26 of detector delay — still sitting in the delay line, and 122 % 64
+        // = 58 of them are an unfinished period out of a sum over 512. On this tone that
+        // is worth +2.3e-5 on the left and +8.7e-5 on the right: two and three orders of
+        // magnitude above the offset under test, and it fails looking exactly like the bug
+        // the test was written to catch. A DC measurement that has not drained the pipeline
+        // is measuring the pipeline's plumbing.
+        //
+        // The same cold-start lesson applies to the meter, not just the mean: a true-peak
+        // FIR started fresh on a block that begins at a crest sees a step, and reports it
+        // at +13.9 % (x8) — -4.89 dBTP for a tone whose sample peak is -6.02 dBFS. That is
+        // the filter being correct about a discontinuity, and a reason to read a file's
+        // numbers from its settled body rather than its first block.
+        let mut drain_l = [0.0f64; 256];
+        let mut drain_r = [0.0f64; 256];
+        let mut stage = PeakStage::new(&cfg, RATE);
+        stage.process(&mut tail_l, &mut tail_r);
+        stage.process(&mut drain_l, &mut drain_r);
+        let s = stage.summarize();
+        let standing = s.dc_offset.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(
+            standing < 1e-11,
+            "the blocked tail still carries {standing:.3e} of offset"
+        );
+        let gr = s.limiter.expect("a ceiling was set").max_gain_reduction_db;
+        assert_eq!(
+            gr, 0.0,
+            "the limiter is still holding down an offset it was never given: {gr} dB"
+        );
+
+        // Wiring, not arithmetic: the stage has to be the thing doing it. Measured over a
+        // whole file from frame 0, which includes the blocker's settling — an honest
+        // rendering starts with the blocker at rest, and its first 1528 samples still
+        // carry some of what they were given. Ten times down is the claim being made.
+        let (mut l, mut r) = pair();
+        cfg.dc_block = true;
+        let mut stage = PeakStage::new(&cfg, RATE);
+        stage.process(&mut l, &mut r);
+        let blocked = stage.summarize().dc_offset[0].abs();
+        assert!(
+            blocked < 0.025,
+            "dc_block is on and the left channel still reports {blocked:.3e}"
+        );
     }
 
     fn ffmpeg_to_f64(tools: &Tools, path: &Path) -> Vec<f64> {
