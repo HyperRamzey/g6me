@@ -528,7 +528,11 @@ pub fn probe_audio(tools: &Tools, path: &Path, pick: usize) -> Result<AudioInfo>
         ])
         .arg("-select_streams")
         .arg(format!("a:{pick}"))
-        .arg(path)
+        // The user's own file name, so ffprobe obeys the same rule as ffmpeg: it parses
+        // `[protocol:]target` before it looks at the filesystem, and answers "Protocol
+        // not found" for a relative name holding a colon. Measured: `ffprobe a:b.wav`
+        // fails that way while `ffprobe ./a:b.wav` reads the file.
+        .arg(crate::util::ffmpeg_path_arg(path))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

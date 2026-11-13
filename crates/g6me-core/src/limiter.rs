@@ -1140,6 +1140,51 @@ mod tests {
         }
     }
 
+    /// The ceiling is a promise, and a promise is only worth what it holds for at the
+    /// settings most likely to break it: a deep cut (a lot of gain reduction to slew), the
+    /// shortest lookahead the API accepts (no time to arrange the reduction in advance),
+    /// and the ratios that make each decibel of overage demand the most reduction.
+    ///
+    /// This is the answer to "a short lookahead needs a wider guard band". It does not:
+    /// every cell of this grid came out under its ceiling, so `Cfg::guard_db()` already
+    /// covers the short-lookahead case and inflating it further would only make the meter
+    /// pessimistic about a risk that is not there.
+    ///
+    /// Sabotage check: set `GAIN_SLEW_GUARD_DB` to 0 and this fails — measured at
+    /// +0.0035 dB over the ceiling with lookahead 0.2 ms, ratio x32, ceiling -12 dBTP —
+    /// so the guard is doing real work and 0.02 dB is enough of it. That is the whole
+    /// answer to asking for a wider band: the margin is earned at the worst cell in the
+    /// grid, not guessed at.
+    #[test]
+    fn the_ceiling_holds_across_ratios_lookahead_and_depth() {
+        let mut worst = f64::NEG_INFINITY;
+        let mut at = String::new();
+        let mut cells = 0usize;
+        for la in [MIN_LOOKAHEAD_MS, 1.0, MAX_LOOKAHEAD_MS] {
+            for ratio in [Ratio::X2, Ratio::X4, Ratio::X8, Ratio::X16, Ratio::X32] {
+                for &ceil in &[-1.0, -3.0, -6.0, -12.0, -18.0] {
+                    let c = cfg(ceil, ratio, la);
+                    for (i, m) in probe_materials().into_iter().enumerate() {
+                        let (_, r) = run(c, &[m], 333);
+                        cells += 1;
+                        let margin = r.post_dbtp - ceil;
+                        if margin > worst {
+                            worst = margin;
+                            at = format!(
+                                "lookahead {la} ms, {ratio:?}, ceiling {ceil} dBTP, material #{i}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst <= 0.0,
+            "post-limiter true peak sat {worst:+.4} dB over its ceiling at {at} \
+             ({cells} configurations)"
+        );
+    }
+
     fn burst(f: f64, amp: f64, n: usize, phase: f64) -> Vec<f64> {
         (0..n)
             .map(|i| amp * (2.0 * std::f64::consts::PI * f * i as f64 / FS + phase).sin())

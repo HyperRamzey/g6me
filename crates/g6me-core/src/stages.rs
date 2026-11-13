@@ -29,6 +29,7 @@ use crate::pcm::{BitDepth, Dither};
 use crate::probe::{AudioInfo, Caps};
 use crate::tp::Ratio;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Input-side normalization: rate conversion and (optionally) a bit-depth
@@ -481,7 +482,7 @@ pub fn input_args(
     mask: u32,
     src: &Path,
     ir_info: Option<&AudioInfo>,
-) -> Result<(Vec<String>, u32, usize)> {
+) -> Result<(Vec<OsString>, u32, usize)> {
     let (_, steps) = input_stage(cfg, info, mask);
     let work_rate = if cfg.resample.enable {
         cfg.resample.rate
@@ -490,24 +491,22 @@ pub fn input_args(
     };
     let channels = mask.count_ones() as usize;
 
-    let mut args: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
+    let mut args: Vec<OsString> = vec!["-v".into(), "error".into(), "-nostdin".into()];
     if let Some(t) = cfg.out.filter_threads {
         args.push("-filter_complex_threads".into());
-        args.push(t.to_string());
+        args.push(t.to_string().into());
     }
     args.push("-i".into());
-    args.push(src.display().to_string());
+    args.push(crate::util::ffmpeg_path_arg(src));
 
     if cfg.ir.enable {
         let ir_path = cfg
             .ir
             .file
             .as_ref()
-            .ok_or_else(|| Error::msg("IR calibration is enabled but no IR file is set"))?
-            .display()
-            .to_string();
+            .ok_or_else(|| Error::msg("IR calibration is enabled but no IR file is set"))?;
         args.push("-i".into());
-        args.push(ir_path);
+        args.push(crate::util::ffmpeg_path_arg(ir_path));
 
         // afir convolves in the main path's time base; an IR recorded at another
         // rate is brought to it, which is the only case where we resample an IR.
@@ -521,6 +520,39 @@ pub fn input_args(
                         work_rate
                     ),
                 );
+                // The calibration gain, and the reason it is not optional.
+                //
+                // A resampler treats an impulse response as the *signal* it is: the
+                // 96 kHz boxcar of height h comes out the far side as a 48 kHz boxcar of
+                // the same height h and half the taps. Physically that is the same
+                // acoustic response, but afir's raw convolution (`irnorm=-1`, which is
+                // what a measured correction filter needs, and the default here) sums
+                // taps without the sample period, so half the taps means half the gain:
+                // an IR authored at 96 kHz comes out 6.02 dB quieter at 48 kHz than the
+                // identical IR convolved at its own rate. Nothing about the file changed
+                // except the rate it was recorded at, and the level did.
+                //
+                // Measured on the installed FFmpeg 9.0.2, one boxcar IR of height 0.002
+                // over 1000 samples at 96 kHz, 100 Hz probe tone, `irnorm=-1`:
+                //   IR resampled to 48 kHz                    -44.095 dB
+                //   same IR convolved at native 96 kHz        -38.052 dB   <- reference
+                //   resampled + this volume= factor           -38.075 dB   <- matches
+                // Multiplying by `f_ir / f_work` (here 2, +6.02 dB) restores the
+                // native-rate answer. It goes BEFORE the aresample, because the
+                // expression reads the sample rate of the stream at that point in the
+                // chain, and after the resampler it would read the target rate and apply
+                // a factor of 1 — a no-op that looks like it was applied.
+                //
+                // Only when the IR is really being moved, and only when nothing else is
+                // already fixing the level: with `irnorm` >= 0, or left unset (affirming
+                // afir's own default of 1), afir normalizes the IR itself and this factor
+                // would be a 6 dB error of its own.
+                if cfg.ir.irnorm.is_some_and(|v| v < 0.0) {
+                    ir_steps.insert(
+                        0,
+                        format!("volume=volume='sample_rate/{work_rate}':eval=once"),
+                    );
+                }
             }
         }
         let mut main = steps.clone();
@@ -533,7 +565,7 @@ pub fn input_args(
             afir_filter(&cfg.ir)
         );
         args.push("-filter_complex".into());
-        args.push(graph);
+        args.push(graph.into());
         args.push("-map".into());
         args.push("[o]".into());
     } else {
@@ -541,13 +573,15 @@ pub fn input_args(
         // for a container that reports no layout it pins the channel count we
         // expect instead of letting the muxer guess.
         args.push("-af".into());
-        args.push(steps.join(","));
+        args.push(steps.join(",").into());
     }
 
     args.push("-f".into());
     args.push("f64le".into());
     args.push("-c:a".into());
     args.push("pcm_f64le".into());
+    // The literal stdout marker, deliberately not run through ffmpeg_path_arg: see
+    // the guard in that function that keeps `./-` from being built out of it.
     args.push("-".into());
     Ok((args, work_rate, channels))
 }
@@ -568,6 +602,56 @@ pub fn encoder_pump_args(work_rate: u32) -> Vec<String> {
     ]
 }
 
+/// The encode-side filter, or `None` when the encoder is fed exactly what the DSP
+/// produced and has nothing to convert.
+///
+/// Lives apart from [`output_args`] because the two reasons it exists — a rate change
+/// and a dither — are independent, and the third thing it carries (the depth the dither
+/// lands on) belongs to the dither rather than to either.
+fn encoder_filter(o: &OutCfg, work_rate: u32) -> Option<String> {
+    let need_resample = o.resample.is_some_and(|r| r != work_rate);
+    let need_dither = o.dither != Dither::None;
+    if !(need_resample || need_dither) {
+        return None;
+    }
+    let rate = o.resample.unwrap_or(work_rate);
+    let mut s = if need_resample {
+        format!(
+            "aresample={rate}:resampler=soxr:precision={}:dither_method={}",
+            o.precision as u32,
+            o.dither.ffmpeg_name()
+        )
+    } else {
+        format!("aresample=dither_method={}", o.dither.ffmpeg_name())
+    };
+    if o.resample.is_some() && !need_resample && o.precision > 0.0 {
+        s.push_str(&format!(":precision={}", o.precision as u32));
+    }
+    // Dither belongs at the depth the file will actually carry.
+    //
+    // libswresample has no 24-bit sample format, so a 24-bit request lands on s32
+    // (`-sample_fmt` in [`output_args`]) and the encoder derives `bps=24` from it. Left
+    // alone, the dither is generated and applied at the s32 least significant bit and the
+    // low 8 bits are then dropped on the way into the encoder: a dither 48.13 dB (2^8)
+    // below the bit it is supposed to straddle. Measured with the installed FFmpeg 9.0.2,
+    // feeding a constant equal to a quarter of the 24-bit LSB through this exact chain:
+    //   as it was              dither on -> -inf dB, the same file no dither produces
+    //   output_sample_bits=24  peak -138.47 dB, RMS -143.61 dB, i.e. real +-1 LSB noise
+    // The option is `output_sample_bits`; `out_sample_bits` does not exist on this filter
+    // and fails the graph at init, which is worth writing down because the wrong name is
+    // the one that circulates.
+    //
+    // It moves bytes only when there is a dither to place: with `dither_method=none` a
+    // 2-second slice of 810.mka hashes identically with and without it
+    // (0fa5a4bc18c68f13...), and identically to the plain auto-convert path. So the
+    // undithered pipeline — the reference render among them — is untouched. This changes
+    // what dither does, not what undithered audio is.
+    if o.depth == BitDepth::S24 {
+        s.push_str(":output_sample_bits=24");
+    }
+    Some(s)
+}
+
 /// Command line for the consuming (encode) child — one ffmpeg process, whatever
 /// the format.
 pub fn output_args(
@@ -576,7 +660,7 @@ pub fn output_args(
     out_path: &Path,
     src: &Path,
     caps: &Caps,
-) -> Result<Vec<String>> {
+) -> Result<Vec<OsString>> {
     let o = &cfg.out;
     o.validate(caps)?;
 
@@ -584,36 +668,21 @@ pub fn output_args(
         // No encoder child at all; the pump hands samples to the tap.
         return Ok(Vec::new());
     }
-    let mut args: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
+    let mut args: Vec<OsString> = vec!["-v".into(), "error".into(), "-nostdin".into()];
     if let Some(t) = o.filter_threads {
         args.push("-filter_complex_threads".into());
-        args.push(t.to_string());
+        args.push(t.to_string().into());
     }
-    args.extend(encoder_pump_args(work_rate));
+    args.extend(encoder_pump_args(work_rate).into_iter().map(OsString::from));
     if o.copy_metadata {
         // Second input, read for its header/tags only.
         args.push("-i".into());
-        args.push(src.display().to_string());
+        args.push(crate::util::ffmpeg_path_arg(src));
     }
 
-    let need_resample = o.resample.is_some_and(|r| r != work_rate);
-    let need_dither = o.dither != Dither::None;
-    if need_resample || need_dither {
-        let rate = o.resample.unwrap_or(work_rate);
-        let mut s = if need_resample {
-            format!(
-                "aresample={rate}:resampler=soxr:precision={}:dither_method={}",
-                o.precision as u32,
-                o.dither.ffmpeg_name()
-            )
-        } else {
-            format!("aresample=dither_method={}", o.dither.ffmpeg_name())
-        };
-        if o.resample.is_some() && !need_resample && o.precision > 0.0 {
-            s.push_str(&format!(":precision={}", o.precision as u32));
-        }
+    if let Some(f) = encoder_filter(o, work_rate) {
         args.push("-af".into());
-        args.push(s);
+        args.push(f.into());
     }
     if o.copy_metadata {
         args.push("-map".into());
@@ -630,19 +699,19 @@ pub fn output_args(
             args.push("-c:a".into());
             args.push("flac".into());
             args.push("-compression_level".into());
-            args.push(level.to_string());
+            args.push(level.to_string().into());
             // Ask for the depth explicitly instead of letting the encoder pick: a
             // 24-bit request lands on s32 (libswresample has no s24 format) and the
             // encoder then derives bps=24 from it, which is what makes the stream
             // genuinely 24-bit rather than a widened one.
             args.push("-sample_fmt".into());
             args.push(o.depth.swr_fmt().into());
-            args.push(out_path.display().to_string());
+            args.push(crate::util::ffmpeg_path_arg(out_path));
         }
         OutFormat::Wav => {
             args.push("-c:a".into());
             args.push(o.depth.codec().into());
-            args.push(out_path.display().to_string());
+            args.push(crate::util::ffmpeg_path_arg(out_path));
         }
         OutFormat::Null => unreachable!("handled above"),
     }
@@ -807,11 +876,167 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.out.depth, BitDepth::S24);
-        let j = args.join(" ");
+        let j = crate::util::args_display(&args);
         assert!(j.contains("-c:a flac"), "{j}");
         assert!(j.contains("-sample_fmt s32"), "{j}");
         assert!(!j.contains("aresample"), "{j}");
         assert!(!j.contains("dither"), "{j}");
+    }
+
+    /// The dither has to be generated at the depth the file carries, not at the width
+    /// libswresample happens to work in.
+    ///
+    /// Sabotage check: delete the `output_sample_bits` branch in `encoder_filter` and the
+    /// first assertion fails while everything else still passes — which is exactly how it
+    /// shipped: a dither 48 dB too quiet to reach the bit being quantised is invisible to
+    /// every test that only checks that a dither was *requested*.
+    #[test]
+    fn a_24_bit_dither_is_generated_at_the_24_bit_lsb() {
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.out.dither = Dither::Triangular;
+        assert_eq!(cfg.out.depth, BitDepth::S24);
+        let j = crate::util::args_display(
+            &output_args(
+                &cfg,
+                48000,
+                Path::new("/tmp/o.flac"),
+                Path::new("/tmp/i.mka"),
+                &caps_flac24(),
+            )
+            .unwrap(),
+        );
+        assert!(j.contains("dither_method="), "{j}");
+        assert!(
+            j.contains("output_sample_bits=24"),
+            "24-bit output quantises through s32, so without this the dither lands on \
+             the 32-bit LSB and the encoder throws it away: {j}"
+        );
+
+        // 16-bit asks libswresample for s16, a format it has, so the dither is already
+        // straddling the right bit. Adding the option there would be noise at best.
+        let mut c16 = RenderCfg::with_defaults();
+        c16.out.depth = BitDepth::S16;
+        c16.out.dither = Dither::Triangular;
+        let j16 = crate::util::args_display(
+            &output_args(
+                &c16,
+                48000,
+                Path::new("/tmp/o.flac"),
+                Path::new("/tmp/i.mka"),
+                &caps_flac24(),
+            )
+            .unwrap(),
+        );
+        assert!(j16.contains("dither_method="), "{j16}");
+        assert!(
+            !j16.contains("output_sample_bits"),
+            "s16 is a real swr format, the depth option belongs to the s32 detour: {j16}"
+        );
+    }
+
+    /// An impulse response carries its own sample rate, and afir's raw convolution sums
+    /// taps without the sample period that makes them a response. See the measurement in
+    /// `input_args`: a 96 kHz IR convolved at 48 kHz comes out 6.02 dB quiet unless the
+    /// ratio of the two rates is put back.
+    #[test]
+    fn a_resampled_ir_is_recalibrated_to_its_own_rate() {
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.ir.enable = true;
+        cfg.ir.file = Some(PathBuf::from("/x/ir96.wav"));
+        let mut ir = info();
+        ir.sample_rate = 96_000;
+        ir.channels = 1;
+        ir.layout = Some("mono".into());
+        let (args, rate, _) = input_args(
+            &cfg,
+            &info(),
+            crate::dsp::MASK_7_1,
+            Path::new("/x/i.mka"),
+            Some(&ir),
+        )
+        .unwrap();
+        assert_eq!(rate, 48_000, "the graph is built at the working rate");
+        let j = crate::util::args_display(&args);
+        let vol = j.find("volume=volume='sample_rate/48000':eval=once");
+        let resample = j.find("aresample=48000");
+        assert!(
+            vol.is_some() && resample.is_some(),
+            "a 96 kHz IR at a 48 kHz working rate needs both the resample and the \
+             2x calibration gain: {j}"
+        );
+        assert!(
+            vol.unwrap() < resample.unwrap(),
+            "the factor reads the sample rate of the stream where it sits, so it has to \
+             come before the resampler or it multiplies by 1 and looks applied: {j}"
+        );
+    }
+
+    #[test]
+    fn an_ir_that_is_already_level_normalised_gets_no_second_gain() {
+        // Leaving `irnorm` unset affirms afir's own default of 1, which normalises the IR.
+        // Applying the rate ratio on top of that is a 6 dB error, so the calibration is
+        // conditional on the raw-IR mode actually being in force.
+        let mut cfg = RenderCfg::with_defaults();
+        cfg.ir.enable = true;
+        cfg.ir.file = Some(PathBuf::from("/x/ir96.wav"));
+        cfg.ir.irnorm = None;
+        let mut ir = info();
+        ir.sample_rate = 96_000;
+        ir.channels = 1;
+        ir.layout = Some("mono".into());
+        let (args, _, _) = input_args(
+            &cfg,
+            &info(),
+            crate::dsp::MASK_7_1,
+            Path::new("/x/i.mka"),
+            Some(&ir),
+        )
+        .unwrap();
+        let j = crate::util::args_display(&args);
+        assert!(j.contains("aresample=48000"), "{j}");
+        assert!(!j.contains("volume="), "{j}");
+    }
+
+    /// A name ffmpeg reads as `[protocol:]target` never reaches the filesystem, and the
+    /// loss is not the same on the two sides: on input the probe fails, on output the
+    /// encoder refuses to start. Both measured on FFmpeg 9.0.2.
+    #[test]
+    fn names_ffmpeg_would_read_as_a_protocol_reach_it_as_a_path() {
+        let cfg = RenderCfg::with_defaults();
+        let (args, _, _) = input_args(
+            &cfg,
+            &info(),
+            crate::dsp::MASK_7_1,
+            Path::new("a:b.mka"),
+            None,
+        )
+        .unwrap();
+        let j = crate::util::args_display(&args);
+        assert!(j.contains(" -i ./a:b.mka "), "{j}");
+        assert!(
+            j.ends_with(" -"),
+            "the stdout marker must stay a bare dash or the decoded audio becomes a file \
+             called '-' and the reader at the other end waits forever: {j}"
+        );
+        assert!(
+            !j.contains("./- "),
+            "a prefixed dash is the bug above wearing a plausible path: {j}"
+        );
+
+        let out = output_args(
+            &cfg,
+            48000,
+            Path::new("out:v.flac"),
+            Path::new("i.mka"),
+            &caps_flac24(),
+        )
+        .unwrap();
+        let jo = crate::util::args_display(&out);
+        assert!(
+            jo.ends_with(" ./out:v.flac"),
+            "the output name is positional, so a leading colon reads as a muxer and the \
+             encoder never starts: {jo}"
+        );
     }
 
     #[test]
@@ -837,7 +1062,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((rate, ch), (48000, 8));
-        let j = args.join(" ");
+        let j = crate::util::args_display(&args);
         assert!(j.contains("-filter_complex"), "{j}");
         assert!(j.contains("[0:a:0]"), "{j}");
         assert!(
@@ -958,7 +1183,7 @@ mod tests {
             &caps_flac24(),
         )
         .unwrap();
-        let j = args.join(" ");
+        let j = crate::util::args_display(&args);
         assert!(
             j.contains("aresample=96000:resampler=soxr:precision=33:dither_method=none"),
             "{j}"

@@ -14,9 +14,12 @@ use g6me_core::limiter::{
     MIN_ATTACK_MS, MIN_CEILING_DB, MIN_LOOKAHEAD_MS, MIN_RELEASE_MS,
 };
 use g6me_core::mask::Slot;
+#[cfg(feature = "monitor")]
 use g6me_core::meter::Meters;
 use g6me_core::pcm::{BitDepth, Dither};
-use g6me_core::pipeline::{self, Plan, RenderOpts};
+#[cfg(feature = "monitor")]
+use g6me_core::pipeline::RenderOpts;
+use g6me_core::pipeline::{self, Plan};
 use g6me_core::probe::{probe_caps, Caps, Tools};
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
 use g6me_core::tp::Ratio;
@@ -179,8 +182,14 @@ pub struct Cli {
     #[arg(long)]
     pub ir_dry: Option<f64>,
 
-    /// Convolution length in seconds (0 = whole IR).
-    #[arg(long)]
+    /// Convolution length as a fraction of the IR: 0.5 convolves half of it. 0 or 1
+    /// means the whole IR, which is also the default.
+    ///
+    /// This is `afir`'s own unit, and it is a fraction, not a duration.
+    // `allow_negative_numbers` for the same reason `--ceiling` has it: without it clap
+    // reads a leading minus as a flag and refuses the command line before the value
+    // parser can say what is actually wrong with the number.
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_ir_length)]
     pub ir_length: Option<f64>,
 
     /// IR phase: `none` keeps linear phase, `min`/`minimum` folds it to a
@@ -411,6 +420,24 @@ fn parse_ir_norm(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// `afir`'s `length` is a fraction of the IR, not a number of seconds.
+///
+/// Measured on FFmpeg 9.0.2, where the option is declared `set IR length (from 0 to 1)
+/// (default 1)`: `length=0.5` runs, and `length=1.5` stops the whole filter graph with
+/// "Value 1.500000 for parameter 'length' out of range [0 - 1]" and exit 222. Left alone,
+/// that failure arrives per file, after the queue has started, phrased as a filter-graph
+/// error that does not name the flag that caused it.
+fn parse_ir_length(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("'{s}' is not a number"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!(
+            "--ir-length is a fraction of the IR (1 or 0 = the whole IR, 0.5 = half of it), \
+             not a duration in seconds; got {v}"
+        ));
+    }
+    Ok(v)
+}
+
 fn parse_ratio(s: &str) -> Result<Ratio, String> {
     s.parse()
 }
@@ -492,7 +519,11 @@ impl Cli {
             gtype: self.ir_gtype,
             wet: self.ir_wet.or_else(|| IrCfg::default().wet),
             dry: self.ir_dry,
-            length: self.ir_length,
+            // 0 is the documented way to ask for the whole IR. afir's default is already
+            // the whole IR, so the honest implementation of that promise is to leave the
+            // option out: passing length=0 would set the fraction to zero and convolve
+            // nothing, which is the opposite of what the flag says.
+            length: self.ir_length.filter(|v| *v > 0.0),
             link: None,
             minp: self.ir_minp.unwrap_or(4096),
             maxp: self.ir_maxp.unwrap_or(4096),
@@ -749,6 +780,7 @@ fn render_batch(cli: &Cli, cfg: BatchCfg, tools: &Tools, caps: &Caps) -> ExitCod
     if cli.dry_run {
         return dry_run(cli, &items, &cfg.render, tools, caps);
     }
+    warn_moved(&items);
 
     let ui = Arc::new(Ui::new(cli.quiet, cli.json));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -829,6 +861,11 @@ fn dry_run(cli: &Cli, items: &[Item], cfg: &RenderCfg, tools: &Tools, caps: &Cap
             item.src.display(),
             item.dst.display()
         );
+        // Said where the plan is printed, because this is the moment the user is reading
+        // the destinations and deciding whether to run it.
+        if let Some(why) = &item.note {
+            println!("#   {why}");
+        }
         match pipeline::plan_file(&item.src, &item.dst, cfg, tools, caps) {
             Ok(plan) => {
                 println_plan(&plan, cli.json);
@@ -853,6 +890,33 @@ fn dry_run(cli: &Cli, items: &[Item], cfg: &RenderCfg, tools: &Tools, caps: &Cap
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// Say out loud, before any work, when files cannot use the output path their names imply.
+///
+/// A batch that quietly renames is a batch that loses files: the colliding write gets
+/// skipped as already rendered, nothing fails, and the output folder is short by however
+/// many collided. Going to stderr keeps `--json` on stdout machine-clean.
+fn warn_moved(items: &[Item]) {
+    let moved: Vec<&Item> = items.iter().filter(|i| i.note.is_some()).collect();
+    if moved.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{} file(s) cannot use the output path their name implies:",
+        moved.len()
+    );
+    for it in moved.iter().take(8) {
+        eprintln!(
+            "  {} -> {}  ({})",
+            it.src.display(),
+            it.dst.display(),
+            it.note.clone().unwrap_or_default()
+        );
+    }
+    if moved.len() > 8 {
+        eprintln!("  ... and {} more", moved.len() - 8);
+    }
 }
 
 fn println_plan(plan: &Plan, json: bool) {
@@ -957,14 +1021,16 @@ fn list_devices() -> ExitCode {
 fn monitor_files(cli: &Cli, tools: &Tools, caps: &Caps) -> ExitCode {
     use g6me_core::monitor::Monitor;
 
-    let mut cfg = match cli.render_cfg() {
+    let base_cfg = match cli.render_cfg() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::from(2);
         }
     };
-    cfg.out.format = OutFormat::Null;
+    let mut base_cfg = base_cfg;
+    base_cfg.out.format = OutFormat::Null;
+    let cfg = &base_cfg;
     let ext = "flac".to_string();
     let items = batch::discover(&cli.input, cli.out_dir.as_deref(), &ext, true);
     // No flag for this on the check path; folders are scanned recursively, as documented.
@@ -1005,15 +1071,16 @@ fn monitor_files(cli: &Cli, tools: &Tools, caps: &Caps) -> ExitCode {
                 continue;
             }
         };
-        if !cli.rate.is_some() && info.sample_rate != mon.sample_rate() {
+        // One config per file, derived from what the user asked for, never carried over
+        // from the file before it.
+        let file_cfg = monitor_cfg_for(cfg, info.sample_rate, mon.sample_rate(), cli.rate);
+        if file_cfg.resample.enable && !cfg.resample.enable {
             eprintln!(
                 "note: {} is {} Hz, device is {} Hz — resampling with soxr to play in tune",
                 item.src.file_name().unwrap_or_default().to_string_lossy(),
                 info.sample_rate,
                 mon.sample_rate()
             );
-            cfg.resample.enable = true;
-            cfg.resample.rate = mon.sample_rate();
         }
         eprintln!(
             "playing {} on {}  [{} ch, {} Hz]",
@@ -1038,7 +1105,7 @@ fn monitor_files(cli: &Cli, tools: &Tools, caps: &Caps) -> ExitCode {
         }
         let t0 = Instant::now();
         let dst = Path::new("");
-        match pipeline::render_file(&item.src, dst, &cfg, &opts) {
+        match pipeline::render_file(&item.src, dst, &file_cfg, &opts) {
             Ok(r) => {
                 let peak: Vec<String> = meters
                     .peaks()
@@ -1083,6 +1150,35 @@ fn monitor_files(cli: &Cli, _tools: &Tools, _caps: &Caps) -> ExitCode {
     let _ = cli;
     eprintln!("this build has no monitoring support (feature `monitor` is off)");
     ExitCode::from(2)
+}
+
+/// The render config for one file in a monitor run.
+///
+/// The device sets the clock, so a file recorded at another rate has to be resampled to
+/// it, which is a real change to the samples. This is a function of one file's rate
+/// rather than a few lines that edit a config in place, because `--monitor` takes
+/// folders: a config mutated by the first file would carry its resample into the second,
+/// so a file that already matched the device would be resampled anyway — silently, and
+/// with the explanatory message attached to whichever file happened to come first.
+///
+/// A `--rate` the user gave outranks the device: they asked for a rate, and layering a
+/// second, guessed decision on top of it is not mine to make.
+// Only the monitor path calls this; the tests below run it either way so the rule it
+// encodes is checked in every build configuration, not just the one CI happens to build.
+#[cfg_attr(not(feature = "monitor"), allow(dead_code))]
+#[must_use]
+fn monitor_cfg_for(
+    base: &RenderCfg,
+    file_rate: u32,
+    device_rate: u32,
+    user_rate: Option<u32>,
+) -> RenderCfg {
+    let mut cfg = base.clone();
+    if user_rate.is_none() && file_rate != device_rate {
+        cfg.resample.enable = true;
+        cfg.resample.rate = device_rate;
+    }
+    cfg
 }
 
 /// A one-line summary of what happens to the samples, for the startup banner.
@@ -1302,10 +1398,82 @@ mod tests {
         assert!(e.contains("8000..=384000"), "{e}");
     }
 
+    /// `afir`'s `length` is a fraction, and a value outside 0..=1 kills the filter graph
+    /// per file rather than being clamped.
+    #[test]
+    fn ir_length_is_a_fraction_and_is_checked_as_one() {
+        let c = Cli::try_parse_from(["g6me", "a.mka", "--ir-length", "0.25"]).unwrap();
+        assert_eq!(c.ir_length, Some(0.25));
+        for bad in ["1.5", "2", "200", "-0.1"] {
+            let e = Cli::try_parse_from(["g6me", "a.mka", "--ir-length", bad]).unwrap_err();
+            let msg = e.to_string();
+            assert!(
+                msg.contains("fraction"),
+                "'{bad}' must be refused by name and explained as a fraction: {msg}"
+            );
+        }
+    }
+
+    /// The documented meaning of `--ir-length 0` is the whole IR, and the whole IR is what
+    /// `afir` does when the option is absent. Passing `length=0` would instead convolve a
+    /// fraction of zero of the response.
+    #[test]
+    fn a_zero_ir_length_means_the_whole_ir() {
+        let c = Cli::try_parse_from(["g6me", "a.mka", "--ir-length", "0"]).unwrap();
+        let cfg = c.render_cfg().unwrap();
+        assert_eq!(
+            cfg.ir.length, None,
+            "0 asks for the whole IR, which is afir's default"
+        );
+        let half = Cli::try_parse_from(["g6me", "a.mka", "--ir-length", "0.5"])
+            .unwrap()
+            .render_cfg()
+            .unwrap();
+        assert_eq!(half.ir.length, Some(0.5));
+    }
+
     #[test]
     fn many_inputs_are_accepted() {
         let c = Cli::try_parse_from(["g6me", "a.mka", "b.mka", "/music/jazz"]).unwrap();
         assert_eq!(c.input.len(), 3);
+    }
+
+    /// A monitor run walks a folder, and the device rate is only known once.
+    ///
+    /// Sabotage check: replace `base.clone()` with a config shared and mutated across the
+    /// loop and the second assertion fails — the 48 kHz file gets resampled by a decision
+    /// that belonged to the 44.1 kHz one before it, with no message about it.
+    #[test]
+    fn a_monitored_file_does_not_inherit_the_previous_files_resample() {
+        let base = RenderCfg::with_defaults();
+        assert!(!base.resample.enable, "default path does not resample");
+        let off_rate = monitor_cfg_for(&base, 44_100, 48_000, None);
+        assert!(off_rate.resample.enable, "44.1 kHz on a 48 kHz device");
+        assert_eq!(
+            off_rate.resample.rate, 48_000,
+            "to the device, not anywhere"
+        );
+        let matched = monitor_cfg_for(&base, 48_000, 48_000, None);
+        assert!(
+            !matched.resample.enable,
+            "a file already at the device rate must not be resampled because some other \
+             file needed it"
+        );
+        assert_eq!(
+            base,
+            RenderCfg::with_defaults(),
+            "the caller's config is untouched"
+        );
+    }
+
+    #[test]
+    fn an_explicit_rate_outranks_the_device_in_a_monitor_run() {
+        let base = RenderCfg::with_defaults();
+        let cfg = monitor_cfg_for(&base, 44_100, 48_000, Some(96_000));
+        assert_eq!(
+            cfg, base,
+            "--rate was given, so the device rate is not layered on top of it"
+        );
     }
 
     trait StrErr {

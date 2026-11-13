@@ -8,6 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::probe::tail;
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -65,7 +66,17 @@ pub(crate) fn spawn_stderr_reader(
 
 impl Proc {
     /// Spawn with stdout piped (a producer we read PCM from).
-    pub fn spawn_reader(name: &'static str, bin: &Path, args: &[String]) -> Result<Self> {
+    ///
+    /// Generic over the argument type rather than fixed to `String`, because a path
+    /// argument must be able to arrive as raw bytes: [`crate::util::ffmpeg_path_arg`]
+    /// hands back an `OsString`, and a `String`-only signature would force the caller
+    /// through a lossy conversion, which is the exact thing that function exists to
+    /// avoid. `&[String]` still fits, so nothing else has to change.
+    pub fn spawn_reader<S: AsRef<OsStr>>(
+        name: &'static str,
+        bin: &Path,
+        args: &[S],
+    ) -> Result<Self> {
         let mut cmd = Command::new(bin);
         cmd.args(args)
             .stdin(Stdio::null())
@@ -75,7 +86,11 @@ impl Proc {
     }
 
     /// Spawn with stdin piped (a consumer we write PCM to).
-    pub fn spawn_writer(name: &'static str, bin: &Path, args: &[String]) -> Result<Self> {
+    pub fn spawn_writer<S: AsRef<OsStr>>(
+        name: &'static str,
+        bin: &Path,
+        args: &[S],
+    ) -> Result<Self> {
         let mut cmd = Command::new(bin);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -86,7 +101,7 @@ impl Proc {
 
     /// Spawn with **both** data pipes open, for a child that sits in the middle
     /// of a chain (ffmpeg writing raw 24-bit PCM that we forward to `flac`).
-    pub fn spawn_rw(name: &'static str, bin: &Path, args: &[String]) -> Result<Self> {
+    pub fn spawn_rw<S: AsRef<OsStr>>(name: &'static str, bin: &Path, args: &[S]) -> Result<Self> {
         let mut cmd = Command::new(bin);
         cmd.args(args)
             .stdin(Stdio::piped())

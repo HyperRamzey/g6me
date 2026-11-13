@@ -23,6 +23,7 @@ use crate::stages::{
 };
 use crate::tp::{db_from_peak, Ratio, TruePeak};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1175,6 +1176,12 @@ pub fn plan_file(
 
     let (input_args, _, _) = input_args(cfg, &info, mask, src, ir_info.as_ref())?;
     let encode_cmd = output_args(cfg, work_rate, dst, src, caps)?;
+    // Both are the *preview* copies. The render paths build their own argument vectors
+    // through the same builders and hand the raw OsStrings straight to the process, so
+    // shrinking these to lossy strings for a `--dry-run` line or a JSON blob cannot
+    // change which file is opened.
+    let input_args = crate::util::args_preview(&input_args);
+    let encode_cmd = crate::util::args_preview(&encode_cmd);
     Ok(Plan {
         info,
         order,
@@ -1292,12 +1299,16 @@ fn measure_delivered(
     channels: usize,
 ) -> Option<Delivered> {
     let stride = channels.max(1);
-    let mut args = vec![
-        "-v".to_string(),
+    // OsString because this is the file we just wrote, whose name may be anything the
+    // user asked for: a lossy `display()` here would look up a name that does not exist,
+    // the measurement would come back `None`, and the report would say the delivered file
+    // was never checked when the real cause is a colon in a file name.
+    let mut args: Vec<OsString> = vec![
+        "-v".into(),
         "error".into(),
         "-nostdin".into(),
         "-i".into(),
-        path.display().to_string(),
+        crate::util::ffmpeg_path_arg(path),
     ];
     args.extend(
         [
@@ -1311,7 +1322,7 @@ fn measure_delivered(
             "-",
         ]
         .iter()
-        .map(|s| s.to_string()),
+        .map(|s| OsString::from(*s)),
     );
     let mut p = Proc::spawn_reader("delivered", &tools.ffmpeg, &args).ok()?;
     let block = 8192usize;
@@ -1815,7 +1826,7 @@ mod tests {
     }
 
     /// Run a produced command line and collect its f64 stream.
-    fn spawn_f64(tools: &Tools, args: &[String]) -> Vec<f64> {
+    fn spawn_f64<S: AsRef<std::ffi::OsStr>>(tools: &Tools, args: &[S]) -> Vec<f64> {
         let mut p = Proc::spawn_reader("decode", &tools.ffmpeg, args).unwrap();
         let mut raw = Vec::new();
         let mut buf = vec![0u8; 1 << 16];

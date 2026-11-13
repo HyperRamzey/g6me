@@ -85,6 +85,12 @@ pub struct Item {
     pub frames: u64,
     pub error: Option<String>,
     pub report: Option<Report>,
+    /// Why this item's destination is not the one its name alone would have produced.
+    ///
+    /// Set when two inputs wanted the same output path. Silence here means the obvious
+    /// destination was used; a rename that nobody can see is how a batch quietly loses a
+    /// file, so the reason travels with the item to the queue row and the dry-run listing.
+    pub note: Option<String>,
 }
 
 impl Item {
@@ -96,7 +102,14 @@ impl Item {
             frames: 0,
             error: None,
             report: None,
+            note: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 
     pub fn seconds(&self) -> f64 {
@@ -195,6 +208,22 @@ pub fn looks_like_audio(p: &Path) -> bool {
 /// `~/Music` lands as `~/Music-flac/Artist/Album/track.flac` instead of 40 000
 /// files in one heap.
 pub fn output_for(src: &Path, base: &Path, out_dir: Option<&Path>, ext: &str) -> PathBuf {
+    output_for_prefixed(src, base, Path::new(""), out_dir, ext)
+}
+
+/// [`output_for`] with a folder component forced in front of the mirrored path.
+///
+/// This is how a second input folder called `Album` gets a tree of its own. Its root
+/// is used as the mirror base (so the relative path is what is inside it) and the
+/// renamed folder becomes this prefix, which keeps every file beneath it in the same
+/// shape as the folder that kept the original name.
+fn output_for_prefixed(
+    src: &Path,
+    base: &Path,
+    prefix: &Path,
+    out_dir: Option<&Path>,
+    ext: &str,
+) -> PathBuf {
     let stem = src
         .file_name()
         .map(|s| {
@@ -205,15 +234,19 @@ pub fn output_for(src: &Path, base: &Path, out_dir: Option<&Path>, ext: &str) ->
             }
         })
         .unwrap_or_else(|| "output".to_string());
-    let root = out_dir.unwrap_or_else(|| src.parent().unwrap_or(Path::new(".")));
-    let subdir = match out_dir {
-        Some(_) => relative_within(src.parent().unwrap_or(Path::new(".")), base)
-            .unwrap_or(Path::new(""))
-            .to_path_buf(),
-        None => PathBuf::new(),
+    let root = match out_dir {
+        Some(r) => r.to_path_buf(),
+        None => src.parent().unwrap_or(Path::new(".")).to_path_buf(),
     };
-    let mut out = root.to_path_buf();
-    out.push(subdir);
+    let mut out = root;
+    if out_dir.is_some() {
+        if !prefix.as_os_str().is_empty() {
+            out.push(prefix);
+        }
+        let subdir =
+            relative_within(src.parent().unwrap_or(Path::new(".")), base).unwrap_or(Path::new(""));
+        out.push(subdir);
+    }
     out.push(format!("{stem}.{ext}"));
     out
 }
@@ -259,7 +292,8 @@ pub fn discover(
     // `Library/AlbumA/01.mka` and `Library/AlbumB/01.mka` both asked for `out/01.flac`, so
     // the second was skipped as "already rendered" and one file of the batch quietly never
     // happened.
-    let mut stack: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // (directory, mirror base, forced output folder, why it was forced)
+    let mut stack: Vec<(PathBuf, PathBuf, PathBuf, Option<String>)> = Vec::new();
     // Folders already entered, by canonical path. A directory reached twice is a queue
     // written twice, and a symlink pointing at an ancestor is a walk that never ends.
     let mut entered: Vec<PathBuf> = Vec::new();
@@ -269,28 +303,71 @@ pub fn discover(
     // `out/01.flac`, and the second would be skipped as already rendered — a batch that
     // quietly renders one file fewer than it was handed.
     let nested = inputs.iter().filter(|p| p.is_dir()).count() > 1;
-    let mut enter = |dir: &Path, stack: &mut Vec<(PathBuf, PathBuf)>| {
+    // Output folder names claimed so far, and the root that claimed each one.
+    //
+    // Two input folders can carry the same basename: `/a/Album` and `/b/Album`, or a
+    // library plus the backup of it that is still on the drive. In the multi-folder mode
+    // each folder's own name is the first component of its output tree, so both ask for
+    // `out/Album/01.flac`; the second one meets a file that is already there, is skipped
+    // as already rendered, and the batch reports success having quietly not made one of
+    // the files it was handed. This is the same loss the per-folder mirror base fixed,
+    // one level up the tree, and the same rule applies: never let two inputs share a
+    // destination, and say out loud when a destination had to move.
+    let mut claimed: Vec<(String, PathBuf)> = Vec::new();
+    let mut enter = |dir: &Path,
+                     stack: &mut Vec<(PathBuf, PathBuf, PathBuf, Option<String>)>,
+                     claimed: &mut Vec<(String, PathBuf)>| {
         let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         if entered.iter().any(|e| e == &key) {
             return;
         }
-        entered.push(key);
-        let base = if nested {
-            dir.parent().unwrap_or(dir).to_path_buf()
-        } else {
-            dir.to_path_buf()
+        // Cloned because `key` is still needed below as the owner to compare against.
+        entered.push(key.clone());
+        // One folder mirrors its contents straight into `out_dir`, which is what
+        // `g6me Music/` has always meant, and no folder name is in play at all.
+        if !nested || out_dir.is_none() {
+            stack.push((dir.to_path_buf(), dir.to_path_buf(), PathBuf::new(), None));
+            return;
+        }
+        let (name, note) = claim_output_folder(dir, &key, claimed);
+        let entry = match note {
+            // The folder kept its own name: mirror against the parent, which is what puts
+            // the folder name at the head of every path under it.
+            None => (
+                dir.to_path_buf(),
+                dir.parent().unwrap_or(dir).to_path_buf(),
+                PathBuf::new(),
+                None,
+            ),
+            // Mirror against the folder itself, so everything inside it keeps the same
+            // shape under the renamed folder as the folder that kept the original name.
+            Some(why) => (
+                dir.to_path_buf(),
+                dir.to_path_buf(),
+                PathBuf::from(&name),
+                Some(why),
+            ),
         };
-        stack.push((dir.to_path_buf(), base));
+        stack.push(entry);
     };
 
     for input in inputs {
         if input.is_dir() {
-            enter(input, &mut stack);
+            enter(input, &mut stack, &mut claimed);
         } else if input.is_file() {
-            push_file(input, &loose_base, out_dir, ext, &mut seen, &mut items);
+            push_file(
+                input,
+                &loose_base,
+                Path::new(""),
+                None,
+                out_dir,
+                ext,
+                &mut seen,
+                &mut items,
+            );
         }
     }
-    while let Some((dir, base)) = stack.pop() {
+    while let Some((dir, base, prefix, note)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue; // unreadable directory: skip it, do not fail the batch
         };
@@ -324,18 +401,117 @@ pub fn discover(
                     continue;
                 }
                 entered.push(key);
-                stack.push((p.clone(), base.clone()));
+                stack.push((p.clone(), base.clone(), prefix.clone(), note.clone()));
             } else if looks_like_audio(p) {
-                push_file(p, &base, out_dir, ext, &mut seen, &mut items);
+                push_file(
+                    p,
+                    &base,
+                    &prefix,
+                    note.as_deref(),
+                    out_dir,
+                    ext,
+                    &mut seen,
+                    &mut items,
+                );
             }
         }
     }
+    keep_each_item_on_its_own_path(&mut items);
     items
+}
+
+/// Give one input folder its own output folder name, numbering it if the name is taken.
+///
+/// The first folder to claim a name keeps it and later ones are numbered in input order,
+/// which is deterministic because the caller's argument order is. A folder reached twice
+/// through two spellings (a symlink, or the same directory named twice on the command
+/// line) is not a collision and is not renumbered.
+fn claim_output_folder(
+    dir: &Path,
+    key: &Path,
+    claimed: &mut Vec<(String, PathBuf)>,
+) -> (String, Option<String>) {
+    let raw = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    let mut name = raw.clone();
+    let mut n = 2usize;
+    while claimed
+        .iter()
+        .any(|(c, owner)| c == &name && owner.as_path() != key)
+    {
+        name = format!("{raw}_{n}");
+        n += 1;
+    }
+    claimed.push((name.clone(), key.to_path_buf()));
+    if name == raw {
+        return (name, None);
+    }
+    (
+        name.clone(),
+        Some(format!(
+            "writes to {name}/ \u{2014} another input folder already owns the name {raw}"
+        )),
+    )
+}
+
+/// Last line of defence against two queue entries sharing one destination.
+///
+/// The folder logic above handles the case that actually happens; this handles the rest,
+/// because every way I can think of for a destination to be wanted twice is a way to lose
+/// a file quietly: the duplicate is skipped as already rendered, the run reports no
+/// failures, and the count of outputs is short by however many collided.
+fn keep_each_item_on_its_own_path(items: &mut [Item]) {
+    let mut taken: Vec<PathBuf> = Vec::with_capacity(items.len());
+    for it in items.iter_mut() {
+        let mut dst = it.dst.clone();
+        let mut n = 2usize;
+        while taken.iter().any(|d| same_destination(d, &dst)) {
+            dst = bump_stem(&dst, n);
+            n += 1;
+        }
+        if dst != it.dst {
+            let moved = dst
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "a renamed file".to_string());
+            let reason = format!("written as {moved} \u{2014} that output path was already taken");
+            it.dst = dst;
+            it.note = Some(match it.note.take() {
+                Some(already) => format!("{already}; {reason}"),
+                None => reason,
+            });
+        }
+        taken.push(it.dst.clone());
+    }
+}
+
+/// Two destinations that would write to the same file.
+fn same_destination(a: &Path, b: &Path) -> bool {
+    a == b || (a.exists() && b.exists() && crate::util::same_file(a, b))
+}
+
+/// `name.ext` -> `name_2.ext`, keeping whatever directory it was in.
+fn bump_stem(p: &Path, n: usize) -> PathBuf {
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    let stem = match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name.as_str(),
+    };
+    let mut out = p.parent().unwrap_or(Path::new("")).to_path_buf();
+    out.push(format!("{stem}_{n}{}", &name[stem.len()..]));
+    out
 }
 
 fn push_file(
     src: &Path,
     base: &Path,
+    prefix: &Path,
+    note: Option<&str>,
     out_dir: Option<&Path>,
     ext: &str,
     seen: &mut Vec<PathBuf>,
@@ -346,8 +522,12 @@ fn push_file(
         return; // the same album reached through two arguments or a symlink
     }
     seen.push(canon);
-    let dst = output_for(src, base, out_dir, ext);
-    items.push(Item::new(src.to_path_buf(), dst));
+    let dst = output_for_prefixed(src, base, prefix, out_dir, ext);
+    let item = Item::new(src.to_path_buf(), dst);
+    items.push(match note {
+        Some(why) => item.with_note(why),
+        None => item,
+    });
 }
 
 /// Live counters, read by the UI thread while workers render.
@@ -808,6 +988,111 @@ mod tests {
             names,
             ["AlbumA/01.flac", "AlbumB/01.flac"],
             "each folder should keep its own name"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two input folders that share a basename, which the test above cannot catch
+    /// because it deliberately gave them different names.
+    ///
+    /// Sabotage check: drop the numbering loop in `claim_output_folder` and the `names`
+    /// assertion fails with both albums claiming `out/Album/01.flac` — the shape of the
+    /// bug where the second file meets a file that is already there, is skipped as already
+    /// rendered, and the batch reports success one file short of what it was handed.
+    #[test]
+    fn two_folders_with_the_same_name_get_their_own_trees() {
+        let root = tmp("same_roots");
+        let a = root.join("a").join("Album");
+        let b = root.join("b").join("Album");
+        touch(&a.join("01.mka"));
+        touch(&b.join("01.mka"));
+        // One album has a subfolder, so the test also proves the renamed album mirrors
+        // its own shape rather than dumping its contents flat.
+        touch(&b.join("Disc 2").join("02.mka"));
+        let out = root.join("out");
+        let items = discover(&[a.clone(), b.clone()], Some(&out), "flac", true);
+
+        let mut names: Vec<String> = items
+            .iter()
+            .map(|i| {
+                i.dst
+                    .strip_prefix(&out)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["Album/01.flac", "Album_2/01.flac", "Album_2/Disc 2/02.flac"],
+            "the first folder keeps its name, the second is numbered, and the renamed one \
+             keeps its own subfolder structure"
+        );
+        assert_ne!(items[0].dst, items[1].dst);
+        assert!(
+            items
+                .iter()
+                .any(|i| i.src == a.join("01.mka") && i.dst == out.join("Album").join("01.flac")),
+            "the first argument is the one that keeps the name: {names:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.src == b.join("Disc 2").join("02.mka")
+                    && i.dst == out.join("Album_2").join("Disc 2").join("02.flac")),
+            "the renamed album must keep its own folder structure: {names:?}"
+        );
+
+        // The rename is not allowed to be silent.
+        let noted: Vec<&Item> = items.iter().filter(|i| i.note.is_some()).collect();
+        assert_eq!(
+            noted.len(),
+            2,
+            "both files of the moved folder should say they moved: {names:?}"
+        );
+        for n in noted {
+            assert!(
+                n.note.as_deref().unwrap().contains("Album_2"),
+                "{:?}",
+                n.note
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The backstop, for the cases the folder logic does not cover: two *different* files
+    /// that compute the same destination.
+    ///
+    /// Reachable without any trickery — hand the tool two loose files of the same name
+    /// that are not under the working directory. Neither is inside the mirror base, so
+    /// both land flat in `out_dir`, and without this the second is skipped as already
+    /// rendered while the run reports no failures.
+    #[test]
+    fn a_second_file_that_wants_a_taken_path_gets_its_own() {
+        let root = tmp("dup_dst");
+        let x = root.join("x").join("song.mka");
+        let y = root.join("y").join("song.mka");
+        touch(&x);
+        touch(&y);
+        let out = root.join("out");
+        let items = discover(&[x.clone(), y.clone()], Some(&out), "flac", true);
+        assert_eq!(items.len(), 2, "both files must be queued");
+        assert_ne!(
+            items[0].dst, items[1].dst,
+            "two different files were queued onto one destination"
+        );
+        let mut stems: Vec<String> = items
+            .iter()
+            .map(|i| i.dst.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        stems.sort();
+        assert_eq!(stems, ["song.flac", "song_2.flac"], "{stems:?}");
+        let noted: Vec<&Item> = items.iter().filter(|i| i.note.is_some()).collect();
+        assert_eq!(noted.len(), 1, "exactly one file had to move: {stems:?}");
+        assert!(
+            noted[0].dst.ends_with("song_2.flac"),
+            "the note must travel with the file that actually moved"
         );
         std::fs::remove_dir_all(&root).ok();
     }
