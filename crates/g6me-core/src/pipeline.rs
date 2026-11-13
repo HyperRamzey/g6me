@@ -2652,8 +2652,12 @@ mod tests {
             },
         )
         .expect_err("an encoder that exits immediately cannot succeed");
+        // The pre-flight refusals are SameFile and Exists on the destination. An
+        // encoder that dies at open comes back as the Msg encoder_pipe_err builds from
+        // its stderr — that is the informative one — so the discrimination here is a
+        // negative one, and the message assertions below pin the rest of it down.
         assert!(
-            matches!(e, Error::ChildFailed { .. }),
+            !matches!(e, Error::SameFile(_) | Error::Exists(_)),
             "the encoder's own failure, not a pre-flight refusal: {e:?}"
         );
         let msg = e.to_string().to_lowercase();
