@@ -562,6 +562,7 @@ pub fn refuse_overwriting_inputs(items: &mut [Item]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_file(
     src: &Path,
     base: &Path,
