@@ -83,6 +83,7 @@
 //! inversion could creep in.
 
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 /// Taps per phase in Annex 2 §3's table (it prints 12 rows).
 pub const ITU_TAPS: usize = 12;
@@ -499,31 +500,53 @@ impl std::fmt::Display for Ratio {
     }
 }
 
+fn cached_phases(ratio: Ratio) -> &'static [f64] {
+    static PHASES_X2: OnceLock<Vec<f64>> = OnceLock::new();
+    static PHASES_X4: OnceLock<Vec<f64>> = OnceLock::new();
+    static PHASES_X8: OnceLock<Vec<f64>> = OnceLock::new();
+    static PHASES_X16: OnceLock<Vec<f64>> = OnceLock::new();
+    static PHASES_X32: OnceLock<Vec<f64>> = OnceLock::new();
+
+    let cell = match ratio {
+        Ratio::X2 => &PHASES_X2,
+        Ratio::X4 => &PHASES_X4,
+        Ratio::X8 => &PHASES_X8,
+        Ratio::X16 => &PHASES_X16,
+        Ratio::X32 => &PHASES_X32,
+    };
+    cell.get_or_init(|| {
+        let branches = ratio.branches();
+        let mut flat = Vec::with_capacity(branches.len() * branches[0].len());
+        for row in &branches {
+            flat.extend_from_slice(row);
+        }
+        flat
+    })
+}
+
 /// One polyphase stage: `phases[p][k]`, oldest tap first, over a shift register in
 /// the same order.
 struct Stage {
     /// Flattened phase coefficients, `phases.len()` branches of `taps` each.
-    phases: Vec<f64>,
+    phases: &'static [f64],
     n_phases: usize,
     taps: usize,
-    /// This stage's input, oldest at index 0.
+    /// This stage's input ring buffer.
     hist: Vec<f64>,
+    head: usize,
 }
 
 impl Stage {
     fn new(ratio: Ratio) -> Self {
-        let branches = ratio.branches();
-        let taps = branches[0].len();
-        let n_phases = branches.len();
-        let mut phases = Vec::with_capacity(n_phases * taps);
-        for row in branches.iter() {
-            phases.extend_from_slice(row);
-        }
+        let phases = cached_phases(ratio);
+        let n_phases = ratio.n();
+        let taps = ratio.taps();
         Self {
             phases,
             n_phases,
             taps,
             hist: vec![0.0; taps],
+            head: 0,
         }
     }
 
@@ -531,8 +554,14 @@ impl Stage {
     /// `out` in interleaved-grid order and returning the largest absolute value.
     #[inline]
     fn push(&mut self, x: f64, out: &mut [f64]) -> f64 {
-        self.hist.copy_within(1..self.taps, 0);
-        self.hist[self.taps - 1] = x;
+        self.hist[self.head] = x;
+        let old_head = self.head;
+        self.head += 1;
+        if self.head == self.taps {
+            self.head = 0;
+        }
+        let taps_minus_head = self.taps - 1 - old_head;
+        let (hist_b, hist_a) = self.hist.split_at(old_head + 1);
         let mut peak = 0.0f64;
         for (p, ph) in self
             .phases
@@ -540,12 +569,16 @@ impl Stage {
             .take(self.n_phases)
             .enumerate()
         {
+            let (ph_a, ph_b) = ph.split_at(taps_minus_head);
             // Fixed order, oldest tap first, one multiply and one add per tap in the
             // written order. Rust does not fuse multiply-add without fast-math, and
-            // nothing here is reordered or parallelised; `zip` walks both slices
-            // forward, so this is the same sequence of operations the indexed form was.
+            // nothing here is reordered or parallelised; walks both slices
+            // forward in identical sequence to linear history.
             let mut acc = 0.0f64;
-            for (&h, &x) in ph.iter().zip(self.hist.iter()) {
+            for (&h, &x) in ph_a.iter().zip(hist_a.iter()) {
+                acc += h * x;
+            }
+            for (&h, &x) in ph_b.iter().zip(hist_b.iter()) {
                 acc += h * x;
             }
             out[p] = acc;
@@ -638,6 +671,7 @@ impl Detector {
     /// sweep, which needs independent runs through the same allocation.
     pub fn clear(&mut self) {
         self.stage.hist.fill(0.0);
+        self.stage.head = 0;
         self.peak = 0.0;
         self.older = 0.0;
         self.newest = 0.0;
@@ -702,7 +736,7 @@ impl Detector {
         // Reading the centre loses nothing over the whole file: every sample passes through
         // the centre exactly once as input advances, including the first ones, which arrive
         // there while `drain()` is clocking the bank out.
-        let centre = self.stage.hist.len() - 1 - self.lag;
+        let centre = (self.stage.head + self.stage.taps - 1 - self.lag) % self.stage.taps;
         let xs = self.stage.hist[centre].abs();
         if xs > peak {
             peak = xs;
@@ -786,10 +820,9 @@ impl TruePeak {
     /// would be folding in audio nobody wrote.
     pub fn drain(&mut self) {
         let n = self.ratio.group_delay().ceil() as usize + 1;
-        let zeros = vec![0.0f64; n];
         for d in &mut self.chans {
-            for &z in &zeros {
-                d.push(z);
+            for _ in 0..n {
+                d.push(0.0);
             }
         }
     }
