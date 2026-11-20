@@ -174,12 +174,30 @@ both on the true-peak side chain:
   it is emitted. Returns in 25 ms. Linked 100 % by default — peaks are ducked in both
   channels together, because a peak in one channel is still a peak in the file.
 * **Level.** A peak-hold window with a 60 ms attack and a 900 ms release, riding under the
-  transient stage: it answers level rather than isolated crests. Linked 75 % by default —
+  transient stage: it answers level rather than isolated crests. **The window slides:** the
+  peak a frame measured leaves the maximum exactly one release window after it went in, so a
+  crest is let go 900 ms after it. It used to be a counter that restarted the hold at its own
+  boundary, which held a peak for anywhere between 900 and 1800 ms depending on where inside
+  the window it happened to land — and, at that same boundary, threw away the rest of the
+  window's content and could let go early out from under a passage still decaying. The hold is
+  now the maximum of exactly the last `release` ms of measured peaks, per channel, which is
+  what the sentence above has always claimed; the test asserts it frame by frame against a
+  rescan of the same ring. Linked 75 % by default —
   level is shared three-quarters, not wholly, because a gain move lasting a third of a second
   is long enough to pull a stereo image about.
 
 Emission multiplies the two, and the transient stage's demand is computed against the peak
 as the level stage left it, so they never spend the same dB twice.
+
+Every number the limiter report prints — `engaged_frames`, `max_gain_reduction_db`,
+`release_frames`, `release_reduction_db`, `transient_reduction_db` — is measured at
+**emission**, on frames that were delivered, and never on the frame currently being fed.
+During the pre-roll those two cursors are `lookahead` frames apart and the fed frames are
+still the delay line's own silence: a counter that is not gated on delivery books reductions
+the listener never heard — with the gate removed, a fixture with a 54-frame lookahead reported
+21 frames engaged before a single delivered sample existed. A file shorter
+than the lookahead now reports zero engaged frames, and the
+transient column no longer fills in the scheduling pass that cannot see the output cursor.
 
 **Where the gain aims.** The gain targets `guard_db` *below* the requested ceiling: what the
 side chain's filter cannot see, plus what the gain slew can still overshoot on the way down.
@@ -231,12 +249,12 @@ two opinions about one level is not a command line. On `810.mka`, whose true pea
 
 | | max reduction | limiter engaged | delivered TP |
 |---|---|---|---|
-| `--ceiling -3` alone | 3.28 dB | 98.2 % of frames | −3.04 dBTP |
+| `--ceiling -3` alone | 3.30 dB | 98.2 % of frames | −3.04 dBTP |
 | `--setpoint -3` | 0.28 dB | 3.3 % of frames | −3.04 dBTP |
 
 That table is the argument. A ceiling asked to do level work holds the file by riding gain
 through nearly all of it — and that 98.2 % is the processor genuinely holding a reduction of
-0.57 dB through the file, not a stuck counter; the same file trimmed by a setpoint is touched
+0.48 dB through the file, not a stuck counter; the same file trimmed by a setpoint is touched
 on 3.3 % of its frames instead. Both rows land at the same −3.04 because the aim is the same;
 what differs is how much of the file had to be held there to get it. (`engaged_frames` used
 to latch: a one-pole release
@@ -244,7 +262,20 @@ converges to within 2.1e-11 dB of unity and then stops in IEEE 754, so `gain < 1
 true for the rest of the file after the first peak. The follower is now told to arrive, and
 the counters ask for a reduction of at least 0.001 dB. Both numbers above are post-fix
 measurements at the default 8x; the 87 % this table first claimed for the setpoint row was
-the latch, not the limiter, and the 17.1 % before it was measured at 4x. Outside cross-check:
+the latch, not the limiter, and the 17.1 % before it was measured at 4x.
+
+Re-measured here on 2026-11-20 against a binary built from the same tree with the pre-sliding
+hold restored (same flags, same file, same ffmpeg, the only difference the two source files):
+**on real content the port moves the report by hundredths of a dB and leaves the ceiling
+claim exactly where it was.** The ceiling
+row engaged on the same 4 134 988 frames of 4 210 642 — not the same percentage, the same
+integer — and the setpoint row moved by 38 frames (140 148 → 140 186, +0.0009 pp). What moved
+is where the slow stage's deepest reduction lands: 3.2803 → 3.3039 dB of total reduction
+(+0.024 dB) and 0.5688 → 0.4751 dB of slow-stage reduction (−0.094 dB), because a hold that
+slides is bound by the loudest of the last 900 ms at *every* frame instead of at a boundary
+that restarted under it, so the frame it binds is a different one. Delivered true peak moved
+by 4.1e-5 dB and the delivered sample peak by 4e-6 dB: the ceiling it holds is the same file.
+Outside cross-check:
 ffmpeg's own `astats` reads −3.040000 dBFS sample peak on the delivered file against our
 −3.0397 dBTP @x8 — a sample peak just under a true peak, which is the shape of a file held
 by true peak rather than by samples.)

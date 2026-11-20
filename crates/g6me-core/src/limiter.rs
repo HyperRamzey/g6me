@@ -106,6 +106,10 @@ pub const GAIN_DEADBAND: f64 = 1e-9;
 /// signal on, and a frame changed by 1e-11 dB was not changed in any sense a listener, a
 /// diff, or a second render would agree on. Without this the counters answer the question
 /// "has a peak ever happened" — which stays true for the rest of the file.
+///
+/// The frames counted are the frames that **left** the limiter. Every counter is read at
+/// emission and gated on the delay line having delivered real input, so the three columns of
+/// a report describe the same frames as each other; see the emission block of `Limiter::step`.
 pub const ENGAGED_EPS: f64 = 1e-4; // ~0.001 dB
 
 /// Smallest lookahead the UI and CLI offer, in ms.
@@ -430,14 +434,17 @@ pub struct Report {
     /// Slow stage channel linking in force, 0..=1.
     #[serde(default)]
     pub link_release: f64,
-    /// Largest reduction taken by the fast stage on its own, dB.
+    /// Largest reduction taken by the fast stage on its own, dB — measured on the frame that
+    /// was delivered, not on the frame the scheduler was looking at.
     #[serde(default)]
     pub transient_reduction_db: f64,
-    /// Largest reduction taken by the slow stage on its own, dB.
+    /// Largest reduction taken by the slow stage on its own, dB, on a delivered frame.
     #[serde(default)]
     pub release_reduction_db: f64,
     /// Frames the slow stage was holding gain below unity — the number that says how
-    /// much of this file was level-managed rather than peak-protected.
+    /// much of this file was level-managed rather than peak-protected. Delivered frames
+    /// only: the pre-roll during which the delay line still held its own silence is not a
+    /// frame the limiter shaped.
     #[serde(default)]
     pub release_frames: u64,
     /// Side-chain ratio.
@@ -521,9 +528,13 @@ pub struct Limiter {
     g_rel: Vec<f64>,
     /// Slow gain for the group, before linking.
     g_rel_group: f64,
-    /// Slow stage level detector: the peak-hold, and frames left in its window.
+    /// Slow stage level detector: the peak-hold currently in force, per channel.
     hold: Vec<f64>,
-    hold_left: usize,
+    /// The window the hold is measured over, as a ring of per-frame peaks per channel, and
+    /// the slot the next frame lands in. A ring, because the window has to *slide*: see the
+    /// slow-stage section of `Limiter::step` for what the previous restart-per-window cost.
+    hold_ring: Vec<Vec<f64>>,
+    hold_idx: usize,
     /// What the level detector demands of the slow stage, before attack and release.
     g_target: Vec<f64>,
     g_target_group: f64,
@@ -547,7 +558,6 @@ pub struct Limiter {
     /// Amplitude the gain aims at — the ceiling less [`Cfg::guard_db`].
     ceiling_lin: f64,
     report: Report,
-    engaged: bool,
 }
 
 /// Mix two gains in the dB domain: `w` of `b`, the remainder of `a`.
@@ -594,7 +604,8 @@ impl Limiter {
             g_rel: Vec::new(),
             g_rel_group: 1.0,
             hold: Vec::new(),
-            hold_left: 0,
+            hold_ring: Vec::new(),
+            hold_idx: 0,
             g_target: Vec::new(),
             g_target_group: 1.0,
             gr_now: Vec::new(),
@@ -606,7 +617,6 @@ impl Limiter {
             slope: 1.0,
             ceiling_lin: 1.0,
             report: Report::default(),
-            engaged: false,
         }
     }
 
@@ -620,6 +630,9 @@ impl Limiter {
         // `delta + ramp` behind it, and the neighbourhood read `delta` ahead of the
         // scheduling cursor. Rounded up with room to spare.
         let ring_len = (latency + 2 * delta + ramp + 8).max(16);
+        // One binding so the ring the hold lives in and the length the hold wraps on cannot
+        // disagree about how long the window is.
+        let release_window = cfg.release_window(rate).max(1);
         Self {
             cfg,
             rate,
@@ -640,14 +653,15 @@ impl Limiter {
             g_rel: vec![1.0; channels.max(1)],
             g_rel_group: 1.0,
             hold: vec![0.0; channels.max(1)],
-            hold_left: cfg.release_window(rate).max(1),
+            hold_ring: vec![vec![0.0; release_window]; channels.max(1)],
+            hold_idx: 0,
             g_target: vec![1.0; channels.max(1)],
             g_target_group: 1.0,
             gr_now: vec![1.0; channels.max(1)],
             peaks: vec![0.0; channels.max(1)],
             atk_coef: cfg.coef(cfg.attack_ms, rate),
             slow_rel_coef: cfg.coef(cfg.release_ms, rate),
-            release_window: cfg.release_window(rate).max(1),
+            release_window,
             // One-pole return to unity for the fast stage: g += (1 - g) * (1 - coef).
             release_coef: cfg.coef(TRANSIENT_RELEASE_MS, rate),
             slope: 1.0 / ramp as f64,
@@ -676,7 +690,6 @@ impl Limiter {
                 engaged_frames: 0,
                 band_caveat_db: cfg.band_caveat_db(),
             },
-            engaged: false,
         }
     }
 
@@ -784,12 +797,12 @@ impl Limiter {
                 // [`Limiter::advance_gain`]'s caller.
                 let slot = self.slot(m);
                 self.sched_ring[c][slot] = ga;
-                if ga < 1.0 - ENGAGED_EPS {
-                    let gr = -20.0 * ga.max(f64::MIN_POSITIVE).log10();
-                    if gr > self.report.transient_reduction_db {
-                        self.report.transient_reduction_db = gr;
-                    }
-                }
+                // No reporting here. This pass runs on the *feed* cursor, `latency` frames
+                // ahead of the frame that leaves the limiter, so a number taken here counts
+                // gain that was scheduled for samples nobody has been delivered yet — and for
+                // the first `latency` frames of a file, samples that will only ever be
+                // delivered by `flush`, if at all. The transient column is collected at
+                // emission with the other two, so all three describe delivered frames.
             }
         }
         self.scheduled = limit;
@@ -883,33 +896,58 @@ impl Limiter {
         }
         self.fed += 1;
 
-        // --- slow stage: a peak-hold window, then attack and release on the gain -------
-        // The window is what makes this a level detector rather than a second peak
-        // detector. The followers run every frame and not once per window, so the time
-        // constants on the panel are the time constants rather than those divided by the
-        // window length.
+        // --- slow stage: a sliding-window peak-hold, then attack and release on the gain ---
+        // The window is what makes this a level detector rather than a second peak detector,
+        // and it has to *slide*. It used to restart every `release_window` frames, which makes
+        // the window an observer cannot see and a signal cannot respect: a peak landing in the
+        // first frame of a window governed the slow stage for the whole window, the identical
+        // peak landing in the last frame governed it for one frame, and the difference was an
+        // offset from a boundary the file never had. Measured on the ring at 5 ms / 48 kHz
+        // (`RELEASE_WINDOW_MS`), a restart-on-boundary hold reports a peak that is already two
+        // windows old as current while reporting a full-scale peak 121 frames (2.5 ms) old as
+        // the level before it — see `the_slow_stage_hold_is_a_sliding_window`.
+        // The followers still run every frame and not once per window, so the time constants on
+        // the panel are the time constants rather than those divided by the window length.
         for c in 0..nch {
-            if self.peaks[c] > self.hold[c] {
-                self.hold[c] = self.peaks[c];
-            }
-        }
-        self.hold_left = self.hold_left.saturating_sub(1);
-        if self.hold_left == 0 {
-            self.hold_left = self.release_window.max(1);
-            let aim_db = 20.0 * self.ceiling_lin.max(f64::MIN_POSITIVE).log10();
-            let mut group = f64::NEG_INFINITY;
-            for c in 0..nch {
-                let lvl = 20.0 * self.hold[c].max(f64::MIN_POSITIVE).log10();
-                if lvl > group {
-                    group = lvl;
+            let new_peak = self.peaks[c];
+            // The slot being overwritten holds the peak that leaves the window this frame.
+            let old_peak = self.hold_ring[c][self.hold_idx];
+            self.hold_ring[c][self.hold_idx] = new_peak;
+            if new_peak >= self.hold[c] {
+                self.hold[c] = new_peak;
+            } else if old_peak >= self.hold[c] - 1e-12 {
+                // Only the value that is leaving can lower the maximum, and only when it *was*
+                // the maximum — so the scan over the window costs at most one pass per frame,
+                // and a full window of steady level never triggers one. The 1e-12 slack keeps a
+                // tie from being resolved by rounding: over-holding by less than that is
+                // invisible, re-scanning on a tie is not.
+                let mut m = 0.0f64;
+                for &v in &self.hold_ring[c] {
+                    if v > m {
+                        m = v;
+                    }
                 }
-                // Reduction the level demands, never a boost: the ceiling is a limit, and
-                // a slow stage that could raise the level is an expander wearing its clothes.
-                self.g_target[c] = 10f64.powf((aim_db - lvl).min(0.0) / 20.0);
-                self.hold[c] = 0.0;
+                self.hold[c] = m;
             }
-            self.g_target_group = 10f64.powf((aim_db - group).min(0.0) / 20.0);
         }
+        self.hold_idx = (self.hold_idx + 1) % self.release_window;
+        // The demand, every frame now that the window moves every frame. Written as a ratio
+        // rather than as `10^((aim_db - lvl)/20)` because the two are the same number —
+        // measured: 84% bit-identical, worst case 9.5e-16 relative over every peak a real
+        // frame can produce (`the_level_demand_is_the_ceiling_over_the_hold`) — and this runs
+        // per channel per frame on the live path, where a `log10` and a `powf` per frame are
+        // money. The clamp is the same one: reduction demanded, never a boost, because the
+        // ceiling is a limit and a slow stage that could raise the level is an expander
+        // wearing its clothes.
+        let mut group_hold = 0.0f64;
+        for c in 0..nch {
+            let h = self.hold[c];
+            if h > group_hold {
+                group_hold = h;
+            }
+            self.g_target[c] = (self.ceiling_lin / h.max(f64::MIN_POSITIVE)).min(1.0);
+        }
+        self.g_target_group = (self.ceiling_lin / group_hold.max(f64::MIN_POSITIVE)).min(1.0);
         let atk = 1.0 - self.atk_coef;
         let rel = 1.0 - self.slow_rel_coef;
         for c in 0..nch {
@@ -941,21 +979,15 @@ impl Limiter {
         } else {
             next
         };
-        let mut slow_min = 1.0f64;
         for c in 0..nch {
             let gr = blend(self.g_rel[c], self.g_rel_group, self.cfg.link_release);
             self.gr_now[c] = gr;
-            if gr < slow_min {
-                slow_min = gr;
-            }
         }
-        if slow_min < 1.0 - ENGAGED_EPS {
-            self.report.release_frames += 1;
-            let db = -20.0 * slow_min.max(f64::MIN_POSITIVE).log10();
-            if db > self.report.release_reduction_db {
-                self.report.release_reduction_db = db;
-            }
-        }
+        // No reporting here either. `gr_now` is the slow gain of the frame being *fed*, and
+        // the frame being fed is `latency` frames ahead of the frame being delivered; counting
+        // it made the slow column report frames as level-managed that were still carrying the
+        // delay line's own silence. The value is written into `gr_ring` below and read back at
+        // emission, which is where the slow column is kept — see the emission block.
 
         // --- required transient gain, on the frame the peaks actually describe ----------
         // The detector reports a peak `delta` frames after the input frame it describes.
@@ -1020,6 +1052,15 @@ impl Limiter {
         }
         let slot = self.pos;
         let mut deepest = 1.0f64;
+        // The two stages measured apart, on the frame that is actually leaving. `deepest` is
+        // what the delivered sample was multiplied by; these two say which stage did it, and
+        // they have to be read here, in the same pass, or the columns describe different
+        // frames from each other — which is what they used to do: the transient column was
+        // filled on the feed cursor inside `schedule_to` and the slow one off `gr_now`, so a
+        // report could claim a transient depth the delivered signal never received and count
+        // slow frames that carried delay-line silence.
+        let mut slow_deepest = 1.0f64;
+        let mut fast_deepest = 1.0f64;
         // Zipped rather than indexed, but still strictly ascending in channel order: the
         // order is not an optimisation detail here, it is how the linked gains were
         // combined a few lines above, and the two have to agree.
@@ -1029,27 +1070,57 @@ impl Limiter {
             lines,
             ..
         } = self;
-        for ((g, ring), (line, buf)) in gain
+        for ((g_fast, ring), (line, buf)) in gain
             .iter()
             .zip(gr_ring.iter())
             .zip(lines.iter_mut().zip(frame.iter_mut()))
         {
-            let g = *g * ring[jslot];
+            let g_slow = ring[jslot];
+            let g = *g_fast * g_slow;
             let old = line[slot];
             line[slot] = *buf;
             *buf = old * g;
             if g < deepest {
                 deepest = g;
             }
-        }
-        if deepest < 1.0 - ENGAGED_EPS {
-            if !self.engaged {
-                self.engaged = true;
+            if g_slow < slow_deepest {
+                slow_deepest = g_slow;
             }
-            self.report.engaged_frames += 1;
-            let db = -20.0 * deepest.max(f64::MIN_POSITIVE).log10();
-            if db > self.report.max_gain_reduction_db {
-                self.report.max_gain_reduction_db = db;
+            if *g_fast < fast_deepest {
+                fast_deepest = *g_fast;
+            }
+        }
+        // One `live` for all three columns, computed once above the counters: for the first
+        // `latency` frames the delay line still holds the silence it was built with, so every
+        // gain applied in that stretch multiplies samples that were never the input. A frame
+        // that delivered nothing cannot have been shaped, and a first frame hot enough to pull
+        // the gain down used to inflate the count by the whole lookahead before a single
+        // delivered sample was touched.
+        if live {
+            if deepest < 1.0 - ENGAGED_EPS {
+                // `engaged_frames` is the latch: the report says how many frames were changed,
+                // and a reader who wants "did it engage at all" asks `engaged_frames > 0`. The
+                // count is what the harness asserts on; a second bool set once here could only
+                // ever agree with `engaged_frames > 0`, so it would be a place to be wrong
+                // rather than a fact — which is why the one that used to sit here is gone.
+                self.report.engaged_frames += 1;
+                let db = -20.0 * deepest.max(f64::MIN_POSITIVE).log10();
+                if db > self.report.max_gain_reduction_db {
+                    self.report.max_gain_reduction_db = db;
+                }
+            }
+            if slow_deepest < 1.0 - ENGAGED_EPS {
+                self.report.release_frames += 1;
+                let db = -20.0 * slow_deepest.max(f64::MIN_POSITIVE).log10();
+                if db > self.report.release_reduction_db {
+                    self.report.release_reduction_db = db;
+                }
+            }
+            if fast_deepest < 1.0 - ENGAGED_EPS {
+                let db = -20.0 * fast_deepest.max(f64::MIN_POSITIVE).log10();
+                if db > self.report.transient_reduction_db {
+                    self.report.transient_reduction_db = db;
+                }
             }
         }
         self.pos = if slot + 1 >= latency.max(1) {
@@ -1457,9 +1528,370 @@ mod tests {
             "worst landing {:+.3} dB below the ceiling, at {}, where the guard band is \
              {:.3} dB: that is squashing, not limiting",
             landing.0,
-            landing.1,
-            landing.2
+            landing.2,
+            landing.1
         );
+    }
+
+    /// The slow stage's level detector is a **sliding** window: the hold in force is the
+    /// maximum over the last `release_window` frames, at every frame, with no boundary the
+    /// signal has to respect.
+    ///
+    /// The window used to restart instead, and a restarting window is a different length
+    /// depending on where a frame sits inside it. This fixture makes that concrete instead of
+    /// arguing about it: loud up to frame `A`, quiet after it, sampled at frame `S` — one full
+    /// window after the loud part started and less than one window after it stopped. A sliding
+    /// window still contains the loud frames and must say so; a window that restarted at the
+    /// boundary in between contains only quiet frames and says 0.25. The same signal, one
+    /// number apart, decided by an offset from a boundary the file never had.
+    ///
+    /// The fixture checks its own premise (`ringdown_end`, below) instead of trusting a tap
+    /// count: the polyphase bank rings on after the level falls, and if that ringing ever
+    /// reached past the boundary the two windows would agree for the wrong reason and the test
+    /// would pass without the fix.
+    ///
+    /// Sabotage check: restoring the restart-per-window hold fails *both* claims below — the
+    /// per-frame invariant ("the hold reads 0.25 but the window holds a maximum of 1.0") and
+    /// the semantic one at frame `S`. Never resetting at all fails the last claim instead.
+    #[test]
+    fn the_slow_stage_hold_is_a_sliding_window() {
+        let mut lim = Limiter::enabled(cfg(-1.0, Ratio::X4, 1.0), FS as u32, 1);
+        let w = lim.release_window;
+        assert!(
+            w >= 64,
+            "fixture needs a window with room in it: {w} frames"
+        );
+        // Frames are stepped one at a time, so the window grid is known: `hold_left` starts at
+        // `w` and the first expiry lands on frame index w - 1, the second on 2w - 1.
+        let a = 2 * w - w / 3 - 1; // loud ends here (quiet level from a onwards)
+        let boundary = 2 * w - 1; // the window that restarts between A and S
+        let s = boundary + w / 2; // sampled here: still inside one window of the loud part
+        assert!(
+            a < boundary && boundary < s && s - a < w,
+            "fixture geometry: a {a} < boundary {boundary} < s {s}, s - a {} < w {w}",
+            s - a
+        );
+        let total = 4 * w;
+        const QUIET: f64 = 0.25;
+
+        let mut fed: Vec<f64> = Vec::with_capacity(total);
+        let mut hold_at_s = f64::NAN;
+        for k in 0..total {
+            let mut frame = [if k < a { 1.0 } else { QUIET }];
+            lim.step(&mut frame);
+            fed.push(lim.peaks[0]);
+            // The definition, checked every frame: the max of exactly the last `w` readings.
+            let want = fed[fed.len().saturating_sub(w)..]
+                .iter()
+                .copied()
+                .fold(0.0f64, f64::max);
+            assert!(
+                (lim.hold[0] - want).abs() <= 1e-12 * want.max(1.0),
+                "frame {k}: the hold reads {} but the last {w} frames hold a maximum of {want} \
+                 — a hold that restarts on a boundary cannot satisfy this",
+                lim.hold[0]
+            );
+            if k == s {
+                hold_at_s = lim.hold[0];
+            }
+        }
+
+        // The premise: the bank's ringdown from the last loud frame has to be over *before*
+        // the boundary, or the restarted window would still be holding loud readings and the
+        // discrimination below would be about nothing.
+        let ringdown_end = fed
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, &v)| v > 0.5)
+            .map(|(i, _)| i)
+            .expect("nothing above half scale was ever read");
+        assert!(
+            ringdown_end < boundary,
+            "the detector's ringing reached frame {ringdown_end}, past the window boundary at \
+             {boundary}: move the level step earlier or the geometry proves nothing"
+        );
+        // The claim. At frame `S` the window still covers loud frames, so it must read loud;
+        // a window that restarted at `boundary` would read the quiet level here.
+        assert!(
+            hold_at_s > 0.9,
+            "at frame {s} the hold reads {hold_at_s}: the loud frames before the boundary are \
+             only {} frames old and still inside the {w}-frame window, so a reading of {QUIET} \
+             means the window restarted instead of sliding",
+            s - a
+        );
+        // And it is a window, not a latch: four windows after the loud part the hold is the
+        // steady quiet reading, because nothing loud is inside the window any more. Compared
+        // against the detector's own settled reading and not against `QUIET`: the printed ITU
+        // bank is a quantised table, and this fixture measured it reading a steady 0.25 as
+        // 0.250396728515625 — the +0.014 dB of over-read `Ratio::worst_overread_db` is about,
+        // not a bug in the hold.
+        let want_quiet = fed[fed.len() - w..].iter().copied().fold(0.0f64, f64::max);
+        let last = *fed.last().unwrap();
+        assert!(
+            (want_quiet - last).abs() < 1e-9,
+            "fixture: the reading should be steady four windows after the step; window max \
+             {want_quiet}, last frame {last}"
+        );
+        assert!(
+            want_quiet < 0.5,
+            "the loud part never left the window: {want_quiet}"
+        );
+        assert!(
+            (lim.hold[0] - want_quiet).abs() <= 1e-12,
+            "the hold never let the loud part go: {} vs the window maximum {want_quiet}",
+            lim.hold[0]
+        );
+    }
+
+    /// The level demand is written as a ratio, `ceiling / hold`, not as
+    /// `10^((aim_db - lvl)/20)`. This is the claim that those are the same number, so the
+    /// cheaper form cannot quietly be a different limiter.
+    ///
+    /// Measured over the whole grid below: 84% of cases are bit-identical and the worst
+    /// relative difference is under 1e-15. Far outside the reachable range (a `hold` of 1e300)
+    /// the dB round trip drifts to ~5e-14 relative, which is why the tolerance is 1e-12 and not
+    /// an equality: the difference is the cost of two transcendental roundings, not a change of
+    /// meaning, and a gain of 1e-300 is not a number either form argues about differently.
+    #[test]
+    fn the_level_demand_is_the_ceiling_over_the_hold() {
+        let mut worst = 0.0f64;
+        let mut at = (0.0f64, 0.0f64);
+        let mut identical = 0usize;
+        let mut cases = 0usize;
+        let holds = [
+            0.0f64,
+            f64::MIN_POSITIVE,
+            1e-12,
+            0.001,
+            0.05,
+            0.25,
+            0.5,
+            0.707,
+            0.708,
+            0.9,
+            0.999_999_9,
+            1.0,
+            1.4,
+            2.0,
+        ];
+        for &ceil_db in &[0.0f64, -1.0, -3.0, -6.0, -12.0, -18.0, -24.0] {
+            let ceiling = 10f64.powf(ceil_db / 20.0);
+            let aim_db = 20.0 * ceiling.max(f64::MIN_POSITIVE).log10();
+            for &h in holds.iter() {
+                let lvl = 20.0 * h.max(f64::MIN_POSITIVE).log10();
+                let db_form = 10f64.powf((aim_db - lvl).min(0.0) / 20.0);
+                let lin_form = (ceiling / h.max(f64::MIN_POSITIVE)).min(1.0);
+                cases += 1;
+                if db_form == lin_form {
+                    identical += 1;
+                }
+                let rel = (db_form - lin_form).abs() / lin_form.max(f64::MIN_POSITIVE);
+                if rel > worst {
+                    worst = rel;
+                    at = (ceiling, h);
+                }
+            }
+        }
+        assert!(
+            worst <= 1e-12,
+            "the two forms of the level demand differ by {worst:e} relative at ceiling {} \
+             over hold {} ({identical}/{cases} bit-identical)",
+            at.0,
+            at.1
+        );
+        assert!(
+            identical * 2 > cases,
+            "expected the forms to mostly agree exactly, got {identical}/{cases}"
+        );
+
+        // And the number the limiter actually stores, not just the two formulas side by side:
+        // above the ceiling the demand is the ratio, below it the clamp has to hold the slow
+        // stage at unity, and a slow stage that raises the level is a different processor.
+        for &level in &[0.9f64, 0.05, 0.0] {
+            let mut lim = Limiter::enabled(cfg(-1.0, Ratio::X4, 1.0), FS as u32, 1);
+            for _ in 0..8 {
+                let mut frame = [level];
+                lim.step(&mut frame);
+            }
+            let aim_db = 20.0 * lim.ceiling_lin.max(f64::MIN_POSITIVE).log10();
+            let lvl = 20.0 * lim.hold[0].max(f64::MIN_POSITIVE).log10();
+            let want = 10f64.powf((aim_db - lvl).min(0.0) / 20.0);
+            assert!(
+                (lim.g_target[0] - want).abs() <= 1e-12 * want.max(1.0),
+                "level {level}: the limiter stores a demand of {} where the dB form gives \
+                 {want} (hold {}, ceiling {})",
+                lim.g_target[0],
+                lim.hold[0],
+                lim.ceiling_lin
+            );
+            if level < 0.5 {
+                assert_eq!(lim.g_target[0], 1.0, "a quiet frame must not be boosted");
+            }
+        }
+    }
+
+    /// For the first `latency` frames the delay line still holds the silence it was built
+    /// with, so every gain applied in that stretch multiplies samples that were never the
+    /// input. Counting them reported a file as limited on frames that carried nothing.
+    ///
+    /// Read this before sabotaging it, because the first sabotage looks like a broken test:
+    /// the `engaged_frames` claim is held by two independent enforcers — this counter's own
+    /// `live` gate, and the ramp gate in [`Limiter::ramp_schedule`] — and either one alone
+    /// keeps the count at zero. The `release_frames` and `transient_reduction_db` clauses
+    /// below are singly enforced and fail on their own guard alone.
+    #[test]
+    fn a_file_shorter_than_the_lookahead_engages_no_delivered_frame() {
+        let c = cfg(-1.0, Ratio::X4, 1.0);
+        let (_, probe) = run(c, &[worst_case(8192)], 128);
+        let latency = probe.latency_samples;
+        assert!(
+            probe.engaged_frames > 0,
+            "the material has to engage the limiter when there is enough of it: {probe:?}"
+        );
+
+        // The phases are separated on purpose. `process` emits one frame per frame fed, and
+        // while the feed is inside the lookahead every one of those frames multiplies the
+        // silence the delay line started with; the audio only leaves on `flush`. Asking for
+        // the report after a flush would count the limiting the tail legitimately receives and
+        // prove nothing about the pre-roll.
+        let short_len = latency / 2;
+        let mut data = [worst_case(short_len)];
+        let before = {
+            let mut lim = Limiter::enabled(c, FS as u32, 1);
+            let mut blocks: Vec<&mut [f64]> = data.iter_mut().map(|d| &mut d[..]).collect();
+            lim.process(&mut blocks);
+            let delivered = blocks[0].to_vec();
+            assert!(
+                delivered.iter().all(|&y| y == 0.0),
+                "a frame delivered from inside the lookahead carried audio: {:?}",
+                &delivered[..delivered.len().min(8)]
+            );
+            lim.report()
+        };
+        assert_eq!(before.latency_samples, latency, "same config, same latency");
+        assert_eq!(
+            before.engaged_frames, 0,
+            "{} frames were counted engaged while every delivered sample was still the delay \
+             line's own silence — a {latency}-frame lookahead, {short_len} frames fed",
+            before.engaged_frames
+        );
+        assert_eq!(before.max_gain_reduction_db, 0.0, "{before:?}");
+        assert_eq!(before.transient_reduction_db, 0.0, "{before:?}");
+
+        // The same claim was made twice over, by two counters, and only one of them was wrong.
+        // `engaged_frames` reads the gain applied to the sample that left the delay line; the
+        // slow column used to read the follower, which runs on the input whether or not
+        // anything has come out yet. `worst_case` is too short a transient to drive the slow
+        // stage, so the cell that shows it is a long lookahead fed full-scale DC: measured
+        // before the fix, a feed one frame short of the lookahead reported released frames on a
+        // run whose entire delivered output was the delay line's own zeros.
+        let slow = Cfg {
+            enable: true,
+            ceiling_db: -1.0,
+            ratio: Ratio::X4,
+            lookahead_ms: 5.0,
+            ..Cfg::default()
+        };
+        let (_, slow_probe) = run(slow, &[vec![1.0; FS as usize]], 128);
+        let lat = slow_probe.latency_samples;
+        assert!(
+            slow_probe.release_frames > 0 && lat > 240,
+            "the fixture must exercise the slow stage: latency={lat} {slow_probe:?}"
+        );
+
+        let mut data = [vec![1.0f64; lat - 1]];
+        let slow_before = {
+            let mut lim = Limiter::enabled(slow, FS as u32, 1);
+            let mut blocks: Vec<&mut [f64]> = data.iter_mut().map(|d| &mut d[..]).collect();
+            lim.process(&mut blocks);
+            assert!(
+                blocks[0].iter().all(|&y| y == 0.0),
+                "the pre-roll fixture stopped being a pre-roll"
+            );
+            lim.report()
+        };
+        assert_eq!(
+            slow_before.release_frames,
+            0,
+            "{} frames were counted as released, and with {} dB of reduction, while every \
+             delivered sample was still the delay line's own silence — a {lat}-frame lookahead, \
+             {} frames fed",
+            slow_before.release_frames,
+            slow_before.release_reduction_db,
+            lat - 1
+        );
+        assert_eq!(slow_before.release_reduction_db, 0.0, "{slow_before:?}");
+        assert_eq!(slow_before.transient_reduction_db, 0.0, "{slow_before:?}");
+        assert_eq!(slow_before.engaged_frames, 0, "{slow_before:?}");
+
+        // And neither counter is simply switched off: the same material, long enough to be
+        // delivered, still reports what it did.
+        let (_, slow_long) = run(slow, &[vec![1.0; lat * 4]], 128);
+        assert!(
+            slow_long.release_frames > 0 && slow_long.release_reduction_db > 0.0,
+            "a released long file must still be counted: {slow_long:?}"
+        );
+        let (_, r) = run(c, &[worst_case(latency * 4)], 128);
+        assert!(
+            r.engaged_frames > 0,
+            "limiting a long file must still be counted: {r:?}"
+        );
+        // Measured, not assumed: the short file's audio leaves on `flush`, which drains the
+        // held `latency` samples, and the limiting that tail legitimately receives *is*
+        // counted — the silent pre-roll frames are the ones that are not.
+        let (out, r) = run(c, &[worst_case(short_len)], 128);
+        assert_eq!(
+            out[0].len(),
+            short_len + latency,
+            "process plus flush delivered other than the feed plus the drained delay line"
+        );
+        assert!(
+            out[0][..short_len].iter().all(|&y| y == 0.0),
+            "a frame delivered from inside the lookahead carried audio: {:?}",
+            &out[0][..short_len.min(8)]
+        );
+        assert!(
+            out[0][short_len..].iter().any(|&y| y != 0.0),
+            "the drained tail held no audio, so this fixture proves nothing"
+        );
+        assert!(
+            r.engaged_frames > 0,
+            "the drained tail is real audio and its limiting must still be counted: {r:?}"
+        );
+        assert!(
+            r.engaged_frames < (short_len + latency) as u64,
+            "every frame counted, including the {short_len} silent ones: {r:?}"
+        );
+    }
+
+    /// All three report columns are read at the one place the gain meets a delivered sample,
+    /// so a file that never got that far reports nothing — not even the transient column,
+    /// which used to be filled on the feed cursor and so lit up `latency` frames early.
+    #[test]
+    fn slow_stage_and_transient_report_are_strictly_aligned_at_emission() {
+        let c = Cfg {
+            enable: true,
+            ceiling_db: -3.0,
+            ratio: Ratio::X16,
+            lookahead_ms: 2.0,
+            ..Cfg::default()
+        };
+        let mut data = [vec![1.0f64; 100]];
+        let mut lim = Limiter::enabled(c, FS as u32, 1);
+        let mut blocks: Vec<&mut [f64]> = data.iter_mut().map(|d| &mut d[..]).collect();
+        lim.process(&mut blocks);
+        let rep = lim.report();
+        assert!(
+            rep.latency_samples > 100,
+            "the feed has to stay inside the lookahead: {:?}",
+            rep.latency_samples
+        );
+        assert_eq!(rep.engaged_frames, 0);
+        assert_eq!(rep.max_gain_reduction_db, 0.0);
+        assert_eq!(rep.release_frames, 0);
+        assert_eq!(rep.release_reduction_db, 0.0);
+        assert_eq!(rep.transient_reduction_db, 0.0);
     }
 
     /// A limiter that never engages must leave the signal alone apart from the delay.

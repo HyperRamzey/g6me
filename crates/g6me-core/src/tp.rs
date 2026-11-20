@@ -634,6 +634,11 @@ pub struct Detector {
     /// successor yet, so it cannot be refined and waits for the next output.
     older: f64,
     newest: f64,
+    /// Has anything been fed since the last [`Detector::reset_peak`]? `newest` survives a
+    /// reset on purpose (it is real signal from just before the seam), so without this the
+    /// brand-new window would open already carrying the last grid point of the old one and
+    /// would not report `-inf` for an empty window.
+    has_samples_since_reset: bool,
     /// Index from the newest input back to the sample the filter output describes: the
     /// group delay, in whole samples. The sample-peak floor is read here rather than off
     /// `x`, so it describes the same instant as the interpolation it is the floor for.
@@ -651,14 +656,24 @@ impl Detector {
             refine: ratio.refines(),
             older: 0.0,
             newest: 0.0,
+            has_samples_since_reset: false,
         }
     }
 
     /// Highest absolute interpolated value so far, linear. Includes the newest output,
     /// unrefined, so the last point of a stream is never dropped.
+    ///
+    /// That inclusion is limited to grid points produced by *this* window: an empty window
+    /// reads 0.0 (and so `-inf` dBTP) even though `newest` still holds the crest that was
+    /// pending when [`Detector::reset_peak`] closed the previous one. Reporting it would
+    /// make a freshly reset meter look like it had already measured something.
     #[must_use]
     pub fn peak(&self) -> f64 {
-        self.peak.max(self.newest)
+        if self.has_samples_since_reset {
+            self.peak.max(self.newest)
+        } else {
+            self.peak
+        }
     }
 
     /// True peak in dBTP; `-inf` for silence.
@@ -667,21 +682,39 @@ impl Detector {
         db_from_peak(self.peak())
     }
 
-    /// Clear the filter state as well as the reading. Only used by the accuracy
-    /// sweep, which needs independent runs through the same allocation.
+    /// Clear the filter state as well as the reading, so the next reading describes a
+    /// signal that shares no past with this one. Used by the accuracy sweep, which needs
+    /// independent runs through the same allocation, and by [`TruePeak::clear`].
     pub fn clear(&mut self) {
         self.stage.hist.fill(0.0);
         self.stage.head = 0;
         self.peak = 0.0;
         self.older = 0.0;
         self.newest = 0.0;
+        self.has_samples_since_reset = false;
     }
 
-    /// Clear the reading but keep the filter state. Meters that report per group
-    /// must not drop state between blocks, or the first block of each group loses
-    /// the filter's memory.
+    /// Forget the accumulated reading but keep the stream's memory: the filter state
+    /// **and** the two refine grid points stay. This is what makes a reset a new
+    /// *reporting window over a continuous stream* — the reading after the reset equals the
+    /// same window measured in one unbroken run
+    /// (`a_per_group_window_equals_the_same_window_measured_unbroken` pins it), which is why
+    /// meters that report per group may call it between blocks at all: dropping the filter
+    /// memory there would make the first frames of every block read through a silent past.
+    ///
+    /// Clearing `older`/`newest` here was tried and is wrong twice over: the pending parabola
+    /// at the seam would read through a fabricated `0.0` neighbour and over-read a steady
+    /// crest (measured: +0.96 dB of over-read on an x2 sweep), and the filter's ringdown
+    /// across the boundary is real audio the window is obliged to report. What the reset does
+    /// withhold is the *display* of that pending point, via the `has_samples_since_reset`
+    /// flag, so an untouched window still reads `-inf`.
+    ///
+    /// For a genuinely independent signal, construct a fresh detector (or call
+    /// [`Detector::clear`]), which starts the refine pair at zeros exactly as any file start
+    /// does.
     pub fn reset_peak(&mut self) {
         self.peak = 0.0;
+        self.has_samples_since_reset = false;
     }
 
     /// Feed one input sample and return the largest value it finalised.
@@ -704,8 +737,23 @@ impl Detector {
     /// sample at a zero crossing has all-zero samples and a true peak of anything. No meter
     /// can recover it from the samples; that is why the derived banks state a band edge
     /// ([`BAND_EDGE`]) instead of claiming to be accurate up to Nyquist.
+    ///
+    /// **Non-finite input is fed to the bank as `0.0`.** The Recommendation describes no
+    /// other reading — a NaN is not audio — and every alternative is worse than the loss:
+    /// left alone the NaN rides the filter history for `taps` samples, every bank output that
+    /// spans it comes out NaN, every comparison against a NaN is false, and the meter reads
+    /// exactly zero while it is blind. One garbage sample would therefore dim the peak of the
+    /// samples around it — the exact error a ceiling cannot survive, because the ceiling is
+    /// the one number that is only ever wrong on the loud side. Silence in the hole
+    /// under-reads the hole itself and nothing else, which is the smallest available loss.
     #[inline]
     pub fn push(&mut self, x: f64) -> f64 {
+        // A fed sample is a fed sample, finite or not: the window has content from here on,
+        // so `peak()` may fold in the pending grid point again. Sanitising first and setting
+        // the flag after would make the flag mean "a finite sample arrived", which is a
+        // different question and not the one `reset_peak` cares about.
+        self.has_samples_since_reset = true;
+        let x = if x.is_finite() { x } else { 0.0 };
         let mut out = [0.0f64; MAX_STREAM];
         let n = self.stage.n_phases;
         let raw = self.stage.push(x, &mut out[..n]);
@@ -840,6 +888,21 @@ impl TruePeak {
     #[must_use]
     pub fn per_channel_dbtp(&self) -> Vec<f64> {
         self.chans.iter().map(Detector::dbtp).collect()
+    }
+
+    /// Start a genuinely independent measurement: forget the reading *and* the filter
+    /// memory of every channel.
+    ///
+    /// [`TruePeak::reset`] keeps the past on purpose, because a meter reporting per group
+    /// over one continuous stream must not lose the ringdown that crosses the seam. That is
+    /// the wrong thing between two files, or between two signals that never shared a
+    /// filter: the previous stream's memory would leak into the new reading as a crest that
+    /// belongs to neither. Constructing a fresh `TruePeak` and calling this are the same
+    /// measurement; this one just reuses the allocations.
+    pub fn clear(&mut self) {
+        for d in &mut self.chans {
+            d.clear();
+        }
     }
 
     pub fn reset(&mut self) {
@@ -1441,6 +1504,161 @@ mod tests {
                 (singles.peak() - want).abs() < 1e-15,
                 "{r}: one-sample feed read {} vs one-shot {want}",
                 singles.peak()
+            );
+        }
+    }
+
+    /// What [`Detector::reset_peak`] promises, pinned from the other side: an untouched
+    /// window has to read as untouched. `newest` deliberately survives a reset (it is real
+    /// signal from before the seam), so without the `has_samples_since_reset` flag a meter
+    /// that reset and then asked would report the crest it had just been told to forget, and
+    /// a group of pure silence would display the previous group's level.
+    #[test]
+    fn reset_peak_reports_silence_until_the_new_window_has_content() {
+        let mut d = Detector::new(Ratio::X16);
+        d.push_block(&sine(11_000.0, 1.0, 100, 0.0));
+        assert!(
+            d.peak() > 0.9,
+            "fixture: the crest should be near full scale"
+        );
+        assert!(d.dbtp() > -1.0, "fixture: {}", d.dbtp());
+
+        d.reset_peak();
+        assert_eq!(
+            d.peak(),
+            0.0,
+            "a reset window must read 0.0 with nothing fed"
+        );
+        assert!(
+            d.dbtp().is_infinite() && d.dbtp() < 0.0,
+            "a reset window must read -inf dBTP, got {}",
+            d.dbtp()
+        );
+        // And it comes back: the flag is not a latch that disables the meter.
+        d.push_block(&sine(11_000.0, 1.0, 100, 0.0));
+        assert!(
+            d.peak() > 0.9,
+            "the window after the reset read {}",
+            d.peak()
+        );
+    }
+
+    /// The other half of the same contract: a reset opens a new **reporting window on a
+    /// continuous stream**, so nothing it reads may differ from the same window measured in
+    /// one unbroken run — filter state and refine pair carried across, seam and all.
+    ///
+    /// Checked at *every* seam position, not one, because the state a reset must keep is
+    /// invisible from a favourable seam: at x16 a seam that wipes `older`/`newest` corrupts
+    /// the first grid point of the frame after it, and the other fifteen grid points of that
+    /// frame are usually larger, so one lucky seam sees nothing — the first version of this
+    /// test passed with that sabotage in place. At x2 there are two grid points per frame, so
+    /// half the frames carry their maximum on the first one and the loss is up to half a dB.
+    #[test]
+    fn a_per_group_window_equals_the_same_window_measured_unbroken() {
+        // (a) A steady full-scale tone, with the seam moved across every frame of it.
+        let x = sine(11_000.0, 1.0, 120, 0.0);
+        let mut unbroken = Detector::new(Ratio::X2);
+        let all: Vec<f64> = x.iter().map(|&v| unbroken.push(v)).collect();
+        assert!(
+            all.iter().copied().fold(0.0f64, f64::max) > 1.02,
+            "fixture: the tone's crest should read above the sample grid"
+        );
+        let mut worst = (0.0f64, 0usize, 0usize, 0.0f64, 0.0f64);
+        for seam in 0..x.len() {
+            let mut split = Detector::new(Ratio::X2);
+            for &v in &x[..seam] {
+                split.push(v);
+            }
+            split.reset_peak();
+            for (i, &v) in x[seam..].iter().enumerate() {
+                let got = split.push(v);
+                let want = all[seam + i];
+                let diff = (got - want).abs();
+                if diff > worst.0 {
+                    worst = (diff, seam, i, got, want);
+                }
+            }
+        }
+        assert!(
+            worst.0 == 0.0,
+            "a reset at frame {} changed the reading {} grid points later: {} against {} in \
+             one unbroken run — the reset dropped state the window needed, and the meter can \
+             tell where the seam was",
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.4
+        );
+
+        // (b) A level step across the boundary: the second window opens on the ringdown of the
+        // level before it, and its own crest is a quarter-sample off the grid. Same equality,
+        // and it is the case that makes clearing the *filter* at a reset wrong — that ringing
+        // is real audio the window is obliged to report.
+        let mut y = sine(11_000.0, 1.0, 300, 0.0);
+        let off = y.len();
+        y.extend(sine(11_000.0, 0.6, 300, 0.7));
+        let mut unbroken = Detector::new(Ratio::X16);
+        let tail_unbroken: Vec<f64> = y.iter().map(|&v| unbroken.push(v)).skip(off).collect();
+        let mut split = Detector::new(Ratio::X16);
+        for &v in &y[..off] {
+            split.push(v);
+        }
+        split.reset_peak();
+        let tail_split: Vec<f64> = y[off..].iter().map(|&v| split.push(v)).collect();
+        assert_eq!(tail_split.len(), tail_unbroken.len());
+        assert!(
+            tail_unbroken.iter().any(|&r| r > 0.5),
+            "the second window should open on real level, not on the step"
+        );
+        for (i, (&got, &want)) in tail_split.iter().zip(tail_unbroken.iter()).enumerate() {
+            assert_eq!(
+                got, want,
+                "reading {i} after the reset differs from the same reading in one unbroken run"
+            );
+        }
+    }
+
+    /// One non-finite sample must not blind the window around it.
+    ///
+    /// The fixture plants the NaN on the tone's first sample — a zero crossing, so replacing
+    /// it with `0.0` is exactly the clean signal — and the tone's only crest arrives inside the
+    /// span the NaN contaminates. Measured with the sanitation removed, at every ratio: the
+    /// reading collapses to the sample floor, `1.0000000` against a clean `1.0394908` at x2
+    /// (0.336 dB), 1.0157869 against 1.0288519 at x4 (0.111 dB), 0.333 dB at x8/x16/x32. Which
+    /// is a meter going quiet on the loud side — the one direction a ceiling cannot survive
+    /// being wrong, because a ceiling is only ever asked about the loud samples.
+    ///
+    /// The equality below is exact, and that is the point: `clean` is above the sample peak, so
+    /// matching it bit for bit is only possible if the interpolated crest survived. Silence in
+    /// the hole under-reads the hole itself and nothing else, which is the smallest loss
+    /// available; the Recommendation describes no other reading, because a NaN is not audio.
+    #[test]
+    fn one_nan_sample_does_not_blind_the_window_around_it() {
+        for &r in Ratio::ALL.iter() {
+            let run = |poison: bool| -> f64 {
+                let mut d = Detector::new(r);
+                for i in 0..120usize {
+                    let mut v = (2.0 * std::f64::consts::PI * 11_000.0 * i as f64 / FS).sin();
+                    if i == 0 && poison {
+                        v = f64::NAN;
+                    }
+                    let _ = d.push(v);
+                }
+                d.peak()
+            };
+            let clean = run(false);
+            let dirty = run(true);
+            assert!(
+                clean > 1.02,
+                "{r}: fixture — an 11 kHz full-scale tone peaks above the sample grid, got \
+                 {clean}; if this is not above 1.0 the test can no longer tell an interpolated \
+                 crest from a sample peak"
+            );
+            assert_eq!(
+                dirty, clean,
+                "{r}: one NaN at a zero crossing changed the reading — the interpolated crest \
+                 was lost and what is left ({dirty}) is the sample floor, not the true peak \
+                 ({clean})"
             );
         }
     }
