@@ -598,20 +598,18 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let ch = config.channels.max(1) as usize;
-    // Only the first two channels of the device are fed from the queue; the rest
-    // are duplicates, so a 5.1 or 7.1 stream does not play silence on the rear.
-    let pairs = ch.min(2);
     let mut scratch: Vec<f32> = Vec::new();
     let callback = move |data: &mut [T], _info: &OutputCallbackInfo| {
         let frames = data.len() / ch;
         scratch.clear();
-        scratch.resize(frames * ch, 0.0);
-        feed.drain(&mut scratch[..frames * pairs]);
-        for (i, frame) in data.chunks_mut(ch).enumerate() {
+        // `Feed` always stores interleaved stereo pairs, even when the output device is mono.
+        scratch.resize(frames * 2, 0.0);
+        feed.drain(&mut scratch[..frames * 2]);
+        for (i, frame) in data.chunks_exact_mut(ch).enumerate() {
             let l = scratch[i * 2];
             let r = scratch[i * 2 + 1];
             for (c, slot) in frame.iter_mut().enumerate() {
-                let src = if pairs == 1 {
+                let src = if ch == 1 {
                     // Mono device: fold both ears rather than dropping one.
                     (l + r) * 0.5
                 } else if c & 1 == 0 {

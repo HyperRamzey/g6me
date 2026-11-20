@@ -623,7 +623,6 @@ impl Limiter {
     #[must_use]
     pub fn enabled(cfg: Cfg, rate: u32, channels: usize) -> Self {
         let delta = cfg.ratio.report_delay();
-        let _lookahead = cfg.lookahead_samples(rate);
         let latency = cfg.latency_samples(rate);
         let ramp = cfg.ramp_frames(rate);
         // Every live index needs a slot: the emission cursor, the scheduling cursor

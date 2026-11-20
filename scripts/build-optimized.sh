@@ -44,9 +44,9 @@ for b in target/release/g6me target-v3/release/g6me; do
   objdump -d "$b" | grep -E "^\s+[0-9a-f]+:" >/tmp/g6me-dis.txt || true
   printf '%-28s ins=%-7s fma=%-3s ymm=%-5s v-opcodes=%s\n' "$b" \
     "$(wc -l </tmp/g6me-dis.txt)" \
-    "$(grep -cE 'vfmadd|vfmsub|vfnmadd|vfnmsub' /tmp/g6me-dis.txt)" \
-    "$(grep -c '%ymm' /tmp/g6me-dis.txt)" \
-    "$(grep -coE '\bv[a-z0-9]+' /tmp/g6me-dis.txt)"
+    "$(grep -cE 'vfmadd|vfmsub|vfnmadd|vfnmsub' /tmp/g6me-dis.txt || true)" \
+    "$(grep -c '%ymm' /tmp/g6me-dis.txt || true)" \
+    "$(grep -coE '\bv[a-z0-9]+' /tmp/g6me-dis.txt || true)"
   rm -f /tmp/g6me-dis.txt
 done
 

@@ -176,7 +176,7 @@ pub fn generate(kind: Kind, frames: usize, channels: u16) -> Vec<f32> {
         }
         Kind::Silence => {}
         Kind::Tiny => {
-            // Straddle the double denormal threshold (2.2e-308) and the f32 one.
+            // Straddle the f32 denormal threshold (1.175e-38).
             for i in 0..frames {
                 for c in 0..ch {
                     let e = 1.0e-38f32 * (1.0 + ((i % 7) as f32) * 0.1);
@@ -251,7 +251,7 @@ pub fn compare(a: &[f32], b: &[f32]) -> Diff {
     let n = a.len().min(b.len());
     d.samples = n / 2;
     if a.len() != b.len() {
-        d.differing = (a.len().max(b.len()) - n) / 2;
+        d.differing = (a.len().max(b.len()) - n).div_ceil(2);
         d.first_frame = Some(d.samples);
         d.max_abs = f64::INFINITY;
         return d;
@@ -277,16 +277,16 @@ pub fn compare(a: &[f32], b: &[f32]) -> Diff {
             if scale > 0.0 {
                 d.max_rel = d.max_rel.max(diff / scale);
             }
-            let ux = x.to_bits() as i32;
-            let uy = y.to_bits() as i32;
-            // Ordered f32 space: negative floats count backwards.
-            let ox = if ux < 0 {
-                0x8000_0000i64 - ux as i64
+            let ux = x.to_bits();
+            let uy = y.to_bits();
+            // Ordered f32 space: negative floats map below zero, counting backwards.
+            let ox = if ux & 0x8000_0000 != 0 {
+                -((ux & 0x7FFF_FFFF) as i64)
             } else {
                 ux as i64
             };
-            let oy = if uy < 0 {
-                0x8000_0000i64 - uy as i64
+            let oy = if uy & 0x8000_0000 != 0 {
+                -((uy & 0x7FFF_FFFF) as i64)
             } else {
                 uy as i64
             };

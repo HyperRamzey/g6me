@@ -43,19 +43,19 @@ pub struct RefBuild {
 
 /// Every reference build that `build.rs` managed to produce.
 pub fn builds() -> Vec<RefBuild> {
-    // (env key, variant label, width) as emitted by build.rs.
-    const SPECS: &[(&str, &str, &str)] = &[
-        ("CONTRACT_OFF", "f32", "f32"),
-        ("CONTRACT_OFF", "f64", "f64"),
-        ("NATIVE", "f32", "f32"),
-        ("NATIVE", "f64", "f64"),
-        ("O3_NATIVE", "f32", "f32"),
-        ("O3_NATIVE", "f64", "f64"),
-        ("CONTRACT_FAST", "f32", "f32"),
-        ("CONTRACT_FAST", "f64", "f64"),
+    // (variant, width) as emitted by build.rs.
+    const SPECS: &[(&str, &str)] = &[
+        ("CONTRACT_OFF", "f32"),
+        ("CONTRACT_OFF", "f64"),
+        ("NATIVE", "f32"),
+        ("NATIVE", "f64"),
+        ("O3_NATIVE", "f32"),
+        ("O3_NATIVE", "f64"),
+        ("CONTRACT_FAST", "f32"),
+        ("CONTRACT_FAST", "f64"),
     ];
     let mut out = Vec::new();
-    for (variant, width, _) in SPECS {
+    for (variant, width) in SPECS {
         let key = format!("G6ME_REF_{variant}_{width}");
         let Some(p) = option_env_str(&key) else {
             continue;
@@ -94,6 +94,14 @@ fn option_env_str(key: &str) -> Option<String> {
         "G6ME_REF_O3_NATIVE_f64",
         "G6ME_REF_CONTRACT_FAST_f32",
         "G6ME_REF_CONTRACT_FAST_f64",
+        "G6ME_REF_CONTRACT_OFF_f32_FLAGS",
+        "G6ME_REF_CONTRACT_OFF_f64_FLAGS",
+        "G6ME_REF_NATIVE_f32_FLAGS",
+        "G6ME_REF_NATIVE_f64_FLAGS",
+        "G6ME_REF_O3_NATIVE_f32_FLAGS",
+        "G6ME_REF_O3_NATIVE_f64_FLAGS",
+        "G6ME_REF_CONTRACT_FAST_f32_FLAGS",
+        "G6ME_REF_CONTRACT_FAST_f64_FLAGS",
     )
 }
 

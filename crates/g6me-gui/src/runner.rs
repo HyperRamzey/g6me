@@ -99,8 +99,8 @@ impl Summary {
 pub struct Runner {
     tx: mpsc::Sender<Event>,
     rx: Arc<Mutex<mpsc::Receiver<Event>>>,
-    /// Shared with every stage of every render, so one press stops the whole run.
-    cancel: Arc<AtomicBool>,
+    /// Cancel token owned by the currently running `Batch`, so one press stops the run.
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
     counters: Arc<Mutex<Option<Arc<Counters>>>>,
     running: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -120,7 +120,7 @@ impl Runner {
         Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Mutex::new(None),
             counters: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             worker: Mutex::new(None),
@@ -191,7 +191,6 @@ impl Runner {
         if let Ok(mut s) = self.started.lock() {
             *s = Some(Instant::now());
         }
-        self.cancel.store(false, Ordering::Relaxed);
         self.running.store(true, Ordering::Relaxed);
 
         let tx = self.tx.clone();
@@ -238,6 +237,9 @@ impl Runner {
         });
 
         let batch = Batch::start(items, cfg, tools, caps, Some(progress));
+        if let Ok(mut c) = self.cancel.lock() {
+            *c = Some(batch.cancel.clone());
+        }
         if let Ok(mut c) = self.counters.lock() {
             *c = Some(batch.counters.clone());
         }
@@ -264,7 +266,11 @@ impl Runner {
     /// partial output, and the queue is abandoned.
     pub fn cancel(&self) {
         if self.is_running() {
-            self.cancel.store(true, Ordering::Relaxed);
+            if let Ok(c) = self.cancel.lock() {
+                if let Some(flag) = c.as_ref() {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
         }
     }
 

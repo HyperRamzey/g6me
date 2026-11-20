@@ -235,42 +235,52 @@ pub fn probe_flac24(tools: &Tools) -> Option<String> {
             pcm.extend_from_slice(&v.to_le_bytes()[..3]);
         }
         std::fs::write(&raw, &pcm).map_err(|e| format!("probe write: {e}"))?;
-        let raw_s = raw.display().to_string();
-        let enc_s = enc.display().to_string();
-        let back_s = back.display().to_string();
+        let raw_arg = crate::util::ffmpeg_path_arg(&raw);
+        let enc_arg = crate::util::ffmpeg_path_arg(&enc);
+        let back_arg = crate::util::ffmpeg_path_arg(&back);
         // Exactly the renderer's encode shape: depth asked for explicitly, level
         // from the default config.
         ffmpeg_ok(
             tools,
             &[
-                "-f",
-                "s24le",
-                "-ar",
-                "48000",
-                "-ac",
-                "2",
-                "-i",
-                &raw_s,
-                "-c:a",
-                "flac",
-                "-compression_level",
-                "5",
-                "-sample_fmt",
-                "s32",
-                "-y",
-                &enc_s,
+                std::ffi::OsStr::new("-f"),
+                std::ffi::OsStr::new("s24le"),
+                std::ffi::OsStr::new("-ar"),
+                std::ffi::OsStr::new("48000"),
+                std::ffi::OsStr::new("-ac"),
+                std::ffi::OsStr::new("2"),
+                std::ffi::OsStr::new("-i"),
+                raw_arg.as_os_str(),
+                std::ffi::OsStr::new("-c:a"),
+                std::ffi::OsStr::new("flac"),
+                std::ffi::OsStr::new("-compression_level"),
+                std::ffi::OsStr::new("5"),
+                std::ffi::OsStr::new("-sample_fmt"),
+                std::ffi::OsStr::new("s32"),
+                std::ffi::OsStr::new("-y"),
+                enc_arg.as_os_str(),
             ],
         )?;
         let info = flac_streaminfo(&enc).ok_or("ffmpeg wrote no readable FLAC stream info")?;
         if info.2 != 24 {
             return Err(format!("ffmpeg wrote {}-bit FLAC, not 24-bit", info.2));
         }
-        ffmpeg_ok(tools, &["-i", &enc_s, "-f", "s24le", "-y", &back_s])?;
+        ffmpeg_ok(
+            tools,
+            &[
+                std::ffi::OsStr::new("-i"),
+                enc_arg.as_os_str(),
+                std::ffi::OsStr::new("-f"),
+                std::ffi::OsStr::new("s24le"),
+                std::ffi::OsStr::new("-y"),
+                back_arg.as_os_str(),
+            ],
+        )?;
         let got = std::fs::read(&back).map_err(|e| format!("probe decode read: {e}"))?;
         if got != pcm {
             let diff = pcm.iter().zip(&got).filter(|(a, b)| a != b).count();
             return Err(format!(
-                "24-bit FLAC is not lossless on this build: {diff} of {} bytes differ                  after a decode",
+                "24-bit FLAC is not lossless on this build: {diff} of {} bytes differ after a decode",
                 pcm.len()
             ));
         }
@@ -281,7 +291,7 @@ pub fn probe_flac24(tools: &Tools) -> Option<String> {
 }
 
 /// Run ffmpeg to completion, reporting its stderr as the reason on failure.
-fn ffmpeg_ok(tools: &Tools, args: &[&str]) -> std::result::Result<(), String> {
+fn ffmpeg_ok<S: AsRef<std::ffi::OsStr>>(tools: &Tools, args: &[S]) -> std::result::Result<(), String> {
     let out = Command::new(&tools.ffmpeg)
         .arg("-v")
         .arg("error")
@@ -351,7 +361,7 @@ fn version(tools: &Tools) -> Result<String> {
 fn run_probe(tools: &Tools, args: &[&str], expect_min_bytes: u64) -> bool {
     let mut cmd = Command::new(&tools.ffmpeg);
     cmd.arg("-v").arg("error").arg("-nostdin").args(args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return false,
@@ -564,7 +574,16 @@ pub fn probe_audio(tools: &Tools, path: &Path, pick: usize) -> Result<AudioInfo>
         stream_index: s.index.unwrap_or(0),
         codec_name: s.codec_name.unwrap_or_else(|| "unknown".into()),
         profile: s.profile,
-        sample_rate: s.sample_rate.and_then(|v| v.parse().ok()).unwrap_or(48000),
+        sample_rate: match s.sample_rate.and_then(|v| v.parse::<u32>().ok()) {
+            Some(0) => {
+                return Err(Error::ProbeFailed {
+                    path: path.display().to_string(),
+                    msg: "ffprobe reported sample_rate = 0".into(),
+                });
+            }
+            Some(r) => r,
+            None => 48000,
+        },
         channels: s.channels.unwrap_or(0),
         layout: s.channel_layout.filter(|l| l != "unknown" && !l.is_empty()),
         bits: s

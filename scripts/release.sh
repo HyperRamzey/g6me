@@ -152,8 +152,19 @@ W=target-win/x86_64-pc-windows-gnu/release
 # is allowed to say, and leaving the old value would mean a checksum over bytes that are
 # no longer there.
 zero_pe_stamps() {
-  printf '\0\0\0\0' | dd of="$1" bs=1 seek=136 count=4 conv=notrunc status=none
-  printf '\0\0\0\0' | dd of="$1" bs=1 seek=216 count=4 conv=notrunc status=none
+  python3 - "$1" <<'PY'
+import struct, sys
+with open(sys.argv[1], "r+b") as f:
+    f.seek(0x3C)
+    (pe_off,) = struct.unpack("<I", f.read(4))
+    f.seek(pe_off)
+    if f.read(4) != b"PE\x00\x00":
+        raise SystemExit(f"{sys.argv[1]}: missing PE signature at {pe_off:#x}")
+    # COFF FileHeader.TimeDateStamp (+8) and OptionalHeader.CheckSum (+88)
+    for off in (pe_off + 8, pe_off + 88):
+        f.seek(off)
+        f.write(b"\x00\x00\x00\x00")
+PY
 }
 for e in g6me.exe g6me-gui.exe; do
   [[ -f $W/$e ]] || { echo "missing $W/$e" >&2; exit 1; }
@@ -171,8 +182,8 @@ G6 Media Encoder $V — Windows
 
 Needs ffmpeg on PATH (or set G6ME_FFMPEG / G6ME_FFPROBE). It is not bundled: it is a
 separate GPL program, and shipping it here would oblige this archive to carry its
-sources too. Any recent build works; 24-bit FLAC output additionally needs the
-reference flac.exe. Test what you have with:
+sources too. Any recent build works (ffmpeg encodes 16- and 24-bit FLAC
+directly). Test what you have with:
 
   g6me.exe --caps
 

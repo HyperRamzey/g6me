@@ -49,8 +49,15 @@ pub fn ffmpeg_path_arg(p: &Path) -> OsString {
     if b.starts_with(b"./") || b.starts_with(b"../") {
         return os.to_os_string();
     }
+    #[cfg(windows)]
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return os.to_os_string();
+    }
     let looks_like_option = b.first() == Some(&b'-');
-    let looks_like_protocol = b.iter().take_while(|&&c| c != b'/').any(|&c| c == b':');
+    let looks_like_protocol = b
+        .iter()
+        .take_while(|&&c| c != b'/' && (!cfg!(windows) || c != b'\\'))
+        .any(|&c| c == b':');
     if looks_like_option || looks_like_protocol {
         let mut out = OsString::from("./");
         out.push(os);
@@ -102,6 +109,15 @@ pub fn args_display<S: AsRef<OsStr>>(args: &[S]) -> String {
 /// overwriting the input with a partially written output is the one mistake this
 /// tool must never make.
 pub fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
+    }
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
         // One side does not exist yet (the normal case for the output): fall
@@ -147,7 +163,6 @@ pub fn human_time(s: f64) -> String {
     }
 }
 
-/// Safe filename for an output derived from an input.
 /// Logical CPUs available to this process.
 ///
 /// The ceiling the GUI's threads slider and the CLI's `--threads` both use, so

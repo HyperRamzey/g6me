@@ -1428,7 +1428,6 @@ dependencies = [
 name = "g6me-verify"
 version = "0.2.0"
 dependencies = [
- "cc",
  "g6me-core",
  "serde_json",
 ]

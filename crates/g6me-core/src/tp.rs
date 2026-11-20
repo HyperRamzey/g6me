@@ -211,7 +211,7 @@ pub fn kaiser_beta(att_db: f64) -> f64 {
 /// count does**. A bank needs about 51 taps per phase to have a 0.1 fs transition band
 /// and an 80 dB stop band, whether it has 2 phases or 32.
 #[must_use]
-pub fn derived_taps(_upsample: usize) -> usize {
+pub fn derived_taps() -> usize {
     ((STOPBAND_DB - 7.95) / (14.36 * (1.0 - 2.0 * BAND_EDGE))).ceil() as usize
 }
 
@@ -333,7 +333,7 @@ impl Ratio {
     pub fn taps(self) -> usize {
         match self {
             Ratio::X4 => ITU_TAPS,
-            r => derived_taps(r.n()),
+            _ => derived_taps(),
         }
     }
 
@@ -594,26 +594,23 @@ impl Stage {
 /// Largest number of phases any bank has, i.e. the most outputs one input sample makes.
 const MAX_STREAM: usize = 32;
 
-/// Value of the parabola through three adjacent magnitudes at its vertex, when the
-/// middle one is a local maximum; the middle one itself otherwise.
+/// Magnitude of the parabola through three adjacent signed samples at its vertex,
+/// when the middle sample is a local extremum; `|b|` otherwise.
 ///
-/// This is what closes the *grid* error. A peak that falls between two points of the
-/// over-sampled grid is read low by up to `20·log10(cos(pi·f/n))` however good the
-/// filter is: 0.55 dB at x4 and f = 0.45 fs, 0.14 dB at x8. No filter can fix that
-/// because the filter was never wrong; the grid is simply too coarse to contain the
-/// crest. Fitting a parabola through the grid point and its two neighbours puts the
-/// crest back to within a few thousandths of a dB at x4 (see `tp::tests::accuracy`).
-/// It can only ever raise the reading (`den < 0` and the vertex of a downward parabola
-/// is at least its middle sample), and over-reads by at most ~0.1 dB on broadband noise.
+/// Operating on signed samples rather than magnitudes avoids fabricating a V-cusp
+/// across zero crossings (which otherwise under- or over-reads crests near Nyquist
+/// and on steep sign-changing transients).
 #[inline]
 fn vertex(a: f64, b: f64, c: f64) -> f64 {
-    if b >= a && b >= c {
+    let is_max = b >= a && b >= c;
+    let is_min = b <= a && b <= c;
+    if is_max || is_min {
         let den = a - 2.0 * b + c;
-        if den < 0.0 {
-            return b - (c - a) * (c - a) / (8.0 * den);
+        if (is_max && den < 0.0) || (is_min && den > 0.0) {
+            return (b - (c - a) * (c - a) / (8.0 * den)).abs();
         }
     }
-    b
+    b.abs()
 }
 
 /// Streaming true-peak detector for one channel.
@@ -630,7 +627,7 @@ pub struct Detector {
     /// (x4), which stays exactly what Annex 2 describes so that its number is the one
     /// other BS.1770 tools print.
     refine: bool,
-    /// The two most recent interpolated magnitudes in time order. The newest has no
+    /// The two most recent signed interpolated samples in time order. The newest has no
     /// successor yet, so it cannot be refined and waits for the next output.
     older: f64,
     newest: f64,
@@ -763,7 +760,11 @@ impl Detector {
             // waveform `p/n` of an interval *earlier* than phase 0, so ascending time is
             // descending `p`.
             for p in (0..n).rev() {
-                let c = out[p].abs();
+                let c = out[p];
+                let ca = c.abs();
+                if ca > self.peak {
+                    self.peak = ca;
+                }
                 let v = vertex(self.older, self.newest, c);
                 if v > peak {
                     peak = v;
@@ -1754,7 +1755,7 @@ mod tests {
         );
         // Cost is the argument for the default, so it has to be right.
         assert_eq!(Ratio::X4.mac_per_sample(), 4 * ITU_TAPS);
-        assert_eq!(Ratio::X32.mac_per_sample(), 32 * derived_taps(32));
+        assert_eq!(Ratio::X32.mac_per_sample(), 32 * derived_taps());
         assert!(Ratio::X32.mac_per_sample() > 30 * Ratio::X4.mac_per_sample());
         for &r in Ratio::ALL.iter() {
             assert!(!r.chain().is_empty());
@@ -1763,7 +1764,7 @@ mod tests {
         // Half the kernel, except for the printed bank, whose phases fan out from the
         // current sample and so carry the extra fraction of an interval.
         assert!((Ratio::X4.group_delay() - 5.875).abs() < 1e-12);
-        let half = (derived_taps(2) - 1) as f64 / 2.0;
+        let half = (derived_taps() - 1) as f64 / 2.0;
         for r in [Ratio::X2, Ratio::X8, Ratio::X16, Ratio::X32] {
             assert!((r.group_delay() - half).abs() < 1e-12, "{r}");
         }
@@ -1773,7 +1774,7 @@ mod tests {
         // Accuracy is bought: a narrow transition band needs a long filter, and a
         // limiter pays for it in lookahead.
         assert!(Ratio::X8.group_delay() > 4.0 * Ratio::X4.group_delay());
-        assert_eq!(derived_taps(8), 51);
+        assert_eq!(derived_taps(), 51);
     }
 
     #[test]

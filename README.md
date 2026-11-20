@@ -149,7 +149,7 @@ before the encoder, so they describe the signal the file is made of.
 4x — the Recommendation's own printed coefficients, in canonical oldest→newest order, with
 none of the 12.04 dB pre-attenuation (every stage here is f64). BS.1770 tabulates 4x only,
 so 2x/8x/16x/32x are designed in this repo: centred Kaiser-windowed polyphase banks, 51
-taps per phase, 80 dB stopband, a stated band edge at 0.45·fs, each phase DC-normalised,
+taps per phase, 80 dB stopband, a stated band edge at 0.45·fs (un-renormalised per phase),
 plus parabolic refinement of the crest between grid points and a floor at the sample peak
 (no interpolating lowpass can read above its own transition band at Nyquist). Accuracy
 gates in `tp.rs` compare against an **exact periodic FFT reconstruction**, and every offered
@@ -233,8 +233,8 @@ ffmpeg reads the x4 file 0.12 dB *hotter* than this program's own x4 measurement
 bytes does; it is under the ceiling either way, but it is the reason a reading is quoted with
 its ratio and never treated as the last word.
 
-**Latency.** Lookahead plus the interpolator's own delay, both appended to the end of the
-file and reported, never hidden. At the defaults that is 96 samples of lookahead — **2.00 ms
+**Latency.** Lookahead plus the interpolator's own delay, prepended as leading zeros at
+the start of the file (with the held tail flushed at the end) and reported, never hidden. At the defaults that is 96 samples of lookahead — **2.00 ms
 at 48 kHz, honoured as asked** — plus 26 samples of filter delay: **122 samples, 2.542 ms**,
 so a rendered file is 122 frames longer than its source and `810.mka` goes from 4210520
 frames to 4210642. A `--lookahead` shorter than the side chain's floor is raised to the floor

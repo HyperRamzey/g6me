@@ -673,7 +673,10 @@ pub fn timing_of(out: &[f32], frames: usize) -> Timing {
     t.first.push(first.unwrap_or(-1));
     t.peak.push(peak_i as i64);
     t.centroid.push(if den > 0.0 { num / den } else { 0.0 });
-    t.sign.push(if out[peak_i * 2] >= 0.0 { 1 } else { -1 });
+    let peak_l = out[peak_i * 2];
+    let peak_r = out[peak_i * 2 + 1];
+    let peak_sample = if peak_r.abs() > peak_l.abs() { peak_r } else { peak_l };
+    t.sign.push(if peak_sample >= 0.0 { 1 } else { -1 });
     t
 }
 
@@ -935,10 +938,7 @@ fn check_f64_contraction() -> Check {
         std::hint::black_box(b),
         std::hint::black_box(c),
     );
-    let sep = {
-        let p = std::hint::black_box(a * b);
-        std::hint::black_box(p + c)
-    };
+    let sep = std::hint::black_box(a * b + c);
     // The exact answer is 2^-104; anything else means contraction happened.
     let fused = 1.0f64 / (1u128 << 104) as f64;
     if sep == 0.0 {

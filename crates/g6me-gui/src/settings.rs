@@ -380,13 +380,6 @@ impl Settings {
                     .to_string(),
             );
         }
-        if self.depth == BitDepth::S32 && self.format == Format::Flac {
-            p.push(
-                "FLAC cannot carry 32-bit PCM: ffmpeg writes a 24-bit stream and drops the \
-                 low byte of every sample. Use WAV for 32-bit or float."
-                    .to_string(),
-            );
-        }
         if self.ir && !(self.ir_norm >= -1.0 && self.ir_norm <= 2.0) {
             p.push("IR `irnorm` must be between -1 and 2.".to_string());
         }

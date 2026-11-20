@@ -173,8 +173,8 @@ pub struct Cli {
     #[arg(long)]
     pub ir: Option<PathBuf>,
 
-    /// IR gain normalisation: -1 = none (mpv's default), 0 = peak, 1 = RMS.
-    #[arg(long, value_parser = parse_ir_norm)]
+    /// IR gain normalisation (afir `irnorm`): -1 = none (mpv's default), 0..=2 = Lp norm (2 = RMS/L2).
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_ir_norm)]
     pub ir_norm: Option<f64>,
 
     /// Wet/dry mix of the convolution.
@@ -193,8 +193,7 @@ pub struct Cli {
     #[arg(long, allow_negative_numbers = true, value_parser = parse_ir_length)]
     pub ir_length: Option<f64>,
 
-    /// IR phase: `none` keeps linear phase, `min`/`minimum` folds it to a
-    /// minimum-phase response (mpv leaves this alone).
+    /// IR auto-gain type (legacy `afir` `gtype`: none, peak, dc, gn, ac, rms).
     #[arg(long, value_parser = parse_gtype)]
     pub ir_gtype: Option<Gtype>,
 
@@ -323,7 +322,7 @@ fn parse_gtype(s: &str) -> Result<Gtype, String> {
         "rms" => Gtype::Rms,
         other => {
             return Err(format!(
-                "unknown IR phase '{other}' (none, peak, dc, gn, ac, rms)"
+                "unknown IR gtype '{other}' (none, peak, dc, gn, ac, rms)"
             ))
         }
     })
@@ -422,9 +421,9 @@ fn parse_precision_bits(s: &str) -> Result<f64, String> {
 
 fn parse_ir_norm(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| format!("'{s}' is not a number"))?;
-    if !(-1.0..=1.0).contains(&v) {
+    if !v.is_finite() || !(-1.0..=2.0).contains(&v) {
         return Err(format!(
-            "--ir-norm must be -1 (none), 0 (peak) or 1 (RMS), got {v}"
+            "--ir-norm must be in -1..=2 (-1 = none, 2 = L2/RMS), got {v}"
         ));
     }
     Ok(v)
@@ -799,12 +798,14 @@ fn render_batch(cli: &Cli, cfg: BatchCfg, tools: &Tools, caps: &Caps) -> ExitCod
 
     let ui = Arc::new(Ui::new(cli.quiet, cli.json));
 
-    eprintln!(
-        "{} file(s), {} worker(s), {}",
-        items.len(),
-        cfg.workers,
-        caps.summary()
-    );
+    if !cli.quiet && !cli.json {
+        eprintln!(
+            "{} file(s), {} worker(s), {}",
+            items.len(),
+            cfg.workers,
+            caps.summary()
+        );
+    }
     ui.line(&format!("loss chain: {}", cfg.render.loss_summary()));
 
     let ui2 = ui.clone();
@@ -879,21 +880,35 @@ fn dry_run(cli: &Cli, items: &[Item], cfg: &RenderCfg, tools: &Tools, caps: &Cap
     }
     let mut bad = 0usize;
     for (i, item) in items.iter().enumerate() {
-        println!(
-            "# {}/{}  {} -> {}",
-            i + 1,
-            items.len(),
-            item.src.display(),
-            item.dst.display()
-        );
-        // Said where the plan is printed, because this is the moment the user is reading
-        // the destinations and deciding whether to run it.
-        if let Some(why) = &item.note {
-            println!("#   {why}");
+        if !cli.json {
+            println!(
+                "# {}/{}  {} -> {}",
+                i + 1,
+                items.len(),
+                item.src.display(),
+                item.dst.display()
+            );
+            // Said where the plan is printed, because this is the moment the user is reading
+            // the destinations and deciding whether to run it.
+            if let Some(why) = &item.note {
+                println!("#   {why}");
+            }
         }
         if let Some(e) = item.error.as_ref().filter(|_| item.phase == Phase::Failed) {
             bad += 1;
-            println!("  would FAIL: {e}");
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "src": item.src,
+                        "dst": item.dst,
+                        "note": item.note,
+                        "error": e,
+                    })
+                );
+            } else {
+                println!("  would FAIL: {e}");
+            }
             continue;
         }
         match pipeline::plan_file(&item.src, &item.dst, cfg, tools, caps) {
@@ -902,12 +917,28 @@ fn dry_run(cli: &Cli, items: &[Item], cfg: &RenderCfg, tools: &Tools, caps: &Cap
             }
             Err(e) => {
                 bad += 1;
-                println!("  would FAIL: {e}");
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "src": item.src,
+                            "dst": item.dst,
+                            "note": item.note,
+                            "error": e.to_string(),
+                        })
+                    );
+                } else {
+                    println!("  would FAIL: {e}");
+                }
             }
         }
     }
     if cli.json {
-        return ExitCode::SUCCESS;
+        return if bad > 0 {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        };
     }
     println!(
         "# {} file(s), {} worker(s), {}",
@@ -1137,6 +1168,13 @@ fn monitor_files(cli: &Cli, tools: &Tools, caps: &Caps) -> ExitCode {
         let dst = Path::new("");
         match pipeline::render_file(&item.src, dst, &file_cfg, &opts) {
             Ok(r) => {
+                // Let the audio device finish draining queued frames before dropping `mon`.
+                while mon.is_running()
+                    && mon.stats().queued_frames > 0
+                    && !cancel.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 let peak: Vec<String> = meters
                     .peaks()
                     .iter()
@@ -1470,7 +1508,8 @@ mod tests {
         assert!(parse_precision_bits("16").is_err());
         assert_eq!(parse_precision_bits("28").unwrap(), 28.0);
         assert_eq!(parse_ir_norm("-1").unwrap(), -1.0);
-        assert!(parse_ir_norm("2").is_err());
+        assert_eq!(parse_ir_norm("2").unwrap(), 2.0);
+        assert!(parse_ir_norm("3").is_err());
         // The message must name the bound, not just "invalid value".
         let e = parse_rate("4800").unwrap_err();
         assert!(e.contains("8000..=384000"), "{e}");

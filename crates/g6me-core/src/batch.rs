@@ -22,10 +22,9 @@
 //! no half-written output behind ([`crate::pipeline`] deletes it).
 
 use crate::error::Error;
-use crate::pcm::BitDepth;
 use crate::pipeline::{render_file, RenderOpts, Report, SampleTap, Sink};
 use crate::probe::{Caps, Tools};
-use crate::stages::{OutFormat, RenderCfg};
+use crate::stages::RenderCfg;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -46,7 +45,7 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
 pub const SKIP_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "nfo", "txt", "md", "cue", "log", "srt", "ass",
     "ssa", "sub", "pdf", "zip", "rar", "7z", "exe", "dll", "json", "xml", "yml", "yaml", "csv",
-    "dat", "jpg", "cover", "jpeg",
+    "dat", "cover",
 ];
 
 /// What one file in the queue is doing.
@@ -953,14 +952,6 @@ impl Batch {
     }
 }
 
-/// Choose the encoder from the requested format and depth, so callers do not
-/// have to know that 24-bit FLAC needs a different binary.
-pub fn encoder_for(fmt: &OutFormat, depth: BitDepth) -> OutFormat {
-    match fmt {
-        OutFormat::Flac { level } if depth == BitDepth::S24 => OutFormat::Flac { level: *level },
-        other => other.clone(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

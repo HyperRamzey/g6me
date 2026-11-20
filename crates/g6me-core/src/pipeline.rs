@@ -745,13 +745,15 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         working_rate: work_rate,
         stage,
         chain,
-        input_args: in_args,
-        encode_cmd: enc_args,
         ir_info,
         warnings: plan_warnings,
         ..
     } = plan;
     warnings.extend(plan_warnings);
+
+    // Rebuild raw OsString argument vectors so non-UTF-8 paths reach ffmpeg lossless.
+    let (in_args, _, _) = input_args(cfg, &info, mask, src, ir_info.as_ref())?;
+    let enc_args = output_args(cfg, work_rate, &staged, src, opts.caps)?;
 
     cfg.limiter
         .validate()
@@ -925,13 +927,20 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     if decoded > 0 {
         if let [tl, tr, ..] = tail.as_mut_slice() {
             if !tl.is_empty() {
+                if let Some(t) = &opts.tap {
+                    let empty_refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+                    t.tap(&empty_refs, tl, tr, tl.len());
+                }
                 if let Some(g) = grid.as_mut() {
                     g.process(tl, tr);
                 }
                 frames += tl.len() as u64;
-                let mut tb = Vec::with_capacity(tl.len() * 4);
+                let mut tb = Vec::with_capacity(tl.len() * 16);
                 interleave_f64(tl, tr, &mut tb);
                 let _ = enc_tx.send(Encoded { bytes: tb });
+                if let Some(p) = &opts.progress {
+                    p.update(frames, bytes_out.load(Ordering::Relaxed));
+                }
             }
         }
     }
@@ -1111,8 +1120,8 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         delivered,
         delivered_note,
         warnings,
-        input_cmd: in_args,
-        encode_cmd: enc_args,
+        input_cmd: crate::util::args_preview(&in_args),
+        encode_cmd: crate::util::args_preview(&enc_args),
         chain,
         true_peak_dbtp: peak_summary.true_peak_dbtp,
         per_channel_true_peak_dbtp: peak_summary.per_channel_true_peak_dbtp,
@@ -1199,6 +1208,9 @@ pub fn plan_file(
             ));
         }
         if i.sample_rate != work_rate {
+            if !caps.soxr {
+                return Err(Error::NoSoxr);
+            }
             warnings.push(format!(
                 "IR is {} Hz but the working rate is {} Hz, so the IR is resampled to match",
                 i.sample_rate, work_rate
@@ -1217,6 +1229,9 @@ pub fn plan_file(
         None
     };
 
+    if !caps.soxr && cfg.out.resample.is_some_and(|r| r != work_rate) {
+        return Err(Error::NoSoxr);
+    }
     let (input_args, _, _) = input_args(cfg, &info, mask, src, ir_info.as_ref())?;
     let encode_cmd = output_args(cfg, work_rate, dst, src, caps)?;
     // Both are the *preview* copies. The render paths build their own argument vectors
@@ -1702,7 +1717,7 @@ enum EncoderSink {
 }
 
 impl EncoderSink {
-    fn new(cfg: &RenderCfg, opts: &RenderOpts, enc_args: &[String]) -> Result<Self> {
+    fn new(cfg: &RenderCfg, opts: &RenderOpts, enc_args: &[std::ffi::OsString]) -> Result<Self> {
         if cfg.out.format.is_null() {
             return Ok(Self::Null { bytes: 0 });
         }
@@ -1713,7 +1728,6 @@ impl EncoderSink {
         })
     }
 
-    #[allow(unused_variables)]
     fn write(&mut self, buf: &[u8], hash: Option<&mut Sha256>) -> Result<()> {
         // The hash covers the samples handed to the encoder, which is what makes
         // two runs comparable regardless of how the container was written.

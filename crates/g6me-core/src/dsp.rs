@@ -350,7 +350,9 @@ impl<T: Real> Ap2<T> {
     pub fn group_delay(&self, w: f64) -> f64 {
         let h = 1e-5;
         let pi = std::f64::consts::PI;
-        let (a, b) = (self.phase((w + h).min(pi)), self.phase((w - h).max(0.0)));
+        let hi = (w + h).min(pi);
+        let lo = (w - h).max(0.0);
+        let (a, b) = (self.phase(hi), self.phase(lo));
         let mut d = a - b;
         // unwrap across the +-pi boundary
         while d > pi {
@@ -359,7 +361,7 @@ impl<T: Real> Ap2<T> {
         while d < -pi {
             d += 2.0 * pi;
         }
-        -d / (2.0 * h)
+        -d / (hi - lo)
     }
 
     /// Roots of the denominator `z^2 + a1 z + a2`; both must satisfy `|z| < 1`

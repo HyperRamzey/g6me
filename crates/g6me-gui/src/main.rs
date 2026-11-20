@@ -194,7 +194,6 @@ pub struct App {
     /// Filled in by a background probe: `probe_caps` runs ffmpeg several times and
     /// a window that appears a second later is better than one that appears frozen.
     caps: Mutex<Option<Caps>>,
-    caps_note: Mutex<Option<String>>,
     runner: Runner,
     cards: Cards,
     palette: Palette,
@@ -308,7 +307,6 @@ impl App {
             settings: Settings::default(),
             tools: Tools::discover(),
             caps: Mutex::new(None),
-            caps_note: Mutex::new(None),
             runner: Runner::new(),
             cards: Cards::default(),
             palette: Palette::default(),
@@ -471,7 +469,6 @@ impl App {
 
     fn bottom_panel(&mut self, ctx: &egui::Context) {
         let counters = self.runner.counters();
-        let running = self.runner.is_running();
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(c) = &counters {
@@ -515,7 +512,6 @@ impl App {
                 }
             });
             ui.separator();
-            let _ = running;
             self.meters_panel(ui, ctx);
         });
     }
@@ -702,9 +698,20 @@ impl App {
                         self.browser.mode = Mode::Dir;
                     }
                 });
-                ui.checkbox(&mut self.settings.recursive, "scan folders recursively");
+                let mut rescan = false;
+                if ui
+                    .checkbox(&mut self.settings.recursive, "scan folders recursively")
+                    .changed()
+                {
+                    rescan = true;
+                }
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.settings.use_out_dir, "write outputs to");
+                    if ui
+                        .checkbox(&mut self.settings.use_out_dir, "write outputs to")
+                        .changed()
+                    {
+                        rescan = true;
+                    }
                     if ui
                         .add_enabled(!running, egui::Button::new("…"))
                         .on_hover_text("choose an output folder")
@@ -714,6 +721,9 @@ impl App {
                         self.browser.mode = Mode::Dir;
                     }
                 });
+                if rescan && !running {
+                    self.rebuild_queue();
+                }
                 if self.settings.use_out_dir {
                     ui.label(
                         egui::RichText::new(widgets::short_path(&self.settings.out_dir, 52))
@@ -752,19 +762,17 @@ impl App {
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| r.src.display().to_string())
                             );
-                            let resp = ui
-                                .horizontal(|ui| {
-                                    ui.colored_label(col, head);
-                                    if !r.shout().is_empty() {
-                                        ui.weak(truncate(r.shout(), 40));
-                                    }
-                                    if !running && ui.small_button("✕").clicked() {
-                                        remove = Some(i);
-                                    }
-                                })
-                                .response
-                                .on_hover_text(r.tooltip());
-                            let _ = resp;
+                            ui.horizontal(|ui| {
+                                ui.colored_label(col, head);
+                                if !r.shout().is_empty() {
+                                    ui.weak(truncate(r.shout(), 40));
+                                }
+                                if !running && ui.small_button("✕").clicked() {
+                                    remove = Some(i);
+                                }
+                            })
+                            .response
+                            .on_hover_text(r.tooltip());
                         }
                         // Removed after the loop: the table is borrowed while it is
                         // being drawn.
@@ -773,7 +781,7 @@ impl App {
                             self.settings.inputs.retain(|p| {
                                 // A folder entry stays: dropping one file out of a
                                 // scanned tree is not the same as un-queuing it.
-                                *p != row.src && !p.is_dir()
+                                *p != row.src || p.is_dir()
                             });
                         }
                     });
@@ -824,8 +832,12 @@ impl App {
     fn tab_output(&mut self, ui: &mut egui::Ui, caps: Option<&Caps>) {
         ui.horizontal(|ui| {
             ui.label("container");
+            let prev_fmt = self.settings.format;
             for f in Format::ALL {
                 ui.selectable_value(&mut self.settings.format, f, f.label());
+            }
+            if self.settings.format != prev_fmt && !self.runner.is_running() {
+                self.rebuild_queue();
             }
             if self.settings.format == Format::Flac {
                 ui.separator();
@@ -964,16 +976,6 @@ impl App {
             return;
         }
         let st = &mut self.settings;
-        let mut cfg = LCfg {
-            enable: true,
-            ceiling_db: st.setpoint_db.unwrap_or(st.ceiling_db),
-            ratio: st.limiter_ratio(),
-            lookahead_ms: st.lookahead_ms,
-            attack_ms: st.attack_ms,
-            release_ms: st.release_ms,
-            link_transient: st.link_transient_pct / 100.0,
-            link_release: st.link_release_pct / 100.0,
-        };
         // One field, two effects: the trim and the ceiling. It is the first control here
         // because it is the one that decides what the others are for — with a setpoint in
         // play the limiter is only ever catching peaks, since the level came down as a
@@ -1008,9 +1010,10 @@ impl App {
         });
         ui.horizontal(|ui| {
             ui.label("ceiling");
-            let mut c = st.ceiling_db;
+            let mut c = st.setpoint_db.unwrap_or(st.ceiling_db);
             if ui
-                .add(
+                .add_enabled(
+                    st.setpoint_db.is_none(),
                     egui::DragValue::new(&mut c)
                         .range(-24.0..=0.0)
                         .speed(0.05)
@@ -1114,13 +1117,16 @@ impl App {
                 st.link_release_pct = lr;
             }
         });
-        cfg.ceiling_db = st.setpoint_db.unwrap_or(st.ceiling_db);
-        cfg.ratio = st.limiter_ratio();
-        cfg.lookahead_ms = st.lookahead_ms;
-        cfg.attack_ms = st.attack_ms;
-        cfg.release_ms = st.release_ms;
-        cfg.link_transient = st.link_transient_pct / 100.0;
-        cfg.link_release = st.link_release_pct / 100.0;
+        let cfg = LCfg {
+            enable: true,
+            ceiling_db: st.setpoint_db.unwrap_or(st.ceiling_db),
+            ratio: st.limiter_ratio(),
+            lookahead_ms: st.lookahead_ms,
+            attack_ms: st.attack_ms,
+            release_ms: st.release_ms,
+            link_transient: st.link_transient_pct / 100.0,
+            link_release: st.link_release_pct / 100.0,
+        };
         let lat = cfg.latency_samples(rate);
         let asked = cfg.lookahead_ms;
         let used = cfg.effective_lookahead_ms(rate);
@@ -1145,7 +1151,7 @@ impl App {
             cfg.ceiling_db - cfg.guard_db()
         ));
         ui.weak(format!(
-            "latency {} samples ({:.3} ms) at {} Hz, added to the end of the file. {}",
+            "latency {} samples ({:.3} ms) at {} Hz, prepended at the start of the file. {}",
             lat,
             lat as f64 / rate as f64 * 1000.0,
             rate,
@@ -1162,7 +1168,7 @@ impl App {
                 format!("{:.2} ms of lookahead is honoured as asked.", used)
             }
         ));
-        if st.limit_ratio.is_some() && st.limit_ratio != Some(st.tp_ratio) {
+        if cfg.ratio != st.tp_ratio {
             ui.weak(format!(
                 "Meter and limiter are running different ratios, so each measures once \
                  more than they would agree: the report's dBTP is the {} reading, the \
@@ -1231,7 +1237,7 @@ impl App {
                 egui::ComboBox::from_id_salt("rsdepth")
                     .selected_text(self.settings.resample_depth.label())
                     .show_ui(ui, |ui| {
-                        for d in BitDepth::ALL {
+                        for d in [BitDepth::S16, BitDepth::S32] {
                             ui.selectable_value(&mut self.settings.resample_depth, d, d.label());
                         }
                     });
@@ -1861,9 +1867,6 @@ impl App {
                     if let Ok(mut c) = self.caps.lock() {
                         *c = Some(caps);
                     }
-                    if let Ok(mut n) = self.caps_note.lock() {
-                        *n = Some(note);
-                    }
                     // Now that the caps are known, the queue can be scanned: which
                     // files already have an output depends on the chosen extension.
                     self.rebuild_queue();
@@ -1874,10 +1877,11 @@ impl App {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         return s.to_string();
     }
-    format!("{}…", &s[..max])
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
 }
 
 /// Note shown next to a bit-depth choice, or `None` when there is nothing to warn

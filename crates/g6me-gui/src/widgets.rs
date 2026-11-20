@@ -768,6 +768,9 @@ pub struct Browser {
     pub message: Option<String>,
     entries: Vec<PathBuf>,
     entries_for: PathBuf,
+    entries_loaded: bool,
+    entries_filter: bool,
+    entries_mode: Mode,
     /// What the list is ordered by. Session state, like the path and "audio only": the
     /// panel keeps no settings file, so there is nothing to persist this into.
     pub sort: Sort,
@@ -790,6 +793,9 @@ impl Default for Browser {
             message: None,
             entries: Vec::new(),
             entries_for: PathBuf::new(),
+            entries_loaded: false,
+            entries_filter: true,
+            entries_mode: Mode::AudioFile,
             sort: Sort::default(),
             listing: Vec::new(),
             sorted_with: None,
@@ -807,11 +813,18 @@ fn dirs_home() -> PathBuf {
 impl Browser {
     fn refresh(&mut self) {
         self.path_text = self.path.display().to_string();
-        if self.entries_for == self.path && !self.entries.is_empty() {
+        if self.entries_loaded
+            && self.entries_for == self.path
+            && self.entries_filter == self.filter_audio
+            && self.entries_mode == self.mode
+        {
             return;
         }
         self.entries.clear();
         self.entries_for = self.path.clone();
+        self.entries_loaded = true;
+        self.entries_filter = self.filter_audio;
+        self.entries_mode = self.mode;
         let read = std::fs::read_dir(&self.path);
         let Ok(rd) = read else {
             self.message = Some(format!("cannot read {}", self.path.display()));
@@ -889,6 +902,7 @@ impl Browser {
         });
         self.entries = list.iter().map(|e| e.path.clone()).collect();
         self.listing = list;
+        self.anchor = None;
         self.sorted_with = Some(sort);
     }
 
@@ -1073,8 +1087,9 @@ impl Browser {
             .auto_shrink([false, true])
             .max_height(280.0)
             .show(ui, |ui| {
-                for (idx, p) in self.entries.iter().enumerate() {
-                    let is_dir = p.is_dir();
+                for (idx, entry) in self.listing.iter().enumerate() {
+                    let p = &entry.path;
+                    let is_dir = entry.is_dir;
                     let name = p
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -1155,6 +1170,7 @@ impl Browser {
         self.path = p;
         self.entries.clear();
         self.entries_for = PathBuf::new();
+        self.entries_loaded = false;
         self.anchor = None;
         self.refresh();
     }

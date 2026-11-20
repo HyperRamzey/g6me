@@ -40,12 +40,13 @@ pub fn guess_mask(channels: u16) -> u32 {
         0x40,   // FLC
         0x80,   // FRC
         0x100,  // BC
-        0x800,  // FLC(SLc?)
-        0x1000, // FRC
-        0x2000, // LTR
-        0x4000, // LTR
-        0x8000, // RSL
-        0x10000, 0x20000,
+        0x800,   // TC  (SPEAKER_TOP_CENTER)
+        0x1000,  // TFL (SPEAKER_TOP_FRONT_LEFT)
+        0x2000,  // TFC (SPEAKER_TOP_FRONT_CENTER)
+        0x4000,  // TFR (SPEAKER_TOP_FRONT_RIGHT)
+        0x8000,  // TBL (SPEAKER_TOP_BACK_LEFT)
+        0x10000, // TBC (SPEAKER_TOP_BACK_CENTER)
+        0x20000, // TBR (SPEAKER_TOP_BACK_RIGHT)
     ];
     BITS.iter()
         .take(channels.min(BITS.len() as u16) as usize)
@@ -53,11 +54,11 @@ pub fn guess_mask(channels: u16) -> u32 {
 }
 
 /// Classic 44-byte header when the file is 1–2 channels and needs no mask,
-/// otherwise the 58-byte extensible header.
+/// otherwise the 68-byte extensible header.
 pub fn header(rate: u32, channels: u16, bits: u32, float: bool, mask: Option<u32>) -> Vec<u8> {
     let block = channels as u32 * bits / 8;
     let extensible = channels > 2 || mask.is_some_and(|m| m != guess_mask(channels));
-    let mut h = Vec::with_capacity(58);
+    let mut h = Vec::with_capacity(if extensible { 68 } else { 44 });
     let tag = if float {
         WAVE_FORMAT_IEEE_FLOAT
     } else {
@@ -136,6 +137,12 @@ impl WavWriter {
 
     pub fn finish(mut self) -> Result<u64> {
         let total = self.data_len;
+        let riff_size = total
+            .checked_add(self.hdr_len - 8)
+            .ok_or_else(|| Error::msg("WAV exceeds 4 GiB RIFF limit"))?;
+        if riff_size > u32::MAX as u64 {
+            return Err(Error::msg("WAV exceeds 4 GiB RIFF limit"));
+        }
         // RIFF chunk size = file size - 8; data chunk size = payload. Both measured from
         // `hdr_len`, because a hard-coded 36 (the 44-byte classic header minus 8) writes a
         // RIFF size 24 bytes short onto every 68-byte extensible file — which is every
@@ -222,6 +229,9 @@ pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
             }
             let mut b = vec![0u8; size as usize];
             f.read_exact(&mut b).map_err(short)?;
+            if size & 1 == 1 {
+                f.seek(SeekFrom::Current(1))?;
+            }
             if b.len() < 16 {
                 return Err(Error::msg("short WAV fmt chunk"));
             }
@@ -229,13 +239,29 @@ pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
             info.channels = u16::from_le_bytes([b[2], b[3]]);
             info.rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
             info.bits = u16::from_le_bytes([b[14], b[15]]) as u32;
-            info.float = tag == WAVE_FORMAT_IEEE_FLOAT;
-            if tag == WAVE_FORMAT_EXTENSIBLE && b.len() >= 40 {
-                // cbSize is at 16, so dwChannelMask follows the 2-byte valid-bits
-                // field at 20, and the 16-byte sub-format GUID starts at 24.
-                info.mask = Some(u32::from_le_bytes([b[20], b[21], b[22], b[23]]));
-                info.float = b[24] == 0x03; // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-            } else if info.channels > 2 {
+            match tag {
+                WAVE_FORMAT_PCM => info.float = false,
+                WAVE_FORMAT_IEEE_FLOAT => info.float = true,
+                WAVE_FORMAT_EXTENSIBLE => {
+                    if b.len() < 40 {
+                        return Err(Error::msg("short WAVE_FORMAT_EXTENSIBLE fmt chunk"));
+                    }
+                    // cbSize is at 16, dwChannelMask at 20, 16-byte SubFormat GUID at 24..40.
+                    info.mask = Some(u32::from_le_bytes([b[20], b[21], b[22], b[23]]));
+                    let guid = &b[24..40];
+                    if guid == SUBTYPE_FLOAT {
+                        info.float = true;
+                    } else if guid == SUBTYPE_PCM {
+                        info.float = false;
+                    } else {
+                        return Err(Error::msg("unsupported WAVE_FORMAT_EXTENSIBLE subtype"));
+                    }
+                }
+                other => {
+                    return Err(Error::msg(format!("unsupported WAV format tag 0x{other:04x}")));
+                }
+            }
+            if info.mask.is_none() && info.channels > 2 {
                 info.mask = Some(guess_mask(info.channels));
             }
         } else if id == b"data" {

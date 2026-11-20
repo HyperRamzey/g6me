@@ -357,6 +357,7 @@ impl RenderCfg {
     pub fn with_defaults() -> Self {
         Self {
             block: 4096,
+            queue_blocks: 16,
             ..Default::default()
         }
     }
@@ -448,7 +449,7 @@ pub fn input_stage(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> (InputStage,
             let mut s = format!(
                 "aresample={}:resampler=soxr:precision={}:dither_method={}",
                 cfg.resample.rate,
-                cfg.resample.precision as u32,
+                cfg.resample.precision,
                 cfg.resample.dither.ffmpeg_name()
             );
             if cfg.resample.cheby {
@@ -524,6 +525,12 @@ pub fn input_args(
     args.push(crate::util::ffmpeg_path_arg(src));
 
     if cfg.ir.enable {
+        if cfg.ir.minp == 0 || cfg.ir.minp > cfg.ir.maxp {
+            return Err(Error::msg(format!(
+                "IR partition bounds require 0 < minp <= maxp, got minp={} maxp={}",
+                cfg.ir.minp, cfg.ir.maxp
+            )));
+        }
         let ir_path = cfg
             .ir
             .file
@@ -648,15 +655,12 @@ fn encoder_filter(o: &OutCfg, work_rate: u32) -> Option<String> {
     let mut s = if need_resample {
         format!(
             "aresample={rate}:resampler=soxr:precision={}:dither_method={}",
-            o.precision as u32,
+            o.precision,
             o.dither.ffmpeg_name()
         )
     } else {
         format!("aresample=dither_method={}", o.dither.ffmpeg_name())
     };
-    if o.resample.is_some() && !need_resample && o.precision > 0.0 {
-        s.push_str(&format!(":precision={}", o.precision as u32));
-    }
     // Dither belongs at the depth the file will actually carry.
     //
     // libswresample has no 24-bit sample format, so a 24-bit request lands on s32
@@ -720,7 +724,7 @@ pub fn output_args(
         args.push("-map_metadata".into());
         args.push("1".into());
         args.push("-map_metadata:s:0".into());
-        args.push("1:s:0".into());
+        args.push(format!("1:s:a:{}", cfg.stream).into());
     }
     args.push("-y".into());
 
@@ -772,7 +776,7 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
             other.label(),
             cfg.resample.rate,
             cfg.resample.dither.label(),
-            cfg.resample.precision as u32
+            cfg.resample.precision
         )),
     }
     if cfg.ir.enable {
