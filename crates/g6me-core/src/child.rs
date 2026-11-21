@@ -203,6 +203,8 @@ impl Proc {
 
     pub fn kill(&mut self) {
         if !self.done {
+            self.close_input();
+            let _ = self.stdout.take();
             let _ = self.child.kill();
             let _ = self.child.wait();
             self.done = true;

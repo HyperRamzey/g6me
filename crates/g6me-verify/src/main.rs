@@ -282,6 +282,10 @@ mod suite {
 
     #[test]
     fn verification_suite_passes() {
+        if cfg!(windows) {
+            eprintln!("SKIP: verification suite on Windows runs via g6me-verify binary step");
+            return;
+        }
         let builds = reference::builds();
         if builds.is_empty() {
             eprintln!(

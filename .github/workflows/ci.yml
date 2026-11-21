@@ -51,9 +51,17 @@ jobs:
       # Tests skip when ffmpeg/flac are absent, so this only buys coverage — but it
       # buys the *whole* render path on Windows, which is where the release binaries
       # for that platform run. If the package manager hiccups, the suite still runs.
-      - name: ffmpeg and flac on PATH
+      - name: Set up FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+      - name: flac on PATH
         continue-on-error: true
-        run: choco install ffmpeg flac -y --no-progress
+        shell: pwsh
+        run: |
+          choco install flac -y --no-progress
+          $flacDir = (Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\flac" -Filter "flac.exe" -Recurse).DirectoryName | Select-Object -First 1
+          if ($flacDir) {
+            "$flacDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo build --locked --release --workspace
       - run: cargo test --locked --workspace
