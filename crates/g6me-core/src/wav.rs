@@ -29,17 +29,17 @@ const SUBTYPE_FLOAT: [u8; 16] = [
 /// Standard channel order for a mask-free file, most-common-first.
 pub fn guess_mask(channels: u16) -> u32 {
     const BITS: [u32; 18] = [
-        0x1,    // FL
-        0x2,    // FR
-        0x4,    // FC
-        0x8,    // LFE
-        0x10,   // BL
-        0x20,   // BR
-        0x200,  // SL
-        0x400,  // SR
-        0x40,   // FLC
-        0x80,   // FRC
-        0x100,  // BC
+        0x1,     // FL
+        0x2,     // FR
+        0x4,     // FC
+        0x8,     // LFE
+        0x10,    // BL
+        0x20,    // BR
+        0x200,   // SL
+        0x400,   // SR
+        0x40,    // FLC
+        0x80,    // FRC
+        0x100,   // BC
         0x800,   // TC  (SPEAKER_TOP_CENTER)
         0x1000,  // TFL (SPEAKER_TOP_FRONT_LEFT)
         0x2000,  // TFC (SPEAKER_TOP_FRONT_CENTER)
@@ -258,7 +258,9 @@ pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
                     }
                 }
                 other => {
-                    return Err(Error::msg(format!("unsupported WAV format tag 0x{other:04x}")));
+                    return Err(Error::msg(format!(
+                        "unsupported WAV format tag 0x{other:04x}"
+                    )));
                 }
             }
             if info.mask.is_none() && info.channels > 2 {

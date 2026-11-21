@@ -2729,17 +2729,31 @@ mod tests {
         let mut cfg = RenderCfg::with_defaults();
         cfg.limiter.enable = false;
         let r = render_file(&w, &dir.join("imp.flac"), &cfg, &opts).unwrap();
-        // Nothing limited it, so the file's true peak is the impulse's own level.
+        // The default meter is strict ITU-R BS.1770-5 Annex 2 Ratio::X4 without sample floor:
+        // its 48-tap FIR response to an isolated impulse peaks at its largest coefficient (0.972),
+        // which evaluates to impulse_dbfs() - 0.247 dB (-6.27 dBTP).
+        let itu_x4_impulse_dbtp = impulse_dbfs() + 20.0 * 0.972f64.log10();
         assert!(
-            (r.true_peak_dbtp - impulse_dbfs()).abs() < 0.05,
-            "reported {:+.2} dBTP, impulse sits at {:+.2} dBFS",
+            (r.true_peak_dbtp - itu_x4_impulse_dbtp).abs() < 0.05,
+            "reported {:+.2} dBTP, expected ITU Annex 2 impulse peak at {:+.2} dBTP (impulse sample at {:+.2} dBFS)",
             r.true_peak_dbtp,
+            itu_x4_impulse_dbtp,
             impulse_dbfs()
         );
         assert_eq!(r.per_channel_true_peak_dbtp.len(), 2);
         assert_eq!(r.true_peak_ratio, Ratio::X4);
         assert!(r.limiter.is_none(), "this render asked for no limiter");
         assert!(r.one_line().contains("tp "), "{}", r.one_line());
+
+        // With a floored meter (Ratio::X8), the centre-tap floor catches the sample peak exactly:
+        cfg.true_peak = Ratio::X8;
+        let r8 = render_file(&w, &dir.join("imp8.flac"), &cfg, &opts).unwrap();
+        assert!(
+            (r8.true_peak_dbtp - impulse_dbfs()).abs() < 0.05,
+            "reported {:+.2} dBTP with X8, impulse sits at {:+.2} dBFS",
+            r8.true_peak_dbtp,
+            impulse_dbfs()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

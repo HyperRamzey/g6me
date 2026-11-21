@@ -952,7 +952,6 @@ impl Batch {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

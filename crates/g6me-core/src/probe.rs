@@ -291,7 +291,10 @@ pub fn probe_flac24(tools: &Tools) -> Option<String> {
 }
 
 /// Run ffmpeg to completion, reporting its stderr as the reason on failure.
-fn ffmpeg_ok<S: AsRef<std::ffi::OsStr>>(tools: &Tools, args: &[S]) -> std::result::Result<(), String> {
+fn ffmpeg_ok<S: AsRef<std::ffi::OsStr>>(
+    tools: &Tools,
+    args: &[S],
+) -> std::result::Result<(), String> {
     let out = Command::new(&tools.ffmpeg)
         .arg("-v")
         .arg("error")

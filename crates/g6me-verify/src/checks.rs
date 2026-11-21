@@ -675,7 +675,11 @@ pub fn timing_of(out: &[f32], frames: usize) -> Timing {
     t.centroid.push(if den > 0.0 { num / den } else { 0.0 });
     let peak_l = out[peak_i * 2];
     let peak_r = out[peak_i * 2 + 1];
-    let peak_sample = if peak_r.abs() > peak_l.abs() { peak_r } else { peak_l };
+    let peak_sample = if peak_r.abs() > peak_l.abs() {
+        peak_r
+    } else {
+        peak_l
+    };
     t.sign.push(if peak_sample >= 0.0 { 1 } else { -1 });
     t
 }

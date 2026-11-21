@@ -586,7 +586,7 @@ impl Limiter {
             },
             rate: 48_000,
             side: Vec::new(),
-            out_meter: TruePeak::new(Ratio::X4, 0),
+            out_meter: TruePeak::new_floored(Ratio::X4, 0),
             lines: Vec::new(),
             pos: 0,
             latency: 0,
@@ -635,8 +635,10 @@ impl Limiter {
         Self {
             cfg,
             rate,
-            side: (0..channels).map(|_| Detector::new(cfg.ratio)).collect(),
-            out_meter: TruePeak::new(cfg.ratio, channels),
+            side: (0..channels)
+                .map(|_| Detector::new_floored(cfg.ratio))
+                .collect(),
+            out_meter: TruePeak::new_floored(cfg.ratio, channels),
             lines: vec![vec![0.0; latency.max(1)]; channels.max(1)],
             pos: 0,
             latency,
@@ -2125,11 +2127,39 @@ mod tests {
                 "{r} should delay by the lookahead it got plus the meter's reporting lag"
             );
         }
-        assert_eq!(Ratio::X4.report_delay(), 6, "the printed bank is 5.875");
+        assert_eq!(Ratio::X4.report_delay(), 6, "the printed bank is 5.5");
         // The top of the range stays usable where the sample rate is normal.
         assert!(!cfg(-1.0, Ratio::X2, MAX_LOOKAHEAD_MS).lookahead_was_raised(48_000));
         assert!(!cfg(-1.0, Ratio::X4, MAX_LOOKAHEAD_MS).lookahead_was_raised(192_000));
         assert!(!cfg(-1.0, Ratio::X32, MAX_LOOKAHEAD_MS).lookahead_was_raised(192_000));
+    }
+
+    #[test]
+    fn limiter_floors_sample_peak_even_when_configured_with_ratio_x4() {
+        let c = Cfg {
+            ceiling_db: 0.0,
+            ratio: Ratio::X4,
+            ..Cfg::default()
+        };
+        let rate = 48_000;
+        let mut lim = Limiter::enabled(c, rate, 1);
+        let amp = 10.0f64.powf(1.0 / 20.0);
+        let mut buf: Vec<f64> = (0..2048)
+            .map(|i| if i % 2 == 0 { amp } else { -amp })
+            .collect();
+        lim.process(&mut [&mut buf[..]]);
+        let latency = lim.report().latency_samples;
+        let max_out = buf[latency + 200..]
+            .iter()
+            .fold(0.0f64, |a, &b| a.max(b.abs()));
+        eprintln!(
+            "max_out={max_out}, latency={latency}, report={:?}",
+            lim.report()
+        );
+        assert!(
+            max_out <= 1.000001,
+            "Ratio::X4 limiter side-chain must floor sample peak to hold brickwall ceiling on Nyquist, got peak {max_out}"
+        );
     }
 
     /// A burst whose crest is in the file's last frames must still be inside the
