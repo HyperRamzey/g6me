@@ -51,9 +51,19 @@ jobs:
         run: |
           tag=${GITHUB_REF_NAME}
           notes="Built by CI from $tag. Needs ffmpeg on PATH; x86-64-v3 (AVX2, 2013+) CPU."
-          gh release create "$tag" --title "G6ME $tag" --notes "$notes" --latest \
-            dist/G6_Media_Encoder-*.AppImage \
-            dist/g6me-*-linux-x86_64.tar.gz \
-            dist/g6me-*-linux-x86_64-desktop.tar.gz \
-            dist/g6me-*-windows-x86_64.zip \
-            dist/README-WINDOWS.txt dist/sha256sums.txt
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "G6ME $tag" --notes "$notes" --latest
+            gh release upload "$tag" --clobber \
+              dist/G6_Media_Encoder-*.AppImage \
+              dist/g6me-*-linux-x86_64.tar.gz \
+              dist/g6me-*-linux-x86_64-desktop.tar.gz \
+              dist/g6me-*-windows-x86_64.zip \
+              dist/README-WINDOWS.txt dist/sha256sums.txt
+          else
+            gh release create "$tag" --title "G6ME $tag" --notes "$notes" --latest \
+              dist/G6_Media_Encoder-*.AppImage \
+              dist/g6me-*-linux-x86_64.tar.gz \
+              dist/g6me-*-linux-x86_64-desktop.tar.gz \
+              dist/g6me-*-windows-x86_64.zip \
+              dist/README-WINDOWS.txt dist/sha256sums.txt
+          fi
