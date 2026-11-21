@@ -2092,7 +2092,7 @@ mod tests {
         }
         // Which ratios can honour the bottom of the range at a normal rate, and which
         // cannot. This is the honest shape of the control, and it is set by filter depth:
-        // the printed 12-tap x4 bank is 5.875 samples deep, so 0.2 ms (9 frames at
+        // the printed 12-tap x4 bank is 5.5 samples deep, so 0.2 ms (9 frames at
         // 48 kHz) is real for it, while every derived Kaiser bank is 51 taps and 25
         // samples deep, so its floor is 0.52 ms at 48 kHz and the UI has to say so rather
         // than pretend the slider reaches 0.2 ms for every setting. Depth is what bought
@@ -2148,14 +2148,10 @@ mod tests {
             .map(|i| if i % 2 == 0 { amp } else { -amp })
             .collect();
         lim.process(&mut [&mut buf[..]]);
+        let tail = lim.flush();
+        buf.extend_from_slice(&tail[0]);
         let latency = lim.report().latency_samples;
-        let max_out = buf[latency + 200..]
-            .iter()
-            .fold(0.0f64, |a, &b| a.max(b.abs()));
-        eprintln!(
-            "max_out={max_out}, latency={latency}, report={:?}",
-            lim.report()
-        );
+        let max_out = buf[latency..].iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         assert!(
             max_out <= 1.000001,
             "Ratio::X4 limiter side-chain must floor sample peak to hold brickwall ceiling on Nyquist, got peak {max_out}"

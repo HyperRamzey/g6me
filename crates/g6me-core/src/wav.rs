@@ -137,8 +137,10 @@ impl WavWriter {
 
     pub fn finish(mut self) -> Result<u64> {
         let total = self.data_len;
+        let pad = total % 2;
         let riff_size = total
-            .checked_add(self.hdr_len - 8)
+            .checked_add(pad)
+            .and_then(|t| t.checked_add(self.hdr_len - 8))
             .ok_or_else(|| Error::msg("WAV exceeds 4 GiB RIFF limit"))?;
         if riff_size > u32::MAX as u64 {
             return Err(Error::msg("WAV exceeds 4 GiB RIFF limit"));
@@ -149,13 +151,16 @@ impl WavWriter {
         // multichannel WAV this program writes. A strict parser honours that size and
         // drops the last 24 bytes of audio, so the file plays and is quietly truncated.
         self.f.seek(SeekFrom::Start(4))?;
-        self.f
-            .write_all(&((total + self.hdr_len - 8) as u32).to_le_bytes())?;
+        self.f.write_all(&(riff_size as u32).to_le_bytes())?;
         // The header ends with "data" followed by its 4-byte size, so the size
         // field is the last 4 bytes of the header — writing 8 bytes back would
         // land on the "data" tag itself and ffmpeg would reject the file.
         self.f.seek(SeekFrom::Start(self.hdr_len - 4))?;
         self.f.write_all(&(total as u32).to_le_bytes())?;
+        if pad != 0 {
+            self.f.seek(SeekFrom::Start(self.hdr_len + total))?;
+            self.f.write_all(&[0u8])?;
+        }
         self.f.flush()?;
         Ok(total)
     }
@@ -247,7 +252,8 @@ pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
                         return Err(Error::msg("short WAVE_FORMAT_EXTENSIBLE fmt chunk"));
                     }
                     // cbSize is at 16, dwChannelMask at 20, 16-byte SubFormat GUID at 24..40.
-                    info.mask = Some(u32::from_le_bytes([b[20], b[21], b[22], b[23]]));
+                    let mask = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
+                    info.mask = (mask != 0).then_some(mask);
                     let guid = &b[24..40];
                     if guid == SUBTYPE_FLOAT {
                         info.float = true;
@@ -456,6 +462,39 @@ mod tests {
         assert!(info.float);
         assert_eq!(info.bits, 64);
         assert_eq!(info.mask, Some(0x63f));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn odd_data_length_is_riff_padded() {
+        let p = tmp("odd.wav");
+        let mut w = WavWriter::create(&p, 48000, 1, 24, false, None).unwrap();
+        w.write(&[1, 2, 3]).unwrap();
+        w.finish().unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(bytes.len(), 48);
+        assert_eq!(bytes[47], 0, "pad byte must be zero");
+        let riff_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(riff_size, 40, "riff size must be file size (48) - 8");
+        let data_size = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+        assert_eq!(data_size, 3, "data chunk size does not include pad byte");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn zero_dwchannelmask_falls_back_to_guess_mask() {
+        let p = tmp("zero_mask.wav");
+        let h = header(48000, 8, 24, false, Some(0));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&h).unwrap();
+        f.write_all(&[0u8; 24 * 8]).unwrap();
+        drop(f);
+        let (info, _) = read_info(&p).unwrap();
+        assert_eq!(
+            info.mask,
+            Some(guess_mask(8)),
+            "dwChannelMask == 0 must fall back to guess_mask for multichannel"
+        );
         std::fs::remove_file(&p).ok();
     }
 }

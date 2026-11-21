@@ -541,16 +541,11 @@ pub fn input_args(
 
         // afir convolves in the main path's time base; an IR recorded at another
         // rate is brought to it, which is the only case where we resample an IR.
+        // Convert to double-precision mono first so integer PCM IRs reach volume and soxr
+        // in float64 without precision loss, matching AFIR_PRECISION = "double".
         let mut ir_steps = vec!["aformat=sample_fmts=dbl:channel_layouts=mono".to_string()];
         if let Some(i) = ir_info {
             if i.sample_rate != work_rate {
-                ir_steps.insert(
-                    0,
-                    format!(
-                        "aresample={}:resampler=soxr:precision=33:dither_method=none",
-                        work_rate
-                    ),
-                );
                 // The calibration gain, and the reason it is not optional.
                 //
                 // A resampler treats an impulse response as the *signal* it is: the
@@ -579,11 +574,14 @@ pub fn input_args(
                 // afir's own default of 1), afir normalizes the IR itself and this factor
                 // would be a 6 dB error of its own.
                 if cfg.ir.irnorm.is_some_and(|v| v < 0.0) {
-                    ir_steps.insert(
-                        0,
-                        format!("volume=volume='sample_rate/{work_rate}':eval=once"),
-                    );
+                    ir_steps.push(format!(
+                        "volume=volume='sample_rate/{work_rate}':precision=double:eval=once"
+                    ));
                 }
+                ir_steps.push(format!(
+                    "aresample={}:resampler=soxr:precision=33:dither_method=none",
+                    work_rate
+                ));
             }
         }
         let mut main = steps.clone();
@@ -1079,17 +1077,16 @@ mod tests {
         .unwrap();
         assert_eq!(rate, 48_000, "the graph is built at the working rate");
         let j = crate::util::args_display(&args);
-        let vol = j.find("volume=volume='sample_rate/48000':eval=once");
+        let fmt = j.find("aformat=sample_fmts=dbl:channel_layouts=mono");
+        let vol = j.find("volume=volume='sample_rate/48000':precision=double:eval=once");
         let resample = j.find("aresample=48000");
         assert!(
-            vol.is_some() && resample.is_some(),
-            "a 96 kHz IR at a 48 kHz working rate needs both the resample and the \
-             2x calibration gain: {j}"
+            fmt.is_some() && vol.is_some() && resample.is_some(),
+            "a 96 kHz IR at a 48 kHz working rate needs aformat, calibration gain, and resample: {j}"
         );
         assert!(
-            vol.unwrap() < resample.unwrap(),
-            "the factor reads the sample rate of the stream where it sits, so it has to \
-             come before the resampler or it multiplies by 1 and looks applied: {j}"
+            fmt.unwrap() < vol.unwrap() && vol.unwrap() < resample.unwrap(),
+            "aformat must precede volume and volume must precede aresample: {j}"
         );
     }
 

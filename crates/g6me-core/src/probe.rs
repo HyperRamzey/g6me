@@ -115,8 +115,7 @@ pub struct Caps {
 }
 
 impl Caps {
-    /// Resampling is possible at all (soxr present; the rubato fallback is
-    /// reported separately by [`crate::stages::resample_backend`]).
+    /// Resampling is possible (soxr present in the host ffmpeg).
     pub fn can_resample(&self) -> bool {
         self.soxr
     }

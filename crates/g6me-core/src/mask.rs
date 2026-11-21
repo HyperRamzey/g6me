@@ -104,65 +104,6 @@ pub fn format_mask_hex(mask: u32) -> String {
     format!("0x{mask:x}")
 }
 
-/// Well-known orders, in the interleaved order ffmpeg/AVFoundation emit them.
-pub const ORDERS: &[(&str, &[Slot])] = &[
-    (
-        "7.1 (FL FR FC LFE BL BR SL SR)",
-        &[
-            Slot::Fl,
-            Slot::Fr,
-            Slot::Fc,
-            Slot::Lfe,
-            Slot::Bl,
-            Slot::Br,
-            Slot::Sl,
-            Slot::Sr,
-        ],
-    ),
-    (
-        "7.1 front-wide (FL FR FC LFE BL BR FLC FRC)",
-        &[
-            Slot::Fl,
-            Slot::Fr,
-            Slot::Fc,
-            Slot::Lfe,
-            Slot::Bl,
-            Slot::Br,
-            Slot::Flc,
-            Slot::Frc,
-        ],
-    ),
-    (
-        "5.1 (FL FR FC LFE BL BR)",
-        &[Slot::Fl, Slot::Fr, Slot::Fc, Slot::Lfe, Slot::Bl, Slot::Br],
-    ),
-    (
-        "5.1 side (FL FR FC LFE SL SR)",
-        &[Slot::Fl, Slot::Fr, Slot::Fc, Slot::Lfe, Slot::Sl, Slot::Sr],
-    ),
-    (
-        "6.1 (FL FR FC LFE BL BC BR)",
-        &[
-            Slot::Fl,
-            Slot::Fr,
-            Slot::Fc,
-            Slot::Lfe,
-            Slot::Bl,
-            Slot::Bc,
-            Slot::Br,
-        ],
-    ),
-    (
-        "quad (FL FR BL BR)",
-        &[Slot::Fl, Slot::Fr, Slot::Bl, Slot::Br],
-    ),
-    (
-        "quad side (FL FR SL SR)",
-        &[Slot::Fl, Slot::Fr, Slot::Sl, Slot::Sr],
-    ),
-    ("stereo (FL FR)", &[Slot::Fl, Slot::Fr]),
-];
-
 /// Map a decoder-reported layout name (and channel count) to a stream order.
 ///
 /// ffmpeg's names are matched case-insensitively. `None` layout with a

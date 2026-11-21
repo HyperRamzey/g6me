@@ -116,23 +116,6 @@ impl Proc {
         Self::start(name, cmd, false, true)
     }
 
-    /// Spawn with **both** data pipes open, for a child that sits in the middle
-    /// of a chain (ffmpeg writing raw 24-bit PCM that we forward to `flac`).
-    pub fn spawn_rw<S: AsRef<OsStr>>(name: &'static str, bin: &Path, args: &[S]) -> Result<Self> {
-        let mut cmd = Command::new(bin);
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        Self::start(name, cmd, true, true)
-    }
-
-    /// Hand the stdout pipe to a caller that wants to move it into its own
-    /// forwarding thread. After this, [`Proc::read`] yields EOF.
-    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.stdout.take()
-    }
-
     fn start(name: &'static str, mut cmd: Command, out: bool, inp: bool) -> Result<Self> {
         // A stray FFREPORT in the environment would make ffmpeg write a report
         // file next to whatever it touches.
@@ -216,15 +199,6 @@ impl Proc {
     pub fn err_tail(&self) -> String {
         let g = self.err.lock().unwrap_or_else(|e| e.into_inner());
         tail(&g, 800)
-    }
-
-    /// Non-blocking check whether the child already exited (used to notice a
-    /// decode failure early instead of reading silence to the end).
-    pub fn try_exit_code(&mut self) -> Option<i32> {
-        match self.child.try_wait() {
-            Ok(Some(st)) => Some(st.code().unwrap_or(-1)),
-            _ => None,
-        }
     }
 
     pub fn kill(&mut self) {

@@ -134,7 +134,7 @@ pub struct Cli {
     #[arg(long, value_parser = parse_ratio)]
     pub limit_ratio: Option<Ratio>,
 
-    /// libsoxr precision in bits, 17..=33, used whenever a bit depth is reduced.
+    /// libsoxr precision in bits, 15..=33, used whenever a bit depth is reduced.
     #[arg(long, default_value_t = 33.0, value_parser = parse_precision_bits)]
     pub precision: f64,
 
@@ -413,8 +413,8 @@ fn parse_precision_bits(s: &str) -> Result<f64, String> {
     let v: f64 = s
         .parse()
         .map_err(|_| format!("'{s}' is not a number of bits"))?;
-    if !(17.0..=33.0).contains(&v) {
-        return Err(format!("soxr precision must be 17..=33 bits, got {v}"));
+    if !(15.0..=33.0).contains(&v) {
+        return Err(format!("soxr precision must be 15..=33 bits, got {v}"));
     }
     Ok(v)
 }
@@ -1505,8 +1505,8 @@ mod tests {
         assert!(parse_block("63").is_err());
         assert!(parse_queue("0").is_err());
         assert!(parse_part("128").is_err());
-        assert!(parse_precision_bits("16").is_err());
-        assert_eq!(parse_precision_bits("28").unwrap(), 28.0);
+        assert!(parse_precision_bits("14").is_err());
+        assert_eq!(parse_precision_bits("15").unwrap(), 15.0);
         assert_eq!(parse_ir_norm("-1").unwrap(), -1.0);
         assert_eq!(parse_ir_norm("2").unwrap(), 2.0);
         assert!(parse_ir_norm("3").is_err());

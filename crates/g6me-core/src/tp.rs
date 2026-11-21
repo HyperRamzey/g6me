@@ -364,23 +364,15 @@ impl Ratio {
 
     /// Group delay in input samples.
     ///
-    /// A linear-phase bank delays every one of its outputs by half its kernel, so the
-    /// derived banks are `(taps - 1) / 2` exactly — their phase grid is centred, which
-    /// is what buys the exact symmetry. The Recommendation's printed bank spaces its
-    /// phases from the current sample outward instead of centring them, so it carries an
-    /// extra `(n - 1) / (2n)` of an interval: 5.875 rather than 5.5. Both are correct
-    /// interpolators and differ by a constant delay; the number that matters to a
-    /// limiter is the one it can observe, and the test in this file measures each bank's
-    /// impulse response instead of trusting the arithmetic.
+    /// A linear-phase filter delays every one of its outputs by half its kernel:
+    /// `(taps - 1) / 2`. For the 12-tap ITU bank, the four phases evaluate symmetrically
+    /// around an exact mean group delay of 5.5 input samples. For the 51-tap derived banks,
+    /// the group delay is exactly 25.0 samples.
     ///
     /// This is the *forward* delay, and it is what bounds a limiter's minimum
     /// lookahead: a peak is not known until this many samples after the input that
     /// caused it. The kernel's support also reaches backwards, but reading samples that
     /// have already arrived costs no lookahead.
-    /// A linear-phase filter delays every one of its outputs by half its kernel:
-    /// `(taps - 1) / 2`. For the 12-tap ITU bank, the four phases evaluate symmetrically
-    /// around an exact mean group delay of 5.5 input samples. For the 51-tap derived banks,
-    /// the group delay is exactly 25.0 samples.
     #[must_use]
     pub fn group_delay(self) -> f64 {
         (self.taps() as f64 - 1.0) / 2.0
@@ -396,20 +388,6 @@ impl Ratio {
     #[must_use]
     pub fn floors_sample(self) -> bool {
         self != Ratio::X4
-    }
-
-    /// Recommended true-peak oversampling ratio for a given sampling rate
-    /// following ITU-R BS.1770-5 Annex 2 guidelines (target oversampled rate >= 192 kHz):
-    /// * fs <= 48 kHz: 4x (4 * 48k = 192 kHz)
-    /// * 48 kHz < fs <= 96 kHz: 2x (2 * 96k = 192 kHz)
-    /// * fs > 96 kHz: 2x (already >= 192 kHz)
-    #[must_use]
-    pub fn itu_for_rate(rate: u32) -> Self {
-        if rate <= 48_000 {
-            Ratio::X4
-        } else {
-            Ratio::X2
-        }
     }
 
     /// Worst under-read of this ratio **for content at or below [`BAND_EDGE`]**
@@ -830,13 +808,6 @@ impl Detector {
             }
             if peak > self.peak {
                 self.peak = peak;
-            }
-            // The newest sample still counts toward the file's maximum — that number has no
-            // instant to be wrong at, and under-reading a true peak is the one error a ceiling
-            // cannot survive.
-            let newest = x.abs();
-            if newest > self.peak {
-                self.peak = newest;
             }
         } else if peak > self.peak {
             self.peak = peak;
@@ -1437,10 +1408,6 @@ mod tests {
     }
 
     /// A full-scale alternating sequence: the sample peak is the true peak, and every
-    /// interpolating lowpass in the set attenuates it, most of them to nothing. This is
-    /// the case a ceiling cannot afford to miss, because a Nyquist component that a
-    /// limiter cannot see passes through at whatever level it arrived.
-    /// A full-scale alternating sequence: the sample peak is the true peak, and every
     /// interpolating lowpass in the set attenuates it. Limiter ratios floor at the sample peak
     /// to guarantee ceiling protection; Ratio::X4 strictly follows BS.1770-5 Annex 2 attenuation.
     #[test]
@@ -1821,7 +1788,7 @@ mod tests {
             }
             let want = r.group_delay();
             // Measured: index 25 for every derived bank (exactly `(taps - 1) / 2`), and 6
-            // against 5.875 for the printed x4 bank, so the dominant tap is the nearest
+            // against 5.5 for the printed x4 bank, so the dominant tap is the nearest
             // whole sample to the group delay and a one-sample error fails.
             assert!(
                 (best.0 as f64 - want).abs() <= 0.5,
@@ -1860,8 +1827,7 @@ mod tests {
             assert!(!r.chain().is_empty());
             assert_eq!(r.to_string(), r.label());
         }
-        // Half the kernel, except for the printed bank, whose phases fan out from the
-        // current sample and so carry the extra fraction of an interval.
+        // Exactly half the kernel: (12 - 1) / 2 = 5.5 for the printed 12-tap bank.
         assert!((Ratio::X4.group_delay() - 5.5).abs() < 1e-12);
         let half = (derived_taps() - 1) as f64 / 2.0;
         for r in [Ratio::X2, Ratio::X8, Ratio::X16, Ratio::X32] {

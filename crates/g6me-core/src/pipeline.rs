@@ -525,7 +525,9 @@ impl PeakStage {
             .then(|| [DcBlocker::new(rate), DcBlocker::new(rate)]);
         Self {
             tp: TruePeak::new(cfg.true_peak, 2),
-            shared: cfg.limiter.enable && cfg.limiter.ratio == cfg.true_peak,
+            shared: cfg.limiter.enable
+                && cfg.limiter.ratio == cfg.true_peak
+                && cfg.true_peak.floors_sample(),
             limiter,
             gain: 10f64.powf(cfg.output_gain_db / 20.0),
             dc,

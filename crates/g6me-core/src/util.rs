@@ -49,10 +49,6 @@ pub fn ffmpeg_path_arg(p: &Path) -> OsString {
     if b.starts_with(b"./") || b.starts_with(b"../") {
         return os.to_os_string();
     }
-    #[cfg(windows)]
-    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-        return os.to_os_string();
-    }
     let looks_like_option = b.first() == Some(&b'-');
     let looks_like_protocol = b
         .iter()

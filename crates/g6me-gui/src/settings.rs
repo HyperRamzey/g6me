@@ -92,8 +92,8 @@ pub struct Settings {
     /// Lookahead the limiter may ask for, ms; the effective value is reported per file
     /// because a deep filter cannot honour a shallow request.
     pub lookahead_ms: f64,
-    /// Ratio the limiter's own detector runs at. `None` = the meter's ratio, which is
-    /// also the cheap case: one measurement serves both jobs.
+    /// Ratio the limiter's own detector runs at. `None` = the default ratio (X8),
+    /// which enforces a sample-peak floor to guarantee brickwall ceiling protection.
     pub limit_ratio: Option<Ratio>,
     /// Strip DC before the trim and the limiter, with a 5 Hz first-order blocker.
     ///
@@ -276,7 +276,7 @@ impl Settings {
                 rate: self.rate,
                 depth: self.use_resample_depth.then_some(self.resample_depth),
                 precision: self.precision,
-                dither: self.dither,
+                dither: Dither::None,
                 cheby: self.cheby,
             },
             ir,
