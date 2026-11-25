@@ -5,23 +5,40 @@
 > Sound BlasterX are trademarks of Creative Technology Ltd. No proprietary firmware or
 > driver binaries are distributed in this repository.
 
-Batch renderer for the **G6 Creative MatrixEncoder** binaural downmixer: takes
-7.1 / 5.1 / Dolby-Atmos-12 (overheads are nulled, use DME\EE first) multichannel audio and writes the same 2-channel
-sum-and-biquad matrix the original plugin produces, as FLAC or WAV, from a
-command line or a GUI, on Linux and Windows.
+Batch renderer for the **G6 Creative MatrixEncoder**, and for **G6+**, a universal
+non-personalized binaural renderer that ships alongside it. Give it 7.1 / 5.1 /
+Dolby-Atmos-12 (overheads are nulled for the reference engine — use DME\EE first)
+and it writes a 2-channel binaural file as FLAC or WAV, from a command line or a
+GUI, on Linux and Windows.
 
 It exists because the plugin itself is a Windows VST2 insert. Real libraries are
 files on a disk, and you want the whole library converted overnight with the same
 numbers — including `.mka` containers holding Dolby TrueHD + Atmos, which the
 plugin can only play in real time through a host.
 
-```
-multichannel file ──ffmpeg decode──► f64 samples ──► Dsp (f64) ──► encoder ──► FLAC/WAV
-   .mka .wav .flac .mkv .mp4 …        (optional soxr      (the exact        (24-bit FLAC,
-                                       resample, IR)       plugin matrix)    or any depth in WAV)
+```text
+multichannel file ──ffmpeg decode──► f64 samples ──► renderer (f64) ──► trim / DC / limiter ──► FLAC/WAV
+ .mka .wav .flac .mkv .mp4 …        (optional soxr      Reference: exact        (the delivered      24-bit FLAC,
+                                     resample, IR)       plugin matrix        ceiling, measured    or any depth
+                                                         Plus: G6+ binaural   and reported)       in WAV)
 ```
 
-## What is guaranteed
+## Two engines, one pipeline
+
+| | **Reference** (default) | **Plus** (`--mode plus`) |
+|---|---|---|
+| What it is | A bit-exact port of the G6 `CMatrixEncoderEfxMod` matrix: the same all-pass cascade, the same gains, the same `f64` state. | A universal, non-personalized binaural renderer: physical head shadow and ITD, causal bass-mono, pinna shadow, diffuse-field equalization, BS.1116 lateral reflections, DEE-safe decorrelation. |
+| Sounds like | Direct and punchy; sharper surround phase contrast, no HRTF or room shaping. | Speakers in front of you: stable out-of-head width, natural interaural time and level, neutral 1-ERB tonality that stacks cleanly under headphone EQ. |
+| The claim | Bit-identical to binaries compiled from the vendored C reference (`g6me-verify`, 98 checks). | Designed, not cloned: every invariant it promises is a test in `plus.rs` (flat diffuse field, Woodworth ITD, bass coherence, symmetry, no pre-ringing, chunk-size invariance). |
+| Verified arithmetic | `f64`, no FMA, no fast-math — proven by disassembly. | Same `f64` contract, zero FMA, deterministic. |
+| Unchanged by it | Every existing command line, GUI preset and verifier contract. | Opt-in. The default path never enters the plus code. |
+
+You choose per render, in the CLI with `--mode`, in the GUI with the **Renderer** tab.
+Both engines run through the same decoder, meters, limiter, encoder and batch
+engine, so the two paths cannot disagree about a file's level, its format or its
+provenance.
+
+## What is guaranteed — Reference engine
 
 | | |
 |---|---|
@@ -36,6 +53,81 @@ multichannel file ──ffmpeg decode──► f64 samples ──► Dsp (f64) �
 
 What is *not* guaranteed: that a downmix that clips on your headphones is
 pleasant. The matrix is the plugin's, gains and all.
+
+## G6+ — the Plus renderer
+
+`--mode plus` (GUI: **Renderer → Plus**) replaces the hardware matrix with a
+binaural renderer designed for 48 kHz surround beds, with no ear scans, no
+measured HRTF and no per-headphone profile. It is built from published acoustics
+rather than sampled from a head:
+
+1. **Brown–Duda (1998) spherical head shadow** — frequency-dependent diffraction
+   ILD for an 8.75 cm head at 343 m/s, converted to strictly causal minimum phase
+   by Hilbert-cepstral folding.
+2. **Kulkarni–Isabelle–Colburn (1999) excess Woodworth ITD** — measures the ITD the
+   shadow filter already carries and adds only the remaining time-of-flight, so
+   total ITD matches Woodworth (FL ≈ 261 µs, SL ≈ 607 µs, BL ≈ 322 µs) without
+   counting the same delay twice.
+3. **Causal LR4 bass-mono crossover** at 120 Hz by default — keeps sub-bass
+   phase-coherent across closed-backs, open-backs, planars and electrostatics,
+   with zero pre-ringing.
+4. **Universal front–back pinna shadow** — a gentle rear HF shelf and a subtle
+   1.2 kHz Blauert directional band, with no sharp individualized notches.
+5. **DEE-safe side/back decorrelation** — a first-order causal all-pass on
+   `BL`/`BR` above the bass-mono frequency, so folding `.4` Atmos heights into
+   `SL+BL`/`SR+BR` cannot phase-lock into a coherent `+4.4 dB` pileup. Individual
+   magnitude coloration is 0.00 dB and ITD is not disturbed.
+6. **Common 1-ERB diffuse-field equalization** (Zaunschirm, Schörkhuber & Höldrich,
+   JASA 2018) on the direct path — the 7.0 ring is flat to within ≤ ±0.20 dB
+   (1-ERB Glasberg–Moore excitation) independent of lateral reflections, then
+   normalized to the reference's uncorrelated per-ear diffuse power (`3.500`,
+   +5.44 dB). This is why a headphone EQ curve measured on top of G6+ stays valid.
+7. **ITU-R BS.1116 lateral early reflections** — smooth alternating polarity,
+   ≥ 8.5 ms, nothing inside 6 ms, with a Hassager-smoothed diffuse tail. The
+   `externalize` control moves the image out of the head without the comb-filter
+   bounce that a bare reflection produces.
+8. **Adaptive 1-ERB phantom-center de-comb** (Shirley–Kendrick–Churchill, JAES
+   2007) — measures the crosstalk comb deficit of each frontal pair above 450 Hz
+   and fills it in minimum phase, so centered vocals and snare stay open.
+9. **Bauer / Linkwitz / Völk–Fastl coherent LF trim** — a user-tunable 340 Hz
+   first-order causal shelf on full-range channels, compensating the +3…+4 dB of
+   in-phase low-frequency summation that correlated music and surround mixes can
+   build up against the reference. Discrete `LFE` is left untouched unless asked.
+10. **LFE and streaming overlap-add** — optional 120 Hz 4th-order Butterworth LPF
+    on `.1`, aligned to the causal pre-delay and summed mono at `1/√2` into both
+    ears. Synthesis is `N_IR = 2048`, `N_FFT = 8192`, `HOP = 6144`, deterministic
+    `f64` with no FMA; kernels scale with the sample rate so the impulse stays
+    ~42.7 ms at 96, 192 and 384 kHz too.
+
+### Profiles
+
+| profile | width | focus | surround | externalize | bass mono | LF trim | de-comb |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `pure` | 1.00 | 0.70 | 1.00 | 0.00 | 120 Hz | 0.0 dB | 0.00 |
+| `studio` (default) | 1.00 | 0.65 | 1.00 | 0.45 | 120 Hz | −1.5 dB | 0.55 |
+| `cinema` | 1.18 | 0.55 | 1.20 | 0.75 | 110 Hz | −2.1 dB | 0.75 |
+
+`pure` is the anechoic speaker sphere: no room, strict 0 dB LF balance, no
+de-comb. `studio` is a balanced nearfield control room. `cinema` is a wider
+theatrical stage with richer surrounds and a deeper room. Move any slider and the
+GUI reports the profile as **Custom**; the CLI can override any single value
+without leaving its profile.
+
+Live controls, CLI and GUI alike: stage width (0.50–1.50), center focus
+(0.00–1.00), surround depth (0.50–1.50), externalization (0.00–1.00), bass-mono
+crossover (0–250 Hz), LF balance (−6.0…+3.0 dB), phantom de-comb (0.00–1.00),
+discrete LFE level (−12…+12 dB), LFE low-pass on/off, and whether the LF shelf
+also applies to `LFE`.
+
+### What Plus changes about timing
+
+G6+ is a causal FIR renderer: a 1 ms pre-delay is built into the kernel, blocks
+are convolved and overlap-added without buffering a block, and at end of file the
+remaining 2047-sample impulse tail is flushed through the limiter and encoded
+rather than discarded. At 48 kHz that is +42.7 ms of file length; at 96/192/384 kHz
+the kernel scales and the tail roughly doubles/quadruples. The output is
+deterministic and the file length is the honest consequence of the filter, not a
+mystery.
 
 ## Requirements
 
@@ -63,22 +155,31 @@ cargo run -p g6me-cli -- --caps
 
 ```sh
 cargo build --release            # g6me (CLI) and g6me-gui in target/release/
-cargo test --workspace           # 133 tests
+cargo test --workspace           # 296 tests (218 core, 23 CLI, 42 GUI, 13 harness)
 cargo run -p g6me-verify         # the bit-exactness evidence (98 checks)
 ```
 
 ## Command line
 
 ```sh
-# a whole library, FLAC level 8, four files at a time
+# the reference matrix, a whole library, FLAC level 8, four files at a time
 g6me -o /music/binaural -j 4 /music/atmos/
 
-# one album to 16-bit FLAC, resampled first, with the headphone calibration IR
-g6me -o out --rate 48000 --depth s16 --dither low_shibata \
-     --ir ~/.config/mpv/ir.wav album.mka
+# G6+ Studio, the universal binaural renderer
+g6me --mode plus -o /music/binaural /music/atmos/
+
+# G6+ Cinema, wider stage and deeper surrounds, with the headphone calibration IR
+g6me --mode plus --plus-profile cinema --ir ~/.config/mpv/ir.wav album.mka
+
+# G6+ tuned by hand: wider front, dry center, +6 dB discrete LFE, no LFE low-pass
+g6me --mode plus --plus-width 1.25 --plus-focus 0.80 \
+     --plus-lfe-gain 6 --no-lfe-lpf out.mka
+
+# one album to 16-bit FLAC, resampled first, with the reference matrix
+g6me -o out --rate 48000 --depth s16 --dither low_shibata album.mka
 
 # exactly what would run, without running it
-g6me --dry-run -o out --rate 44100 concert.mka
+g6me --dry-run -o out --mode plus --rate 44100 concert.mka
 ```
 
 Inputs are files **and folders**, as many as you like; folders are scanned
@@ -90,19 +191,33 @@ pointing back at an ancestor, is visited once. Without `-o`, each output lands
 next to its input. Existing outputs are skipped, not overwritten (`-y` to force —
 and `--force` will still never truncate an input file).
 
-The switches that matter most, and why:
+Any container ffmpeg can decode is accepted at render time; the folder scanner
+offers `mka mkv webm m4a m4b mp4 mov m4v flac wav wave rf64 aiff aif aifc afc w64
+caf wma ape mlp thd tta wv tak oga ogg opus spx ac3 eac3 dts dtshd dff dsf aac mp3
+mp2 m4r amr 3gp 3g2 voc au snd raw`, and skips obvious non-audio sidecars. Multi-channel
+streams may be 5.1, 7.1 or Atmos-12; a stream with no front pair is refused rather
+than folded.
+
+### The switches that matter most, and why
 
 | flag | why it exists |
 |---|---|
-| `-r, --rate` | Rate conversion happens **before** the downmix, through libsoxr, and only when you pass it. Doing it afterwards would make the resampler part of the matrix's phase response. |
-| `--depth`, `--dither` | Depth reduction is a separate, explicit decision from rate conversion. `--dither low_shibata \| triangular \| none`. |
+| `--mode reference \| plus` | Which renderer. `reference` is the default and the bit-exact path; `plus` selects G6+. |
+| `--plus-profile pure \| studio \| cinema` | G6+ acoustic preset. `studio` is the default. |
+| `--plus-width`, `--plus-focus`, `--plus-surround`, `--plus-externalize` | G6+ soundfield geometry: stage width, center dryness, surround depth, lateral early reflections. |
+| `--plus-bass-mono`, `--plus-bass-trim`, `--plus-decomb` | G6+ low end and center: LR4 bass-mono crossover, 340 Hz coherent-LF shelf, phantom-center fill. |
+| `--plus-lfe-gain`, `--plus-lfe-lf-trim`, `--no-lfe-lpf` | G6+ `.1` handling: discrete LFE level, whether the LF shelf reaches LFE, and the 120 Hz LFE low-pass. |
+| `-r, --rate` | Rate conversion happens **before** the renderer, through libsoxr, and only when you pass it. Doing it afterwards would make the resampler part of the matrix's phase response. |
+| `--depth`, `--dither` | Depth reduction is a separate, explicit decision from rate conversion. `--dither low_shibata \| triangular \| none`, plus the full soxr dither set. |
 | `--ir` | Mono headphone-calibration impulse convolved into every input channel first, exactly the way mpv's `afir` does (`irnorm=-1`, `precision=double`), so the calibration you already use for listening is the one applied here. |
 | `--order FL,FR,FC,LFE,BL,BR,SL,SR` | Some containers mislabel their channel layout. This overrides it instead of guessing. |
 | `--queue` | The memory bound: `queue × block × channels × 8` bytes per file. |
 | `--sha256` | Prints a hash per output, so "deterministic" is something you can check rather than believe. |
 | `--monitor`, `--device` | Play the result through an output device instead of writing a file (CLI only; the GUI has no audio path at all). |
 
-Full help: `g6me --help`. `--json` emits one object per finished file for scripts.
+Full help: `g6me --help`. `--json` emits one object per finished file for scripts,
+including the renderer, the true peak with its ratio, the limiter report, the
+delivered file measurement, DC offset and the full BS.1770-5 loudness block.
 
 ## GUI
 
@@ -110,12 +225,33 @@ Full help: `g6me --help`. `--json` emits one object per finished file for script
 cargo run -p g6me-gui
 ```
 
-Wayland, X11 and Windows (eframe/egui). Same controls as the CLI — format, depth,
-level, resample, dither, IR, channel order, threads, block, queue, force, dry run,
-SHA-256 — plus:
+Wayland, X11 and Windows (eframe/egui). Native OS file and folder pickers through
+Win32 COM, Cocoa, or the XDG Desktop Portal on Linux (no GTK C dependency), with
+the built-in egui browser available when built `--no-default-features`. Files and
+folders can also be dragged onto the window, and every path bar accepts a pasted
+path.
 
+The window is the render, arranged the way a mixer expects: queue left, controls
+centre, meters and history along the bottom. It never opens an audio device.
+
+* **Renderer tab.** Choose **Reference (Bit-Exact G6)** or **Plus (G6+ Binaural)**.
+  In Plus mode, pick `pure` / `studio` / `cinema` and adjust width, center focus,
+  surround depth, externalization, bass-mono, LF balance, phantom de-comb, LFE
+  level and LFE filtering, with a live polar soundfield radar beside them and a
+  readout of the resulting FL ITD, center DRR, LF balance, LFE level, de-comb
+  amount and the DFEQ tolerance.
+* **Output, True peak, Resample, IR calibration, Advanced tabs.** Same controls as
+  the CLI — format, depth, level, resample, dither, IR, channel order, threads,
+  block, queue, metadata, force, SHA-256, block DC — bound to the same core types,
+  so the two front ends cannot drift apart.
+* **Mastering presets** on the True peak tab: `Transparent (-3 dBTP)`,
+  `Streaming (-1 dBTP)`, `Headroom Setpoint (-3 dB)`, `Bit-Exact (Limiter Off)`.
+  One click sets ceiling, trim, DC blocking, lookahead and linking together.
 * **Queue with real multi-selection.** Click, Ctrl-click to add or remove, Shift-click
   for a range, double-click to commit. Selected count is shown before you commit.
+  A filename filter, status chips with live counts (`all`, `queued`, `done`,
+  `failed`, `skipped`), per-row detail and removal, and an audio-only filter on the
+  file browser.
 * **Drive and volume shortcuts**, read from the mount table (Linux), the drive letters
   (Windows) or `/Volumes` (macOS), filtered to things worth visiting — no `/proc`,
   no `tmpfs`, no squashfs snaps, and `/run/media/<you>/…` does appear. `/boot` and `/tmp`
@@ -127,15 +263,22 @@ SHA-256 — plus:
   would not date at the end rather than the start. "Created" is birth time where the
   filesystem records one; where it does not, the modified date is used and the picker says
   so above the list instead of showing a column of identical values.
-* **Per-file meters.** Every file being rendered gets its own card: the plugin's eight
+* **Per-file meters.** Every file being rendered gets its own card: the renderer's eight
   input slots plus the two outputs, sample peak, peak-hold, decay, with the same
-  0.30 s fall-off the VST2 meter used. Cards keep their last frame after the file
-  finishes, so you can see what clipped after the batch is done, and clicking a card
-  clears its holds.
+  0.30 s fall-off the VST2 meter used, plus a live EBU Tech 3205-E stereo phase
+  correlation meter beside the output bars. Cards keep their last frame after the
+  file finishes, so you can see what clipped after the batch is done, and clicking a
+  card clears its holds.
+* **Finished-file history.** One retained line per file with true peak and ratio,
+  sample peak and RMS, integrated LUFS, momentary/short-term maxima, LRA, PLR and
+  phase correlation, graded against a selectable delivery target. Copy it as text,
+  CSV or JSON — the record is of the bytes written, not of the renderer's
+  intention.
 * **Dry run before you commit**: source codec and profile, detected layout, the channel
-  order and mask actually chosen, the input stage selected, the human-readable chain,
-  and the exact ffmpeg command lines.
+  order and mask actually chosen, the input stage selected, the renderer and its
+  settings, the human-readable chain, and the exact ffmpeg command lines.
 * **Four themes**: system, dark, light, and a true `#000000` OLED black.
+* **Keyboard**: Ctrl+Enter starts, Esc cancels, Ctrl+D runs the dry run.
 
 ## True peak
 
@@ -234,7 +377,8 @@ bytes does; it is under the ceiling either way, but it is the reason a reading i
 its ratio and never treated as the last word.
 
 **Latency.** Lookahead plus the interpolator's own delay, prepended as leading zeros at
-the start of the file (with the held tail flushed at the end) and reported, never hidden. At the defaults that is 96 samples of lookahead — **2.00 ms
+the start of the file (with the held tail flushed at the end) and reported, never hidden. At
+the defaults that is 96 samples of lookahead — **2.00 ms
 at 48 kHz, honoured as asked** — plus 26 samples of filter delay: **122 samples, 2.542 ms**,
 so a rendered file is 122 frames longer than its source and `810.mka` goes from 4210520
 frames to 4210642. A `--lookahead` shorter than the side chain's floor is raised to the floor
@@ -281,7 +425,7 @@ ffmpeg's own `astats` reads −3.040000 dBFS sample peak on the delivered file a
 by true peak rather than by samples.)
 
 **Defaults**: limiter on, −3 dBTP, 2 ms lookahead, 60/900 ms, 100 %/75 % linking, 8x side
-chain on a 4x meter. The 8x only became true in this release: both front ends fell back to
+chain on a 4x meter. The 8x only became true in the 0.3 line: both front ends fell back to
 `Ratio::default()`, which is the *meter's* 4x, so the side chain ran a step shallower than
 this document, the CLI's own help text and `Cfg::default` each claimed, `guard_db` was 0.62
 not 0.04, and every limited file sat about 0.58 dB below the ceiling it was set to. The
@@ -295,6 +439,45 @@ the contract, and it is proven rather than asserted: `--no-limit` on `810.mka` s
 independent, so FLAC and WAV of the same render agree), `file_sha256` is the file as
 `sha256sum` sees it. The old field is neither of the two and does not survive a container
 change.
+
+## Loudness, range, PLR and stereo phase
+
+Every render also produces a **BS.1770-5 loudness report**, measured on the stereo
+stream handed to the encoder (which on the default lossless path is the finished file's
+sample stream; the decoded-back file is reported separately as `delivered`, as with the
+true peak):
+
+* **Integrated loudness** (`integrated_lufs`), ITU-R BS.1770-5 / EBU R128: the two-stage
+  K-weighting pre-filter, 400 ms gating blocks with 75 % overlap, a −70 LKFS absolute gate
+  and a −10 LU relative gate. The biquads are designed from Brecht De Man's (AES 2018)
+  continuous-time prototype, which reproduces the Recommendation's 48 kHz tables to
+  `< 1e-15` and keeps 44.1/88.2/96/192 kHz inside EBU Tech 3341's ±0.1 LU.
+* **Momentary and short-term maxima** (400 ms / 3 s), **Loudness Range** (`P95 − P10` over
+  gated 3 s blocks, EBU Tech 3342), and **PLR** (`true peak − integrated loudness`,
+  AES TD1008).
+* **Stereo phase correlation** (`rho`, EBU Tech 3205-E): `+1.0` is identical mono, `0.0`
+  is decorrelated stereo, negative is inverted polarity. This is the number that catches a
+  mislabelled surround channel or an all-pass stage that has drifted, before it reaches a
+  headphone.
+
+Fields that are mathematically undefined — integrated loudness for a clip under 400 ms,
+LRA under 3 s, silence — are reported as `null` rather than as a fabricated number, so the
+JSON stays RFC 8259 clean and a downstream script can tell "quiet" from "unmeasured".
+
+**Delivery targets.** The GUI grades the finished-file history against one of four targets,
+and the badge is the answer rather than a colour:
+
+| target | loudness | tolerance | max true peak |
+|---|:-:|:-:|:-:|
+| Streaming | −14 LUFS | ±2.0 LU | −1.0 dBTP |
+| EBU R128 | −23 LUFS | ±0.5 LU | −1.0 dBTP |
+| ATSC A/85 | −24 LUFS | ±2.0 LU | −2.0 dBTP |
+| Cinema | −24 LUFS | ±3.0 LU | −1.0 dBTP |
+
+The badge reads `PASS`, `+1.2 LU` / `−1.2 LU`, `OVER TP`, or `—` when the file is too short
+to measure. The selected target travels with the copied CSV/JSON, so a delivery note records
+which standard it was graded against. The CLI prints a compact `I −14.2 LUFS · LRA 6.1 LU ·
+PLR 12.4 dB` on the completion line, and the full block in `--json`.
 
 ## Verification
 
@@ -323,6 +506,14 @@ Run it through `cargo run -p g6me-verify` (or `cargo test -p g6me-verify`) rathe
 than a stale binary in `target/` — an out-of-date verifier is worse than none. Every
 check also runs per-group (`--group bitexact` …), so a failure can be reproduced
 without waiting for the whole suite.
+
+The workspace test suite covers what the verifier does not: 296 tests across the
+core (218), CLI (23), GUI (42) and harness (13). The G6+ invariants live there —
+a flat 1-ERB diffuse field across all three profiles, measured ITD against
+Woodworth, sub-bass coherence, exact L/R mirror symmetry, a clean kernel tail with
+no pre-ringing, chunk-size-invariant overlap-add streaming, stereo bypass, LFE gain
+and filtering, and high-sample-rate behaviour — along with the limiter's sliding
+hold, the loudness gates, the correlation meter and the queue filter.
 
 Two claims beyond the check itself are worth stating, because both are cheap to assert
 falsely:
@@ -383,7 +574,9 @@ What *is* guaranteed across machines is the thing that matters here: the **audio
 `810.mka` rendered by the Windows binary under Wine against a BtbN ffmpeg, and by the
 Linux binary against a distro ffmpeg, produced SHA-256
 `0c3d30cdaff5dffc5db24360b353bca9d1a8393a664a1e13a085540434a2eb9a` both times — the same
-file, from different builds, on different platforms.
+file, from different builds, on different platforms. (That hash is from the reference
+engine; G6+ is deterministic too, but its kernel depends on the sample rate and the
+profile, as documented above.)
 
 ## Optimized builds (x86-64-v3)
 
@@ -425,7 +618,9 @@ instructions and fails the same comparison, so "no FMA found" means something.
 
 End to end the two builds write **byte-identical** FLAC — SHA-256 compared — for the
 plain matrix, for `--rate 48000 --depth s16 --dither low_shibata`, and for the IR
-convolution.
+convolution. G6+ is deterministic under the same flags, but its kernels are a function
+of the sample rate and profile, so compare G6+ output against the same G6+ settings, not
+against the reference engine.
 
 What it actually buys: about 12 % off the DSP's own time (150 ms → 132 ms on the 60 s
 verification case). Total throughput did not move measurably, because ffmpeg decode and
@@ -435,8 +630,9 @@ do not make it the default you ship.
 ## Layout
 
 ```
-crates/g6me-core     DSP port, pipeline (ffmpeg ⇄ DSP ⇄ encoder), batch engine,
-                     capabilities probe, meters, WAV I/O, monitoring (CLI-side)
+crates/g6me-core     DSP port, G6+ renderer, FFT, pipeline (ffmpeg ⇄ renderer ⇄ encoder),
+                     batch engine, capabilities probe, meters, loudness, WAV I/O,
+                     monitoring (CLI-side)
 crates/g6me-cli      `g6me`
 crates/g6me-gui      `g6me-gui` — eframe, no audio backend
 crates/g6me-verify   bit-exactness harness; builds vendor/g6ct in 8 configurations
@@ -464,7 +660,8 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
   the report says so instead of quoting a crest the file cannot hold. On the default
   lossless path the two agree to four decimal places. The cost is one extra decode
   pass per file: an 8 s render becomes about 14 s. (`-r/--rate` is input-side, before
-  the downmix, so it is not what this is about; the output-side resampler is.)
+  the renderer, so it is not what this is about; the output-side resampler is.)
+
 * **DC is metered, and removed only on request.** Every render reports `dc_offset`
   per channel — in full-scale units, because an offset carries a sign and is compared
   against a quantisation step — for the stream and again for the finished file decoded
@@ -497,6 +694,15 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
   own settling spread over the file — which is the reason a DC figure is only meaningful
   with the window it was measured over, and why the tests here drain the limiter's
   lookahead and skip the filter's transient before they claim a number.
+
+* **G6+ is a universal renderer, not your HRTF.** It is deliberately non-individualized:
+  the head is a sphere, the pinna is a broad shadow rather than a measured notch, and the
+  image is built from published models. It will not place a source at the same elevation or
+  with the same front-back certainty as a measured HRTF for your own ears. What it does
+  promise is that the result is neutral in tonality, stable across headphones, and free of
+  the DEE height-folding pileup that a naive sum produces — and that stacking your own
+  headphone EQ on top changes the tone, not the geometry.
+
 * **FLAC stops at 24 bits.** That is the container and the encoder, not a choice:
   ffmpeg's FLAC encoder writes `bps=24` and, fed 32-bit PCM, drops the low byte of
   every sample. G6ME therefore refuses `--format flac --depth 32` instead of shipping
@@ -512,4 +718,6 @@ scripts/             build-optimized.sh (verified v3 build), release.sh (artefac
 MIT — see [LICENSE](LICENSE). The DSP is a port of the G6 Creative MatrixEncoder
 analysis; the C reference under `vendor/g6ct/` is kept byte-identical to its source
 (`vendor/g6ct/UPSTREAM.md` records which) so that "we match the reference" stays a
-checkable claim rather than a memory.
+checkable claim rather than a memory. G6+ is an original implementation of published
+acoustics (Brown–Duda, Woodworth, Kulkarni–Isabelle–Colburn, Zaunschirm, ITU-R BS.1116,
+Shirley–Kendrick, Bauer–Linkwitz) on top of that same `f64` pipeline.
