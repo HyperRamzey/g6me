@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 g6me-core = { workspace = true }
+serde_json.workspace = true
 # eframe's default features already cover the three platforms this project
 # promises: winit's X11 and Wayland backends, native Windows, and AccessKit for
 # screen readers. Keeping them default rather than hand-picked means an
@@ -26,12 +27,6 @@ egui = "0.31"
 # `--no-default-features` fall back cleanly to the built-in egui browser.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"], optional = true }
 
-[dev-dependencies]
-# The meter-history tests decode a real render's report instead of hand-writing thirty
-# fields. A fixture from an actual clamped s16 render also keeps these tests honest about
-# the shape of `Report`: a rename that drops DC or the decoded-back pass from the panel has
-# to fail here rather than quietly disappear from the copy text.
-serde_json.workspace = true
 
 [features]
 # No `monitor` feature here on purpose: this app never opens an audio device. The

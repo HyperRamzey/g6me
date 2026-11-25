@@ -409,6 +409,102 @@ pub fn meter_card(ui: &mut Ui, meters: &Meters, card: &Card, height: f32) -> boo
         }
     }
 
+    // Live EBU Tech 3205-E stereo phase correlation meter (-1 .. 0 .. +1) to the right
+    // of the output bars whenever the card has spare horizontal space.
+    let corr_x0 = g.row_right + 16.0;
+    let corr_x1 = (corr_x0 + 116.0).min(r.right() - 8.0);
+    if corr_x1 - corr_x0 >= 72.0 && g.bar_height() >= 36.0 {
+        let corr = meters.correlation().clamp(-1.0, 1.0);
+        let corr_col = if corr < 0.0 {
+            tone(
+                ui,
+                Color32::from_rgb(222, 84, 66),
+                Color32::from_rgb(188, 42, 28),
+            )
+        } else if corr < 0.2 {
+            tone(
+                ui,
+                Color32::from_rgb(216, 178, 58),
+                Color32::from_rgb(168, 128, 14),
+            )
+        } else {
+            tone(
+                ui,
+                Color32::from_rgb(96, 176, 92),
+                Color32::from_rgb(30, 122, 60),
+            )
+        };
+        painter.text(
+            Pos2::new(corr_x0, g.group_y),
+            Align2::LEFT_TOP,
+            "phase",
+            FontId::proportional(9.5),
+            v.weak_text_color(),
+        );
+        painter.text(
+            Pos2::new(corr_x1, g.group_y),
+            Align2::RIGHT_TOP,
+            format!("{corr:+.2}"),
+            FontId::monospace(9.5),
+            if card.finished {
+                v.weak_text_color()
+            } else {
+                corr_col
+            },
+        );
+        let cy = (g.top + g.bottom) * 0.5;
+        let track = Rect::from_min_max(Pos2::new(corr_x0, cy - 5.0), Pos2::new(corr_x1, cy + 5.0));
+        painter.rect_filled(track, 2.0, v.extreme_bg_color);
+        painter.rect_stroke(
+            track,
+            2.0,
+            Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color),
+            StrokeKind::Inside,
+        );
+        let mid = track.center().x;
+        let end = mid + corr * (track.width() * 0.5);
+        let (fx0, fx1) = if end >= mid { (mid, end) } else { (end, mid) };
+        if fx1 - fx0 > 0.5 {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(fx0, track.top() + 1.0),
+                    Pos2::new(fx1, track.bottom() - 1.0),
+                ),
+                1.5,
+                corr_col,
+            );
+        }
+        painter.line_segment(
+            [
+                Pos2::new(mid, track.top() - 2.0),
+                Pos2::new(mid, track.bottom() + 2.0),
+            ],
+            Stroke::new(1.0_f32, scale),
+        );
+        let tick_y = track.bottom() + 4.0;
+        painter.text(
+            Pos2::new(corr_x0, tick_y),
+            Align2::LEFT_TOP,
+            "−1",
+            FontId::proportional(8.5),
+            scale,
+        );
+        painter.text(
+            Pos2::new(mid, tick_y),
+            Align2::CENTER_TOP,
+            "0",
+            FontId::proportional(8.5),
+            scale,
+        );
+        painter.text(
+            Pos2::new(corr_x1, tick_y),
+            Align2::RIGHT_TOP,
+            "+1",
+            FontId::proportional(8.5),
+            scale,
+        );
+    }
+
     // The release curve lives in the meter, not here: a redraw is not a sample, so
     // decay is driven by the render thread. Clicking only clears the holds.
     resp.clicked()

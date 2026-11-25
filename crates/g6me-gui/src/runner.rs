@@ -179,13 +179,11 @@ impl Runner {
             .and_then(|c| c.as_ref().map(|c| c.snapshot()))
     }
 
-    /// Start a batch. Fails fast on an unusable queue rather than half-running it.
-    ///
-    /// Hands back the exact item list the workers were given, so the table the user
-    /// sees and the queue being rendered cannot drift apart — progress events carry
-    /// an index into this list.
-    pub fn start(
+    /// Start a batch over an explicit item list (preserving any manual removals or
+    /// retry filtering done in the GUI queue).
+    pub fn start_items(
         &self,
+        items: Vec<Item>,
         cfg: &BatchCfg,
         tools: Tools,
         caps: Caps,
@@ -193,8 +191,18 @@ impl Runner {
         if self.is_running() {
             return Err("a run is already in progress".into());
         }
-        let ext = cfg.render.out.format.extension().to_string();
-        let items = batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext, cfg.recursive);
+        // Reclaim any finished worker handle from an earlier run.
+        if let Ok(mut w) = self.worker.lock() {
+            if let Some(prev) = w.take() {
+                let _ = prev.join();
+            }
+        }
+        let items = if items.is_empty() {
+            let ext = cfg.render.out.format.extension().to_string();
+            batch::discover(&cfg.inputs, cfg.out_dir.as_deref(), &ext, cfg.recursive)
+        } else {
+            items
+        };
         if items.is_empty() {
             return Err(
                 "no audio files found — check the queue, the extension filter, and whether \
@@ -263,10 +271,7 @@ impl Runner {
         let h = std::thread::spawn(move || {
             let started = Instant::now();
             let outcome = batch.finish();
-            let mut s = Summary::from_outcome(&outcome, started.elapsed());
-            if outcome.cancelled {
-                s.error = None;
-            }
+            let s = Summary::from_outcome(&outcome, started.elapsed());
             let _ = tx2.send(Event::Finished(s));
             running.store(false, Ordering::Relaxed);
             wake();
@@ -298,5 +303,16 @@ impl Runner {
             }
         }
         out
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Ok(mut w) = self.worker.lock() {
+            if let Some(h) = w.take() {
+                let _ = h.join();
+            }
+        }
     }
 }

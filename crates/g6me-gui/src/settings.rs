@@ -41,6 +41,54 @@ impl Format {
     }
 }
 
+/// One-click true-peak / headroom mastering presets for the True Peak tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MasteringPreset {
+    /// Default transparent brickwall protection (-3.0 dBTP, unity trim, 8x detector).
+    Transparent,
+    /// Streaming / broadcast safety (-1.0 dBTP, unity trim, DC block, 8x detector).
+    StreamingSafe,
+    /// Clean headroom setpoint (-3.0 dB pre-gain trim + -3.0 dBTP ceiling, DC block).
+    HeadroomSetpoint,
+    /// Untouched bit-exact pass (limiter off, 0 dB trim, DC block off).
+    BitExactOff,
+}
+
+impl MasteringPreset {
+    pub const ALL: [Self; 4] = [
+        Self::Transparent,
+        Self::StreamingSafe,
+        Self::HeadroomSetpoint,
+        Self::BitExactOff,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transparent => "Transparent (-3 dBTP)",
+            Self::StreamingSafe => "Streaming (-1 dBTP)",
+            Self::HeadroomSetpoint => "Headroom Setpoint (-3 dB)",
+            Self::BitExactOff => "Bit-Exact (Limiter Off)",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Transparent => {
+                "Default two-stage lookahead limiter at -3.0 dBTP ceiling with 0 dB pre-gain."
+            }
+            Self::StreamingSafe => {
+                "Caps true peaks at -1.0 dBTP for streaming/AAC/Opus codecs with 5 Hz DC blocker."
+            }
+            Self::HeadroomSetpoint => {
+                "Trims level by -3.0 dB and caps at -3.0 dBTP so the limiter only catches stray crests."
+            }
+            Self::BitExactOff => {
+                "Disables limiter, gain trim, and DC blocker so samples pass through bit-for-bit untouched."
+            }
+        }
+    }
+}
+
 /// Everything the user can set, in the order the panels show it.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -65,6 +113,8 @@ pub struct Settings {
     /// level; the reference `flac` CLI's `-0..-8` presets are a different scale.
     pub flac_level: u32,
     pub depth: BitDepth,
+    /// Output quantization dither (applied when reducing bit depth to the output container).
+    pub dither: Dither,
     pub copy_metadata: bool,
     pub overwrite: bool,
     pub sha256: bool,
@@ -119,7 +169,8 @@ pub struct Settings {
     pub use_resample_depth: bool,
     /// soxr quality in bits, 15..=33.
     pub precision: f64,
-    pub dither: Dither,
+    /// Dither applied inside the input resampler (when resampling / quantizing on input).
+    pub resample_dither: Dither,
     pub cheby: bool,
 
     // ---- IR calibration ----------------------------------------------------
@@ -160,6 +211,7 @@ impl Default for Settings {
             format: Format::Flac,
             flac_level: 8,
             depth: BitDepth::S24,
+            dither: Dither::None,
             copy_metadata: true,
             overwrite: false,
             sha256: false,
@@ -185,7 +237,7 @@ impl Default for Settings {
             resample_depth: BitDepth::S32,
             use_resample_depth: false,
             precision: 33.0,
-            dither: Dither::None,
+            resample_dither: Dither::None,
             cheby: false,
             ir: false,
             ir_file: PathBuf::new(),
@@ -204,7 +256,7 @@ impl Default for Settings {
             // 4096 frames is ~85 ms at 48 kHz: large enough that ffmpeg's pipe
             // rarely sees a short read, small enough to stay responsive.
             block: 4096,
-            queue_blocks: 8,
+            queue_blocks: 16,
             stream: 0,
         }
     }
@@ -249,6 +301,60 @@ impl Settings {
         }
     }
 
+    /// Apply a one-click mastering preset to the true-peak / limiter controls.
+    pub fn apply_mastering_preset(&mut self, preset: MasteringPreset) {
+        self.lookahead_ms = g6me_core::limiter::DEFAULT_LOOKAHEAD_MS;
+        self.attack_ms = default_attack_ms();
+        self.release_ms = default_release_ms();
+        self.link_transient_pct = default_link_transient();
+        self.link_release_pct = default_link_release();
+        self.limit_ratio = None;
+        match preset {
+            MasteringPreset::Transparent => {
+                self.limiter = true;
+                self.setpoint_db = None;
+                self.gain_db = 0.0;
+                self.ceiling_db = g6me_core::limiter::DEFAULT_CEILING_DB;
+                self.dc_block = false;
+            }
+            MasteringPreset::StreamingSafe => {
+                self.limiter = true;
+                self.setpoint_db = None;
+                self.gain_db = 0.0;
+                self.ceiling_db = -1.0;
+                self.dc_block = true;
+            }
+            MasteringPreset::HeadroomSetpoint => {
+                self.limiter = true;
+                self.setpoint_db = Some(-3.0);
+                self.gain_db = 0.0;
+                self.ceiling_db = -3.0;
+                self.dc_block = true;
+            }
+            MasteringPreset::BitExactOff => {
+                self.limiter = false;
+                self.setpoint_db = None;
+                self.gain_db = 0.0;
+                self.ceiling_db = g6me_core::limiter::DEFAULT_CEILING_DB;
+                self.dc_block = false;
+            }
+        }
+    }
+
+    /// Reset all rendering, output, limiter, resample, IR, and advanced settings to defaults
+    /// while preserving the queued input paths and output folder choice.
+    pub fn reset_preserving_queue(&mut self) {
+        let inputs = std::mem::take(&mut self.inputs);
+        let use_out_dir = self.use_out_dir;
+        let out_dir = std::mem::take(&mut self.out_dir);
+        let recursive = self.recursive;
+        *self = Self::default();
+        self.inputs = inputs;
+        self.use_out_dir = use_out_dir;
+        self.out_dir = out_dir;
+        self.recursive = recursive;
+    }
+
     /// Mirror of the CLI's translation. Keep the two in step.
     /// The side-chain ratio, with the limiter's own default behind it.
     ///
@@ -287,7 +393,7 @@ impl Settings {
                 rate: self.rate,
                 depth: self.use_resample_depth.then_some(self.resample_depth),
                 precision: self.precision,
-                dither: Dither::None,
+                dither: self.resample_dither,
                 cheby: self.cheby,
             },
             ir,
@@ -304,7 +410,11 @@ impl Settings {
             },
             order: self.order.clone(),
             true_peak: self.tp_ratio,
-            output_gain_db: self.setpoint_db.unwrap_or(self.gain_db),
+            output_gain_db: if self.limiter {
+                self.setpoint_db.unwrap_or(self.gain_db)
+            } else {
+                self.gain_db
+            },
             limiter: g6me_core::limiter::Cfg {
                 enable: self.limiter,
                 ceiling_db: self.setpoint_db.unwrap_or(self.ceiling_db),
@@ -427,6 +537,24 @@ impl Settings {
                 p.push(format!("G6+ renderer: {e}"));
             }
         }
+        let cfg = self.render_cfg();
+        if let Err(e) = cfg.out.validate(caps) {
+            let msg = e.to_string();
+            // Avoid duplicating format/depth messages already pushed above.
+            if !p.iter().any(|existing| {
+                (existing.contains("24-bit FLAC") && msg.contains("24-bit FLAC"))
+                    || (existing.contains("FLAC carries")
+                        && (msg.contains("FLAC is integer-only") || msg.contains("32-bit FLAC")))
+                    || (existing.contains("FLAC level") && msg.contains("FLAC compression level"))
+            }) {
+                p.push(msg);
+            }
+        }
+        if cfg.limiter.enable {
+            if let Err(e) = cfg.limiter.validate() {
+                p.push(format!("Limiter: {e}"));
+            }
+        }
         p
     }
 
@@ -480,11 +608,16 @@ impl Settings {
 pub fn describe(s: &Settings) -> String {
     let mut v = Vec::new();
     v.push(format!(
-        "{} {}",
+        "{} {}{}",
         s.depth.label(),
         match s.format {
             Format::Flac => format!("FLAC -{}", s.flac_level.min(12)),
             Format::Wav => "WAV".to_string(),
+        },
+        if s.dither == Dither::None {
+            String::new()
+        } else {
+            format!(" ({})", s.dither.label())
         }
     ));
     if s.resample {
@@ -492,10 +625,10 @@ pub fn describe(s: &Settings) -> String {
             "soxr {} Hz/{} bits{}",
             s.rate,
             s.precision,
-            if s.dither == Dither::None {
+            if s.resample_dither == Dither::None {
                 " no dither".to_string()
             } else {
-                format!(" {}", s.dither.label())
+                format!(" {}", s.resample_dither.label())
             }
         ));
     } else {
@@ -817,5 +950,88 @@ mod tests {
         assert!((custom_cfg.plus.phantom_decomb - 0.90).abs() < 1e-6);
         assert!((custom_cfg.plus.lfe_gain_db - (-4.5)).abs() < 1e-6);
         assert!(custom_cfg.plus.lfe_lf_trim);
+    }
+
+    #[test]
+    fn limiter_off_ignores_setpoint_and_dithers_are_independent() {
+        let s = Settings {
+            limiter: false,
+            setpoint_db: Some(-4.0),
+            gain_db: 0.0,
+            dither: Dither::Triangular,
+            resample_dither: Dither::Rectangular,
+            ..Default::default()
+        };
+        let cfg = s.render_cfg();
+        assert!(
+            !cfg.limiter.enable && cfg.output_gain_db == 0.0,
+            "limiter off must not apply setpoint_db as output_gain_db (got {})",
+            cfg.output_gain_db
+        );
+        assert_eq!(cfg.out.dither, Dither::Triangular);
+        assert_eq!(cfg.resample.dither, Dither::Rectangular);
+
+        let caps = Caps {
+            flac: true,
+            flac24: true,
+            soxr: true,
+            ..Default::default()
+        };
+        let bad_dither = Settings {
+            inputs: vec![PathBuf::from(".")],
+            depth: BitDepth::S24,
+            dither: Dither::Shibata,
+            ..Default::default()
+        };
+        assert!(
+            bad_dither
+                .problems(&caps)
+                .iter()
+                .any(|p| p.contains("shibata") || p.contains("noise-shaping")),
+            "problems() must reject noise-shaping dither on 24-bit output: {:?}",
+            bad_dither.problems(&caps)
+        );
+    }
+
+    #[test]
+    fn mastering_presets_and_reset_preserving_queue_behave_cleanly() {
+        let mut s = Settings {
+            inputs: vec![PathBuf::from("/music/album")],
+            use_out_dir: true,
+            out_dir: PathBuf::from("/out"),
+            recursive: false,
+            ..Default::default()
+        };
+        s.apply_mastering_preset(MasteringPreset::StreamingSafe);
+        let cfg = s.render_cfg();
+        assert!(cfg.limiter.enable);
+        assert_eq!(cfg.limiter.ceiling_db, -1.0);
+        assert_eq!(cfg.output_gain_db, 0.0);
+        assert!(cfg.dc_block);
+
+        s.apply_mastering_preset(MasteringPreset::HeadroomSetpoint);
+        let cfg = s.render_cfg();
+        assert!(cfg.limiter.enable);
+        assert_eq!(cfg.limiter.ceiling_db, -3.0);
+        assert_eq!(cfg.output_gain_db, -3.0);
+        assert!(cfg.dc_block);
+
+        s.apply_mastering_preset(MasteringPreset::BitExactOff);
+        let cfg = s.render_cfg();
+        assert!(!cfg.limiter.enable);
+        assert_eq!(cfg.output_gain_db, 0.0);
+        assert!(!cfg.dc_block);
+
+        s.format = Format::Wav;
+        s.renderer = RendererMode::Plus;
+        s.resample = true;
+        s.reset_preserving_queue();
+        assert_eq!(s.format, Format::Flac);
+        assert_eq!(s.renderer, RendererMode::Reference);
+        assert!(!s.resample);
+        assert_eq!(s.inputs, vec![PathBuf::from("/music/album")]);
+        assert!(s.use_out_dir);
+        assert_eq!(s.out_dir, PathBuf::from("/out"));
+        assert!(!s.recursive);
     }
 }
