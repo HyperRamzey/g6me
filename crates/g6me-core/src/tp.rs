@@ -181,33 +181,7 @@ pub const BAND_EDGE: f64 = 0.45;
 /// move a reading by a few ten-thousandths of a dB.
 pub const STOPBAND_DB: f64 = 80.0;
 
-/// Modified Bessel function of the first kind, order zero, by its power series.
-#[must_use]
-pub fn bessel_i0(x: f64) -> f64 {
-    let q = x * x / 4.0;
-    let mut term = 1.0f64;
-    let mut sum = 1.0f64;
-    let mut k = 1.0f64;
-    while term > 1e-18 * sum {
-        term *= q / (k * k);
-        sum += term;
-        k += 1.0;
-    }
-    sum
-}
-
-/// Kaiser's window shape parameter for a stop-band attenuation of `att_db` (Kaiser 1974,
-/// as given in Oppenheim & Schafer, *Discrete-Time Signal Processing*, section 7.5).
-#[must_use]
-pub fn kaiser_beta(att_db: f64) -> f64 {
-    if att_db > 50.0 {
-        0.1102 * (att_db - 8.7)
-    } else if att_db >= 21.0 {
-        0.5842 * (att_db - 21.0).powf(0.4) + 0.07886 * (att_db - 21.0)
-    } else {
-        0.0
-    }
-}
+pub use crate::fft::{i0 as bessel_i0, kaiser_beta};
 
 /// Taps per phase of a derived bank.
 ///
@@ -717,9 +691,9 @@ impl Detector {
     /// Clearing `older`/`newest` here was tried and is wrong twice over: the pending parabola
     /// at the seam would read through a fabricated `0.0` neighbour and over-read a steady
     /// crest (measured: +0.96 dB of over-read on an x2 sweep), and the filter's ringdown
-    /// across the boundary is real audio the window is obliged to report. What the reset does
-    /// withhold is the *display* of that pending point, via the `has_samples_since_reset`
-    /// flag, so an untouched window still reads `-inf`.
+    /// across the boundary is real audio the window is obliged to report. Because `peak`
+    /// is reset to `0.0` and `newest` is only folded into `peak` when new samples arrive,
+    /// an untouched window still reads `-inf`.
     ///
     /// For a genuinely independent signal, construct a fresh detector (or call
     /// [`Detector::clear`]), which starts the refine pair at zeros exactly as any file start
@@ -1527,9 +1501,8 @@ mod tests {
 
     /// What [`Detector::reset_peak`] promises, pinned from the other side: an untouched
     /// window has to read as untouched. `newest` deliberately survives a reset (it is real
-    /// signal from before the seam), so without the `has_samples_since_reset` flag a meter
-    /// that reset and then asked would report the crest it had just been told to forget, and
-    /// a group of pure silence would display the previous group's level.
+    /// signal from before the seam), while `peak` resets to `0.0` so a reset window with
+    /// no subsequent samples still reports `0.0` / `-inf` rather than the prior window's crest.
     #[test]
     fn reset_peak_reports_silence_until_the_new_window_has_content() {
         let mut d = Detector::new(Ratio::X16);
@@ -1887,72 +1860,27 @@ mod accuracy {
     //! theirs; the tone-derived guard band that resulted was off by up to 0.8 dB on
     //! broadband material.
     use super::*;
+    use crate::fft::{Complex, FftPlan};
     use std::f64::consts::PI;
-
-    /// In-place iterative radix-2 FFT; `inverse` also scales by `1/n`.
-    fn fft(re: &mut [f64], im: &mut [f64], inverse: bool) {
-        let n = re.len();
-        assert!(n.is_power_of_two() && im.len() == n);
-        let mut j = 0usize;
-        for i in 1..n {
-            let mut bit = n >> 1;
-            while j & bit != 0 {
-                j ^= bit;
-                bit >>= 1;
-            }
-            j ^= bit;
-            if i < j {
-                re.swap(i, j);
-                im.swap(i, j);
-            }
-        }
-        let mut len = 2;
-        while len <= n {
-            let ang = 2.0 * PI / len as f64 * if inverse { 1.0 } else { -1.0 };
-            let (wr, wi) = (ang.cos(), ang.sin());
-            for start in (0..n).step_by(len) {
-                let (mut cr, mut ci) = (1.0f64, 0.0f64);
-                for k in 0..len / 2 {
-                    let a = start + k;
-                    let b = a + len / 2;
-                    let tr = re[b] * cr - im[b] * ci;
-                    let ti = re[b] * ci + im[b] * cr;
-                    re[b] = re[a] - tr;
-                    im[b] = im[a] - ti;
-                    re[a] += tr;
-                    im[a] += ti;
-                    let ncr = cr * wr - ci * wi;
-                    ci = cr * wi + ci * wr;
-                    cr = ncr;
-                }
-            }
-            len <<= 1;
-        }
-        if inverse {
-            let s = 1.0 / n as f64;
-            re.iter_mut().for_each(|v| *v *= s);
-            im.iter_mut().for_each(|v| *v *= s);
-        }
-    }
 
     /// Exact true peak of a periodic block with no energy at fs/2, read on an `l`x grid
     /// (`l` = 32 puts the grid error of the *reference* below 0.0004 dB).
     fn exact_peak(x: &[f64], l: usize) -> f64 {
         let n = x.len();
         let m = n * l;
-        let mut re = x.to_vec();
-        let mut im = vec![0.0; n];
-        fft(&mut re, &mut im, false);
-        let mut yr = vec![0.0; m];
-        let mut yi = vec![0.0; m];
-        yr[..n / 2].copy_from_slice(&re[..n / 2]);
-        yi[..n / 2].copy_from_slice(&im[..n / 2]);
+        let plan_n = FftPlan::new(n);
+        let plan_m = FftPlan::new(m);
+        let mut spec: Vec<Complex> = x.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        plan_n.forward(&mut spec);
+        let mut padded = vec![Complex::ZERO; m];
+        padded[..n / 2].copy_from_slice(&spec[..n / 2]);
         for k in 1..n / 2 {
-            yr[m - k] = re[n - k];
-            yi[m - k] = im[n - k];
+            padded[m - k] = spec[n - k];
         }
-        fft(&mut yr, &mut yi, true);
-        yr.iter().fold(0.0f64, |a, &v| a.max((v * l as f64).abs()))
+        plan_m.inverse(&mut padded);
+        padded
+            .iter()
+            .fold(0.0f64, |a, c| a.max((c.re * l as f64).abs()))
     }
 
     fn lcg(state: &mut u64) -> f64 {
@@ -1966,21 +1894,20 @@ mod accuracy {
     /// sample, nothing above, and nothing at Nyquist, peak-normalised to 0.9.
     fn band_noise(n: usize, fmax: f64, seed: u64) -> Vec<f64> {
         let mut st = 0x9E3779B97F4A7C15u64 ^ seed.wrapping_mul(0xD1B54A32D192ED03);
-        let mut re: Vec<f64> = (0..n)
-            .map(|_| (0..4).map(|_| lcg(&mut st)).sum::<f64>())
+        let mut buf: Vec<Complex> = (0..n)
+            .map(|_| Complex::new((0..4).map(|_| lcg(&mut st)).sum::<f64>(), 0.0))
             .collect();
-        let mut im = vec![0.0; n];
-        fft(&mut re, &mut im, false);
-        for k in 0..n {
+        let plan = FftPlan::new(n);
+        plan.forward(&mut buf);
+        for (k, c) in buf.iter_mut().enumerate() {
             let f = k.min(n - k) as f64 / n as f64;
             if f > fmax || k == n / 2 {
-                re[k] = 0.0;
-                im[k] = 0.0;
+                *c = Complex::ZERO;
             }
         }
-        fft(&mut re, &mut im, true);
-        let pk = re.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        re.iter().map(|v| v * 0.9 / pk).collect()
+        plan.inverse(&mut buf);
+        let pk = buf.iter().fold(0.0f64, |a, c| a.max(c.re.abs()));
+        buf.iter().map(|c| c.re * 0.9 / pk).collect()
     }
 
     /// A detector's reading of a periodic block: one period to settle the filter, then

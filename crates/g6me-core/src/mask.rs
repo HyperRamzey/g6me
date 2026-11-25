@@ -158,6 +158,31 @@ pub fn order_from_layout(layout: Option<&str>, channels: usize) -> Option<Vec<Sl
             // error, not a preference.
             return (slots.len() == channels).then(|| slots.to_vec());
         }
+        // FFmpeg 5.1+ `av_channel_layout_describe()` emits composite strings such as
+        // `FL+FR+FC+LFE+BL+BR` for non-standard layouts. Accept them when every token
+        // is a known speaker slot, no slot repeats, and the count matches `channels`.
+        if key.contains('+') {
+            let mut parsed = Vec::new();
+            let mut seen_mask = 0u32;
+            let mut ok = true;
+            for tok in key.split('+') {
+                if let Some(slot) = Slot::parse(tok) {
+                    if (seen_mask & slot.bit()) != 0 {
+                        ok = false;
+                        break;
+                    }
+                    seen_mask |= slot.bit();
+                    parsed.push(slot);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && parsed.len() == channels {
+                return Some(parsed);
+            }
+            return None;
+        }
         // A name that exists but is not in the table is refused rather than guessed
         // from the channel count. "The container says octagon" and "the container says
         // nothing" are different statements, and answering the first one with the 8ch

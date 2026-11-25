@@ -63,17 +63,6 @@ pub fn ffmpeg_path_arg(p: &Path) -> OsString {
     }
 }
 
-/// The same path for a line a human reads: a dry-run preview, a log, JSON.
-///
-/// Lossy by definition, and honest about it — the bytes that reach the process come
-/// from [`ffmpeg_path_arg`], never from this. A name that is not valid UTF-8 shows
-/// here with the usual replacement characters while still rendering correctly on
-/// disk.
-#[must_use]
-pub fn path_display(p: &Path) -> String {
-    ffmpeg_path_arg(p).to_string_lossy().into_owned()
-}
-
 /// A `Vec<String>` copy of an argument list, for JSON and for the preview pane.
 ///
 /// Lossy on purpose and labelled as such: these are the words a person reads, not the

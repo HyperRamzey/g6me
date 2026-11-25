@@ -345,6 +345,7 @@ impl Feed {
     }
 
     fn close(&self) {
+        let _q = self.q.lock().unwrap_or_else(|e| e.into_inner());
         self.closed.store(true, Ordering::Release);
         self.ready.notify_all();
     }
@@ -401,7 +402,7 @@ impl Monitor {
             .default_output_config()
             .map_err(|e| Error::Device(format!("default config: {e}")))?;
         let config = StreamConfig {
-            channels: 2,
+            channels: cfg.channels().clamp(1, 2),
             sample_rate: cfg.sample_rate(),
             buffer_size: match cfg.buffer_size() {
                 cpal::SupportedBufferSize::Range { min, max } => {
@@ -598,7 +599,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let ch = config.channels.max(1) as usize;
-    let mut scratch: Vec<f32> = Vec::new();
+    let mut scratch: Vec<f32> = Vec::with_capacity(feed.capacity_frames.max(4096) * 2);
     let callback = move |data: &mut [T], _info: &OutputCallbackInfo| {
         let frames = data.len() / ch;
         scratch.clear();

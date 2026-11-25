@@ -178,7 +178,7 @@ pub const TRANSIENT_RELEASE_MS: f64 = 25.0;
 /// Settings for the true-peak limiter.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cfg {
-    /// Off by default: the whole point of G6ME is that nothing happens unless asked.
+    /// On by default (see [`Default`]); set to `false` for the bit-exact untouched path.
     pub enable: bool,
     /// Output ceiling in dBTP.
     pub ceiling_db: f64,

@@ -92,26 +92,6 @@ impl Error {
     pub fn msg(s: impl Into<String>) -> Self {
         Error::Msg(s.into())
     }
-
-    /// True for the conditions that should not stop a batch: a bad or
-    /// already-done file is reported and the queue moves on.
-    pub fn is_per_file(&self) -> bool {
-        matches!(
-            self,
-            Error::NoAudio(_)
-                | Error::ProbeFailed { .. }
-                | Error::UnsupportedLayout { .. }
-                | Error::MaskUnknown { .. }
-                | Error::OrderMismatch { .. }
-                | Error::IrMissing(_)
-                | Error::NoFrontPair(_)
-                | Error::Exists(_)
-                | Error::InputUnreadable { .. }
-                | Error::ChildFailed { .. }
-                | Error::NoData { .. }
-                | Error::NonFinite { .. }
-        )
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -29,7 +29,6 @@ struct Args {
     group: Option<String>,
     seconds: u64,
     frames: usize,
-    quiet: bool,
 }
 
 fn main() {
@@ -231,7 +230,6 @@ fn parse() -> Result<Args, String> {
         match flag {
             "--json" => a.json = true,
             "--require-all" => a.require_all = true,
-            "--quiet" => a.quiet = true,
             "--group" => {
                 a.group = Some(value_at(&argv, i, "--group")?);
                 i += 1;

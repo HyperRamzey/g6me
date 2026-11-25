@@ -13,7 +13,6 @@ edition = "2021"
 rust-version = "1.87"
 license = "MIT"
 repository = "https://github.com/HyperRamzey/g6me"
-authors = ["HyperRamzey"]
 
 [workspace.dependencies]
 g6me-core = { path = "crates/g6me-core" }

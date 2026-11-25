@@ -21,15 +21,6 @@ impl BitDepth {
         BitDepth::F64,
     ];
 
-    pub fn sample_bytes(self) -> usize {
-        match self {
-            BitDepth::S16 => 2,
-            BitDepth::S24 => 3,
-            BitDepth::S32 | BitDepth::F32 => 4,
-            BitDepth::F64 => 8,
-        }
-    }
-
     /// ffmpeg decoder/muxer name for raw PCM of this format.
     pub fn codec(self) -> &'static str {
         match self {
@@ -38,17 +29,6 @@ impl BitDepth {
             BitDepth::S32 => "pcm_s32le",
             BitDepth::F32 => "pcm_f32le",
             BitDepth::F64 => "pcm_f64le",
-        }
-    }
-
-    /// ffmpeg `-f` raw muxer name.
-    pub fn raw_fmt(self) -> &'static str {
-        match self {
-            BitDepth::S16 => "s16le",
-            BitDepth::S24 => "s24le",
-            BitDepth::S32 => "s32le",
-            BitDepth::F32 => "f32le",
-            BitDepth::F64 => "f64le",
         }
     }
 
@@ -220,38 +200,12 @@ impl Dither {
     }
 }
 
-/// What one render actually did, for the log and for the GUI's result list.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct Stats {
-    pub frames_in: u64,
-    pub frames_out: u64,
-    /// Loudest |sample| seen on any input channel.
-    pub peak_in: f64,
-    /// Loudest |sample| produced by the downmixer, before encoding.
-    pub peak_out: f64,
-    /// Output samples outside [-1, 1] — i.e. what the encoder will clip.
-    pub clipped: u64,
-    pub seconds_wall: f64,
-    pub out_bytes: u64,
-    pub sha256: Option<String>,
-}
-
-impl Stats {
-    /// Full-scale reference for PCM: `1.0` maps to 0 dBFS.
-    pub fn dbfs(x: f64) -> f64 {
-        if x > 0.0 && x.is_finite() {
-            20.0 * x.log10()
-        } else {
-            f64::NEG_INFINITY
-        }
-    }
-
-    pub fn peak_in_db(&self) -> f64 {
-        Self::dbfs(self.peak_in)
-    }
-
-    pub fn peak_out_db(&self) -> f64 {
-        Self::dbfs(self.peak_out)
+/// Full-scale reference for PCM: `1.0` maps to 0 dBFS.
+pub fn dbfs(x: f64) -> f64 {
+    if x > 0.0 && x.is_finite() {
+        20.0 * x.log10()
+    } else {
+        f64::NEG_INFINITY
     }
 }
 
@@ -311,12 +265,9 @@ mod tests {
     }
 
     #[test]
-    fn wire_sizes() {
-        assert_eq!(BitDepth::S24.sample_bytes(), 3);
-        assert_eq!(BitDepth::F64.sample_bytes(), 8);
+    fn codec_names_are_populated() {
         for d in BitDepth::ALL {
             assert!(!d.codec().is_empty());
-            assert!(!d.raw_fmt().is_empty());
         }
     }
 
@@ -335,10 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn dbfs() {
-        assert_eq!(Stats::dbfs(1.0), 0.0);
-        assert!(Stats::dbfs(0.0).is_nan() || Stats::dbfs(0.0) == f64::NEG_INFINITY);
-        assert!((Stats::dbfs(0.5) + 6.0206).abs() < 0.01);
+    fn dbfs_conversions() {
+        assert_eq!(dbfs(1.0), 0.0);
+        assert_eq!(dbfs(0.0), f64::NEG_INFINITY);
+        assert!((dbfs(0.5) + 6.0206).abs() < 0.01);
     }
 
     /// What ffmpeg's 24-bit encoders do with the `s32` they are handed.

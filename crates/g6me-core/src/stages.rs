@@ -340,9 +340,9 @@ pub struct RenderCfg {
     pub true_peak: Ratio,
     /// True-peak limiter, applied after the downmixer and before the encoder.
     ///
-    /// Off by default, like every other stage here. When enabled it is the last thing
-    /// that touches the samples, because a ceiling asserted before the last gain stage
-    /// is not a ceiling.
+    /// On by default (at `-1.0 dBTP`, matching [`LimiterCfg::default`]). When enabled it
+    /// is the last thing that touches the samples, because a ceiling asserted before the
+    /// last gain stage is not a ceiling.
     #[serde(default)]
     pub limiter: LimiterCfg,
     /// Gain staging: one constant multiplier applied to every sample, in dB, before the
@@ -635,8 +635,8 @@ pub fn encoder_pump_args(work_rate: u32) -> Vec<String> {
         "pcm_f64le".into(),
         "-ar".into(),
         work_rate.to_string(),
-        "-ch_layout".into(),
-        "stereo".into(),
+        "-ac".into(),
+        "2".into(),
         "-i".into(),
         "pipe:0".into(),
     ]
@@ -776,9 +776,15 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
             v.push("2. input stage: off (source values reach the DSP unchanged)".into())
         }
         InputStage::Noop => v.push(format!("2. input stage: {}", stage.label())),
-        other => v.push(format!(
+        InputStage::DepthOnly => v.push(format!(
+            "2. input stage: {} ({} Hz kept, dither {})",
+            stage.label(),
+            info.sample_rate,
+            cfg.resample.dither.label()
+        )),
+        InputStage::Soxr | InputStage::SoxrAndDepth => v.push(format!(
             "2. input stage: {} -> {} Hz, dither {}, precision {} bits",
-            other.label(),
+            stage.label(),
             cfg.resample.rate,
             cfg.resample.dither.label(),
             cfg.resample.precision
@@ -1328,7 +1334,7 @@ mod tests {
     fn pump_declares_rate_and_layout_for_raw_stdin() {
         let j = encoder_pump_args(48000).join(" ");
         assert!(j.contains("-ar 48000"), "{j}");
-        assert!(j.contains("-ch_layout stereo"), "{j}");
+        assert!(j.contains("-ac 2"), "{j}");
         assert!(j.contains("pipe:0"), "{j}");
     }
 

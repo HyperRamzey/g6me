@@ -227,10 +227,10 @@ pub struct Cli {
     #[arg(long, allow_negative_numbers = true, value_parser = parse_ir_norm)]
     pub ir_norm: Option<f64>,
 
-    /// Wet/dry mix of the convolution.
-    #[arg(long)]
+    /// Wet/dry mix of the convolution (0.0..=10.0).
+    #[arg(long, value_parser = parse_ir_mix)]
     pub ir_wet: Option<f64>,
-    #[arg(long)]
+    #[arg(long, value_parser = parse_ir_mix)]
     pub ir_dry: Option<f64>,
 
     /// Convolution length as a fraction of the IR: 0.5 convolves half of it. 0 or 1
@@ -522,6 +522,10 @@ fn parse_ir_norm(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+fn parse_ir_mix(s: &str) -> Result<f64, String> {
+    parse_span(s, "IR wet/dry gain", 0.0, 10.0)
+}
+
 /// `afir`'s `length` is a fraction of the IR, not a number of seconds.
 ///
 /// Measured on FFmpeg 9.0.2, where the option is declared `set IR length (from 0 to 1)
@@ -601,9 +605,9 @@ impl Cli {
                 ));
             }
         }
-        if self.no_limit && (self.limit || self.setpoint.is_some()) {
+        if self.no_limit && (self.limit || self.setpoint.is_some() || self.ceiling.is_some()) {
             return Err(
-                "--no-limit cannot be combined with --limit or --setpoint, which both ask for a limiter".into(),
+                "--no-limit cannot be combined with --limit, --ceiling, or --setpoint, which ask for a limiter".into(),
             );
         }
         let format = match self.format.as_str() {
@@ -775,8 +779,8 @@ impl Ui {
             }
             *last = Instant::now();
         }
-        let per_item = if c.done + c.failed > 0 {
-            c.seconds_done / (c.done + c.failed) as f64
+        let per_item = if c.done > 0 {
+            c.seconds_done / c.done as f64
         } else {
             0.0
         };
@@ -870,18 +874,38 @@ fn main() -> ExitCode {
     }
 
     let caps = probe_caps(&tools);
-    // Reject an impossible format before discovering a tree and spawning children.
-    // `--monitor` writes no file, so its output format is not validated.
-    if !cli.monitor {
-        if let Err(e) = cli
-            .render_cfg()
-            .and_then(|c| c.out.validate(&caps).map_err(|e| e.to_string()))
-        {
-            return fail(&e);
+    // Reject an impossible format or invalid DSP settings before discovering a tree
+    // and spawning children. `--monitor` writes no file, so its output format is skipped.
+    if let Err(e) = cli.render_cfg().and_then(|c| {
+        if !cli.monitor {
+            c.out.validate(&caps).map_err(|e| e.to_string())?;
         }
+        c.limiter.validate()?;
+        if c.renderer == g6me_core::plus::RendererMode::Plus {
+            c.plus.validate()?;
+        }
+        if c.ir.file.is_some() {
+            if c.ir.minp > c.ir.maxp {
+                return Err(format!(
+                    "--ir-minp ({}) must be <= --ir-maxp ({})",
+                    c.ir.minp, c.ir.maxp
+                ));
+            }
+            if let Some(len) = c.ir.length {
+                if !len.is_finite() || !(0.0..=1.0).contains(&len) {
+                    return Err(format!("--ir-length must be in 0.0..=1.0, got {len}"));
+                }
+            }
+        }
+        Ok(())
+    }) {
+        return fail(&e);
     }
     if cli.monitor {
+        #[cfg(feature = "monitor")]
         return monitor_files(&cli, &tools, &caps);
+        #[cfg(not(feature = "monitor"))]
+        return fail("this build has no monitoring support (feature `monitor` is off)");
     }
     match cli.batch_cfg() {
         Ok(cfg) => render_batch(&cli, cfg, &tools, &caps),
@@ -1147,8 +1171,9 @@ fn println_plan(plan: &Plan, json: bool) {
 fn join_cmd(args: &[String]) -> String {
     args.iter()
         .map(|a| {
-            if a.contains([' ', '"', '\'']) {
-                format!("\"{a}\"")
+            if a.is_empty() || a.contains([' ', '\t', '"', '\'', '\\']) {
+                let escaped = a.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
             } else {
                 a.clone()
             }
@@ -1305,7 +1330,7 @@ fn monitor_files(cli: &Cli, tools: &Tools, caps: &Caps) -> ExitCode {
                 let peak: Vec<String> = meters
                     .peaks()
                     .iter()
-                    .map(|p| format!("{:>6.1}", g6me_core::pcm::Stats::dbfs(*p as f64)))
+                    .map(|p| format!("{:>6.1}", g6me_core::pcm::dbfs(*p as f64)))
                     .collect();
                 if !cli.quiet {
                     eprintln!(
@@ -1338,13 +1363,6 @@ fn monitor_files(cli: &Cli, tools: &Tools, caps: &Caps) -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
-}
-
-#[cfg(not(feature = "monitor"))]
-fn monitor_files(cli: &Cli, _tools: &Tools, _caps: &Caps) -> ExitCode {
-    let _ = cli;
-    eprintln!("this build has no monitoring support (feature `monitor` is off)");
-    ExitCode::from(2)
 }
 
 /// The render config for one file in a monitor run.
@@ -1405,10 +1423,33 @@ impl LossSummary for RenderCfg {
                 self.ir.file.as_deref().unwrap_or(Path::new("?"))
             ));
         }
-        v.push("downmix".into());
+        match self.renderer {
+            RendererMode::Reference => v.push("downmix".into()),
+            RendererMode::Plus => v.push(format!("G6+ {}", self.plus.profile.label())),
+        }
+        if self.dc_block {
+            v.push("DC block".into());
+        }
+        if self.output_gain_db != 0.0 {
+            v.push(format!("gain {:+.2} dB", self.output_gain_db));
+        }
+        if self.limiter.enable {
+            v.push(format!(
+                "limiter {:.2} dBTP @{}",
+                self.limiter.ceiling_db,
+                self.limiter.ratio.label()
+            ));
+        }
+        let dither = if self.out.dither == Dither::None {
+            String::new()
+        } else {
+            format!(" ({})", self.out.dither.label())
+        };
         v.push(match &self.out.format {
-            OutFormat::Flac { level } => format!("FLAC {} @ level {level}", self.depth_label()),
-            OutFormat::Wav => format!("WAV {}", self.depth_label()),
+            OutFormat::Flac { level } => {
+                format!("FLAC {} @ level {level}{dither}", self.depth_label())
+            }
+            OutFormat::Wav => format!("WAV {}{dither}", self.depth_label()),
             OutFormat::Null => "monitor only".to_string(),
         });
         v.join(" -> ")
@@ -1763,6 +1804,54 @@ mod tests {
         assert!((cfg.plus.lfe_gain_db - (-3.5)).abs() < 1e-9);
         assert!(cfg.plus.lfe_lf_trim);
         assert!(!cfg.plus.lfe_lpf);
+    }
+
+    #[test]
+    fn no_limit_rejects_ceiling_and_ir_mix_is_validated() {
+        let c = Cli::try_parse_from(["g6me", "--no-limit", "--ceiling", "-1", "x.mka"]).unwrap();
+        let err = c.render_cfg().unwrap_err();
+        assert!(err.contains("--ceiling"), "{err}");
+
+        assert!(Cli::try_parse_from(["g6me", "--ir-wet", "-1", "x.mka"]).is_err());
+        assert!(Cli::try_parse_from(["g6me", "--ir-wet", "NaN", "x.mka"]).is_err());
+        assert!(Cli::try_parse_from(["g6me", "--ir-dry", "11", "x.mka"]).is_err());
+        let ok =
+            Cli::try_parse_from(["g6me", "--ir-wet", "1.0", "--ir-dry", "0.25", "x.mka"]).unwrap();
+        assert_eq!(ok.ir_wet, Some(1.0));
+        assert_eq!(ok.ir_dry, Some(0.25));
+    }
+
+    #[test]
+    fn loss_summary_reports_plus_dc_gain_limiter_dither_and_join_cmd_escapes() {
+        let c = Cli::try_parse_from([
+            "g6me",
+            "--mode",
+            "plus",
+            "--dc-block",
+            "--setpoint",
+            "-2",
+            "--dither",
+            "triangular",
+            "x.mka",
+        ])
+        .unwrap();
+        let s = c.render_cfg().unwrap().loss_summary();
+        for want in [
+            "G6+ studio",
+            "DC block",
+            "gain -2.00 dB",
+            "limiter -2.00 dBTP",
+            "triangular",
+        ] {
+            assert!(s.contains(want), "loss_summary missing '{want}': {s}");
+        }
+
+        let cmd = join_cmd(&[
+            "ffmpeg".into(),
+            "my \"quoted\" \\path.wav".into(),
+            "plain.flac".into(),
+        ]);
+        assert_eq!(cmd, "ffmpeg \"my \\\"quoted\\\" \\\\path.wav\" plain.flac");
     }
 
     trait StrErr {

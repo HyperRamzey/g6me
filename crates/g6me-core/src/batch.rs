@@ -36,9 +36,9 @@ use std::time::{Duration, Instant};
 /// Anything ffmpeg can decode is accepted at render time regardless.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mka", "mkv", "webm", "m4a", "m4b", "mp4", "mov", "m4v", "flac", "wav", "wave", "rf64", "aiff",
-    "aif", "aifc", "afc", "w64", "caf", "wma", "ape", "mla", "tta", "wv", "tak", "oga", "ogg",
-    "opus", "spx", "ac3", "eac3", "dts", "dtshd", "dff", "dsf", "aac", "mp3", "mp2", "m4r", "amr",
-    "3gp", "3g2", "voc", "au", "snd", "raw",
+    "aif", "aifc", "afc", "w64", "caf", "wma", "ape", "mlp", "thd", "tta", "wv", "tak", "oga",
+    "ogg", "opus", "spx", "ac3", "eac3", "dts", "dtshd", "dff", "dsf", "aac", "mp3", "mp2", "m4r",
+    "amr", "3gp", "3g2", "voc", "au", "snd", "raw",
 ];
 
 /// Files that are definitely not audio, so a folder scan does not offer them.
@@ -604,8 +604,21 @@ impl Counters {
         f64::from_bits(self.seconds.load(Ordering::Relaxed))
     }
 
-    pub fn set_seconds_done(&self, v: f64) {
-        self.seconds.store(v.to_bits(), Ordering::Relaxed);
+    /// Atomically add `delta` seconds of completed audio without losing concurrent updates.
+    pub fn add_seconds_done(&self, delta: f64) {
+        let mut cur = self.seconds.load(Ordering::Relaxed);
+        loop {
+            let next = (f64::from_bits(cur) + delta).to_bits();
+            match self.seconds.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     pub fn snapshot(&self) -> CountersView {
@@ -853,7 +866,7 @@ impl Batch {
                                 counters
                                     .bytes
                                     .fetch_add(report.output_bytes, Ordering::Relaxed);
-                                counters.set_seconds_done(counters.seconds_done() + report.seconds);
+                                counters.add_seconds_done(report.seconds);
                                 item.phase = Phase::Done;
                                 item.report = Some(report);
                                 item.error = None;
@@ -1791,6 +1804,35 @@ mod tests {
         assert!(cfg.taps.0.is_none());
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("MeterFactory(none)"), "{dbg}");
+    }
+
+    #[test]
+    fn audio_extensions_include_mlp_and_thd() {
+        assert!(AUDIO_EXTENSIONS.contains(&"mlp"));
+        assert!(AUDIO_EXTENSIONS.contains(&"thd"));
+        assert!(!AUDIO_EXTENSIONS.contains(&"mla"));
+    }
+
+    #[test]
+    fn counters_add_seconds_done_is_atomic_under_contention() {
+        let c = Arc::new(Counters::default());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c2 = c.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    c2.add_seconds_done(0.25);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(
+            (c.seconds_done() - 1000.0).abs() < 1e-9,
+            "expected 1000.0s, got {}",
+            c.seconds_done()
+        );
     }
 
     fn tools_and_caps() -> Option<(Tools, Caps)> {

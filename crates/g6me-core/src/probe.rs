@@ -90,12 +90,30 @@ pub fn which(name: &str) -> Option<PathBuf> {
         }
         for ext in &exts {
             let cand = dir.join(format!("{name}{ext}"));
-            if cand.is_file() {
+            if is_executable(&cand) {
                 return Some(cand);
             }
         }
     }
     None
+}
+
+fn is_executable(p: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// What this ffmpeg build can actually do for us.
@@ -576,7 +594,7 @@ pub fn probe_audio(tools: &Tools, path: &Path, pick: usize) -> Result<AudioInfo>
         stream_index: s.index.unwrap_or(0),
         codec_name: s.codec_name.unwrap_or_else(|| "unknown".into()),
         profile: s.profile,
-        sample_rate: match s.sample_rate.and_then(|v| v.parse::<u32>().ok()) {
+        sample_rate: match s.sample_rate.as_deref().and_then(|v| v.parse::<u32>().ok()) {
             Some(0) => {
                 return Err(Error::ProbeFailed {
                     path: path.display().to_string(),
@@ -584,7 +602,12 @@ pub fn probe_audio(tools: &Tools, path: &Path, pick: usize) -> Result<AudioInfo>
                 });
             }
             Some(r) => r,
-            None => 48000,
+            None => {
+                return Err(Error::ProbeFailed {
+                    path: path.display().to_string(),
+                    msg: "ffprobe did not report a valid sample_rate".into(),
+                });
+            }
         },
         channels: s.channels.unwrap_or(0),
         layout: s.channel_layout.filter(|l| l != "unknown" && !l.is_empty()),

@@ -56,6 +56,7 @@ struct Pipe<T> {
 
 impl<T> Pipe<T> {
     fn close(&self) {
+        let _q = self.q.lock().unwrap_or_else(|e| e.into_inner());
         self.closed.store(true, Ordering::Release);
         self.empty.notify_all();
         self.full.notify_all();

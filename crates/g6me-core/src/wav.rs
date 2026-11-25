@@ -56,7 +56,12 @@ pub fn guess_mask(channels: u16) -> u32 {
 /// Classic 44-byte header when the file is 1–2 channels and needs no mask,
 /// otherwise the 68-byte extensible header.
 pub fn header(rate: u32, channels: u16, bits: u32, float: bool, mask: Option<u32>) -> Vec<u8> {
-    let block = channels as u32 * bits / 8;
+    assert!(
+        bits > 0 && bits.is_multiple_of(8),
+        "WAV bits per sample must be a positive multiple of 8 (got {bits})"
+    );
+    let block = (channels as u32).saturating_mul(bits / 8);
+    let byte_rate = rate.saturating_mul(block);
     let extensible = channels > 2 || mask.is_some_and(|m| m != guess_mask(channels));
     let mut h = Vec::with_capacity(if extensible { 68 } else { 44 });
     let tag = if float {
@@ -79,7 +84,7 @@ pub fn header(rate: u32, channels: u16, bits: u32, float: bool, mask: Option<u32
     h.extend_from_slice(&fmt_tag.to_le_bytes());
     h.extend_from_slice(&channels.to_le_bytes());
     h.extend_from_slice(&rate.to_le_bytes());
-    h.extend_from_slice(&(rate * block).to_le_bytes());
+    h.extend_from_slice(&byte_rate.to_le_bytes());
     h.extend_from_slice(&(block as u16).to_le_bytes());
     h.extend_from_slice(&(bits as u16).to_le_bytes());
     if extensible {
@@ -276,8 +281,14 @@ pub fn read_info_file(f: &mut std::fs::File) -> Result<(WavInfo, u64)> {
             // Samples with no format in front of them are not a stream. Returned as a
             // parsed header it says 0 channels at 0 Hz and 0 bits, which every caller
             // believes until it divides.
-            if info.channels == 0 || info.rate == 0 || info.bits == 0 {
-                return Err(Error::msg("WAV data chunk before any fmt chunk"));
+            if info.channels == 0
+                || info.rate == 0
+                || info.bits == 0
+                || !info.bits.is_multiple_of(8)
+            {
+                return Err(Error::msg(
+                    "WAV data chunk before a valid byte-aligned fmt chunk",
+                ));
             }
             let off = f.stream_position()?;
             info.data_len = size;

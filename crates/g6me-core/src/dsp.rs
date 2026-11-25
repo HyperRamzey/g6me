@@ -350,6 +350,7 @@ impl<T: Real> Ap2<T> {
     pub fn group_delay(&self, w: f64) -> f64 {
         let h = 1e-5;
         let pi = std::f64::consts::PI;
+        let w = w.clamp(0.0, pi);
         let hi = (w + h).min(pi);
         let lo = (w - h).max(0.0);
         let (a, b) = (self.phase(hi), self.phase(lo));
@@ -378,12 +379,6 @@ impl<T: Real> Ap2<T> {
             let rad = a2.max(0.0).sqrt();
             (rad, -rad)
         }
-    }
-
-    /// Largest pole radius; must be `< 1.0`.
-    pub fn pole_radius(&self) -> f64 {
-        let (p, q) = self.poles();
-        p.abs().max(q.abs())
     }
 }
 
