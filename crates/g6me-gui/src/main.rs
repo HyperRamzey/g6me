@@ -27,7 +27,7 @@ mod settings;
 mod theme;
 mod widgets;
 
-use crate::runner::{Event, Level, Runner, Summary};
+use crate::runner::{Event, Level, PickTarget, Runner, Summary};
 use crate::settings::{describe, Format, Settings};
 use crate::theme::Palette;
 use crate::widgets::{Browser, Mode};
@@ -38,6 +38,7 @@ use g6me_core::meter::{MeterTap, Meters};
 use g6me_core::pcm::{BitDepth, Dither};
 use g6me_core::pipeline;
 use g6me_core::pipeline::Report;
+use g6me_core::plus::{woodworth_itd_s, PlusCfg, PlusProfile, RendererMode};
 use g6me_core::probe::{probe_caps, Caps, Tools};
 use g6me_core::stages::Gtype;
 use g6me_core::util;
@@ -47,6 +48,7 @@ use std::sync::Mutex;
 /// Which settings page is showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Renderer,
     Output,
     TruePeak,
     Resample,
@@ -55,7 +57,8 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [
+    const ALL: [Tab; 6] = [
+        Tab::Renderer,
         Tab::Output,
         Tab::TruePeak,
         Tab::Resample,
@@ -65,6 +68,7 @@ impl Tab {
 
     fn label(self) -> &'static str {
         match self {
+            Tab::Renderer => "Renderer",
             Tab::Output => "Output",
             Tab::TruePeak => "True peak",
             Tab::Resample => "Resample",
@@ -140,14 +144,6 @@ impl Cards {
     }
 }
 
-/// Which browser the window is showing, if any.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pick {
-    /// Files and folders to queue.
-    Queue,
-    OutDir,
-    Ir,
-}
 
 /// One row of the queue table.
 struct Row {
@@ -202,8 +198,11 @@ pub struct App {
     installed: Option<Palette>,
     tab: Tab,
     queue: Vec<Row>,
-    pick: Option<Pick>,
+    pick: Option<PickTarget>,
     browser: Browser,
+    /// Editable/pasteable path buffers kept synced with `settings.out_dir` / `settings.ir_file`.
+    out_dir_text: String,
+    ir_file_text: String,
     log: Vec<(Level, String)>,
     summary: Option<Summary>,
     /// Every file that has finished this session, with the levels it was measured at.
@@ -303,18 +302,23 @@ impl MeterRow {
 
 impl App {
     fn new(cc: &CreationContext<'_>) -> Self {
+        let settings = Settings::default();
+        let out_dir_text = settings.out_dir.display().to_string();
+        let ir_file_text = settings.ir_file.display().to_string();
         let mut app = Self {
-            settings: Settings::default(),
+            settings,
             tools: Tools::discover(),
             caps: Mutex::new(None),
             runner: Runner::new(),
             cards: Cards::default(),
             palette: Palette::default(),
             installed: None,
-            tab: Tab::Output,
+            tab: Tab::Renderer,
             queue: Vec::new(),
             pick: None,
             browser: Browser::default(),
+            out_dir_text,
+            ir_file_text,
             log: Vec::new(),
             summary: None,
             history: Vec::new(),
@@ -684,18 +688,25 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(!running, egui::Button::new("add audio files…"))
+                        .on_hover_text("Open system file picker (or drag & drop files onto the window)")
                         .clicked()
                     {
-                        self.pick = Some(Pick::Queue);
-                        self.browser.mode = Mode::AudioFile;
-                        self.browser.set_single(None);
+                        self.open_picker(ctx, PickTarget::Queue, Mode::AudioFile);
                     }
                     if ui
                         .add_enabled(!running, egui::Button::new("add folder…"))
+                        .on_hover_text("Open system folder picker (or drag & drop folders onto the window)")
                         .clicked()
                     {
-                        self.pick = Some(Pick::Queue);
-                        self.browser.mode = Mode::Dir;
+                        self.open_picker(ctx, PickTarget::Queue, Mode::Dir);
+                    }
+                    #[cfg(feature = "native-dialogs")]
+                    if ui
+                        .add_enabled(!running, egui::Button::new("in-app…"))
+                        .on_hover_text("Open built-in cross-platform browser (for minimal sessions without a portal)")
+                        .clicked()
+                    {
+                        self.open_in_app_picker(PickTarget::Queue, Mode::AudioFile);
                     }
                 });
                 let mut rescan = false;
@@ -717,21 +728,28 @@ impl App {
                         .on_hover_text("choose an output folder")
                         .clicked()
                     {
-                        self.pick = Some(Pick::OutDir);
-                        self.browser.mode = Mode::Dir;
+                        self.open_picker(ctx, PickTarget::OutDir, Mode::Dir);
                     }
                 });
-                if rescan && !running {
-                    self.rebuild_queue();
-                }
                 if self.settings.use_out_dir {
-                    ui.label(
-                        egui::RichText::new(widgets::short_path(&self.settings.out_dir, 52))
-                            .monospace()
-                            .size(11.0),
-                    );
+                    ui.horizontal(|ui| {
+                        let resp = ui.add_enabled(
+                            !running,
+                            egui::TextEdit::singleline(&mut self.out_dir_text)
+                                .desired_width(ui.available_width())
+                                .font(egui::FontId::monospace(11.0))
+                                .hint_text("paste an output folder path…"),
+                        );
+                        if resp.changed() {
+                            self.settings.out_dir = widgets::clean_pasted_path(&self.out_dir_text);
+                            rescan = true;
+                        }
+                    });
                 } else {
                     ui.weak("outputs go next to each input");
+                }
+                if rescan && !running {
+                    self.rebuild_queue();
                 }
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -739,9 +757,9 @@ impl App {
                     .show(ui, |ui| {
                         if self.queue.is_empty() {
                             ui.weak(
-                                "Nothing queued.\n\nAdd files, or add a folder and the whole \
-                                 tree is scanned for anything ffmpeg can decode — .mka \
-                                 (TrueHD/Atmos), .wav, .flac, .mkv, .m4a…",
+                                "Nothing queued.\n\nDrag and drop audio files or folders onto \
+                                 this window, or add them above — anything ffmpeg can decode \
+                                 works (.mka TrueHD/Atmos, .wav, .flac, .mkv, .m4a…).",
                             );
                             return;
                         }
@@ -818,6 +836,7 @@ impl App {
                 .max_height(settings_h)
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.tab {
+                    Tab::Renderer => self.tab_renderer(ui),
                     Tab::Output => self.tab_output(ui, caps.as_ref()),
                     Tab::TruePeak => self.tab_true_peak(ui),
                     Tab::Resample => self.tab_resample(ui, caps.as_ref()),
@@ -826,6 +845,207 @@ impl App {
                 });
             ui.separator();
             self.log_panel(ui);
+        });
+    }
+
+    /// Nugen Halo Upmix–inspired binaural renderer & soundfield profile controls.
+    fn tab_renderer(&mut self, ui: &mut egui::Ui) {
+        let running = self.runner.is_running();
+        ui.horizontal(|ui| {
+            ui.label("engine");
+            ui.add_enabled_ui(!running, |ui| {
+                for m in [RendererMode::Reference, RendererMode::Plus] {
+                    ui.selectable_value(&mut self.settings.renderer, m, m.display_name());
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        let live_in = self
+            .cards
+            .list()
+            .into_iter()
+            .find(|(_, _, finished)| !finished)
+            .map(|(_, meters, _)| std::array::from_fn(|i| meters.param(i)));
+
+        ui.horizontal_top(|ui| {
+            widgets::soundfield_radar(
+                ui,
+                self.settings.renderer,
+                &self.settings.plus,
+                live_in,
+                228.0,
+            );
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                if self.settings.renderer == RendererMode::Reference {
+                    ui.strong("Bit-Exact G6 Reference Engine");
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Runs the untouched CMatrixEncoderEfxMod 64-bit matrix with exact \
+                         sample-for-sample parity against vendor/g6ct.",
+                    );
+                    ui.add_space(6.0);
+                    ui.weak(
+                        "Switch to Plus (G6+ Binaural) for the universal non-personalized \
+                         renderer: physical Woodworth ITD, Brown–Duda spherical head shadow, \
+                         causal LR4 bass-mono, DEE-safe rear decorrelation, dry ITU-BS.1116 \
+                         lateral externalization, and strict 1-ERB diffuse-field equalization \
+                         that stacks cleanly with HyprEQ.",
+                    );
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(
+                            !running,
+                            egui::Button::new("Switch to G6+ Plus (Studio) →"),
+                        )
+                        .clicked()
+                    {
+                        self.settings.renderer = RendererMode::Plus;
+                        self.settings.plus = PlusCfg::from_profile(PlusProfile::Studio);
+                    }
+                    return;
+                }
+
+                // Plus mode: presets + real-time tweakable soundfield sliders.
+                ui.horizontal(|ui| {
+                    ui.label("profile");
+                    ui.add_enabled_ui(!running, |ui| {
+                        for p in [PlusProfile::Pure, PlusProfile::Studio, PlusProfile::Cinema] {
+                            let active = self.settings.plus.profile == p;
+                            if ui.selectable_label(active, p.display_name()).clicked() {
+                                self.settings.plus = PlusCfg::from_profile(p);
+                            }
+                        }
+                    });
+                    if self.settings.plus.profile == PlusProfile::Custom {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(76, 194, 232),
+                            "• Custom",
+                        );
+                    }
+                });
+                ui.weak(self.settings.plus.profile.description());
+                ui.add_space(6.0);
+
+                let mut changed = false;
+                ui.add_enabled_ui(!running, |ui| {
+                    let p = &mut self.settings.plus;
+                    let fl_deg = (30.0 * p.width).clamp(15.0, 65.0);
+                    ui.horizontal(|ui| {
+                        ui.label("stage width");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.width, 0.50..=1.50)
+                                    .step_by(0.01)
+                                    .fixed_decimals(2),
+                            )
+                            .on_hover_text(
+                                "Scales the frontal L/R speaker angle (1.00 = ±30° ITU standard).",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.weak(format!("±{fl_deg:.0}°"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("center focus");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.center_focus, 0.00..=1.00)
+                                    .step_by(0.01)
+                                    .fixed_decimals(2),
+                            )
+                            .on_hover_text(
+                                "Tightens center-channel dialogue focus and dries its early reflections.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("surround depth");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.surround_depth, 0.50..=1.50)
+                                    .step_by(0.01)
+                                    .fixed_decimals(2),
+                            )
+                            .on_hover_text(
+                                "Adjusts side/rear surround envelopment and front–back separation.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("externalize");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.externalize, 0.00..=1.00)
+                                    .step_by(0.01)
+                                    .fixed_decimals(2),
+                            )
+                            .on_hover_text(
+                                "Dry ITU-R BS.1116 lateral early reflections (≥ 8.8 ms, zero comb bounce). 0.00 = pure anechoic.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("bass mono");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.bass_mono_hz, 0.0..=200.0)
+                                    .step_by(5.0)
+                                    .fixed_decimals(0)
+                                    .suffix(" Hz"),
+                            )
+                            .on_hover_text(
+                                "Causal 4th-order Linkwitz–Riley crossover keeping sub-bass phase-coherent across all headphones (0 = off).",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    if ui
+                        .checkbox(
+                            &mut p.lfe_lpf,
+                            "LFE 120 Hz low-pass (4th-order Butterworth, phase-aligned)",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+                if changed {
+                    self.settings.plus.sync_profile();
+                }
+
+                ui.add_space(6.0);
+                let fl_az = (30.0 * self.settings.plus.width).clamp(15.0, 65.0);
+                let fl_itd_us = woodworth_itd_s(fl_az) * 1e6;
+                let drr = match self.settings.plus.estimated_center_drr_db() {
+                    Some(d) => format!("{d:+.1} dB"),
+                    None => "∞ (dry)".to_string(),
+                };
+                ui.monospace(format!(
+                    "FL ITD {fl_itd_us:.0} µs · FC DRR {drr} · DFEQ ±0.25 dB (1-ERB) · pre-delay 1.0 ms"
+                ));
+                ui.weak(
+                    "Universal non-personalized cues (no ear scan or SOFA needed). Diffuse-field \
+                     flatness preserves HyprEQ / headphone EQ tonality and matches stock G6 loudness.",
+                );
+                if let Err(e) = self.settings.plus.validate() {
+                    ui.colored_label(egui::Color32::from_rgb(226, 110, 90), e);
+                }
+            });
         });
     }
 
@@ -1293,16 +1513,30 @@ impl App {
         ui.add_enabled_ui(self.settings.ir, |ui| {
             ui.horizontal(|ui| {
                 ui.label("IR file");
-                let shown = if self.settings.ir_file.as_os_str().is_empty() {
-                    "(none chosen)".to_string()
-                } else {
-                    widgets::short_path(&self.settings.ir_file, 44)
-                };
-                ui.monospace(shown);
-                if ui.button("…").clicked() {
-                    self.pick = Some(Pick::Ir);
-                    self.browser.mode = Mode::AnyFile;
-                    self.browser.set_single(Some(self.settings.ir_file.clone()));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.ir_file_text)
+                        .desired_width((ui.available_width() - 96.0).max(160.0))
+                        .font(egui::FontId::monospace(11.0))
+                        .hint_text("paste an IR .wav path or click …"),
+                );
+                if resp.changed() {
+                    self.settings.ir_file = widgets::clean_pasted_path(&self.ir_file_text);
+                }
+                if ui
+                    .button("…")
+                    .on_hover_text("Choose impulse response file")
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.open_picker(&ctx, PickTarget::Ir, Mode::AnyFile);
+                }
+                #[cfg(feature = "native-dialogs")]
+                if ui
+                    .button("in-app")
+                    .on_hover_text("Open built-in file browser")
+                    .clicked()
+                {
+                    self.open_in_app_picker(PickTarget::Ir, Mode::AnyFile);
                 }
             });
             ui.horizontal(|ui| {
@@ -1506,15 +1740,14 @@ impl App {
     }
 
     fn windows(&mut self, ctx: &egui::Context) {
-        // The browser is a window rather than a native dialog on purpose: a native
-        // dialog on Linux means GTK or an XDG portal, and this has to run on a plain
-        // Wayland or dwm session.
+        // Built-in browser window: always available as fallback (or via "in-app…") for
+        // minimal Wayland/X11 sessions without an XDG desktop portal.
         let pick = self.pick.take();
         if let Some(p) = pick {
             let title = match p {
-                Pick::Queue => "Add to queue",
-                Pick::OutDir => "Choose output folder",
-                Pick::Ir => "Choose impulse response",
+                PickTarget::Queue => "Add to queue",
+                PickTarget::OutDir => "Choose output folder",
+                PickTarget::Ir => "Choose impulse response",
             };
             let mut open = true;
             let mut done: Option<Vec<PathBuf>> = None;
@@ -1523,45 +1756,11 @@ impl App {
                 .default_pos([220.0, 160.0])
                 .default_size([520.0, 420.0])
                 .show(ctx, |ui| {
-                    // Several paths at once is the point: ctrl- and shift-clicking a
-                    // list of tracks and adding them all is how a queue actually gets
-                    // built.
                     self.browser.ui(ui, |paths| done = Some(paths));
                 });
             self.pick = if open { Some(p) } else { None };
             if let Some(paths) = done {
-                match p {
-                    Pick::Queue => {
-                        let mut added = 0usize;
-                        for path in paths {
-                            if !self.settings.inputs.contains(&path) {
-                                self.settings.inputs.push(path);
-                                added += 1;
-                            }
-                        }
-                        if added > 1 {
-                            // Worth saying out loud: a ctrl-drag that lands on four
-                            // tracks should be visibly four, not one row appearing.
-                            self.push_log(Level::Info, format!("added {added} files to the queue"));
-                        }
-                    }
-                    // These take exactly one path; the first of a selection is what was
-                    // clicked, so extras are ignored rather than guessed at.
-                    Pick::OutDir => {
-                        if let Some(path) = paths.into_iter().next() {
-                            self.settings.use_out_dir = true;
-                            self.settings.out_dir = path;
-                        }
-                    }
-                    Pick::Ir => {
-                        if let Some(path) = paths.into_iter().next() {
-                            self.settings.ir_file = path;
-                        }
-                    }
-                }
-                if p != Pick::Ir {
-                    self.rebuild_queue();
-                }
+                self.apply_picked(p, paths, "added");
             }
         }
 
@@ -1630,6 +1829,185 @@ impl App {
     }
 
     // ---- actions -----------------------------------------------------------
+
+    /// Open a native Windows/Linux/macOS OS file/folder dialog on a background
+    /// thread so the UI never blocks; falls back to the in-app browser when built
+    /// with `--no-default-features`.
+    fn open_picker(&mut self, ctx: &egui::Context, target: PickTarget, mode: Mode) {
+        #[cfg(feature = "native-dialogs")]
+        {
+            let tx = self.runner.sender();
+            let ctx = ctx.clone();
+            let start_dir: Option<PathBuf> = match target {
+                PickTarget::OutDir if self.settings.out_dir.is_dir() => {
+                    Some(self.settings.out_dir.clone())
+                }
+                PickTarget::Ir => self
+                    .settings
+                    .ir_file
+                    .parent()
+                    .filter(|p| p.is_dir())
+                    .map(PathBuf::from),
+                _ => None,
+            };
+            std::thread::spawn(move || {
+                let mut dlg = rfd::FileDialog::new();
+                if let Some(dir) = start_dir {
+                    dlg = dlg.set_directory(dir);
+                }
+                let paths: Vec<PathBuf> = match (target, mode) {
+                    (PickTarget::Queue, Mode::AudioFile) => dlg
+                        .set_title("Add audio files to queue")
+                        .add_filter(
+                            "Audio / Media",
+                            &[
+                                "mka", "mkv", "wav", "flac", "mlp", "thd", "ac3", "eac3", "dts",
+                                "m4a", "mp4", "ogg", "opus", "wv", "aiff", "aif", "caf",
+                            ],
+                        )
+                        .add_filter("All files", &["*"])
+                        .pick_files()
+                        .unwrap_or_default(),
+                    (_, Mode::Dir) => dlg
+                        .set_title(if target == PickTarget::OutDir {
+                            "Choose output folder"
+                        } else {
+                            "Add folder to queue"
+                        })
+                        .pick_folder()
+                        .into_iter()
+                        .collect(),
+                    (PickTarget::Ir, _) => dlg
+                        .set_title("Choose impulse response")
+                        .add_filter("Impulse Response / Audio", &["wav", "flac", "aiff", "aif"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                        .into_iter()
+                        .collect(),
+                    _ => dlg.pick_files().unwrap_or_default(),
+                };
+                if !paths.is_empty() {
+                    let _ = tx.send(Event::Picked { target, paths });
+                    ctx.request_repaint();
+                }
+            });
+            return;
+        }
+        #[cfg(not(feature = "native-dialogs"))]
+        {
+            let _ = ctx;
+            self.open_in_app_picker(target, mode);
+        }
+    }
+
+    fn open_in_app_picker(&mut self, target: PickTarget, mode: Mode) {
+        self.pick = Some(target);
+        self.browser.mode = mode;
+        match target {
+            PickTarget::Queue => self.browser.set_single(None),
+            PickTarget::Ir => self.browser.set_single(Some(self.settings.ir_file.clone())),
+            PickTarget::OutDir => {}
+        }
+    }
+
+    fn apply_picked(&mut self, target: PickTarget, paths: Vec<PathBuf>, verb: &str) {
+        match target {
+            PickTarget::Queue => {
+                let mut added = 0usize;
+                for path in paths {
+                    if !self.settings.inputs.contains(&path) {
+                        self.settings.inputs.push(path);
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    self.push_log(
+                        Level::Info,
+                        format!(
+                            "{verb} {added} {} to the queue",
+                            if added == 1 { "item" } else { "items" }
+                        ),
+                    );
+                }
+            }
+            PickTarget::OutDir => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.settings.use_out_dir = true;
+                    self.out_dir_text = path.display().to_string();
+                    self.settings.out_dir = path;
+                }
+            }
+            PickTarget::Ir => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.ir_file_text = path.display().to_string();
+                    self.settings.ir_file = path;
+                }
+            }
+        }
+        if target != PickTarget::Ir {
+            self.rebuild_queue();
+        }
+    }
+
+    /// Handle OS drag-and-drop of audio files or folders onto the window.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let running = self.runner.is_running();
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if hovering {
+            let rect = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop-overlay"),
+            ));
+            painter.rect_filled(
+                rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(12, 18, 28, 190),
+            );
+            let inner = rect.shrink(28.0);
+            let accent = if running {
+                egui::Color32::from_rgb(226, 140, 90)
+            } else {
+                egui::Color32::from_rgb(76, 194, 232)
+            };
+            painter.rect_stroke(
+                inner,
+                12.0,
+                egui::Stroke::new(2.0_f32, accent),
+                egui::StrokeKind::Inside,
+            );
+            let msg = if running {
+                "Render in progress — wait or cancel before dropping files"
+            } else {
+                "Drop audio files or folders to add to queue"
+            };
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(20.0),
+                egui::Color32::WHITE,
+            );
+        }
+
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            if running {
+                self.push_log(
+                    Level::Warn,
+                    "ignored dropped files while a render is already running",
+                );
+            } else {
+                self.apply_picked(PickTarget::Queue, dropped, "dropped");
+            }
+        }
+    }
 
     fn rebuild_queue(&mut self) {
         let cfg = self.settings.batch_cfg();
@@ -1871,6 +2249,11 @@ impl App {
                     // files already have an output depends on the chosen extension.
                     self.rebuild_queue();
                 }
+                Event::Picked { target, paths } => {
+                    if !self.runner.is_running() {
+                        self.apply_picked(target, paths, "added");
+                    }
+                }
             }
         }
     }
@@ -1919,6 +2302,7 @@ impl eframe::App for App {
         self.queue_panel(ctx);
         self.central_panel(ctx);
         self.windows(ctx);
+        self.handle_drops(ctx);
         // The meters decay on the render thread, so a live meter needs a redraw
         // clock. 20 fps is enough to read and cheap enough to leave running; when
         // nothing is active the window goes quiet.

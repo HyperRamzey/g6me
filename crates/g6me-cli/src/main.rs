@@ -20,6 +20,7 @@ use g6me_core::pcm::{BitDepth, Dither};
 #[cfg(feature = "monitor")]
 use g6me_core::pipeline::RenderOpts;
 use g6me_core::pipeline::{self, Plan};
+use g6me_core::plus::{PlusCfg, PlusProfile, RendererMode};
 use g6me_core::probe::{probe_caps, Caps, Tools};
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
 use g6me_core::tp::Ratio;
@@ -57,6 +58,39 @@ pub struct Cli {
     /// FLAC encoder writes at most 24-bit, so 32-bit and float need --format wav.
     #[arg(long, default_value = "s24", value_parser = parse_depth)]
     pub depth: BitDepth,
+
+    /// Binaural renderer mode: `reference` (bit-exact G6 hardware port, default)
+    /// or `plus` (`G6+` universal non-personalized binaural renderer).
+    #[arg(long, default_value = "reference", value_parser = parse_renderer_mode)]
+    pub mode: RendererMode,
+
+    /// Acoustic profile when `--mode plus` is active: `pure`, `studio` (default), or `cinema`.
+    #[arg(long, default_value = "studio", value_parser = parse_plus_profile)]
+    pub plus_profile: PlusProfile,
+
+    /// G6+ frontal stereo stage width (0.50 ..= 1.50; overrides profile default).
+    #[arg(long, value_parser = parse_plus_width)]
+    pub plus_width: Option<f64>,
+
+    /// G6+ center dialogue focus (0.00 ..= 1.00; higher = drier, tighter center).
+    #[arg(long, value_parser = parse_plus_unit)]
+    pub plus_focus: Option<f64>,
+
+    /// G6+ surround & rear immersion depth (0.50 ..= 1.50; overrides profile default).
+    #[arg(long, value_parser = parse_plus_surround)]
+    pub plus_surround: Option<f64>,
+
+    /// G6+ dry ITU-BS.1116 lateral early-reflection externalization (0.00 ..= 1.00).
+    #[arg(long, value_parser = parse_plus_unit)]
+    pub plus_externalize: Option<f64>,
+
+    /// G6+ causal LR4 bass-mono crossover frequency in Hz (0 ..= 250; 0 disables).
+    #[arg(long, value_parser = parse_plus_bass_mono)]
+    pub plus_bass_mono: Option<f64>,
+
+    /// Disable the G6+ 120 Hz 4th-order Butterworth low-pass filter on the LFE channel.
+    #[arg(long)]
+    pub no_lfe_lpf: bool,
 
     /// Over-sampling ratio the true peak is measured at: 2, 4, 8, 16 or 32 ("x4" works
     /// too). Every render reports the result, quoted with this ratio, because a dBTP
@@ -260,6 +294,43 @@ pub struct Cli {
     /// List output devices, then exit.
     #[arg(long)]
     pub list_devices: bool,
+}
+
+fn parse_renderer_mode(s: &str) -> Result<RendererMode, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "reference" | "ref" | "classic" | "g6" => Ok(RendererMode::Reference),
+        "plus" | "g6+" | "g6plus" => Ok(RendererMode::Plus),
+        other => Err(format!(
+            "unknown renderer mode '{other}' (reference, plus)"
+        )),
+    }
+}
+
+fn parse_plus_profile(s: &str) -> Result<PlusProfile, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "pure" => Ok(PlusProfile::Pure),
+        "studio" => Ok(PlusProfile::Studio),
+        "cinema" => Ok(PlusProfile::Cinema),
+        other => Err(format!(
+            "unknown plus profile '{other}' (pure, studio, cinema)"
+        )),
+    }
+}
+
+fn parse_plus_width(s: &str) -> Result<f64, String> {
+    parse_span(s, "G6+ stage width", 0.50, 1.50)
+}
+
+fn parse_plus_surround(s: &str) -> Result<f64, String> {
+    parse_span(s, "G6+ surround depth", 0.50, 1.50)
+}
+
+fn parse_plus_unit(s: &str) -> Result<f64, String> {
+    parse_span(s, "G6+ parameter (0.00..=1.00)", 0.0, 1.0)
+}
+
+fn parse_plus_bass_mono(s: &str) -> Result<f64, String> {
+    parse_span(s, "G6+ bass-mono frequency in Hz", 0.0, 250.0)
 }
 
 fn parse_depth(s: &str) -> Result<BitDepth, String> {
@@ -537,7 +608,29 @@ impl Cli {
             minp: self.ir_minp.unwrap_or(4096),
             maxp: self.ir_maxp.unwrap_or(4096),
         };
+        let mut plus = PlusCfg::from_profile(self.plus_profile);
+        if let Some(w) = self.plus_width {
+            plus.width = w;
+        }
+        if let Some(f) = self.plus_focus {
+            plus.center_focus = f;
+        }
+        if let Some(s) = self.plus_surround {
+            plus.surround_depth = s;
+        }
+        if let Some(e) = self.plus_externalize {
+            plus.externalize = e;
+        }
+        if let Some(b) = self.plus_bass_mono {
+            plus.bass_mono_hz = b;
+        }
+        if self.no_lfe_lpf {
+            plus.lfe_lpf = false;
+        }
+        plus.sync_profile();
         let mut cfg = RenderCfg {
+            renderer: self.mode,
+            plus,
             resample: g6me_core::stages::ResampleCfg {
                 enable: self.rate.is_some(),
                 rate: self.rate.unwrap_or(48000),
@@ -1591,6 +1684,40 @@ mod tests {
             cfg, base,
             "--rate was given, so the device rate is not layered on top of it"
         );
+    }
+
+    #[test]
+    fn renderer_mode_defaults_to_reference_and_parses_plus_overrides() {
+        let def = Cli::try_parse_from(["g6me", "x.mka"]).unwrap();
+        let cfg = def.render_cfg().unwrap();
+        assert_eq!(cfg.renderer, RendererMode::Reference);
+
+        let plus_studio = Cli::try_parse_from(["g6me", "--mode", "plus", "x.mka"]).unwrap();
+        let cfg = plus_studio.render_cfg().unwrap();
+        assert_eq!(cfg.renderer, RendererMode::Plus);
+        assert_eq!(cfg.plus.profile, PlusProfile::Studio);
+        assert!(cfg.plus.lfe_lpf);
+
+        let plus_custom = Cli::try_parse_from([
+            "g6me",
+            "--mode",
+            "g6+",
+            "--plus-profile",
+            "cinema",
+            "--plus-width",
+            "1.30",
+            "--plus-externalize",
+            "0.25",
+            "--no-lfe-lpf",
+            "x.mka",
+        ])
+        .unwrap();
+        let cfg = plus_custom.render_cfg().unwrap();
+        assert_eq!(cfg.renderer, RendererMode::Plus);
+        assert_eq!(cfg.plus.profile, PlusProfile::Custom);
+        assert!((cfg.plus.width - 1.30).abs() < 1e-9);
+        assert!((cfg.plus.externalize - 0.25).abs() < 1e-9);
+        assert!(!cfg.plus.lfe_lpf);
     }
 
     trait StrErr {

@@ -16,6 +16,7 @@
 use g6me_core::batch::BatchCfg;
 use g6me_core::mask::{self, Slot};
 use g6me_core::pcm::{BitDepth, Dither};
+use g6me_core::plus::{PlusCfg, RendererMode};
 use g6me_core::probe::Caps;
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
 use g6me_core::tp::Ratio;
@@ -51,6 +52,12 @@ pub struct Settings {
     pub recursive: bool,
     /// Files rendered at once. DSP stays single-threaded inside each file.
     pub threads: usize,
+
+    // ---- renderer ----------------------------------------------------------
+    /// Reference (bit-exact G6) vs Plus (G6+ universal binaural renderer).
+    pub renderer: RendererMode,
+    /// Runtime-tweakable G6+ soundfield parameters & profile.
+    pub plus: PlusCfg,
 
     // ---- output ------------------------------------------------------------
     pub format: Format,
@@ -148,6 +155,8 @@ impl Default for Settings {
             // A music library is a tree; the exception is rarer than the rule.
             recursive: true,
             threads: g6me_core::batch::default_workers(),
+            renderer: RendererMode::Reference,
+            plus: PlusCfg::default(),
             format: Format::Flac,
             flac_level: 8,
             depth: BitDepth::S24,
@@ -270,6 +279,8 @@ impl Settings {
             maxp: self.ir_maxp,
         };
         RenderCfg {
+            renderer: self.renderer,
+            plus: self.plus,
             dc_block: self.dc_block,
             resample: g6me_core::stages::ResampleCfg {
                 enable: self.resample,
@@ -411,6 +422,11 @@ impl Settings {
                 BitDepth::quantize_note()
             ));
         }
+        if self.renderer == RendererMode::Plus {
+            if let Err(e) = self.plus.validate() {
+                p.push(format!("G6+ renderer: {e}"));
+            }
+        }
         p
     }
 
@@ -497,7 +513,10 @@ pub fn describe(s: &Settings) -> String {
         ));
     }
     v.push(format!("{} threads", s.threads()));
-    v.push("f64 dsp".to_string());
+    match s.renderer {
+        RendererMode::Reference => v.push("f64 dsp (ref)".to_string()),
+        RendererMode::Plus => v.push(format!("f64 {}", s.plus.summary())),
+    }
     v.join(" · ")
 }
 
@@ -767,5 +786,17 @@ mod tests {
             bytes * 2,
             "the label must be honest"
         );
+    }
+
+    #[test]
+    fn renderer_mode_defaults_to_reference_and_forwards_plus_settings() {
+        let mut s = Settings::default();
+        assert_eq!(s.render_cfg().renderer, RendererMode::Reference);
+        s.renderer = RendererMode::Plus;
+        s.plus = PlusCfg::from_profile(g6me_core::plus::PlusProfile::Cinema);
+        let cfg = s.render_cfg();
+        assert_eq!(cfg.renderer, RendererMode::Plus);
+        assert_eq!(cfg.plus.profile, g6me_core::plus::PlusProfile::Cinema);
+        assert!(describe(&s).contains("G6+ cinema"));
     }
 }
