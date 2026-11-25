@@ -44,7 +44,8 @@ pub struct Meters {
     rate_bits: AtomicU32,
     block: AtomicU64,
     frames: AtomicU64,
-    xruns: AtomicU64,
+    /// Smoothed L/R output phase correlation (`-1.0 ..= +1.0`), packed as `f32` bits.
+    corr_bits: AtomicU32,
 }
 
 impl Meters {
@@ -54,7 +55,7 @@ impl Meters {
             rate_bits: AtomicU32::new(0),
             block: AtomicU64::new(0),
             frames: AtomicU64::new(0),
-            xruns: AtomicU64::new(0),
+            corr_bits: AtomicU32::new(0.0f32.to_bits()),
         }
     }
 
@@ -125,14 +126,35 @@ impl Meters {
         }
         self.hold(IN_CHANNELS, Self::peak_of(l, n));
         self.hold(IN_CHANNELS + 1, Self::peak_of(r, n));
+        self.update_correlation(l, r, n);
         self.frames.fetch_add(n as u64, AtomicOrd::Relaxed);
     }
 
-    /// Release-only tick, for a source that went silent (or between files).
-    pub fn decay_once(&self) {
-        for i in 0..TOTAL {
-            self.hold(i, 0.0);
+    fn update_correlation<T: Real>(&self, l: &[T], r: &[T], n: usize) {
+        let mut s_ll = 0.0_f64;
+        let mut s_rr = 0.0_f64;
+        let mut s_lr = 0.0_f64;
+        for (&xl, &xr) in l.iter().zip(r.iter()).take(n) {
+            let fl = xl.to_f64();
+            let fr = xr.to_f64();
+            if fl.is_finite() && fr.is_finite() {
+                s_ll += fl * fl;
+                s_rr += fr * fr;
+                s_lr += fl * fr;
+            }
         }
+        let denom = (s_ll * s_rr).sqrt();
+        let prev = f32::from_bits(self.corr_bits.load(AtomicOrd::Relaxed));
+        let prev = if prev.is_finite() { prev } else { 0.0 };
+        let d = self.decay();
+        let next = if denom > 1e-18 {
+            let inst = (s_lr / denom).clamp(-1.0, 1.0) as f32;
+            prev * d + inst * (1.0 - d)
+        } else {
+            prev * d
+        };
+        self.corr_bits
+            .store(next.clamp(-1.0, 1.0).to_bits(), AtomicOrd::Relaxed);
     }
 
     /// Linear peak, 0.0 .. >1.0 (above 1.0 means the encoder will clip).
@@ -152,16 +174,18 @@ impl Meters {
         level_to_param(self.peak(index))
     }
 
+    /// Live smoothed stereo L/R phase correlation in `[-1.0, +1.0]`.
+    pub fn correlation(&self) -> f32 {
+        let v = f32::from_bits(self.corr_bits.load(AtomicOrd::Relaxed));
+        if v.is_finite() {
+            v.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
     pub fn frames(&self) -> u64 {
         self.frames.load(AtomicOrd::Relaxed)
-    }
-
-    pub fn xruns(&self) -> u64 {
-        self.xruns.load(AtomicOrd::Relaxed)
-    }
-
-    pub fn note_xrun(&self, n: u64) {
-        self.xruns.fetch_add(n, AtomicOrd::Relaxed);
     }
 
     pub fn reset(&self) {
@@ -169,7 +193,7 @@ impl Meters {
             v.store(0, AtomicOrd::Relaxed);
         }
         self.frames.store(0, AtomicOrd::Relaxed);
-        self.xruns.store(0, AtomicOrd::Relaxed);
+        self.corr_bits.store(0.0f32.to_bits(), AtomicOrd::Relaxed);
     }
 }
 
@@ -410,6 +434,35 @@ mod tests {
             tap.rate(),
             48_000,
             "a zero rate would divide the decay by zero"
+        );
+    }
+
+    #[test]
+    fn live_phase_correlation_tracks_in_phase_and_inverted_stereo() {
+        let m = Meters::new();
+        m.set_format(48_000.0, 4096);
+        let empty: [Option<&[f64]>; crate::dsp::SLOTS] = [None; crate::dsp::SLOTS];
+        let l: Vec<f64> = (0..4096)
+            .map(|i| (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin())
+            .collect();
+        let inv: Vec<f64> = l.iter().map(|&x| -x).collect();
+        for _ in 0..20 {
+            m.observe_block(&empty, &l, &l, l.len());
+        }
+        assert!(
+            m.correlation() > 0.99,
+            "in-phase mono should approach +1, got {}",
+            m.correlation()
+        );
+        m.reset();
+        assert_eq!(m.correlation(), 0.0);
+        for _ in 0..20 {
+            m.observe_block(&empty, &l, &inv, l.len());
+        }
+        assert!(
+            m.correlation() < -0.99,
+            "inverted stereo should approach -1, got {}",
+            m.correlation()
         );
     }
 }

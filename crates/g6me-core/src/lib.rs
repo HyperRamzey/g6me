@@ -52,6 +52,7 @@ pub mod dsp;
 pub mod error;
 pub mod fft;
 pub mod limiter;
+pub mod loudness;
 pub mod mask;
 pub mod meter;
 pub mod pcm;

@@ -15,6 +15,7 @@ use crate::child::Proc;
 use crate::dsp::SLOTS;
 use crate::error::{Error, Result};
 use crate::limiter::{Limiter, Report as LimiterReport};
+use crate::loudness::{LoudnessMeter, LoudnessReport};
 use crate::mask::{format_order, is_downmixable, mask_of, order_from_layout, Slot};
 use crate::pcm::{Grid24, Sha256};
 use crate::plus::{Renderer, RendererMode};
@@ -154,6 +155,10 @@ pub struct Report {
     /// file, which is the mean-square figure the source meter showed next to its peak.
     /// Silence reports `f64::NEG_INFINITY`, not a lie.
     pub rms_dbfs: Vec<f64>,
+    /// ITU-R BS.1770-5 / EBU R128 integrated loudness, momentary/short-term max,
+    /// EBU Tech 3342 LRA, AES TD1008 PLR, and EBU Tech 3205-E stereo phase correlation.
+    #[serde(default)]
+    pub loudness: Option<LoudnessReport>,
 }
 
 impl Report {
@@ -183,6 +188,10 @@ impl Report {
             self.true_peak_dbtp,
             self.true_peak_ratio.label()
         ));
+        if let Some(short) = self.loudness.as_ref().and_then(LoudnessReport::short_line) {
+            s.push_str("  ");
+            s.push_str(&short);
+        }
         if let Some(l) = &self.limiter {
             if l.within_ceiling() {
                 s.push_str(&format!(
@@ -327,6 +336,10 @@ impl Report {
                 d.true_peak_dbtp, peak, level
             ));
         }
+        if let Some(l) = &self.loudness {
+            s.push('\n');
+            s.push_str(&l.detail_line());
+        }
         if let Some(n) = &self.delivered_note {
             s.push_str(&format!("\nWARNING: {n}"));
         }
@@ -377,6 +390,7 @@ struct PeakSummary {
     rms_dbfs: Vec<f64>,
     dc_offset: Vec<f64>,
     limiter: Option<LimiterReport>,
+    loudness: LoudnessReport,
 }
 
 /// The last thing to touch a sample, and the pair of numbers that describe it.
@@ -397,6 +411,8 @@ struct PeakStage {
     dc: Option<[DcBlocker; 2]>,
     /// Per channel: held sample peak, running sum of squares, mean, frames seen.
     accum: [Accum; 2],
+    /// ITU-R BS.1770-5 / EBU R128 loudness + LRA + stereo phase correlation meter.
+    loudness: LoudnessMeter,
 }
 
 /// Peak and mean-square, held per channel for the whole file.
@@ -535,6 +551,7 @@ impl PeakStage {
             gain: 10f64.powf(cfg.output_gain_db / 20.0),
             dc,
             accum: std::array::from_fn(|_| Accum::default()),
+            loudness: LoudnessMeter::new(rate),
         }
     }
 
@@ -570,6 +587,7 @@ impl PeakStage {
             self.tp.push_ch(0, left);
             self.tp.push_ch(1, right);
         }
+        self.loudness.push(left, right);
         // Sample peak and mean-square are always accumulated, shared meter or not: two
         // passes over a block that is already in cache, and they are the numbers the
         // history panel is built from.
@@ -598,6 +616,7 @@ impl PeakStage {
                 self.tp.push_ch(0, left);
                 self.tp.push_ch(1, right);
             }
+            self.loudness.push(left, right);
             for (acc, buf) in self
                 .accum
                 .iter_mut()
@@ -627,6 +646,7 @@ impl PeakStage {
             ),
             _ => (self.tp.dbtp(), self.tp.per_channel_dbtp()),
         };
+        let loudness = self.loudness.summarize(true_peak_dbtp);
         PeakSummary {
             true_peak_dbtp,
             per_channel_true_peak_dbtp,
@@ -634,6 +654,7 @@ impl PeakStage {
             rms_dbfs: self.accum.iter().map(Accum::rms_db).collect(),
             dc_offset: self.accum.iter().map(Accum::dc).collect(),
             limiter: report,
+            loudness,
         }
     }
 }
@@ -1171,6 +1192,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         sample_peak_dbfs: peak_summary.sample_peak_dbfs,
         rms_dbfs: peak_summary.rms_dbfs,
         dc_offset: peak_summary.dc_offset,
+        loudness: Some(peak_summary.loudness),
     })
 }
 
