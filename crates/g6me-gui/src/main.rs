@@ -28,11 +28,12 @@ mod theme;
 mod widgets;
 
 use crate::runner::{Event, Level, PickTarget, Runner, Summary};
-use crate::settings::{describe, Format, Settings};
+use crate::settings::{describe, Format, MasteringPreset, Settings};
 use crate::theme::Palette;
 use crate::widgets::{Browser, Mode};
 use eframe::CreationContext;
 use g6me_core::batch::{self, Phase};
+use g6me_core::loudness::{Compliance, DeliveryTarget, LoudnessReport};
 use g6me_core::mask;
 use g6me_core::meter::{MeterTap, Meters};
 use g6me_core::pcm::{BitDepth, Dither};
@@ -44,6 +45,64 @@ use g6me_core::stages::Gtype;
 use g6me_core::util;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+/// Filter for the queue list in the left sidebar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QueueFilter {
+    #[default]
+    All,
+    Queued,
+    Done,
+    Failed,
+    Skipped,
+}
+
+impl QueueFilter {
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Queued,
+        Self::Done,
+        Self::Failed,
+        Self::Skipped,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Queued => "queued",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    fn matches(self, phase: Phase) -> bool {
+        match self {
+            Self::All => true,
+            Self::Queued => matches!(phase, Phase::Queued | Phase::Running),
+            Self::Done => phase == Phase::Done,
+            Self::Failed => phase == Phase::Failed,
+            Self::Skipped => phase == Phase::Skipped,
+        }
+    }
+}
+
+fn row_matches_filter(row: &Row, filter: QueueFilter, query: &str) -> bool {
+    if !filter.matches(row.phase) {
+        return false;
+    }
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let q_low = q.to_lowercase();
+    let name = row
+        .src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| row.src.display().to_string().to_lowercase());
+    name.contains(&q_low) || row.shout().to_lowercase().contains(&q_low)
+}
 
 /// Which settings page is showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,6 +256,8 @@ pub struct App {
     installed: Option<Palette>,
     tab: Tab,
     queue: Vec<Row>,
+    queue_filter: QueueFilter,
+    queue_search: String,
     pick: Option<PickTarget>,
     browser: Browser,
     /// Editable/pasteable path buffers kept synced with `settings.out_dir` / `settings.ir_file`.
@@ -212,6 +273,8 @@ pub struct App {
     /// come in over the ceiling", and the answer has to still be on the screen. Kept
     /// across runs, cleared by hand, newest first.
     history: Vec<MeterRow>,
+    /// Delivery loudness/true-peak target used to grade finished files in `history`.
+    delivery_target: DeliveryTarget,
     status: String,
     show_caps: bool,
     dry_run: Mutex<Option<DryRun>>,
@@ -233,10 +296,18 @@ struct DryRun {
 /// a queue of two thousand files redraws sixty times a second and should not be asked to
 /// re-render two thousand float formats to do it.
 struct MeterRow {
+    /// Output filename (basename), for structured CSV/JSON export.
+    filename: String,
     /// Compact levels for the list row.
     levels: String,
     /// The same measurement in full, for copying.
     text: String,
+    /// Measured true peak, detector ratio, sample peak, RMS, and BS.1770-5 loudness.
+    true_peak_dbtp: f64,
+    true_peak_ratio: String,
+    sample_peak_dbfs: Vec<f64>,
+    rms_dbfs: Vec<f64>,
+    loudness: Option<LoudnessReport>,
     /// Came in at or over 0 dBTP, or failed to render.
     hot: bool,
     ok: bool,
@@ -251,6 +322,80 @@ fn db(v: f64) -> String {
     } else {
         format!("{v:+.2}")
     }
+}
+
+/// RFC 4180 CSV field escaping.
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn fmt_csv_f64(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x.is_finite() => format!("{x:.3}"),
+        _ => String::new(),
+    }
+}
+
+/// Export session history as RFC 4180 CSV, newest first, graded against `target`.
+fn history_csv(rows: &[MeterRow], target: DeliveryTarget) -> String {
+    let mut out = String::from(
+        "file,true_peak_dbtp,tp_ratio,sample_peak_l_dbfs,sample_peak_r_dbfs,\
+         rms_l_dbfs,rms_r_dbfs,integrated_lufs,momentary_max_lufs,\
+         short_term_max_lufs,lra_lu,plr_db,correlation,compliance\n",
+    );
+    for row in rows.iter().rev() {
+        let comp = target.evaluate(row.true_peak_dbtp, row.loudness).badge();
+        let l = row.loudness;
+        let fields = [
+            csv_escape(&row.filename),
+            fmt_csv_f64(row.true_peak_dbtp.is_finite().then_some(row.true_peak_dbtp)),
+            csv_escape(&row.true_peak_ratio),
+            fmt_csv_f64(row.sample_peak_dbfs.first().copied()),
+            fmt_csv_f64(row.sample_peak_dbfs.get(1).copied()),
+            fmt_csv_f64(row.rms_dbfs.first().copied()),
+            fmt_csv_f64(row.rms_dbfs.get(1).copied()),
+            fmt_csv_f64(l.and_then(|x| x.integrated_lufs)),
+            fmt_csv_f64(l.and_then(|x| x.momentary_max_lufs)),
+            fmt_csv_f64(l.and_then(|x| x.short_term_max_lufs)),
+            fmt_csv_f64(l.and_then(|x| x.lra_lu)),
+            fmt_csv_f64(l.and_then(|x| x.plr_db)),
+            fmt_csv_f64(l.map(|x| x.correlation)),
+            csv_escape(&comp),
+        ];
+        out.push_str(&fields.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// Export session history as pretty-printed JSON, newest first, graded against `target`.
+fn history_json(rows: &[MeterRow], target: DeliveryTarget) -> String {
+    let finite_or_null = |v: Option<f64>| match v {
+        Some(x) if x.is_finite() => serde_json::json!(x),
+        _ => serde_json::Value::Null,
+    };
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .rev()
+        .map(|row| {
+            let comp = target.evaluate(row.true_peak_dbtp, row.loudness).badge();
+            serde_json::json!({
+                "file": row.filename,
+                "true_peak_dbtp": finite_or_null(Some(row.true_peak_dbtp)),
+                "true_peak_ratio": row.true_peak_ratio,
+                "sample_peak_dbfs": row.sample_peak_dbfs.iter().map(|&x| finite_or_null(Some(x))).collect::<Vec<_>>(),
+                "rms_dbfs": row.rms_dbfs.iter().map(|&x| finite_or_null(Some(x))).collect::<Vec<_>>(),
+                "loudness": row.loudness,
+                "delivery_target": target.label(),
+                "compliance": comp,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
 }
 
 impl MeterRow {
@@ -276,6 +421,13 @@ impl MeterRow {
             list(&r.sample_peak_dbfs),
             list(&r.rms_dbfs)
         );
+        if let Some(l) = r.loudness {
+            if let Some(short) = l.short_line() {
+                levels.push_str(" · ");
+                levels.push_str(&short);
+                levels.push_str(&format!(" · ρ {:+.2}", l.correlation));
+            }
+        }
         // DC follows the rule the CLI headline uses: measured on every file, printed in the
         // full copy text on every file, and on the row a person scans only when some channel
         // is over the threshold where an offset is a finding instead of a floor.
@@ -291,8 +443,14 @@ impl MeterRow {
             // the row nobody should have to read closely to distrust.
             || r.delivered_note.is_some();
         Self {
+            filename: name.clone(),
             levels,
             text: format!("{}\n{}", name, r.peak_line()),
+            true_peak_dbtp: r.true_peak_dbtp,
+            true_peak_ratio: r.true_peak_ratio.label().to_string(),
+            sample_peak_dbfs: r.sample_peak_dbfs.clone(),
+            rms_dbfs: r.rms_dbfs.clone(),
+            loudness: r.loudness,
             hot,
             ok: true,
         }
@@ -314,6 +472,8 @@ impl App {
             installed: None,
             tab: Tab::Renderer,
             queue: Vec::new(),
+            queue_filter: QueueFilter::All,
+            queue_search: String::new(),
             pick: None,
             browser: Browser::default(),
             out_dir_text,
@@ -321,6 +481,7 @@ impl App {
             log: Vec::new(),
             summary: None,
             history: Vec::new(),
+            delivery_target: DeliveryTarget::default(),
             status: "idle".to_string(),
             show_caps: false,
             dry_run: Mutex::new(None),
@@ -410,7 +571,9 @@ impl App {
             ui.horizontal(|ui| {
                 let running = self.runner.is_running();
                 let ready = caps.is_some() && !self.queue.is_empty();
-                let start = ui.add_enabled(!running && ready, egui::Button::new("▶ Start"));
+                let start = ui
+                    .add_enabled(!running && ready, egui::Button::new("▶ Start"))
+                    .on_hover_text("Start rendering the queued files (Ctrl+Enter).");
                 if start.clicked() {
                     self.start_run();
                 }
@@ -418,7 +581,7 @@ impl App {
                     .add_enabled(running, egui::Button::new("■ Cancel"))
                     .on_hover_text(
                         "Stops after the current block and removes partial outputs, so a \
-                         cancelled run leaves nothing half-written.",
+                         cancelled run leaves nothing half-written (Esc).",
                     )
                     .clicked()
                 {
@@ -489,10 +652,9 @@ impl App {
                         util::human_time(c.seconds_done)
                     ));
                     // ETA from the observed throughput so far, using the average
-                    // duration of a finished file for the ones still queued.
-                    let finished = c.done + c.failed;
-                    let per_item = if finished > 0 {
-                        c.seconds_done / finished as f64
+                    // duration of a completed file for the ones still queued.
+                    let per_item = if c.done > 0 {
+                        c.seconds_done / c.done as f64
                     } else {
                         0.0
                     };
@@ -594,14 +756,47 @@ impl App {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.weak(format!("finished files — {}", self.history.len()));
+            egui::ComboBox::from_id_salt("delivery-target")
+                .selected_text(self.delivery_target.label())
+                .show_ui(ui, |ui| {
+                    for t in DeliveryTarget::ALL {
+                        ui.selectable_value(&mut self.delivery_target, t, t.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Delivery loudness & true-peak standard used to grade finished files \
+                     (ITU-R BS.1770-5 / EBU R128 / ATSC A/85).",
+                );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
+                    .small_button("copy JSON")
+                    .on_hover_text(
+                        "Copy finished-file measurements and compliance as JSON, newest first.",
+                    )
+                    .clicked()
+                {
+                    ctx.copy_text(history_json(&self.history, self.delivery_target));
+                    self.status = format!("copied {} row(s) as JSON", self.history.len());
+                }
+                if ui
+                    .small_button("copy CSV")
+                    .on_hover_text(
+                        "Copy finished-file measurements and compliance as CSV, newest first.",
+                    )
+                    .clicked()
+                {
+                    ctx.copy_text(history_csv(&self.history, self.delivery_target));
+                    self.status = format!("copied {} row(s) as CSV", self.history.len());
+                }
+                if ui
                     .small_button("copy all")
-                    .on_hover_text("Copy every line as text, newest last.")
+                    .on_hover_text("Copy every line as plain text, newest first.")
                     .clicked()
                 {
                     let text = self.history_text();
                     ctx.copy_text(text);
+                    self.status = format!("copied {} row(s) as text", self.history.len());
                 }
                 if ui
                     .small_button("clear")
@@ -621,8 +816,36 @@ impl App {
                 // Drawn newest first: the file that just finished is the one being asked
                 // about, and a list that grows downwards pushes it off screen.
                 for row in self.history.iter().rev() {
+                    let comp = self
+                        .delivery_target
+                        .evaluate(row.true_peak_dbtp, row.loudness);
+                    let badge_col = match comp {
+                        Compliance::Pass => widgets::tone(
+                            ui,
+                            egui::Color32::from_rgb(96, 176, 92),
+                            egui::Color32::from_rgb(30, 122, 60),
+                        ),
+                        Compliance::OverCeiling => widgets::tone(
+                            ui,
+                            egui::Color32::from_rgb(240, 110, 96),
+                            egui::Color32::from_rgb(176, 26, 16),
+                        ),
+                        Compliance::TooLoud(_) | Compliance::Quiet(_) => widgets::tone(
+                            ui,
+                            egui::Color32::from_rgb(216, 178, 58),
+                            egui::Color32::from_rgb(168, 128, 14),
+                        ),
+                        Compliance::Unmeasured => ui.visuals().weak_text_color(),
+                    };
                     ui.horizontal(|ui| {
                         ui.colored_label(widgets::status_dot(ui, row.hot, row.ok), "●");
+                        ui.label(
+                            egui::RichText::new(format!("[{}]", comp.badge()))
+                                .monospace()
+                                .size(10.0)
+                                .color(badge_col),
+                        )
+                        .on_hover_text(format!("Graded against {}", self.delivery_target.label()));
                         // Selectable so a single line can be copied without the button.
                         ui.add(egui::Label::new(&row.levels).selectable(true));
                         if ui
@@ -637,7 +860,7 @@ impl App {
             });
     }
 
-    /// The whole history as plain text, newest last, for a log or a delivery note.
+    /// The whole history as plain text, newest first, for a log or a delivery note.
     fn history_text(&self) -> String {
         let mut out = String::new();
         for row in self.history.iter().rev() {
@@ -668,6 +891,11 @@ impl App {
 
     fn queue_panel(&mut self, ctx: &egui::Context) {
         let running = self.runner.is_running();
+        let failed_count = self
+            .queue
+            .iter()
+            .filter(|r| r.phase == Phase::Failed)
+            .count();
         egui::SidePanel::left("queue")
             .default_width(360.0)
             .min_width(260.0)
@@ -681,6 +909,17 @@ impl App {
                         {
                             self.queue.clear();
                             self.settings.inputs.clear();
+                        }
+                        if failed_count > 0
+                            && ui
+                                .add_enabled(
+                                    !running,
+                                    egui::Button::new(format!("retry failed ({failed_count})")),
+                                )
+                                .on_hover_text("Re-run only the files that failed in the last batch.")
+                                .clicked()
+                        {
+                            self.retry_failed();
                         }
                     });
                 });
@@ -729,6 +968,13 @@ impl App {
                     {
                         self.open_picker(ctx, PickTarget::OutDir, Mode::Dir);
                     }
+                    if ui
+                        .small_button("open folder")
+                        .on_hover_text("Open the current output folder in the system file manager.")
+                        .clicked()
+                    {
+                        self.open_output_folder();
+                    }
                 });
                 if self.settings.use_out_dir {
                     ui.horizontal(|ui| {
@@ -750,6 +996,34 @@ impl App {
                 if rescan && !running {
                     self.rebuild_queue();
                 }
+                if !self.queue.is_empty() {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.queue_search)
+                                .desired_width((ui.available_width() - 26.0).max(80.0))
+                                .hint_text("filter queue by filename…"),
+                        );
+                        if !self.queue_search.is_empty() && ui.small_button("✕").clicked() {
+                            self.queue_search.clear();
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        for f in QueueFilter::ALL {
+                            let n = self
+                                .queue
+                                .iter()
+                                .filter(|r| f.matches(r.phase))
+                                .count();
+                            let label = if f == QueueFilter::All || n > 0 {
+                                format!("{} ({n})", f.label())
+                            } else {
+                                f.label().to_string()
+                            };
+                            ui.selectable_value(&mut self.queue_filter, f, label);
+                        }
+                    });
+                }
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -763,7 +1037,12 @@ impl App {
                             return;
                         }
                         let mut remove: Option<usize> = None;
+                        let mut shown = 0usize;
                         for (i, r) in self.queue.iter().enumerate() {
+                            if !row_matches_filter(r, self.queue_filter, &self.queue_search) {
+                                continue;
+                            }
+                            shown += 1;
                             let col = match r.phase {
                                 Phase::Queued => egui::Color32::GRAY,
                                 Phase::Running => egui::Color32::from_rgb(120, 170, 220),
@@ -791,6 +1070,9 @@ impl App {
                             .response
                             .on_hover_text(r.tooltip());
                         }
+                        if shown == 0 {
+                            ui.weak("No queued files match the current filter.");
+                        }
                         // Removed after the loop: the table is borrowed while it is
                         // being drawn.
                         if let Some(i) = remove {
@@ -817,7 +1099,7 @@ impl App {
                         .button("dry run")
                         .on_hover_text(
                             "Plan the first queued file: show the filter chain and the exact \
-                             commands, write nothing.",
+                             commands, write nothing (Ctrl+D).",
                         )
                         .clicked()
                     {
@@ -1045,7 +1327,7 @@ impl App {
                         ui.label("bass mono");
                         if ui
                             .add(
-                                egui::Slider::new(&mut p.bass_mono_hz, 0.0..=200.0)
+                                egui::Slider::new(&mut p.bass_mono_hz, 0.0..=250.0)
                                     .step_by(5.0)
                                     .fixed_decimals(0)
                                     .suffix(" Hz"),
@@ -1260,6 +1542,40 @@ impl App {
                    stream, but it cannot carry 32-bit PCM or float — WAV does both.",
             );
         }
+        ui.horizontal(|ui| {
+            ui.label("output dither");
+            egui::ComboBox::from_id_salt("out-dither")
+                .selected_text(self.settings.dither.label())
+                .show_ui(ui, |ui| {
+                    for d in Dither::ALL {
+                        let invalid_24 = self.settings.depth == BitDepth::S24
+                            && !g6me_core::pcm::Grid24::supports(d);
+                        let label = if invalid_24 {
+                            format!("{} — 16-bit only", d.label())
+                        } else {
+                            d.label().to_string()
+                        };
+                        ui.selectable_value(&mut self.settings.dither, d, label);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Applied when quantizing down to the output bit depth. Noise-shaping dithers \
+                     (Lipshitz, Shibata, E/F-weighted) are restricted to 16-bit by ffmpeg's libswresample.",
+                );
+            if self.settings.dither != Dither::None {
+                if self.settings.depth == BitDepth::S24
+                    && !g6me_core::pcm::Grid24::supports(self.settings.dither)
+                {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(226, 110, 90),
+                        "24-bit supports rectangular / triangular / triangular_hp only",
+                    );
+                } else {
+                    ui.weak("deterministic: the same input gives the same output every run");
+                }
+            }
+        });
         ui.checkbox(&mut self.settings.copy_metadata, "copy source metadata");
         ui.checkbox(
             &mut self.settings.overwrite,
@@ -1286,6 +1602,23 @@ impl App {
     fn tab_true_peak(&mut self, ui: &mut egui::Ui) {
         use g6me_core::limiter::Cfg as LCfg;
         use g6me_core::tp::Ratio;
+
+        let running = self.runner.is_running();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("presets");
+            ui.add_enabled_ui(!running, |ui| {
+                for preset in MasteringPreset::ALL {
+                    if ui
+                        .small_button(preset.label())
+                        .on_hover_text(preset.description())
+                        .clicked()
+                    {
+                        self.settings.apply_mastering_preset(preset);
+                    }
+                }
+            });
+        });
+        ui.separator();
 
         // The rate the DSP runs at: the resampler's target when resampling is on, and
         // otherwise whatever the source is. Lookahead in ms and latency in samples trade
@@ -1347,7 +1680,27 @@ impl App {
                  so DACs and AAC/Opus encoders don't clip or crackle on hot surround peaks.",
             );
         if !self.settings.limiter {
-            ui.weak("Off: files are measured, never changed.");
+            ui.horizontal(|ui| {
+                ui.label("gain trim");
+                let mut g = self.settings.gain_db;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut g)
+                            .range(-24.0..=0.0)
+                            .speed(0.05)
+                            .suffix(" dB"),
+                    )
+                    .on_hover_text("Constant gain staging applied to every sample before encoding (0 dB = untouched).")
+                    .changed()
+                {
+                    self.settings.gain_db = g.clamp(-24.0, 0.0);
+                }
+                if self.settings.gain_db == 0.0 && !self.settings.dc_block {
+                    ui.weak("Off: files are measured, never changed.");
+                } else {
+                    ui.weak("Limiter off: only DC block / gain trim above apply.");
+                }
+            });
             return;
         }
         let st = &mut self.settings;
@@ -1373,22 +1726,32 @@ impl App {
             {
                 st.setpoint_db = Some(sp.clamp(-24.0, 0.0));
             }
-            if st.setpoint_db.is_some() {
+            if let Some(sp) = st.setpoint_db {
                 ui.label(format!(
-                    "(- trim, - cap{}; clear it to set the two apart)",
-                    if st.gain_db != 0.0 {
-                        format!(", plus your own {:+.2} dB gain", st.gain_db)
-                    } else {
-                        String::new()
-                    }
+                    "({sp:+.2} dB trim & {sp:+.2} dBTP ceiling; click separate to decouple)"
                 ));
-            }
-            if ui
-                .button("separate")
-                .on_hover_text("Decouples pre-gain trim from peak ceiling so you can preserve raw loudness.")
-                .clicked()
-            {
-                st.setpoint_db = None;
+                if ui
+                    .button("separate")
+                    .on_hover_text("Decouples pre-gain trim from peak ceiling so you can preserve raw loudness.")
+                    .clicked()
+                {
+                    st.setpoint_db = None;
+                }
+            } else {
+                ui.label("gain trim");
+                let mut g = st.gain_db;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut g)
+                            .range(-24.0..=0.0)
+                            .speed(0.05)
+                            .suffix(" dB"),
+                    )
+                    .on_hover_text("Constant gain applied before the limiter (0 dB = unity).")
+                    .changed()
+                {
+                    st.gain_db = g.clamp(-24.0, 0.0);
+                }
             }
         });
         ui.horizontal(|ui| {
@@ -1691,20 +2054,20 @@ impl App {
                     );
             });
             ui.horizontal(|ui| {
-                ui.label("dither");
-                egui::ComboBox::from_id_salt("dither")
-                    .selected_text(self.settings.dither.label())
+                ui.label("resample dither");
+                egui::ComboBox::from_id_salt("resample-dither")
+                    .selected_text(self.settings.resample_dither.label())
                     .show_ui(ui, |ui| {
                         for d in Dither::ALL {
-                            ui.selectable_value(&mut self.settings.dither, d, d.label());
+                            ui.selectable_value(&mut self.settings.resample_dither, d, d.label());
                         }
                     })
                     .response
                     .on_hover_text(
-                        "Adds ultra-faint noise when quantizing down so quiet reverb tails fade \
-                         smoothly instead of breaking into gritty distortion.",
+                        "Dither applied inside the input resampler when quantizing before the downmix \
+                         (separate from output dither on the Output tab).",
                     );
-                if self.settings.dither != Dither::None {
+                if self.settings.resample_dither != Dither::None {
                     ui.weak("deterministic: the same input gives the same output every run");
                 }
             });
@@ -1925,13 +2288,13 @@ impl App {
             ui.label("blocks");
             if ui
                 .selectable_label(
-                    self.settings.block == 4096 && self.settings.queue_blocks == 8,
+                    self.settings.block == 4096 && self.settings.queue_blocks == 16,
                     "default",
                 )
                 .clicked()
             {
                 self.settings.block = 4096;
-                self.settings.queue_blocks = 8;
+                self.settings.queue_blocks = 16;
             }
         });
         ui.weak(format!(
@@ -1945,6 +2308,25 @@ impl App {
             ui.add(egui::DragValue::new(&mut s).range(0..=31));
             self.settings.stream = s;
             ui.weak("(0 = first audio stream)");
+        });
+        ui.separator();
+        let running = self.runner.is_running();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("reset settings to defaults"))
+                .on_hover_text(
+                    "Restores Renderer, Output, True peak, Resample, IR, and Advanced controls to \
+                     defaults while keeping your queued files and output folder.",
+                )
+                .clicked()
+            {
+                self.settings.reset_preserving_queue();
+                self.out_dir_text = self.settings.out_dir.display().to_string();
+                self.ir_file_text = self.settings.ir_file.display().to_string();
+                self.rebuild_queue();
+                self.push_log(Level::Info, "reset settings to defaults (queue preserved)");
+            }
+            ui.weak("shortcuts: Ctrl+Enter start · Esc cancel · Ctrl+D dry run");
         });
         ui.separator();
         ui.weak(
@@ -2282,6 +2664,41 @@ impl App {
     }
 
     fn start_run(&mut self) {
+        let explicit_items: Vec<batch::Item> = self
+            .queue
+            .iter()
+            .map(|r| {
+                let mut it = batch::Item::new(r.src.clone(), r.dst.clone());
+                if !r.collision.is_empty() {
+                    it.note = Some(r.collision.clone());
+                }
+                it
+            })
+            .collect();
+        self.start_with_items(explicit_items, "start");
+    }
+
+    fn retry_failed(&mut self) {
+        let failed_items: Vec<batch::Item> = self
+            .queue
+            .iter()
+            .filter(|r| r.phase == Phase::Failed)
+            .map(|r| {
+                let mut it = batch::Item::new(r.src.clone(), r.dst.clone());
+                if !r.collision.is_empty() {
+                    it.note = Some(r.collision.clone());
+                }
+                it
+            })
+            .collect();
+        if failed_items.is_empty() {
+            self.status = "no failed files to retry".to_string();
+            return;
+        }
+        self.start_with_items(failed_items, "retry failed");
+    }
+
+    fn start_with_items(&mut self, explicit_items: Vec<batch::Item>, verb: &str) {
         let caps = match self.caps() {
             Some(c) => c,
             None => {
@@ -2307,7 +2724,10 @@ impl App {
         cfg.taps = self.meter_factory();
         self.cards.clear();
         self.summary = None;
-        match self.runner.start(&cfg, self.tools.clone(), caps) {
+        match self
+            .runner
+            .start_items(explicit_items, &cfg, self.tools.clone(), caps)
+        {
             Ok(items) => {
                 self.queue = items
                     .iter()
@@ -2323,10 +2743,9 @@ impl App {
                 self.push_log(
                     Level::Info,
                     format!(
-                        "start · {} · {} → {}",
+                        "{verb} · {} · {} file(s)",
                         describe(&self.settings),
-                        items.len(),
-                        "files"
+                        items.len()
                     ),
                 );
             }
@@ -2339,6 +2758,33 @@ impl App {
                 self.status = "not started".to_string();
             }
         }
+    }
+
+    /// Open the active output folder (or the first queued destination's parent) in the OS
+    /// file manager on a detached thread so the UI never blocks.
+    fn open_output_folder(&mut self) {
+        let dir = if self.settings.use_out_dir {
+            Some(self.settings.out_dir.clone())
+        } else {
+            self.queue
+                .first()
+                .and_then(|r| r.dst.parent().map(PathBuf::from))
+        };
+        let Some(dir) = dir.filter(|d| d.is_dir()) else {
+            self.push_log(
+                Level::Warn,
+                "no existing output folder to open — queue a file or pick an output folder first",
+            );
+            return;
+        };
+        std::thread::spawn(move || {
+            #[cfg(target_os = "linux")]
+            let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(&dir).spawn();
+            #[cfg(target_os = "windows")]
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        });
     }
 
     fn run_dry_run(&mut self) {
@@ -2383,8 +2829,8 @@ impl App {
                     String::new(),
                     "chain".to_string(),
                 ];
-                for (i, step) in p.chain.iter().enumerate() {
-                    lines.push(format!("  {}. {step}", i + 1));
+                for step in &p.chain {
+                    lines.push(format!("  {step}"));
                 }
                 lines.push(String::new());
                 lines.push("decode".to_string());
@@ -2532,6 +2978,26 @@ fn depth_note(d: BitDepth, f: Format, caps: Option<&Caps>) -> Option<&'static st
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        // Global keyboard shortcuts when no text input has focus.
+        if !ctx.wants_keyboard_input() {
+            let (start_key, dry_key, esc_key) = ctx.input(|i| {
+                let cmd = i.modifiers.command || i.modifiers.ctrl;
+                (
+                    cmd && i.key_pressed(egui::Key::Enter),
+                    cmd && i.key_pressed(egui::Key::D),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            let running = self.runner.is_running();
+            if esc_key && running {
+                self.runner.cancel();
+                self.status = "cancelling…".to_string();
+            } else if start_key && !running && self.caps().is_some() && !self.queue.is_empty() {
+                self.start_run();
+            } else if dry_key && !running && !self.queue.is_empty() {
+                self.run_dry_run();
+            }
+        }
         // The palette is installed on a change, not every frame: `apply` rewrites
         // egui's stored styles, and doing that sixty times a second would throw away
         // the caching it keeps them for.
@@ -2653,5 +3119,91 @@ mod tests {
         assert_eq!(db(f64::NEG_INFINITY), "\u{2212}inf");
         assert_eq!(db(f64::NAN), "n/a");
         assert_eq!(db(-3.0), "-3.00");
+    }
+
+    #[test]
+    fn meter_row_includes_loudness_metrics_and_exports_csv_and_json() {
+        let mut r1 = rendered();
+        r1.output = PathBuf::from("/out/track, \"1\".flac");
+        r1.true_peak_dbtp = -1.2;
+        r1.delivered_note = None;
+        r1.loudness = Some(LoudnessReport {
+            integrated_lufs: Some(-14.3),
+            momentary_max_lufs: Some(-10.1),
+            short_term_max_lufs: Some(-12.0),
+            lra_lu: Some(6.4),
+            plr_db: Some(13.1),
+            correlation: 0.87,
+        });
+        let row1 = MeterRow::from_report(&r1);
+        for want in ["I -14.3 LUFS", "LRA 6.4 LU", "PLR 13.1 dB", "ρ +0.87"] {
+            assert!(
+                row1.levels.contains(want),
+                "missing {want} in levels: {}",
+                row1.levels
+            );
+        }
+        assert!(row1.text.contains("loudness (BS.1770-5)"));
+
+        let mut r2 = rendered();
+        r2.output = PathBuf::from("/out/newer.flac");
+        r2.true_peak_dbtp = -0.2;
+        r2.loudness = Some(LoudnessReport {
+            integrated_lufs: Some(-11.0),
+            ..Default::default()
+        });
+        let row2 = MeterRow::from_report(&r2);
+        let history = vec![row1, row2];
+
+        let csv = history_csv(&history, DeliveryTarget::Streaming);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows: {csv}");
+        assert!(lines[0].starts_with("file,true_peak_dbtp,"));
+        // Newest first (row2 before row1), with RFC 4180 quoting on row1's filename.
+        assert!(lines[1].starts_with("newer.flac,"));
+        assert!(lines[1].ends_with(",OVER TP"));
+        assert!(lines[2].starts_with("\"track, \"\"1\"\".flac\","));
+        assert!(lines[2].ends_with(",PASS"));
+
+        let json_str = history_json(&history, DeliveryTarget::Streaming);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("valid JSON");
+        let arr = parsed.as_array().expect("JSON array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["file"], "newer.flac");
+        assert_eq!(arr[0]["compliance"], "OVER TP");
+        assert_eq!(arr[1]["file"], "track, \"1\".flac");
+        assert_eq!(arr[1]["compliance"], "PASS");
+    }
+
+    #[test]
+    fn queue_filter_and_search_match_expected_rows() {
+        let rows = [
+            Row {
+                src: PathBuf::from("/music/Atmos_Track_01.mka"),
+                dst: PathBuf::from("/out/Atmos_Track_01.flac"),
+                phase: Phase::Done,
+                note: "100 frames".into(),
+                collision: String::new(),
+            },
+            Row {
+                src: PathBuf::from("/music/Concert_Live.wav"),
+                dst: PathBuf::from("/out/Concert_Live.flac"),
+                phase: Phase::Failed,
+                note: "decode error".into(),
+                collision: String::new(),
+            },
+            Row {
+                src: PathBuf::from("/music/Pending_Mix.flac"),
+                dst: PathBuf::from("/out/Pending_Mix.flac"),
+                phase: Phase::Running,
+                note: String::new(),
+                collision: String::new(),
+            },
+        ];
+        assert!(row_matches_filter(&rows[0], QueueFilter::Done, "atmos"));
+        assert!(!row_matches_filter(&rows[0], QueueFilter::Failed, "atmos"));
+        assert!(row_matches_filter(&rows[1], QueueFilter::Failed, "DECODE"));
+        assert!(row_matches_filter(&rows[2], QueueFilter::Queued, ""));
+        assert!(!row_matches_filter(&rows[2], QueueFilter::Skipped, ""));
     }
 }
