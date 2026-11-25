@@ -9,8 +9,8 @@
 //!
 //! Acoustic model:
 //! 1. **Physical Brown–Duda (1998) spherical head shadow** (frequency-dependent
-//!    diffraction ILD, `a = 8.75 cm`, `c = 343 m/s`, `f0 = 623.9 Hz`) converted
-//!    to strictly causal minimum phase via Hilbert-cepstral folding.
+//!    diffraction ILD, `a = 8.75 cm`, `c = 343 m/s`, `f0 = c/(pi*a) = 1247.8 Hz`)
+//!    converted to strictly causal minimum phase via Hilbert-cepstral folding.
 //! 2. **Kulkarni–Isabelle–Colburn (1999) excess Woodworth ITD**: measures the
 //!    natural minimum-phase ITD already contributed by the head-shadow filter
 //!    and applies only the remaining causal time-of-flight delay so total ITD
@@ -66,10 +66,20 @@ pub const N_FFT: usize = 8_192;
 pub const OLA_HOP: usize = 6_144;
 /// Causal direct-path pre-delay in seconds (`1.0 ms` = `48` samples at 48 kHz).
 pub const PRE_DELAY_S: f64 = 0.001;
-/// Half-Kaiser tail taper length at the end of `N_IR`.
+/// Half-Kaiser tail taper length at the end of `N_IR` (48 kHz base).
 const KAISER_TAIL: usize = 256;
 /// Kaiser beta for tail taper (`> 119 dB` window edge attenuation).
 const KAISER_BETA: f64 = 16.0;
+
+/// Power-of-two time-support scale factor relative to 48 kHz (`1` for `<= 48 kHz`,
+/// `2` for `88.2/96 kHz`, `4` for `176.4/192 kHz`, `8` for `352.8/384 kHz`).
+/// Keeps `N_IR` at `~42.7 ms` (preserving all `>= 8.5..30 ms` early reflections and
+/// LR4/LFE tails) and `N_SYNTH` at `~341 ms` across every supported sample rate.
+#[inline]
+fn sr_scale(sample_rate: u32) -> usize {
+    let mult = (sample_rate.max(8_000) as f64 / 48_000.0).ceil() as usize;
+    mult.max(1).next_power_of_two().min(8)
+}
 /// Spherical head radius (meters) — Woodworth / Brown–Duda universal average.
 const HEAD_RADIUS_M: f64 = 0.0875;
 /// Speed of sound in air at 20 °C (m/s).
@@ -418,10 +428,14 @@ impl KernelBank {
     /// Synthesize all 12×2 binaural FIR kernels deterministically in `f64`.
     pub fn synthesize(cfg: PlusCfg, sample_rate: u32) -> Self {
         let fs = (sample_rate.max(8_000)) as f64;
-        let nb = N_SYNTH / 2 + 1;
-        let plan = FftPlan::new(N_SYNTH);
+        let scale = sr_scale(sample_rate);
+        let n_synth = N_SYNTH * scale;
+        let n_ir = N_IR * scale;
+        let kaiser_tail = KAISER_TAIL * scale;
+        let nb = n_synth / 2 + 1;
+        let plan = FftPlan::new(n_synth);
         let freqs: Vec<f64> = (0..nb)
-            .map(|k| (k as f64) * fs / (N_SYNTH as f64))
+            .map(|k| (k as f64) * fs / (n_synth as f64))
             .collect();
         let pre_delay_samples = (PRE_DELAY_S * fs).round().max(1.0) as usize;
         let pre_delay_s = (pre_delay_samples as f64) / fs;
@@ -558,28 +572,31 @@ impl KernelBank {
             );
         }
 
-        // 5. Broadband Parseval 7.0 diffuse power preservation (`TARGET_DF_POWER = 3.5`)
-        //    after reflections & de-comb so total loudness matches stock `g6ct` (`3.5017`)
-        //    without tilting the direct spectrum.
+        // 5. Audible-band Parseval 7.0 diffuse power preservation (`TARGET_DF_POWER = 3.5`)
+        //    over `0..=min(24 kHz, fs/2)` after reflections & de-comb so total loudness
+        //    matches stock `g6ct` (`3.5017`) identically at 48 kHz, 96 kHz, and 192 kHz
+        //    without ultrasonic bins biasing the gain or tilting the direct spectrum.
+        let f_ref = 24_000.0_f64.min(0.5 * fs);
+        let k_end = ((f_ref * (n_synth as f64) / fs).round() as usize).clamp(1, nb - 1);
+        let inv_band = 1.0 / ((2 * k_end) as f64);
         let mut tot_p = 0.0_f64;
-        let inv_n = 1.0 / (N_SYNTH as f64);
         for &ch in &DF_RING_SLOTS {
             let pl = (spec_l[ch][0].norm_sq()
-                + spec_l[ch][nb - 1].norm_sq()
+                + spec_l[ch][k_end].norm_sq()
                 + 2.0
-                    * spec_l[ch][1..nb - 1]
+                    * spec_l[ch][1..k_end]
                         .iter()
                         .map(|c| c.norm_sq())
                         .sum::<f64>())
-                * inv_n;
+                * inv_band;
             let pr = (spec_r[ch][0].norm_sq()
-                + spec_r[ch][nb - 1].norm_sq()
+                + spec_r[ch][k_end].norm_sq()
                 + 2.0
-                    * spec_r[ch][1..nb - 1]
+                    * spec_r[ch][1..k_end]
                         .iter()
                         .map(|c| c.norm_sq())
                         .sum::<f64>())
-                * inv_n;
+                * inv_band;
             tot_p += 0.5 * (pl + pr);
         }
         let g_bb = (TARGET_DF_POWER / tot_p.max(1e-12)).sqrt();
@@ -635,20 +652,20 @@ impl KernelBank {
             }
         }
 
-        // 8. IFFT to time domain, truncate to `N_IR`, and apply half-Kaiser tail taper.
-        let mut scratch = vec![Complex::ZERO; N_SYNTH];
-        let mut time_buf = vec![0.0_f64; N_SYNTH];
-        let mut ir_l = vec![vec![0.0_f64; N_IR]; SLOTS];
-        let mut ir_r = vec![vec![0.0_f64; N_IR]; SLOTS];
+        // 8. IFFT to time domain, truncate to `n_ir`, and apply half-Kaiser tail taper.
+        let mut scratch = vec![Complex::ZERO; n_synth];
+        let mut time_buf = vec![0.0_f64; n_synth];
+        let mut ir_l = vec![vec![0.0_f64; n_ir]; SLOTS];
+        let mut ir_r = vec![vec![0.0_f64; n_ir]; SLOTS];
 
         for ch in 0..SLOTS {
             plan.irfft(&spec_l[ch], &mut scratch, &mut time_buf);
-            ir_l[ch].copy_from_slice(&time_buf[..N_IR]);
-            half_kaiser_tail_apply(&mut ir_l[ch], KAISER_TAIL, KAISER_BETA);
+            ir_l[ch].copy_from_slice(&time_buf[..n_ir]);
+            half_kaiser_tail_apply(&mut ir_l[ch], kaiser_tail, KAISER_BETA);
 
             plan.irfft(&spec_r[ch], &mut scratch, &mut time_buf);
-            ir_r[ch].copy_from_slice(&time_buf[..N_IR]);
-            half_kaiser_tail_apply(&mut ir_r[ch], KAISER_TAIL, KAISER_BETA);
+            ir_r[ch].copy_from_slice(&time_buf[..n_ir]);
+            half_kaiser_tail_apply(&mut ir_r[ch], kaiser_tail, KAISER_BETA);
         }
 
         Self {
@@ -870,6 +887,32 @@ fn add_channel_reflections(
     let hpf_base: f64 = if base_az.abs() < 1e-6 { 520.0 } else { 400.0 };
     let hpf_fc = hpf_base.min(0.4 * fs);
 
+    // Precompute the unit-circle z^-1 phasors and the shared 4th-order reflection
+    // high-pass + direct-path DFEQ envelope once per channel rather than per tap/bin.
+    let z1s: Vec<Complex> = freqs
+        .iter()
+        .map(|&f| Complex::from_polar(1.0, -2.0 * PI * f / fs))
+        .collect();
+    let kh = (PI * hpf_fc / fs).tan();
+    let kh2 = kh * kh;
+    let sq2 = std::f64::consts::SQRT_2;
+    let h_norm = 1.0 / (1.0 + sq2 * kh + kh2);
+    let hb0 = h_norm;
+    let hb1 = -2.0 * h_norm;
+    let hb2 = h_norm;
+    let ha1 = 2.0 * (kh2 - 1.0) * h_norm;
+    let ha2 = (1.0 - sq2 * kh + kh2) * h_norm;
+    let hpf4_dfeq: Vec<Complex> = (0..nb)
+        .map(|k| {
+            let z1 = z1s[k];
+            let z2 = z1.mul(z1);
+            let num = Complex::new(hb0, 0.0).add(z1.scale(hb1)).add(z2.scale(hb2));
+            let den = Complex::ONE.add(z1.scale(ha1)).add(z2.scale(ha2));
+            let hpf2 = num.div(den);
+            hpf2.mul(hpf2).mul(dfeq_min[k])
+        })
+        .collect();
+
     for tap in taps {
         let g = tap.gain * refl_scale * base_scale;
         if g.abs() <= 1e-9 {
@@ -884,16 +927,20 @@ fn add_channel_reflections(
         let del_l_smp = (pre_delay_s + tap.delay_s + rt_l) * fs;
         let del_r_smp = (pre_delay_s + tap.delay_s + rt_r) * fs;
         let lpf_fc = tap.lpf_hz.min(0.45 * fs);
+        let kl = (PI * lpf_fc / fs).tan();
+        let l_norm = 1.0 / (1.0 + kl);
+        let lb0 = kl * l_norm;
+        let la1 = (kl - 1.0) * l_norm;
         for (k, &f) in freqs.iter().enumerate() {
-            let hpf2 = butter2_hpf(f, hpf_fc, fs);
-            let wall = hpf2
-                .mul(hpf2)
-                .mul(first_order_lpf(f, lpf_fc, fs))
-                .mul(dfeq_min[k]);
+            let z1 = z1s[k];
+            let lpf = Complex::new(lb0, 0.0)
+                .add(z1.scale(lb0))
+                .div(Complex::ONE.add(z1.scale(la1)));
+            let wall = hpf4_dfeq[k].mul(lpf);
             let bdl = brown_duda_mag(f, tap.az_deg, 1.0, 0.75);
             let bdr = brown_duda_mag(f, tap.az_deg, -1.0, 0.75);
-            let dl = causal_frac_delay(f, del_l_smp, fs).scale(g * bdl);
-            let dr = causal_frac_delay(f, del_r_smp, fs).scale(g * bdr);
+            let dl = causal_frac_delay_z(f, del_l_smp, fs, z1).scale(g * bdl);
+            let dr = causal_frac_delay_z(f, del_r_smp, fs, z1).scale(g * bdr);
             sl[k] = sl[k].add(wall.mul(dl));
             sr[k] = sr[k].add(wall.mul(dr));
         }
@@ -944,7 +991,7 @@ fn brown_duda_mag(f_hz: f64, az_deg: f64, ear_sign: f64, depth: f64) -> f64 {
     let alpha_raw =
         (1.0 + 0.5 * alpha_min) + (1.0 - 0.5 * alpha_min) * (diff * PI / theta_min).cos();
     let alpha = (1.0 + depth * (alpha_raw - 1.0)).clamp(0.08, 2.15);
-    let w0 = SPEED_OF_SOUND / HEAD_RADIUS_M;
+    let w0 = 2.0 * SPEED_OF_SOUND / HEAD_RADIUS_M;
     let x = (2.0 * PI * f_hz) / w0;
     ((alpha * alpha * x * x + 1.0) / (x * x + 1.0)).sqrt()
 }
@@ -1105,24 +1152,17 @@ fn butter4_lpf(f_hz: f64, fc_hz: f64, fs: f64) -> Complex {
     acc
 }
 
-/// Bilinear causal 1st-order low-pass filter.
-#[inline]
-fn first_order_lpf(f_hz: f64, fc_hz: f64, fs: f64) -> Complex {
-    let k = (PI * fc_hz / fs).tan();
-    let norm = 1.0 / (1.0 + k);
-    let b0 = k * norm;
-    let a1 = (k - 1.0) * norm;
-    let z1 = Complex::from_polar(1.0, -2.0 * PI * f_hz / fs);
-    let num = Complex::new(b0, 0.0).add(z1.scale(b0));
-    let den = Complex::ONE.add(z1.scale(a1));
-    num.div(den)
-}
-
 /// Strictly causal fractional sample delay (`total_samples >= 2.0`) combining an
 /// integer sample shift `z^{-d_int}` with a 2nd-order Thiran all-pass filter
 /// (`D = 2.0 + frac`, `|H| == 1.0` to machine precision, zero sinc pre-ringing).
 #[inline]
 fn causal_frac_delay(f_hz: f64, total_samples: f64, fs: f64) -> Complex {
+    let z1 = Complex::from_polar(1.0, -2.0 * PI * f_hz / fs);
+    causal_frac_delay_z(f_hz, total_samples, fs, z1)
+}
+
+#[inline]
+fn causal_frac_delay_z(f_hz: f64, total_samples: f64, fs: f64, z1: Complex) -> Complex {
     if total_samples < 2.0 {
         let d_int = total_samples.round().max(0.0);
         return Complex::from_polar(1.0, -2.0 * PI * f_hz * d_int / fs);
@@ -1133,32 +1173,12 @@ fn causal_frac_delay(f_hz: f64, total_samples: f64, fs: f64) -> Complex {
     let a1 = -2.0 * (d - 2.0) / (d + 1.0);
     let a2 = ((d - 1.0) * (d - 2.0)) / ((d + 1.0) * (d + 2.0));
 
-    let z1 = Complex::from_polar(1.0, -2.0 * PI * f_hz / fs);
     let z2 = z1.mul(z1);
     let num = Complex::new(a2, 0.0).add(z1.scale(a1)).add(z2);
     let den = Complex::ONE.add(z1.scale(a1)).add(z2.scale(a2));
     let ap = num.div(den);
     let shift = Complex::from_polar(1.0, -2.0 * PI * f_hz * d_int / fs);
     shift.mul(ap)
-}
-
-/// Bilinear causal 2nd-order Butterworth high-pass filter (studio reflection low-cut).
-#[inline]
-fn butter2_hpf(f_hz: f64, fc_hz: f64, fs: f64) -> Complex {
-    let k = (PI * fc_hz / fs).tan();
-    let k2 = k * k;
-    let sq2 = std::f64::consts::SQRT_2;
-    let norm = 1.0 / (1.0 + sq2 * k + k2);
-    let b0 = norm;
-    let b1 = -2.0 * norm;
-    let b2 = norm;
-    let a1 = 2.0 * (k2 - 1.0) * norm;
-    let a2 = (1.0 - sq2 * k + k2) * norm;
-    let z1 = Complex::from_polar(1.0, -2.0 * PI * f_hz / fs);
-    let z2 = z1.mul(z1);
-    let num = Complex::new(b0, 0.0).add(z1.scale(b1)).add(z2.scale(b2));
-    let den = Complex::ONE.add(z1.scale(a1)).add(z2.scale(a2));
-    num.div(den)
 }
 
 /// Dry ITU-R BS.1116 control-room (`6.0 × 5.0 × 3.0 m`) lateral early-reflection
@@ -1355,11 +1375,13 @@ pub struct BinauralPlus {
     sample_rate: u32,
     cfg: PlusCfg,
     pre_delay_samples: usize,
+    n_ir: usize,
+    ola_hop: usize,
     plan: FftPlan,
-    /// Pre-transformed `N_FFT/2 + 1` frequency-domain kernels for each slot.
+    /// Pre-transformed `n_fft/2 + 1` frequency-domain kernels for each slot.
     kern_l: Vec<Vec<Complex>>,
     kern_r: Vec<Vec<Complex>>,
-    /// Overlap tails (`N_IR - 1` samples) carried between blocks.
+    /// Overlap tails (`n_ir - 1` samples) carried between blocks.
     ov_l: Vec<f64>,
     ov_r: Vec<f64>,
     /// Reusable per-block scratch buffers (zero allocation in `process`).
@@ -1376,20 +1398,24 @@ pub struct BinauralPlus {
 impl BinauralPlus {
     pub fn new(mask: u32, cfg: PlusCfg, sample_rate: u32) -> Self {
         let bank = KernelBank::synthesize(cfg, sample_rate);
-        let plan = FftPlan::new(N_FFT);
-        let nb = N_FFT / 2 + 1;
-        let mut scratch = vec![Complex::ZERO; N_FFT];
-        let mut pad = vec![0.0_f64; N_FFT];
+        let scale = sr_scale(sample_rate);
+        let n_ir = N_IR * scale;
+        let n_fft = N_FFT * scale;
+        let ola_hop = n_fft - n_ir;
+        let plan = FftPlan::new(n_fft);
+        let nb = n_fft / 2 + 1;
+        let mut scratch = vec![Complex::ZERO; n_fft];
+        let mut pad = vec![0.0_f64; n_fft];
         let mut kern_l = vec![vec![Complex::ZERO; nb]; SLOTS];
         let mut kern_r = vec![vec![Complex::ZERO; nb]; SLOTS];
 
         for ch in 0..SLOTS {
             pad.fill(0.0);
-            pad[..N_IR].copy_from_slice(&bank.ir_l[ch]);
+            pad[..n_ir].copy_from_slice(&bank.ir_l[ch]);
             plan.rfft(&pad, &mut scratch, &mut kern_l[ch]);
 
             pad.fill(0.0);
-            pad[..N_IR].copy_from_slice(&bank.ir_r[ch]);
+            pad[..n_ir].copy_from_slice(&bank.ir_r[ch]);
             plan.rfft(&pad, &mut scratch, &mut kern_r[ch]);
         }
 
@@ -1398,18 +1424,20 @@ impl BinauralPlus {
             sample_rate,
             cfg,
             pre_delay_samples: bank.pre_delay_samples,
+            n_ir,
+            ola_hop,
             plan,
             kern_l,
             kern_r,
-            ov_l: vec![0.0_f64; N_IR - 1],
-            ov_r: vec![0.0_f64; N_IR - 1],
-            in_pad: vec![0.0_f64; N_FFT],
-            fft_scratch: vec![Complex::ZERO; N_FFT],
+            ov_l: vec![0.0_f64; n_ir - 1],
+            ov_r: vec![0.0_f64; n_ir - 1],
+            in_pad: vec![0.0_f64; n_fft],
+            fft_scratch: vec![Complex::ZERO; n_fft],
             x_bins: vec![Complex::ZERO; nb],
             acc_l: vec![Complex::ZERO; nb],
             acc_r: vec![Complex::ZERO; nb],
-            y_l: vec![0.0_f64; N_FFT],
-            y_r: vec![0.0_f64; N_FFT],
+            y_l: vec![0.0_f64; n_fft],
+            y_r: vec![0.0_f64; n_fft],
             finite: true,
         }
     }
@@ -1451,11 +1479,17 @@ impl BinauralPlus {
         }
         if self.mask == MASK_STEREO {
             if let Some(l) = inputs[SLOT_FL] {
+                if l[..frames].iter().any(|v| !v.is_finite()) {
+                    self.finite = false;
+                }
                 out_l[..frames].copy_from_slice(&l[..frames]);
             } else {
                 out_l[..frames].fill(0.0);
             }
             if let Some(r) = inputs[SLOT_FR] {
+                if r[..frames].iter().any(|v| !v.is_finite()) {
+                    self.finite = false;
+                }
                 out_r[..frames].copy_from_slice(&r[..frames]);
             } else {
                 out_r[..frames].fill(0.0);
@@ -1465,7 +1499,7 @@ impl BinauralPlus {
 
         let mut offset = 0usize;
         while offset < frames {
-            let m = (frames - offset).min(OLA_HOP);
+            let m = (frames - offset).min(self.ola_hop);
             self.process_hop(
                 inputs,
                 offset,
@@ -1485,12 +1519,15 @@ impl BinauralPlus {
         out_r: &mut [f64],
         m: usize,
     ) {
-        debug_assert!((1..=OLA_HOP).contains(&m));
-        let nb = N_FFT / 2 + 1;
+        debug_assert!((1..=self.ola_hop).contains(&m));
+        let nb = self.plan.len() / 2 + 1;
         self.acc_l.fill(Complex::ZERO);
         self.acc_r.fill(Complex::ZERO);
 
         for (ch, slot) in inputs.iter().enumerate() {
+            if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                continue;
+            }
             let Some(buf) = slot else { continue };
             let slice = &buf[offset..offset + m];
             // Fast silence skip per channel.
@@ -1516,7 +1553,7 @@ impl BinauralPlus {
         self.plan
             .irfft(&self.acc_r, &mut self.fft_scratch, &mut self.y_r);
 
-        let ov_len = N_IR - 1;
+        let ov_len = self.n_ir - 1;
         for i in 0..m {
             let ol = if i < ov_len { self.ov_l[i] } else { 0.0 };
             let or = if i < ov_len { self.ov_r[i] } else { 0.0 };
@@ -1540,7 +1577,7 @@ impl BinauralPlus {
         }
     }
 
-    /// Drain the remaining `N_IR - 1` overlap-add impulse tail at EOF and reset
+    /// Drain the remaining `n_ir - 1` overlap-add impulse tail at EOF and reset
     /// the tail state to zero. Returns empty vectors for stereo bypass.
     pub fn flush(&mut self) -> (Vec<f64>, Vec<f64>) {
         if self.mask == MASK_STEREO {
@@ -2138,6 +2175,134 @@ mod tests {
             ((trim_db40 - ref_db40) - (-3.911)).abs() < 0.15,
             "LFE LF-shelf trim at 40 Hz expected ~-3.91 dB, got {:+.3} dB",
             trim_db40 - ref_db40
+        );
+    }
+
+    /// High-sample-rate (`96 kHz`, `192 kHz`) kernels scale their FIR support to
+    /// preserve all early reflections (`<= 30 ms`) and match `48 kHz` audible-band
+    /// diffuse-field loudness within `±0.10 dB`.
+    #[test]
+    fn high_sample_rates_preserve_reflections_and_audible_loudness() {
+        let cfg = PlusCfg::from_profile(PlusProfile::Studio);
+        let b48 = KernelBank::synthesize(cfg, 48_000);
+        let b96 = KernelBank::synthesize(cfg, 96_000);
+        let b192 = KernelBank::synthesize(cfg, 192_000);
+
+        assert_eq!(b48.ir_l[SLOT_FC].len(), N_IR);
+        assert_eq!(b96.ir_l[SLOT_FC].len(), N_IR * 2);
+        assert_eq!(b192.ir_l[SLOT_FC].len(), N_IR * 4);
+
+        // FC's 28.4 ms lateral reflection (at ~29.4 ms with 1 ms pre-delay) must survive
+        // intact at 96 kHz (sample ~2822) and 192 kHz (sample ~5645) with clean tail decay.
+        let late96 = b96.ir_l[SLOT_FC][2700..3000]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            late96 > 1e-3,
+            "96 kHz 28.4 ms FC reflection truncated or missing: peak {late96:e}"
+        );
+        let tail96_db = 20.0
+            * b96.ir_l[SLOT_FC][b96.ir_l[SLOT_FC].len() - 4..]
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1e-20)
+                .log10();
+        assert!(
+            tail96_db < -140.0,
+            "96 kHz tail too loud: {tail96_db:.1} dB"
+        );
+
+        // Compare audible-band (20 Hz..18 kHz) 7.0 diffuse power between 48 kHz and 96/192 kHz.
+        let audible_df_power = |bank: &KernelBank, n_fft: usize| -> f64 {
+            let fs = bank.sample_rate as f64;
+            let k_max = ((18_000.0 * n_fft as f64 / fs).round() as usize).min(n_fft / 2);
+            let k_min = (20.0 * n_fft as f64 / fs).round() as usize;
+            let mut sum = 0.0_f64;
+            for &ch in &DF_RING_SLOTS {
+                let mut pl = vec![0.0; n_fft];
+                let mut pr = vec![0.0; n_fft];
+                pl[..bank.ir_l[ch].len()].copy_from_slice(&bank.ir_l[ch]);
+                pr[..bank.ir_r[ch].len()].copy_from_slice(&bank.ir_r[ch]);
+                let sl = rfft(&pl);
+                let sr = rfft(&pr);
+                for k in k_min..=k_max {
+                    sum += 0.5 * (sl[k].norm_sq() + sr[k].norm_sq());
+                }
+            }
+            sum / ((k_max - k_min + 1) as f64)
+        };
+        let p48 = audible_df_power(&b48, 4096);
+        let p96 = audible_df_power(&b96, 8192);
+        let p192 = audible_df_power(&b192, 16384);
+        let diff96 = 10.0 * (p96 / p48).log10();
+        let diff192 = 10.0 * (p192 / p48).log10();
+        assert!(
+            diff96.abs() < 0.10,
+            "96 kHz audible DF power drifted vs 48 kHz: {diff96:+.3} dB"
+        );
+        assert!(
+            diff192.abs() < 0.10,
+            "192 kHz audible DF power drifted vs 48 kHz: {diff192:+.3} dB"
+        );
+    }
+
+    /// Brown & Duda (1998) Eq. (5) uses `w0 = 2c/a` (`f0 = 1247.8 Hz` for `a = 8.75 cm`),
+    /// so at `f = f0` (`x = 1`) the head-shadow response equals `sqrt((alpha^2 + 1) / 2)`.
+    #[test]
+    fn brown_duda_matches_1998_eq5_cutoff_frequency() {
+        let f0 = SPEED_OF_SOUND / (PI * HEAD_RADIUS_M);
+        // Directly facing left ear (`az = +90°`, `diff = 0`): `alpha = 2.0`,
+        // so at `f = f0` (`x = 1`), `|H| = sqrt((4 + 1) / 2) = sqrt(2.5)`.
+        let ipsi = brown_duda_mag(f0, 90.0, 1.0, 1.0);
+        let want_ipsi = 2.5_f64.sqrt();
+        assert!(
+            (ipsi - want_ipsi).abs() < 1e-12,
+            "ipsilateral |H(f0)|={ipsi:.6}, expected sqrt(2.5)={want_ipsi:.6}"
+        );
+        // Contralateral shadow (`az = +90°`, right ear `-90°`, `diff = 180°`):
+        // `alpha = 1.05 + 0.95 * cos(180/150 * pi) = 1.05 + 0.95 * cos(216°)`.
+        let alpha_contra = 1.05 + 0.95 * (180.0 * PI / 150.0).cos();
+        let contra = brown_duda_mag(f0, 90.0, -1.0, 1.0);
+        let want_contra = ((alpha_contra * alpha_contra + 1.0) * 0.5).sqrt();
+        assert!(
+            (contra - want_contra).abs() < 1e-12,
+            "contralateral |H(f0)|={contra:.6}, expected {want_contra:.6}"
+        );
+    }
+
+    /// Stereo bypass must flag non-finite input samples, and multichannel mode must
+    /// ignore input slots whose bits are cleared in `mask`.
+    #[test]
+    fn stereo_bypass_detects_nan_and_multichannel_respects_mask() {
+        let mut st = BinauralPlus::new(MASK_STEREO, PlusCfg::default(), 48_000);
+        let bad_l = [0.0, f64::NAN, 0.0, 0.0];
+        let good_r = [0.0; 4];
+        let mut refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        refs[SLOT_FL] = Some(&bad_l);
+        refs[SLOT_FR] = Some(&good_r);
+        let mut out_l = [0.0; 4];
+        let mut out_r = [0.0; 4];
+        st.process(&refs, &mut out_l, &mut out_r, 4);
+        assert!(
+            !st.is_finite(),
+            "stereo bypass failed to flag non-finite input"
+        );
+
+        // Mask has FL|FR|FC only; a loud impulse placed on BL must be ignored.
+        let mask_3_0 = crate::dsp::CH_FL | crate::dsp::CH_FR | crate::dsp::CH_FC;
+        let mut eng = BinauralPlus::new(mask_3_0, PlusCfg::from_profile(PlusProfile::Pure), 48_000);
+        let mut bl = vec![0.0; 256];
+        bl[0] = 1.0;
+        let mut refs2: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        refs2[SLOT_BL] = Some(&bl);
+        let mut ol = vec![0.0; 256];
+        let mut or = vec![0.0; 256];
+        eng.process(&refs2, &mut ol, &mut or, 256);
+        assert!(
+            ol.iter().chain(&or).all(|&v| v == 0.0),
+            "unmasked BL slot leaked into output"
         );
     }
 }
