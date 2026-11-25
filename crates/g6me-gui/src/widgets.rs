@@ -1377,7 +1377,11 @@ pub fn soundfield_radar(
 
     // 4. Center dialogue focus beam (narrows & sharpens as `center_focus` rises).
     {
-        let focus = if is_plus { cfg.center_focus as f32 } else { 0.7 };
+        let focus = if is_plus {
+            cfg.center_focus as f32
+        } else {
+            0.7
+        };
         let half_beam = 22.0 - 15.0 * focus; // 22° wide when 0.0 -> 7° tight when 1.0
         let beam_r = 0.74 + 0.10 * focus;
         let mut poly = Vec::with_capacity(16);
@@ -1401,7 +1405,11 @@ pub fn soundfield_radar(
 
     // 5. Surround & rear immersion arc (`SL -> BL -> BR -> SR`, reacts to `surround_depth`).
     {
-        let depth = if is_plus { cfg.surround_depth as f32 } else { 1.0 };
+        let depth = if is_plus {
+            cfg.surround_depth as f32
+        } else {
+            1.0
+        };
         let sr_r = (0.66 + 0.16 * depth).clamp(0.68, 0.90);
         let mut pts = Vec::with_capacity(34);
         for i in 0..=32 {
@@ -1504,15 +1512,20 @@ pub fn soundfield_radar(
         accent_front,
     );
     let lfe_energy = live_in_params.map(|m| m[3]).unwrap_or(0.0);
-    let lfe_text = if is_plus && cfg.lfe_lpf {
-        "LFE 120Hz"
+    let lfe_text = if is_plus {
+        match (cfg.lfe_gain_db.abs() > 0.05, cfg.lfe_lpf) {
+            (true, true) => format!("LFE {:+.1}dB 120Hz", cfg.lfe_gain_db),
+            (true, false) => format!("LFE {:+.1}dB", cfg.lfe_gain_db),
+            (false, true) => "LFE 120Hz".to_string(),
+            (false, false) => "LFE".to_string(),
+        }
     } else {
-        "LFE"
+        "LFE".to_string()
     };
     p.text(
         rect.right_bottom() - Vec2::new(8.0, 7.0),
         Align2::RIGHT_BOTTOM,
-        lfe_text,
+        &lfe_text,
         FontId::monospace(9.5),
         if lfe_energy > 0.05 {
             accent_room

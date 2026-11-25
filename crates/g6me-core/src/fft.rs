@@ -59,6 +59,7 @@ impl Complex {
     }
 
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, o: Self) -> Self {
         Self {
             re: self.re + o.re,
@@ -67,6 +68,7 @@ impl Complex {
     }
 
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, o: Self) -> Self {
         Self {
             re: self.re - o.re,
@@ -75,6 +77,7 @@ impl Complex {
     }
 
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, o: Self) -> Self {
         Self {
             re: self.re * o.re - self.im * o.im,
@@ -83,6 +86,7 @@ impl Complex {
     }
 
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, o: Self) -> Self {
         let d = o.norm_sq();
         Self {
@@ -177,7 +181,10 @@ pub struct FftPlan {
 
 impl FftPlan {
     pub fn new(n: usize) -> Self {
-        assert!(n.is_power_of_two() && n >= 2, "FFT size must be power of 2 >= 2");
+        assert!(
+            n.is_power_of_two() && n >= 2,
+            "FFT size must be power of 2 >= 2"
+        );
         let mut bitrev = vec![0usize; n];
         let mut j = 0usize;
         for slot in bitrev.iter_mut() {
@@ -233,8 +240,7 @@ impl FftPlan {
     fn execute(&self, buf: &mut [Complex], inverse: bool) {
         let n = self.n;
         debug_assert_eq!(buf.len(), n);
-        for i in 0..n {
-            let j = self.bitrev[i];
+        for (i, &j) in self.bitrev.iter().enumerate().take(n) {
             if i < j {
                 buf.swap(i, j);
             }
@@ -524,7 +530,12 @@ mod tests {
         let n = 512;
         let plan = FftPlan::new(n);
         let orig: Vec<Complex> = (0..n)
-            .map(|i| Complex::new(((i * 37) % 101) as f64 * 0.01 - 0.5, ((i * 19) % 89) as f64 * 0.01))
+            .map(|i| {
+                Complex::new(
+                    ((i * 37) % 101) as f64 * 0.01 - 0.5,
+                    ((i * 19) % 89) as f64 * 0.01,
+                )
+            })
             .collect();
         let mut a = orig.clone();
         let mut b = orig;

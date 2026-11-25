@@ -88,6 +88,22 @@ pub struct Cli {
     #[arg(long, value_parser = parse_plus_bass_mono)]
     pub plus_bass_mono: Option<f64>,
 
+    /// G6+ coherent LF balance shelf trim in dB (-6.0 ..= 3.0; 340 Hz 1st-order causal shelf on full-range channels; discrete LFE untouched).
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_plus_bass_trim)]
+    pub plus_bass_trim: Option<f64>,
+
+    /// G6+ adaptive 1-ERB frontal phantom-center comb-notch fill (0.00 ..= 1.00).
+    #[arg(long, value_parser = parse_plus_unit)]
+    pub plus_decomb: Option<f64>,
+
+    /// G6+ discrete `.1` LFE gain offset in dB (-12.0 ..= 12.0; 0.0 matches Nuendo / Reference discrete LFE).
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_plus_lfe_gain)]
+    pub plus_lfe_gain: Option<f64>,
+
+    /// Apply G6+ `--plus-bass-trim` LF balance shelf to discrete `LFE` too (default leaves discrete LFE untouched).
+    #[arg(long)]
+    pub plus_lfe_lf_trim: bool,
+
     /// Disable the G6+ 120 Hz 4th-order Butterworth low-pass filter on the LFE channel.
     #[arg(long)]
     pub no_lfe_lpf: bool,
@@ -300,9 +316,7 @@ fn parse_renderer_mode(s: &str) -> Result<RendererMode, String> {
     match s.to_ascii_lowercase().as_str() {
         "reference" | "ref" | "classic" | "g6" => Ok(RendererMode::Reference),
         "plus" | "g6+" | "g6plus" => Ok(RendererMode::Plus),
-        other => Err(format!(
-            "unknown renderer mode '{other}' (reference, plus)"
-        )),
+        other => Err(format!("unknown renderer mode '{other}' (reference, plus)")),
     }
 }
 
@@ -331,6 +345,14 @@ fn parse_plus_unit(s: &str) -> Result<f64, String> {
 
 fn parse_plus_bass_mono(s: &str) -> Result<f64, String> {
     parse_span(s, "G6+ bass-mono frequency in Hz", 0.0, 250.0)
+}
+
+fn parse_plus_bass_trim(s: &str) -> Result<f64, String> {
+    parse_span(s, "G6+ LF balance trim in dB", -6.0, 3.0)
+}
+
+fn parse_plus_lfe_gain(s: &str) -> Result<f64, String> {
+    parse_span(s, "G6+ discrete LFE level in dB", -12.0, 12.0)
 }
 
 fn parse_depth(s: &str) -> Result<BitDepth, String> {
@@ -623,6 +645,18 @@ impl Cli {
         }
         if let Some(b) = self.plus_bass_mono {
             plus.bass_mono_hz = b;
+        }
+        if let Some(t) = self.plus_bass_trim {
+            plus.bass_trim_db = t;
+        }
+        if let Some(d) = self.plus_decomb {
+            plus.phantom_decomb = d;
+        }
+        if let Some(g) = self.plus_lfe_gain {
+            plus.lfe_gain_db = g;
+        }
+        if self.plus_lfe_lf_trim {
+            plus.lfe_lf_trim = true;
         }
         if self.no_lfe_lpf {
             plus.lfe_lpf = false;
@@ -1708,6 +1742,13 @@ mod tests {
             "1.30",
             "--plus-externalize",
             "0.25",
+            "--plus-bass-trim",
+            "-2.5",
+            "--plus-decomb",
+            "0.85",
+            "--plus-lfe-gain",
+            "-3.5",
+            "--plus-lfe-lf-trim",
             "--no-lfe-lpf",
             "x.mka",
         ])
@@ -1717,6 +1758,10 @@ mod tests {
         assert_eq!(cfg.plus.profile, PlusProfile::Custom);
         assert!((cfg.plus.width - 1.30).abs() < 1e-9);
         assert!((cfg.plus.externalize - 0.25).abs() < 1e-9);
+        assert!((cfg.plus.bass_trim_db - (-2.5)).abs() < 1e-9);
+        assert!((cfg.plus.phantom_decomb - 0.85).abs() < 1e-9);
+        assert!((cfg.plus.lfe_gain_db - (-3.5)).abs() < 1e-9);
+        assert!(cfg.plus.lfe_lf_trim);
         assert!(!cfg.plus.lfe_lpf);
     }
 

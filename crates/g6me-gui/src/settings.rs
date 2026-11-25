@@ -797,6 +797,25 @@ mod tests {
         let cfg = s.render_cfg();
         assert_eq!(cfg.renderer, RendererMode::Plus);
         assert_eq!(cfg.plus.profile, g6me_core::plus::PlusProfile::Cinema);
+        assert!((cfg.plus.bass_trim_db - (-2.1)).abs() < 1e-6);
+        assert!((cfg.plus.phantom_decomb - 0.75).abs() < 1e-6);
+        assert!(cfg.plus.lfe_gain_db.abs() < 1e-6);
+        assert!(!cfg.plus.lfe_lf_trim);
         assert!(describe(&s).contains("G6+ cinema"));
+
+        s.plus.bass_trim_db = -3.0;
+        s.plus.phantom_decomb = 0.90;
+        s.plus.lfe_gain_db = -4.5;
+        s.plus.lfe_lf_trim = true;
+        s.plus.sync_profile();
+        let custom_cfg = s.render_cfg();
+        assert_eq!(
+            custom_cfg.plus.profile,
+            g6me_core::plus::PlusProfile::Custom
+        );
+        assert!((custom_cfg.plus.bass_trim_db - (-3.0)).abs() < 1e-6);
+        assert!((custom_cfg.plus.phantom_decomb - 0.90).abs() < 1e-6);
+        assert!((custom_cfg.plus.lfe_gain_db - (-4.5)).abs() < 1e-6);
+        assert!(custom_cfg.plus.lfe_lf_trim);
     }
 }

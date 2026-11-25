@@ -144,7 +144,6 @@ impl Cards {
     }
 }
 
-
 /// One row of the queue table.
 struct Row {
     src: PathBuf,
@@ -854,9 +853,24 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("engine");
             ui.add_enabled_ui(!running, |ui| {
-                for m in [RendererMode::Reference, RendererMode::Plus] {
-                    ui.selectable_value(&mut self.settings.renderer, m, m.display_name());
-                }
+                ui.selectable_value(
+                    &mut self.settings.renderer,
+                    RendererMode::Reference,
+                    RendererMode::Reference.display_name(),
+                )
+                .on_hover_text(
+                    "Legacy Sound BlasterX G6 all-pass downmix (bit-exact hardware clone): \
+                     direct, punchy, with sharper surround phase contrast and no HRTF/DFEQ shaping.",
+                );
+                ui.selectable_value(
+                    &mut self.settings.renderer,
+                    RendererMode::Plus,
+                    RendererMode::Plus.display_name(),
+                )
+                .on_hover_text(
+                    "G6+ physical binaural renderer: speaker-like out-of-head width, natural \
+                     head shadow/ITD, and neutral 1-ERB diffuse-field EQ that preserves HyprEQ tonality.",
+                );
             });
         });
         ui.add_space(6.0);
@@ -913,7 +927,29 @@ impl App {
                     ui.add_enabled_ui(!running, |ui| {
                         for p in [PlusProfile::Pure, PlusProfile::Studio, PlusProfile::Cinema] {
                             let active = self.settings.plus.profile == p;
-                            if ui.selectable_label(active, p.display_name()).clicked() {
+                            let tip = match p {
+                                PlusProfile::Pure => {
+                                    "Pure anechoic speaker sphere: zero room reflections, strict \
+                                     0 dB LF balance, and no de-comb. Sounds maximally direct/dry, \
+                                     though close stereo mixes can feel closer to the head and warmer in bass."
+                                }
+                                PlusProfile::Studio => {
+                                    "Balanced nearfield control room: subtle lateral space (+9 dB DRR), \
+                                     -1.5 dB LF balance to clear stereo bass buildup, and 55% phantom \
+                                     de-comb for natural, unboxed vocals."
+                                }
+                                PlusProfile::Cinema => {
+                                    "Wide theatrical stage (±35°), richer surrounds (1.20x), deeper \
+                                     room cues, -2.1 dB LF balance, and 75% de-comb. Big spatial scale \
+                                     without boomy low-end."
+                                }
+                                PlusProfile::Custom => "",
+                            };
+                            if ui
+                                .selectable_label(active, p.display_name())
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
                                 self.settings.plus = PlusCfg::from_profile(p);
                             }
                         }
@@ -941,7 +977,9 @@ impl App {
                                     .fixed_decimals(2),
                             )
                             .on_hover_text(
-                                "Scales the frontal L/R speaker angle (1.00 = ±30° ITU standard).",
+                                "Spreads or narrows the front L/R speakers (±15° to ±45°; 1.00 = ±30°). \
+                                 Higher makes guitars, pads, and panning feel wider around your head; \
+                                 lower pulls lead focus and punch tighter inward.",
                             )
                             .changed()
                         {
@@ -958,7 +996,9 @@ impl App {
                                     .fixed_decimals(2),
                             )
                             .on_hover_text(
-                                "Tightens center-channel dialogue focus and dries its early reflections.",
+                                "Locks center dialogue crisp and forward by drying early reflections on FC. \
+                                 Higher sounds closer, clearer, and better anchored; lower blends speech \
+                                 more softly into the room.",
                             )
                             .changed()
                         {
@@ -974,7 +1014,9 @@ impl App {
                                     .fixed_decimals(2),
                             )
                             .on_hover_text(
-                                "Adjusts side/rear surround envelopment and front–back separation.",
+                                "Scales side and rear channel level (SL/SR/BL/BR) relative to the front. \
+                                 Raise for deeper 360° movie envelopment and Atmos height immersion; \
+                                 lower if ambient surrounds sit too loud.",
                             )
                             .changed()
                         {
@@ -990,7 +1032,9 @@ impl App {
                                     .fixed_decimals(2),
                             )
                             .on_hover_text(
-                                "Dry ITU-R BS.1116 lateral early reflections (≥ 8.8 ms, zero comb bounce). 0.00 = pure anechoic.",
+                                "Blends smooth, comb-free lateral studio reflections (>= 8.8 ms). \
+                                 Higher moves the soundstage out in front of your face like room speakers; \
+                                 0.00 gives dry, close in-head monitors.",
                             )
                             .changed()
                         {
@@ -1007,22 +1051,100 @@ impl App {
                                     .suffix(" Hz"),
                             )
                             .on_hover_text(
-                                "Causal 4th-order Linkwitz–Riley crossover keeping sub-bass phase-coherent across all headphones (0 = off).",
+                                "Sums sub-bass below this cutoff cleanly to center mono (4th-order LR4; 0 = off). \
+                                 Firms up kick impact and eliminates phase-hollow bass across headphones; \
+                                 0 keeps raw stereo/surround bass phase.",
                             )
                             .changed()
                         {
                             changed = true;
                         }
                     });
-                    if ui
-                        .checkbox(
-                            &mut p.lfe_lpf,
-                            "LFE 120 Hz low-pass (4th-order Butterworth, phase-aligned)",
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.label("LF balance");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.bass_trim_db, -6.0..=3.0)
+                                    .step_by(0.1)
+                                    .fixed_decimals(1)
+                                    .suffix(" dB"),
+                            )
+                            .on_hover_text(
+                                "Bauer / Linkwitz 340 Hz shelf trimming coherent in-phase bass buildup on \
+                                 full-range channels. Negative dB (-1.5 to -2.5) clears boxy warmth and \
+                                 boominess vs Reference; positive dB thickens low-end weight.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("phantom de-comb");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.phantom_decomb, 0.00..=1.00)
+                                    .step_by(0.01)
+                                    .fixed_decimals(2),
+                            )
+                            .on_hover_text(
+                                "Shirley–Kendrick adaptive 1-ERB fill for the 1.6–2.0 kHz comb notch when \
+                                 centered L/R signals overlap. Higher restores open vocal presence and snare \
+                                 snap without adding harsh cymbal treble.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("LFE level");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.lfe_gain_db, -12.0..=12.0)
+                                    .step_by(0.1)
+                                    .fixed_decimals(1)
+                                    .suffix(" dB"),
+                            )
+                            .on_hover_text(
+                                "Discrete `.1` LFE gain offset (-12 to +12 dB). 0.0 dB preserves exact \
+                                 Reference / Nuendo discrete LFE unity (when no bass is routed as objects \
+                                 into LFE); boost (+6 to +10 dB) for theatrical `.1` rumble or cut if LFE overpowers.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(
+                                &mut p.lfe_lpf,
+                                "LFE 120 Hz LPF",
+                            )
+                            .on_hover_text(
+                                "Rolls off discrete `.1` LFE above 120 Hz (phase-aligned 4th-order Butterworth). \
+                                 Keeps LFE strictly sub-bass rumble and prevents upper-bass bleed from muddying vocals.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut p.lfe_lf_trim,
+                                "apply LF balance to LFE",
+                            )
+                            .on_hover_text(
+                                "Off (default): discrete `.1` LFE ignores the LF balance shelf and stays at your \
+                                 exact LFE level (0.0 dB for Nuendo discrete LFE). On: applies the same 340 Hz \
+                                 LF balance shelf to `.1` so sub-bass tracks the main bed.",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
                 });
                 if changed {
                     self.settings.plus.sync_profile();
@@ -1036,11 +1158,19 @@ impl App {
                     None => "∞ (dry)".to_string(),
                 };
                 ui.monospace(format!(
-                    "FL ITD {fl_itd_us:.0} µs · FC DRR {drr} · DFEQ ±0.25 dB (1-ERB) · pre-delay 1.0 ms"
+                    "FL ITD {fl_itd_us:.0} µs · FC DRR {drr} · LF {:+.1} dB{} · LFE {:+.1} dB · decomb {:.0}% · DFEQ ±0.20 dB",
+                    self.settings.plus.bass_trim_db,
+                    if self.settings.plus.lfe_lf_trim {
+                        "+LFE"
+                    } else {
+                        ""
+                    },
+                    self.settings.plus.lfe_gain_db,
+                    self.settings.plus.phantom_decomb * 100.0,
                 ));
                 ui.weak(
-                    "Universal non-personalized cues (no ear scan or SOFA needed). Diffuse-field \
-                     flatness preserves HyprEQ / headphone EQ tonality and matches stock G6 loudness.",
+                    "Universal non-personalized cues (no ear scan or SOFA needed). Direct-path \
+                     1-ERB DFEQ + Bauer LF balance preserve HyprEQ tonality across stereo & 7.1.",
                 );
                 if let Err(e) = self.settings.plus.validate() {
                     ui.colored_label(egui::Color32::from_rgb(226, 110, 90), e);
@@ -1054,7 +1184,17 @@ impl App {
             ui.label("container");
             let prev_fmt = self.settings.format;
             for f in Format::ALL {
-                ui.selectable_value(&mut self.settings.format, f, f.label());
+                let tip = match f {
+                    Format::Flac => {
+                        "Lossless compressed audio: bit-for-bit identical sound to WAV at smaller file size."
+                    }
+                    Format::Wav => {
+                        "Uncompressed PCM/float audio: bit-for-bit identical sound at 16/24-bit, plus \
+                         supports 32-bit float to preserve overs above 0 dBFS without clipping."
+                    }
+                };
+                ui.selectable_value(&mut self.settings.format, f, f.label())
+                    .on_hover_text(tip);
             }
             if self.settings.format != prev_fmt && !self.runner.is_running() {
                 self.rebuild_queue();
@@ -1065,7 +1205,13 @@ impl App {
                 let mut l = self.settings.flac_level;
                 // ffmpeg's FLAC encoder counts 0..=12 and refuses 13; the reference
                 // flac CLI's -0..-8 presets are a different scale and not in use.
-                if ui.add(egui::DragValue::new(&mut l).range(0..=12)).changed() {
+                if ui
+                    .add(egui::DragValue::new(&mut l).range(0..=12))
+                    .on_hover_text(
+                        "Lossless compression effort only: zero sonic difference across 0..12.",
+                    )
+                    .changed()
+                {
                     self.settings.flac_level = l.min(12);
                 }
                 ui.weak("(0 fast … 12 smallest)");
@@ -1084,7 +1230,12 @@ impl App {
                         };
                         ui.selectable_value(&mut self.settings.depth, d, label);
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Sets output quantization floor: 24-bit (-144 dB) is transparent; 16-bit raises \
+                     background hiss slightly on quiet tails; 32-bit float keeps peaks above 0 dBFS intact.",
+                );
             if self.settings.depth == BitDepth::S24 && self.settings.format == Format::Flac {
                 // Not a claim about a version string: the probe encodes a known
                 // 24-bit block with this ffmpeg and checks the bytes come back.
@@ -1161,7 +1312,12 @@ impl App {
                             ),
                         );
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Reporting detector oversampling only: changes no sound or output bytes; higher \
+                     ratios catch inter-sample peaks more accurately.",
+                );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak(format!("at {}", self.settings.tp_ratio.chain()));
             });
@@ -1181,16 +1337,15 @@ impl App {
         // box gets ticked from a measurement rather than from a hunch.
         ui.checkbox(&mut self.settings.dc_block, "block DC (5 Hz high-pass)")
             .on_hover_text(
-                "Removes DC before the gain trim and the limiter: exactly zero at DC, \
-                 exactly unity at Nyquist, so the top octave is left alone. Off is the \
-                 bit-exact path -- the downmixer contributes a settled +4e-10, which is \
-                 not the reason to press this. What is: a 7.1 matrix carries an input \
-                 offset at +5.18 on the left, and real recordings arrive with 1e-4 of it. \
-                 The meter history shows each file's measured dc_offset. Turning this on \
-                 changes every byte, so every hash changes with it.",
+                "Removes DC offset below 5 Hz without altering audible bass, mids, or treble. \
+                 Prevents silent DC bias from prematurely triggering the limiter or clicking at edits.",
             );
         ui.add_space(6.0);
-        ui.checkbox(&mut self.settings.limiter, "limit the true peak");
+        ui.checkbox(&mut self.settings.limiter, "limit the true peak")
+            .on_hover_text(
+                "Transparent two-stage lookahead limiter catching inter-sample overs above your ceiling \
+                 so DACs and AAC/Opus encoders don't clip or crackle on hot surround peaks.",
+            );
         if !self.settings.limiter {
             ui.weak("Off: files are measured, never changed.");
             return;
@@ -1210,6 +1365,10 @@ impl App {
                         .speed(0.05)
                         .suffix(" dBTP"),
                 )
+                .on_hover_text(
+                    "Lowers overall level cleanly by this dB and caps peaks there too. \
+                     Keeps dynamic punch natural by padding headroom so the limiter only catches stray crests.",
+                )
                 .changed()
             {
                 st.setpoint_db = Some(sp.clamp(-24.0, 0.0));
@@ -1224,7 +1383,11 @@ impl App {
                     }
                 ));
             }
-            if ui.button("separate").clicked() {
+            if ui
+                .button("separate")
+                .on_hover_text("Decouples pre-gain trim from peak ceiling so you can preserve raw loudness.")
+                .clicked()
+            {
                 st.setpoint_db = None;
             }
         });
@@ -1238,6 +1401,10 @@ impl App {
                         .range(-24.0..=0.0)
                         .speed(0.05)
                         .suffix(" dBTP"),
+                )
+                .on_hover_text(
+                    "Maximum peak level allowed cleanly out of the limiter (-1.0 to -0.3 dBTP avoids DAC \
+                     reconstruction clipping while keeping full transient snap).",
                 )
                 .changed()
             {
@@ -1254,6 +1421,10 @@ impl App {
                         )
                         .speed(0.02)
                         .suffix(" ms"),
+                )
+                .on_hover_text(
+                    "Pre-reads upcoming transients so gain ducks smoothly right before peaks arrive, \
+                     avoiding harsh clicky clipping distortion.",
                 )
                 .changed()
             {
@@ -1274,7 +1445,12 @@ impl App {
                     for r in Ratio::ALL {
                         ui.selectable_value(&mut st.limit_ratio, Some(r), r.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Oversampling precision inside the limiter detector: higher catches sharp inter-sample \
+                     overs cleanly so crisp highs never saturate.",
+                );
         });
         // The slow stage's shape and how much of it the channels share. Both linking
         // controls live here rather than behind a menu, because the damage they prevent
@@ -1292,6 +1468,10 @@ impl App {
                         .speed(0.5)
                         .suffix(" ms"),
                 )
+                .on_hover_text(
+                    "How fast the slow leveling stage ducks sustained loud bursts: slower preserves \
+                     drum punch; faster softens continuous loudness earlier.",
+                )
                 .changed()
             {
                 st.attack_ms = a;
@@ -1307,6 +1487,10 @@ impl App {
                         .speed(2.0)
                         .suffix(" ms"),
                 )
+                .on_hover_text(
+                    "How fast level recovers after a loud peak: too short sounds pumped/gritty on bass; \
+                     longer feels transparent and smooth.",
+                )
                 .changed()
             {
                 st.release_ms = r;
@@ -1320,6 +1504,10 @@ impl App {
                         .speed(1.0)
                         .suffix("% transient"),
                 )
+                .on_hover_text(
+                    "How much L and R duck fast peaks together: high linking keeps centered kicks/snares \
+                     dead-center without pulling sideways.",
+                )
                 .changed()
             {
                 st.link_transient_pct = lt;
@@ -1331,6 +1519,10 @@ impl App {
                         .range(0.0..=100.0)
                         .speed(1.0)
                         .suffix("% release"),
+                )
+                .on_hover_text(
+                    "How much L and R share slow recovery: keeping this moderate prevents loud hits on \
+                     one side from dipping the quiet opposite ear.",
                 )
                 .changed()
             {
@@ -1422,6 +1614,10 @@ impl App {
         ui.checkbox(
             &mut self.settings.resample,
             "resample the input before the downmix (libsoxr)",
+        )
+        .on_hover_text(
+            "Converts source sample rate before binaural filtering so crossfeed, phase, and \
+             DFEQ timbre stay true on 44.1 / 96 / 192 kHz files.",
         );
         ui.weak(
             "Rate conversion happens before the downmix, never after: the filter coefficients \
@@ -1438,6 +1634,10 @@ impl App {
                             .speed(100)
                             .range(8_000..=384_000),
                     )
+                    .on_hover_text(
+                        "48000 Hz matches native Reference G6 / Dolby Atmos filter timing cleanly; \
+                         higher rates extend ultrasonic bandwidth.",
+                    )
                     .changed()
                 {
                     self.settings.rate = r;
@@ -1453,7 +1653,11 @@ impl App {
                 }
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.settings.use_resample_depth, "quantize to");
+                ui.checkbox(&mut self.settings.use_resample_depth, "quantize to")
+                    .on_hover_text(
+                        "Truncates resampled audio to 16 or 32 bits before downmixing. Keep off (32-bit \
+                         float internal) for cleanest headroom and lowest noise.",
+                    );
                 egui::ComboBox::from_id_salt("rsdepth")
                     .selected_text(self.settings.resample_depth.label())
                     .show_ui(ui, |ui| {
@@ -1472,11 +1676,19 @@ impl App {
                             .text("bits")
                             .step_by(1.0),
                     )
+                    .on_hover_text(
+                        "Controls anti-aliasing steepness and stopband depth: 33 bits virtually \
+                         eliminates treble foldback/aliasing glare.",
+                    )
                     .changed()
                 {
                     self.settings.precision = p;
                 }
-                ui.checkbox(&mut self.settings.cheby, "Chebyshev passband");
+                ui.checkbox(&mut self.settings.cheby, "Chebyshev passband")
+                    .on_hover_text(
+                        "Trades tiny passband ripple for a steeper top-octave cutoff. Leave off for \
+                         flattest frequency and phase linearity.",
+                    );
             });
             ui.horizontal(|ui| {
                 ui.label("dither");
@@ -1486,7 +1698,12 @@ impl App {
                         for d in Dither::ALL {
                             ui.selectable_value(&mut self.settings.dither, d, d.label());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(
+                        "Adds ultra-faint noise when quantizing down so quiet reverb tails fade \
+                         smoothly instead of breaking into gritty distortion.",
+                    );
                 if self.settings.dither != Dither::None {
                     ui.weak("deterministic: the same input gives the same output every run");
                 }
@@ -1505,6 +1722,10 @@ impl App {
         ui.checkbox(
             &mut self.settings.ir,
             "convolve every input channel with a headphone correction IR",
+        )
+        .on_hover_text(
+            "Applies your headphone/room correction EQ impulse response (e.g. AutoEQ / HyprEQ) to \
+             every speaker before binaural downmixing.",
         );
         ui.weak(
             "Same shape mpv uses: mono IR, applied to all input channels before the downmix, \
@@ -1544,12 +1765,17 @@ impl App {
                 let mut n = self.settings.ir_norm;
                 if ui
                     .add(egui::DragValue::new(&mut n).speed(0.05).range(-1.0..=2.0))
+                    .on_hover_text(
+                        "Rescales the IR's loudness before convolving. Leave at -1 for measured EQ \
+                         curves so target bass/treble gain stays calibrated.",
+                    )
                     .changed()
                 {
                     self.settings.ir_norm = n;
                 }
                 if ui
                     .selectable_label(self.settings.ir_norm == -1.0, "none (-1)")
+                    .on_hover_text("Disables IR loudness rescaling so exact filter gain is preserved.")
                     .clicked()
                 {
                     self.settings.ir_norm = -1.0;
@@ -1561,14 +1787,21 @@ impl App {
                 let mut w = self.settings.ir_wet;
                 if ui
                     .add(egui::Slider::new(&mut w, 0.0..=2.0).step_by(0.05))
+                    .on_hover_text(
+                        "Controls how strongly the EQ/room IR shapes the sound (1.00 = full effect).",
+                    )
                     .changed()
                 {
                     self.settings.ir_wet = w;
                 }
-                ui.checkbox(&mut self.settings.use_ir_dry, "dry");
+                ui.checkbox(&mut self.settings.use_ir_dry, "dry")
+                    .on_hover_text(
+                        "Blends unprocessed direct signal back in to tame extreme headphone EQ or reverb.",
+                    );
                 if self.settings.use_ir_dry {
                     let mut d = self.settings.ir_dry;
-                    ui.add(egui::Slider::new(&mut d, 0.0..=2.0).step_by(0.05));
+                    ui.add(egui::Slider::new(&mut d, 0.0..=2.0).step_by(0.05))
+                        .on_hover_text("Dry blend level alongside the convolved wet signal.");
                     self.settings.ir_dry = d;
                 }
             });
@@ -1592,13 +1825,18 @@ impl App {
                         ] {
                             ui.selectable_value(&mut cur, Some(g), g.ffmpeg_name());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(
+                        "Selects how ffmpeg normalizes overall IR gain (dc/rms/peak/none) when irnorm >= 0.",
+                    );
                 self.settings.ir_gtype = cur;
                 ui.label("partition");
                 let mut mn = self.settings.ir_minp;
                 let mut mx = self.settings.ir_maxp;
                 if ui
                     .add(egui::DragValue::new(&mut mn).range(64..=65536))
+                    .on_hover_text("FFT block partition size in ffmpeg afir (speed only; sonically identical).")
                     .changed()
                 {
                     self.settings.ir_minp = mn;
@@ -1606,6 +1844,7 @@ impl App {
                 ui.label("…");
                 if ui
                     .add(egui::DragValue::new(&mut mx).range(64..=65536))
+                    .on_hover_text("Maximum FFT partition size in ffmpeg afir (speed only; sonically identical).")
                     .changed()
                 {
                     self.settings.ir_maxp = mx;
@@ -1623,6 +1862,10 @@ impl App {
                         .speed(0.02)
                         .range(0.0..=1.0)
                         .fixed_decimals(2),
+                )
+                .on_hover_text(
+                    "Fraction of the IR tail used (0 or 1 = whole IR). Shortening truncates low-bass \
+                     resolution and room decay.",
                 );
                 self.settings.ir_length = l;
                 ui.weak("(fraction of the IR; 0 or 1 = whole)");
@@ -1891,7 +2134,6 @@ impl App {
                     ctx.request_repaint();
                 }
             });
-            return;
         }
         #[cfg(not(feature = "native-dialogs"))]
         {

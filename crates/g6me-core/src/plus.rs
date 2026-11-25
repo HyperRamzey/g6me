@@ -25,18 +25,26 @@
 //!    `BL`/`BR` above `bass_mono_hz` prevents coherent `+4.4 dB` phase-locked
 //!    pileup when DEE folds `.4` Atmos heights simultaneously into `SL+BL`/`SR+BR`,
 //!    with 0.00 dB individual magnitude coloration and 0 µs ITD corruption.
-//! 6. **Dry ITU-R BS.1116 lateral early reflections** (`>= 8.5 ms`, zero `< 6 ms`
-//!    comb bounce, `180 Hz` HPF + studio wall HF damping) controlled by
-//!    `externalize` and `center_focus`.
-//! 7. **Strict 1-ERB common Diffuse-Field Equalization (DFEQ)** applied as one
-//!    shared causal minimum-phase filter to all full-range channels, preserving
-//!    every ITD, ILD, and L/R symmetry to machine precision while keeping the
-//!    diffuse-field response flat (`<= ±0.25 dB`, `20 Hz – 18 kHz`).
-//! 8. **LFE**: optional 120 Hz 4th-order Butterworth LPF aligned to `PRE_DELAY`,
-//!    mono `1/sqrt(2)` in-phase to both ears, zero reflections.
-//! 9. **Streaming overlap-add engine** (`N_IR = 2048`, `N_FFT = 8192`, `HOP = 6144`)
-//!    with 1:1 block emission, `1.0 ms` (`48`-sample @ 48 kHz) causal pre-delay,
-//!    and deterministic zero-FMA `f64` arithmetic.
+//! 6. **Direct-path 1-ERB common Diffuse-Field Equalization (Zaunschirm,
+//!    Schörkhuber & Höldrich, JASA 2018)**: equalizes the direct 7.0 ring
+//!    to within `<= ±0.25 dB` independently of lateral room reflections so
+//!    `> 400 Hz` early reflections never pull down direct midrange relative to bass,
+//!    followed by broadband Parseval reflection power normalization (`3.50`).
+//! 7. **Smooth alternating-polarity ITU-R BS.1116 lateral early reflections**
+//!    (`>= 8.5 ms`, zero `< 6 ms` comb bounce, `Hassager, Gran & Dau, JASA 2016`
+//!    smoothed diffuse tail) controlled by `externalize` and `center_focus`.
+//! 8. **Adaptive 1-ERB Shirley–Kendrick–Churchill (JAES 2007) phantom-center
+//!    de-comb** (`phantom_decomb`): measures each frontal stereo pair's crosstalk
+//!    comb-filter deficit above `450 Hz` and fills it in causal minimum phase so
+//!    stereo/music vocals stay open without tonal hollowing.
+//! 9. **Bauer / Linkwitz / Völk–Fastl (AES 2011) coherent LF trim shelf**
+//!    (`bass_trim_db`): user-tunable 1st-order causal minimum-phase `340 Hz`
+//!    shelf on full-range channels (discrete `LFE` left untouched) compensating
+//!    in-phase low-frequency summation (`+3..+4 dB`) on correlated music and
+//!    surround mixes vs `Reference`.
+//! 10. **LFE & Streaming OLA**: optional 120 Hz 4th-order Butterworth LPF aligned
+//!     to `PRE_DELAY`, mono `1/sqrt(2)` in-phase to both ears; `N_IR = 2048`,
+//!     `N_FFT = 8192`, `HOP = 6144`, deterministic zero-FMA `f64` arithmetic.
 
 use std::f64::consts::PI;
 
@@ -137,8 +145,12 @@ impl PlusProfile {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Pure => "Pure physical head-shadow & ITD cues, zero room reflections, strict DFEQ",
-            Self::Studio => "Dry ITU-BS.1116 control-room lateral cues (DRR ~+9 dB), tight dialogue focus",
+            Self::Pure => {
+                "Pure physical head-shadow & ITD cues, zero room reflections, strict DFEQ"
+            }
+            Self::Studio => {
+                "Dry ITU-BS.1116 control-room lateral cues (DRR ~+9 dB), tight dialogue focus"
+            }
             Self::Cinema => "Wider frontal stage, deeper surrounds, richer lateral externalization",
             Self::Custom => "Custom soundfield tuning",
         }
@@ -161,6 +173,18 @@ pub struct PlusCfg {
     pub externalize: f64,
     /// Causal LR4 bass-mono crossover frequency in Hz (`0.0` disables; `60..=200` typical).
     pub bass_mono_hz: f64,
+    /// Bauer / Linkwitz coherent low-frequency balance trim in dB (`-6.0 ..= +3.0 dB`,
+    /// 1st-order causal minimum-phase shelf at `340 Hz` on full-range channels; discrete
+    /// `LFE` left untouched). Tames coherent stereo/surround bass buildup vs `Reference`.
+    pub bass_trim_db: f64,
+    /// Shirley–Kendrick adaptive 1-ERB phantom-center comb-notch fill (`0.00 ..= 1.00`).
+    pub phantom_decomb: f64,
+    /// Discrete `.1` LFE gain offset in dB (`-12.0 ..= +12.0 dB`; `0.0` = unity `1/sqrt(2)`
+    /// matching Reference / Nuendo 0 dB discrete LFE).
+    pub lfe_gain_db: f64,
+    /// Apply `bass_trim_db` (340 Hz LF balance shelf) to discrete `LFE` as well (`false` keeps
+    /// discrete `LFE` at `0 dB` relative to untrimmed Reference; `true` trims `.1` with mains).
+    pub lfe_lf_trim: bool,
     /// Apply 120 Hz 4th-order Butterworth low-pass filter to the LFE channel.
     pub lfe_lpf: bool,
 }
@@ -181,6 +205,10 @@ impl PlusCfg {
                 surround_depth: 1.00,
                 externalize: 0.00,
                 bass_mono_hz: 120.0,
+                bass_trim_db: 0.0,
+                phantom_decomb: 0.00,
+                lfe_gain_db: 0.0,
+                lfe_lf_trim: false,
                 lfe_lpf: true,
             },
             PlusProfile::Studio => Self {
@@ -190,6 +218,10 @@ impl PlusCfg {
                 surround_depth: 1.00,
                 externalize: 0.45,
                 bass_mono_hz: 120.0,
+                bass_trim_db: -1.5,
+                phantom_decomb: 0.55,
+                lfe_gain_db: 0.0,
+                lfe_lf_trim: false,
                 lfe_lpf: true,
             },
             PlusProfile::Cinema => Self {
@@ -199,6 +231,10 @@ impl PlusCfg {
                 surround_depth: 1.20,
                 externalize: 0.75,
                 bass_mono_hz: 110.0,
+                bass_trim_db: -2.1,
+                phantom_decomb: 0.75,
+                lfe_gain_db: 0.0,
+                lfe_lf_trim: false,
                 lfe_lpf: true,
             },
             PlusProfile::Custom => Self {
@@ -217,6 +253,10 @@ impl PlusCfg {
                 && (self.surround_depth - r.surround_depth).abs() < 1e-4
                 && (self.externalize - r.externalize).abs() < 1e-4
                 && (self.bass_mono_hz - r.bass_mono_hz).abs() < 0.25
+                && (self.bass_trim_db - r.bass_trim_db).abs() < 0.05
+                && (self.phantom_decomb - r.phantom_decomb).abs() < 1e-4
+                && (self.lfe_gain_db - r.lfe_gain_db).abs() < 0.05
+                && self.lfe_lf_trim == r.lfe_lf_trim
                 && self.lfe_lpf == r.lfe_lpf
             {
                 return p;
@@ -231,7 +271,10 @@ impl PlusCfg {
 
     pub fn validate(&self) -> std::result::Result<(), String> {
         if !self.width.is_finite() || !(0.5..=1.5).contains(&self.width) {
-            return Err(format!("plus.width must be in 0.50..=1.50, got {}", self.width));
+            return Err(format!(
+                "plus.width must be in 0.50..=1.50, got {}",
+                self.width
+            ));
         }
         if !self.center_focus.is_finite() || !(0.0..=1.0).contains(&self.center_focus) {
             return Err(format!(
@@ -257,18 +300,40 @@ impl PlusCfg {
                 self.bass_mono_hz
             ));
         }
+        if !self.bass_trim_db.is_finite() || !(-6.0..=3.0).contains(&self.bass_trim_db) {
+            return Err(format!(
+                "plus.bass_trim_db must be in -6.0..=+3.0 dB, got {}",
+                self.bass_trim_db
+            ));
+        }
+        if !self.phantom_decomb.is_finite() || !(0.0..=1.0).contains(&self.phantom_decomb) {
+            return Err(format!(
+                "plus.phantom_decomb must be in 0.00..=1.00, got {}",
+                self.phantom_decomb
+            ));
+        }
+        if !self.lfe_gain_db.is_finite() || !(-12.0..=12.0).contains(&self.lfe_gain_db) {
+            return Err(format!(
+                "plus.lfe_gain_db must be in -12.0..=+12.0 dB, got {}",
+                self.lfe_gain_db
+            ));
+        }
         Ok(())
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "G6+ {} (width {:.2}, focus {:.2}, surr {:.2}, ext {:.2}, bass-mono {:.0} Hz{})",
+            "G6+ {} (width {:.2}, focus {:.2}, surr {:.2}, ext {:.2}, bass-mono {:.0} Hz, lf {:+.1} dB{}, decomb {:.2}, lfe {:+.1} dB{})",
             self.profile.label(),
             self.width,
             self.center_focus,
             self.surround_depth,
             self.externalize,
             self.bass_mono_hz,
+            self.bass_trim_db,
+            if self.lfe_lf_trim { "+lfe" } else { "" },
+            self.phantom_decomb,
+            self.lfe_gain_db,
             if self.lfe_lpf { ", lfe-lpf" } else { "" },
         )
     }
@@ -355,7 +420,9 @@ impl KernelBank {
         let fs = (sample_rate.max(8_000)) as f64;
         let nb = N_SYNTH / 2 + 1;
         let plan = FftPlan::new(N_SYNTH);
-        let freqs: Vec<f64> = (0..nb).map(|k| (k as f64) * fs / (N_SYNTH as f64)).collect();
+        let freqs: Vec<f64> = (0..nb)
+            .map(|k| (k as f64) * fs / (N_SYNTH as f64))
+            .collect();
         let pre_delay_samples = (PRE_DELAY_S * fs).round().max(1.0) as usize;
         let pre_delay_s = (pre_delay_samples as f64) / fs;
 
@@ -384,15 +451,16 @@ impl KernelBank {
             ap_rear[k] = num.div(den);
         }
 
-        let mut spec_l: Vec<Vec<Complex>> = vec![vec![Complex::ZERO; nb]; SLOTS];
-        let mut spec_r: Vec<Vec<Complex>> = vec![vec![Complex::ZERO; nb]; SLOTS];
+        let mut dir_l: Vec<Vec<Complex>> = vec![vec![Complex::ZERO; nb]; SLOTS];
+        let mut dir_r: Vec<Vec<Complex>> = vec![vec![Complex::ZERO; nb]; SLOTS];
+        let mut chan_weights = [1.0_f64; SLOTS];
 
-        // 1. Synthesize each full-range slot (direct path + dry lateral reflections).
+        // 1. Synthesize each full-range slot's anechoic direct path first.
         for ch in 0..SLOTS {
             if ch == SLOT_LFE {
                 continue;
             }
-            let (sl, sr) = synthesize_channel_spectrum(
+            let (sl, sr, cw) = synthesize_direct_spectrum(
                 ch,
                 &cfg,
                 fs,
@@ -403,43 +471,133 @@ impl KernelBank {
                 &ap_rear,
                 &plan,
             );
-            spec_l[ch] = sl;
-            spec_r[ch] = sr;
+            dir_l[ch] = sl;
+            dir_r[ch] = sr;
+            chan_weights[ch] = cw;
         }
 
-        // 2. Strict 1-ERB common Diffuse-Field Equalization (DFEQ) across the 7.0 ring.
-        //    Normalizes total uncorrelated 7.0 per-ear power to `TARGET_DF_POWER = 3.5`
-        //    (matching stock `g6ct` = `3.5017` to within 0.002 dB).
-        let mut p_df = vec![0.0_f64; nb];
+        // 2. Direct-path 1-ERB common Diffuse-Field Equalization (Zaunschirm,
+        //    Schörkhuber & Höldrich, JASA 2018): computing DFEQ on the direct 7.0
+        //    ring alone prevents `> 400 Hz` lateral room reflections from biasing DFEQ
+        //    into attenuating direct midrange vs sub-150 Hz bass.
+        let mut p_dir = vec![0.0_f64; nb];
         for &ch in &DF_RING_SLOTS {
             for k in 0..nb {
-                p_df[k] += 0.5 * (spec_l[ch][k].norm_sq() + spec_r[ch][k].norm_sq());
+                p_dir[k] += 0.5 * (dir_l[ch][k].norm_sq() + dir_r[ch][k].norm_sq());
             }
         }
-        let p_df_smooth = roex_smooth_power(&freqs, &p_df, 0.75);
-        let dfeq_mag: Vec<f64> = p_df_smooth
+        let p_dir_smooth = roex_smooth_power(&freqs, &p_dir, 0.75);
+        let dfeq_mag: Vec<f64> = p_dir_smooth
             .iter()
             .map(|&p| (TARGET_DF_POWER / p.max(1e-9)).sqrt().clamp(0.25, 4.0))
             .collect();
         let dfeq_min = minimum_phase_spectrum(&dfeq_mag, &plan);
 
-        // Apply the single common causal minimum-phase DFEQ identically to every
-        // full-range channel (both L and R) so ITD, ILD, and L/R symmetry are
-        // mathematically invariant.
+        // Apply the common direct-path DFEQ to every full-range channel identically
+        // so ITD, ILD, and L/R symmetry stay mathematically invariant.
         for ch in 0..SLOTS {
             if ch == SLOT_LFE {
                 continue;
             }
             for k in 0..nb {
-                spec_l[ch][k] = spec_l[ch][k].mul(dfeq_min[k]);
-                spec_r[ch][k] = spec_r[ch][k].mul(dfeq_min[k]);
+                dir_l[ch][k] = dir_l[ch][k].mul(dfeq_min[k]);
+                dir_r[ch][k] = dir_r[ch][k].mul(dfeq_min[k]);
             }
         }
 
-        // 3. Synthesize LFE: mono `1/sqrt(2)` per ear (so `gL^2 + gR^2 = 1.0`,
-        //    matching stock `g6ct` LFE energy), aligned to `pre_delay_s`, optional
-        //    causal 120 Hz 4th-order Butterworth LPF, zero reflections.
-        let lfe_gain = std::f64::consts::FRAC_1_SQRT_2;
+        let mut spec_l = dir_l.clone();
+        let mut spec_r = dir_r.clone();
+
+        // 3. Add dry smooth alternating-polarity ITU-R BS.1116 / Hassager–Gran–Dau
+        //    lateral early reflections (`>= 8.5 ms`) when `externalize > 0`, filtered by
+        //    the direct diffuse envelope (`dfeq_min`) for clean spectral integration.
+        if cfg.externalize > 1e-6 {
+            for ch in 0..SLOTS {
+                if ch == SLOT_LFE {
+                    continue;
+                }
+                add_channel_reflections(
+                    ch,
+                    &cfg,
+                    fs,
+                    pre_delay_s,
+                    chan_weights[ch],
+                    &freqs,
+                    &dfeq_min,
+                    &mut spec_l[ch],
+                    &mut spec_r[ch],
+                    &plan,
+                );
+            }
+        }
+
+        // 4. Adaptive 1-ERB Shirley–Kendrick–Churchill (JAES 2007) phantom-center
+        //    de-comb on frontal stereo pairs `(FL, FR)` and `(FLC, FRC)` above 450 Hz.
+        if cfg.phantom_decomb > 1e-6 {
+            apply_frontal_decomb(
+                SLOT_FL,
+                SLOT_FR,
+                &freqs,
+                &dir_l,
+                &dir_r,
+                &mut spec_l,
+                &mut spec_r,
+                cfg.phantom_decomb,
+                &plan,
+            );
+            apply_frontal_decomb(
+                SLOT_FLC,
+                SLOT_FRC,
+                &freqs,
+                &dir_l,
+                &dir_r,
+                &mut spec_l,
+                &mut spec_r,
+                cfg.phantom_decomb,
+                &plan,
+            );
+        }
+
+        // 5. Broadband Parseval 7.0 diffuse power preservation (`TARGET_DF_POWER = 3.5`)
+        //    after reflections & de-comb so total loudness matches stock `g6ct` (`3.5017`)
+        //    without tilting the direct spectrum.
+        let mut tot_p = 0.0_f64;
+        let inv_n = 1.0 / (N_SYNTH as f64);
+        for &ch in &DF_RING_SLOTS {
+            let pl = (spec_l[ch][0].norm_sq()
+                + spec_l[ch][nb - 1].norm_sq()
+                + 2.0
+                    * spec_l[ch][1..nb - 1]
+                        .iter()
+                        .map(|c| c.norm_sq())
+                        .sum::<f64>())
+                * inv_n;
+            let pr = (spec_r[ch][0].norm_sq()
+                + spec_r[ch][nb - 1].norm_sq()
+                + 2.0
+                    * spec_r[ch][1..nb - 1]
+                        .iter()
+                        .map(|c| c.norm_sq())
+                        .sum::<f64>())
+                * inv_n;
+            tot_p += 0.5 * (pl + pr);
+        }
+        let g_bb = (TARGET_DF_POWER / tot_p.max(1e-12)).sqrt();
+        for ch in 0..SLOTS {
+            if ch == SLOT_LFE {
+                continue;
+            }
+            for k in 0..nb {
+                spec_l[ch][k] = spec_l[ch][k].scale(g_bb);
+                spec_r[ch][k] = spec_r[ch][k].scale(g_bb);
+            }
+        }
+
+        // 6. Synthesize LFE: mono `1/sqrt(2)` per ear (so `gL^2 + gR^2 = 1.0`,
+        //    matching stock `g6ct` / Nuendo 0 dB discrete LFE energy by default),
+        //    scaled by `lfe_gain_db`, aligned to `pre_delay_s`, optional causal
+        //    120 Hz 4th-order Butterworth LPF, zero reflections.
+        let lfe_gain = std::f64::consts::FRAC_1_SQRT_2 * 10.0_f64.powf(cfg.lfe_gain_db / 20.0);
         for (k, &f) in freqs.iter().enumerate() {
             let phase = Complex::from_polar(1.0, -2.0 * PI * f * pre_delay_s);
             let h = if cfg.lfe_lpf {
@@ -452,7 +610,32 @@ impl KernelBank {
             spec_r[SLOT_LFE][k] = v;
         }
 
-        // 4. IFFT to time domain, truncate to `N_IR`, and apply half-Kaiser tail taper.
+        // 7. Bauer (1961) / Linkwitz (1971) / Völk–Fastl (AES 2011) causal minimum-phase
+        //    coherent LF trim shelf at 340 Hz across the full-range ring (and discrete
+        //    `LFE` only when `cfg.lfe_lf_trim` is enabled).
+        if cfg.bass_trim_db.abs() > 1e-6 {
+            let fc_lf = 340.0_f64.min(0.45 * fs);
+            let g_lf = 10.0_f64.powf(cfg.bass_trim_db / 20.0);
+            let lf_mag: Vec<f64> = freqs
+                .iter()
+                .map(|&f| {
+                    let x = f / fc_lf;
+                    ((g_lf * g_lf + x * x) / (1.0 + x * x)).sqrt()
+                })
+                .collect();
+            let lf_min = minimum_phase_spectrum(&lf_mag, &plan);
+            for ch in 0..SLOTS {
+                if ch == SLOT_LFE && !cfg.lfe_lf_trim {
+                    continue;
+                }
+                for k in 0..nb {
+                    spec_l[ch][k] = spec_l[ch][k].mul(lf_min[k]);
+                    spec_r[ch][k] = spec_r[ch][k].mul(lf_min[k]);
+                }
+            }
+        }
+
+        // 8. IFFT to time domain, truncate to `N_IR`, and apply half-Kaiser tail taper.
         let mut scratch = vec![Complex::ZERO; N_SYNTH];
         let mut time_buf = vec![0.0_f64; N_SYNTH];
         let mut ir_l = vec![vec![0.0_f64; N_IR]; SLOTS];
@@ -478,9 +661,63 @@ impl KernelBank {
     }
 }
 
-/// Synthesize one full-range channel's un-equalized `(H_L, H_R)` complex spectrum.
+/// Apply Shirley, Kendrick & Churchill (JAES 2007) adaptive 1-ERB phantom-center
+/// comb-notch compensation identically to a frontal L/R speaker pair `(ch_l, ch_r)`.
 #[allow(clippy::too_many_arguments)]
-fn synthesize_channel_spectrum(
+fn apply_frontal_decomb(
+    ch_l: usize,
+    ch_r: usize,
+    freqs: &[f64],
+    dir_l: &[Vec<Complex>],
+    dir_r: &[Vec<Complex>],
+    spec_l: &mut [Vec<Complex>],
+    spec_r: &mut [Vec<Complex>],
+    strength: f64,
+    plan: &FftPlan,
+) {
+    let nb = freqs.len();
+    let max_boost = 10.0_f64.powf(3.0 / 20.0);
+    let mut p_coh = Vec::with_capacity(nb);
+    let mut p_inc = Vec::with_capacity(nb);
+    for k in 0..nb {
+        let sl = dir_l[ch_l][k].add(dir_l[ch_r][k]).norm_sq();
+        let sr = dir_r[ch_l][k].add(dir_r[ch_r][k]).norm_sq();
+        p_coh.push(0.5 * (sl + sr));
+        p_inc.push(
+            0.5 * (dir_l[ch_l][k].norm_sq()
+                + dir_l[ch_r][k].norm_sq()
+                + dir_r[ch_l][k].norm_sq()
+                + dir_r[ch_r][k].norm_sq()),
+        );
+    }
+    let sm_coh = roex_smooth_power(freqs, &p_coh, 1.0);
+    let sm_inc = roex_smooth_power(freqs, &p_inc, 1.0);
+    let dc_mag: Vec<f64> = freqs
+        .iter()
+        .enumerate()
+        .map(|(k, &f)| {
+            let fade = ((f - 450.0) / 500.0).clamp(0.0, 1.0);
+            let deficit = if sm_coh[k] < sm_inc[k] {
+                sm_inc[k] / sm_coh[k].max(1e-12)
+            } else {
+                1.0
+            };
+            deficit.powf(0.5 * strength * fade).min(max_boost)
+        })
+        .collect();
+    let dc_min = minimum_phase_spectrum(&dc_mag, plan);
+    for &ch in &[ch_l, ch_r] {
+        for k in 0..nb {
+            spec_l[ch][k] = spec_l[ch][k].mul(dc_min[k]);
+            spec_r[ch][k] = spec_r[ch][k].mul(dc_min[k]);
+        }
+    }
+}
+
+/// Synthesize one full-range channel's un-equalized anechoic direct spectrum
+/// `(H_L, H_R)` and its channel weight.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_direct_spectrum(
     ch: usize,
     cfg: &PlusCfg,
     fs: f64,
@@ -490,7 +727,7 @@ fn synthesize_channel_spectrum(
     lr4_hi: &[Complex],
     ap_rear: &[Complex],
     plan: &FftPlan,
-) -> (Vec<Complex>, Vec<Complex>) {
+) -> (Vec<Complex>, Vec<Complex>, f64) {
     let nb = freqs.len();
     let base_az = SLOT_AZ_DEG[ch];
     let is_front_pair = matches!(ch, SLOT_FL | SLOT_FR | SLOT_FLC | SLOT_FRC);
@@ -566,8 +803,6 @@ fn synthesize_channel_spectrum(
 
     // 4. Assemble direct path with causal LR4 bass-mono crossover, causal Thiran
     //    fractional delay (zero sinc pre-ringing), & DEE-safe rear all-pass.
-    //    At DC, `bd = 1.0` and `pinna = 1.0`, so `rms_dc = 1/sqrt(2) * chan_weight` gives
-    //    unit energy per channel (`gL^2 + gR^2 = chan_weight^2`) before DFEQ.
     let base_scale = std::f64::consts::FRAC_1_SQRT_2 * chan_weight;
     let use_rear_ap = matches!(ch, SLOT_BL | SLOT_BR);
     let pre_smp = pre_delay_s * fs;
@@ -588,83 +823,106 @@ fn synthesize_channel_spectrum(
             hi_r = hi_r.mul(ap_rear[k]);
         }
 
-        // Low band (`lr4_lo`) is strictly mono & in-phase across both ears;
-        // high band (`lr4_hi`) carries full directional cues. Because `|lr4_lo + lr4_hi| == 1`
-        // for an all-pass Linkwitz–Riley 4th-order pair, the crossover sums flat with zero dip.
-        let dl = lr4_lo[k].mul(d_pre).add(lr4_hi[k].mul(hi_l)).scale(base_scale);
-        let dr = lr4_lo[k].mul(d_pre).add(lr4_hi[k].mul(hi_r)).scale(base_scale);
+        let dl = lr4_lo[k]
+            .mul(d_pre)
+            .add(lr4_hi[k].mul(hi_l))
+            .scale(base_scale);
+        let dr = lr4_lo[k]
+            .mul(d_pre)
+            .add(lr4_hi[k].mul(hi_r))
+            .scale(base_scale);
         sl.push(dl);
         sr.push(dr);
     }
 
-    // 5. Add dry ITU-R BS.1116 lateral early reflections (`>= 8.5 ms`) when `externalize > 0`.
-    if cfg.externalize > 1e-6 {
-        let refl_scale = if is_center {
-            cfg.externalize * (1.0 - 0.50 * cfg.center_focus)
+    (sl, sr, chan_weight)
+}
+
+/// Add smooth dry ITU-R BS.1116 / Hassager–Gran–Dau lateral early reflections
+/// (`>= 8.5 ms`) weighted by direct diffuse equalization `dfeq_min`.
+#[allow(clippy::too_many_arguments)]
+fn add_channel_reflections(
+    ch: usize,
+    cfg: &PlusCfg,
+    fs: f64,
+    pre_delay_s: f64,
+    chan_weight: f64,
+    freqs: &[f64],
+    dfeq_min: &[Complex],
+    sl: &mut [Complex],
+    sr: &mut [Complex],
+    plan: &FftPlan,
+) {
+    let nb = freqs.len();
+    let base_az = SLOT_AZ_DEG[ch];
+    let is_center = ch == SLOT_FC;
+    let refl_scale = if is_center {
+        cfg.externalize * (1.0 - 0.50 * cfg.center_focus)
+    } else {
+        cfg.externalize
+    };
+    if refl_scale <= 1e-6 {
+        return;
+    }
+
+    let base_scale = std::f64::consts::FRAC_1_SQRT_2 * chan_weight;
+    let taps = itu_bs1116_reflections(ch);
+    let hpf_base: f64 = if base_az.abs() < 1e-6 { 520.0 } else { 400.0 };
+    let hpf_fc = hpf_base.min(0.4 * fs);
+
+    for tap in taps {
+        let g = tap.gain * refl_scale * base_scale;
+        if g.abs() <= 1e-9 {
+            continue;
+        }
+        let r_itd = woodworth_itd_s(tap.az_deg);
+        let (rt_l, rt_r) = if tap.az_deg >= 0.0 {
+            (0.0, r_itd)
         } else {
-            cfg.externalize
+            (r_itd, 0.0)
         };
-        if refl_scale > 1e-6 {
-            let taps = itu_bs1116_reflections(ch);
-            for tap in taps {
-                let g = tap.gain * refl_scale * base_scale;
-                if g.abs() <= 1e-9 {
-                    continue;
-                }
-                let r_itd = woodworth_itd_s(tap.az_deg);
-                let (rt_l, rt_r) = if tap.az_deg >= 0.0 {
-                    (0.0, r_itd)
-                } else {
-                    (r_itd, 0.0)
-                };
-                let del_l_smp = (pre_delay_s + tap.delay_s + rt_l) * fs;
-                let del_r_smp = (pre_delay_s + tap.delay_s + rt_r) * fs;
-                // 4th-order causal Butterworth HPF (520 Hz on center-axis to keep vocal
-                // fundamentals and 1-ERB L/R symmetry ultra-clean; 400 Hz off-axis)
-                // + 1st-order studio wall LPF.
-                let hpf_base: f64 = if base_az.abs() < 1e-6 { 520.0 } else { 400.0 };
-                let hpf_fc = hpf_base.min(0.4 * fs);
-                let lpf_fc = tap.lpf_hz.min(0.45 * fs);
-                for (k, &f) in freqs.iter().enumerate() {
-                    let hpf2 = butter2_hpf(f, hpf_fc, fs);
-                    let wall = hpf2.mul(hpf2).mul(first_order_lpf(f, lpf_fc, fs));
-                    let bdl = brown_duda_mag(f, tap.az_deg, 1.0, 0.75);
-                    let bdr = brown_duda_mag(f, tap.az_deg, -1.0, 0.75);
-                    let dl = causal_frac_delay(f, del_l_smp, fs).scale(g * bdl);
-                    let dr = causal_frac_delay(f, del_r_smp, fs).scale(g * bdr);
-                    sl[k] = sl[k].add(wall.mul(dl));
-                    sr[k] = sr[k].add(wall.mul(dr));
-                }
-            }
-            // For center-axis channels (`FC`, `BC`, `TC`), apply a tiny (< ±0.06 dB)
-            // symmetric minimum-phase L/R ERB balance so anti-symmetric lateral reflections
-            // preserve exact 0.00 dB phantom center alignment across 20 Hz – 20 kHz.
-            if base_az.abs() < 1e-6 {
-                let pl: Vec<f64> = sl.iter().map(|c| c.norm_sq()).collect();
-                let pr: Vec<f64> = sr.iter().map(|c| c.norm_sq()).collect();
-                let sml = roex_smooth_power(freqs, &pl, 0.75);
-                let smr = roex_smooth_power(freqs, &pr, 0.75);
-                let gl_mag: Vec<f64> = sml
-                    .iter()
-                    .zip(&smr)
-                    .map(|(&l, &r)| (0.5 * (l + r) / l.max(1e-18)).sqrt())
-                    .collect();
-                let gr_mag: Vec<f64> = sml
-                    .iter()
-                    .zip(&smr)
-                    .map(|(&l, &r)| (0.5 * (l + r) / r.max(1e-18)).sqrt())
-                    .collect();
-                let gl = minimum_phase_spectrum(&gl_mag, plan);
-                let gr = minimum_phase_spectrum(&gr_mag, plan);
-                for k in 0..nb {
-                    sl[k] = sl[k].mul(gl[k]);
-                    sr[k] = sr[k].mul(gr[k]);
-                }
-            }
+        let del_l_smp = (pre_delay_s + tap.delay_s + rt_l) * fs;
+        let del_r_smp = (pre_delay_s + tap.delay_s + rt_r) * fs;
+        let lpf_fc = tap.lpf_hz.min(0.45 * fs);
+        for (k, &f) in freqs.iter().enumerate() {
+            let hpf2 = butter2_hpf(f, hpf_fc, fs);
+            let wall = hpf2
+                .mul(hpf2)
+                .mul(first_order_lpf(f, lpf_fc, fs))
+                .mul(dfeq_min[k]);
+            let bdl = brown_duda_mag(f, tap.az_deg, 1.0, 0.75);
+            let bdr = brown_duda_mag(f, tap.az_deg, -1.0, 0.75);
+            let dl = causal_frac_delay(f, del_l_smp, fs).scale(g * bdl);
+            let dr = causal_frac_delay(f, del_r_smp, fs).scale(g * bdr);
+            sl[k] = sl[k].add(wall.mul(dl));
+            sr[k] = sr[k].add(wall.mul(dr));
         }
     }
 
-    (sl, sr)
+    // Center-axis channels (`FC`, `BC`, `TC`): symmetric L/R 1-ERB balance preserves
+    // exact 0.00 dB phantom center alignment across 20 Hz – 20 kHz.
+    if base_az.abs() < 1e-6 {
+        let pl: Vec<f64> = sl.iter().map(|c| c.norm_sq()).collect();
+        let pr: Vec<f64> = sr.iter().map(|c| c.norm_sq()).collect();
+        let sml = roex_smooth_power(freqs, &pl, 0.75);
+        let smr = roex_smooth_power(freqs, &pr, 0.75);
+        let gl_mag: Vec<f64> = sml
+            .iter()
+            .zip(&smr)
+            .map(|(&l, &r)| (0.5 * (l + r) / l.max(1e-18)).sqrt())
+            .collect();
+        let gr_mag: Vec<f64> = sml
+            .iter()
+            .zip(&smr)
+            .map(|(&l, &r)| (0.5 * (l + r) / r.max(1e-18)).sqrt())
+            .collect();
+        let gl = minimum_phase_spectrum(&gl_mag, plan);
+        let gr = minimum_phase_spectrum(&gr_mag, plan);
+        for k in 0..nb {
+            sl[k] = sl[k].mul(gl[k]);
+            sr[k] = sr[k].mul(gr[k]);
+        }
+    }
 }
 
 /// Brown & Duda (1998) Eq. (5) spherical head-shadow magnitude transfer function.
@@ -683,8 +941,8 @@ fn brown_duda_mag(f_hz: f64, az_deg: f64, ear_sign: f64, depth: f64) -> f64 {
     }
     let alpha_min = 0.1;
     let theta_min = 150.0;
-    let alpha_raw = (1.0 + 0.5 * alpha_min)
-        + (1.0 - 0.5 * alpha_min) * (diff * PI / theta_min).cos();
+    let alpha_raw =
+        (1.0 + 0.5 * alpha_min) + (1.0 - 0.5 * alpha_min) * (diff * PI / theta_min).cos();
     let alpha = (1.0 + depth * (alpha_raw - 1.0)).clamp(0.08, 2.15);
     let w0 = SPEED_OF_SOUND / HEAD_RADIUS_M;
     let x = (2.0 * PI * f_hz) / w0;
@@ -708,7 +966,7 @@ fn broad_pinna_mag(f_hz: f64, az_deg: f64, is_top: bool, scale: f64) -> f64 {
     }
     if abs_az <= 120.0 {
         // Side channels: subtle -1.0 dB broad pinna shelf above 4 kHz.
-        let db = -1.0 * scale;
+        let db = -scale;
         let g = 10.0_f64.powf(db / 20.0);
         let x = f_hz / 4_000.0;
         return ((g * g * x * x + 1.0) / (x * x + 1.0)).sqrt();
@@ -920,39 +1178,159 @@ fn itu_bs1116_reflections(ch: usize) -> [ReflectionTap; 6] {
     }
 
     let fl = [
-        ReflectionTap { delay_s: 0.0092, az_deg: 68.0, gain: 0.25, lpf_hz: 6_200.0 },
-        ReflectionTap { delay_s: 0.0138, az_deg: -62.0, gain: 0.21, lpf_hz: 5_600.0 },
-        ReflectionTap { delay_s: 0.0169, az_deg: 112.0, gain: 0.16, lpf_hz: 4_800.0 },
-        ReflectionTap { delay_s: 0.0196, az_deg: -108.0, gain: 0.14, lpf_hz: 4_400.0 },
-        ReflectionTap { delay_s: 0.0228, az_deg: 54.0, gain: 0.12, lpf_hz: 4_000.0 },
-        ReflectionTap { delay_s: 0.0259, az_deg: -58.0, gain: 0.10, lpf_hz: 3_600.0 },
+        ReflectionTap {
+            delay_s: 0.0092,
+            az_deg: 68.0,
+            gain: 0.25,
+            lpf_hz: 6_200.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0138,
+            az_deg: -62.0,
+            gain: -0.21,
+            lpf_hz: 5_600.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0169,
+            az_deg: 112.0,
+            gain: 0.16,
+            lpf_hz: 4_800.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0196,
+            az_deg: -108.0,
+            gain: -0.14,
+            lpf_hz: 4_400.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0228,
+            az_deg: 54.0,
+            gain: 0.12,
+            lpf_hz: 4_000.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0259,
+            az_deg: -58.0,
+            gain: -0.10,
+            lpf_hz: 3_600.0,
+        },
     ];
 
     let fc = [
-        ReflectionTap { delay_s: 0.0182, az_deg: 68.0, gain: 0.46, lpf_hz: 6_000.0 },
-        ReflectionTap { delay_s: 0.0182, az_deg: -68.0, gain: -0.46, lpf_hz: 6_000.0 },
-        ReflectionTap { delay_s: 0.0231, az_deg: 108.0, gain: -0.38, lpf_hz: 4_800.0 },
-        ReflectionTap { delay_s: 0.0231, az_deg: -108.0, gain: 0.38, lpf_hz: 4_800.0 },
-        ReflectionTap { delay_s: 0.0284, az_deg: 54.0, gain: 0.30, lpf_hz: 4_000.0 },
-        ReflectionTap { delay_s: 0.0284, az_deg: -54.0, gain: -0.30, lpf_hz: 4_000.0 },
+        ReflectionTap {
+            delay_s: 0.0182,
+            az_deg: 68.0,
+            gain: 0.46,
+            lpf_hz: 6_000.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0182,
+            az_deg: -68.0,
+            gain: -0.46,
+            lpf_hz: 6_000.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0231,
+            az_deg: 108.0,
+            gain: -0.38,
+            lpf_hz: 4_800.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0231,
+            az_deg: -108.0,
+            gain: 0.38,
+            lpf_hz: 4_800.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0284,
+            az_deg: 54.0,
+            gain: 0.30,
+            lpf_hz: 4_000.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0284,
+            az_deg: -54.0,
+            gain: -0.30,
+            lpf_hz: 4_000.0,
+        },
     ];
 
     let sl = [
-        ReflectionTap { delay_s: 0.0088, az_deg: 76.0, gain: 0.22, lpf_hz: 5_500.0 },
-        ReflectionTap { delay_s: 0.0144, az_deg: -72.0, gain: 0.18, lpf_hz: 5_000.0 },
-        ReflectionTap { delay_s: 0.0181, az_deg: 126.0, gain: 0.15, lpf_hz: 4_400.0 },
-        ReflectionTap { delay_s: 0.0213, az_deg: -118.0, gain: 0.13, lpf_hz: 4_000.0 },
-        ReflectionTap { delay_s: 0.0246, az_deg: 64.0, gain: 0.11, lpf_hz: 3_600.0 },
-        ReflectionTap { delay_s: 0.0274, az_deg: -66.0, gain: 0.09, lpf_hz: 3_300.0 },
+        ReflectionTap {
+            delay_s: 0.0088,
+            az_deg: 76.0,
+            gain: 0.22,
+            lpf_hz: 5_500.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0144,
+            az_deg: -72.0,
+            gain: -0.18,
+            lpf_hz: 5_000.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0181,
+            az_deg: 126.0,
+            gain: 0.15,
+            lpf_hz: 4_400.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0213,
+            az_deg: -118.0,
+            gain: -0.13,
+            lpf_hz: 4_000.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0246,
+            az_deg: 64.0,
+            gain: 0.11,
+            lpf_hz: 3_600.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0274,
+            az_deg: -66.0,
+            gain: -0.09,
+            lpf_hz: 3_300.0,
+        },
     ];
 
     let bl = [
-        ReflectionTap { delay_s: 0.0095, az_deg: 118.0, gain: 0.21, lpf_hz: 5_000.0 },
-        ReflectionTap { delay_s: 0.0151, az_deg: -112.0, gain: 0.17, lpf_hz: 4_600.0 },
-        ReflectionTap { delay_s: 0.0188, az_deg: 78.0, gain: 0.14, lpf_hz: 4_200.0 },
-        ReflectionTap { delay_s: 0.0221, az_deg: -82.0, gain: 0.12, lpf_hz: 3_800.0 },
-        ReflectionTap { delay_s: 0.0252, az_deg: 132.0, gain: 0.10, lpf_hz: 3_500.0 },
-        ReflectionTap { delay_s: 0.0280, az_deg: -128.0, gain: 0.09, lpf_hz: 3_200.0 },
+        ReflectionTap {
+            delay_s: 0.0095,
+            az_deg: 118.0,
+            gain: 0.21,
+            lpf_hz: 5_000.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0151,
+            az_deg: -112.0,
+            gain: -0.17,
+            lpf_hz: 4_600.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0188,
+            az_deg: 78.0,
+            gain: 0.14,
+            lpf_hz: 4_200.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0221,
+            az_deg: -82.0,
+            gain: -0.12,
+            lpf_hz: 3_800.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0252,
+            az_deg: 132.0,
+            gain: 0.10,
+            lpf_hz: 3_500.0,
+        },
+        ReflectionTap {
+            delay_s: 0.0280,
+            az_deg: -128.0,
+            gain: -0.09,
+            lpf_hz: 3_200.0,
+        },
     ];
 
     match ch {
@@ -1107,7 +1485,7 @@ impl BinauralPlus {
         out_r: &mut [f64],
         m: usize,
     ) {
-        debug_assert!(m >= 1 && m <= OLA_HOP);
+        debug_assert!((1..=OLA_HOP).contains(&m));
         let nb = N_FFT / 2 + 1;
         self.acc_l.fill(Complex::ZERO);
         self.acc_r.fill(Complex::ZERO);
@@ -1178,14 +1556,14 @@ impl BinauralPlus {
 
 /// Unified renderer dispatch used by `pipeline.rs`.
 pub enum Renderer {
-    Classic(Dsp<f64>),
+    Classic(Box<Dsp<f64>>),
     Plus(Box<BinauralPlus>),
 }
 
 impl Renderer {
     pub fn new(mode: RendererMode, plus: PlusCfg, mask: u32, sample_rate: u32) -> Self {
         match mode {
-            RendererMode::Reference => Self::Classic(Dsp::<f64>::new(mask)),
+            RendererMode::Reference => Self::Classic(Box::new(Dsp::<f64>::new(mask))),
             RendererMode::Plus => Self::Plus(Box::new(BinauralPlus::new(mask, plus, sample_rate))),
         }
     }
@@ -1238,16 +1616,16 @@ mod tests {
         rfft(&buf)
     }
 
-    /// 1-ERB diffuse-field excitation flatness across `20 Hz – 18 kHz` must stay
-    /// within `±0.25 dB` for every built-in profile (`Pure`, `Studio`, `Cinema`).
+    /// Zaunschirm (JASA 2018) direct-path 1-ERB diffuse-field excitation across
+    /// `20 Hz – 18 kHz` must stay within `±0.20 dB` across all profile geometries
+    /// (`Pure`, `Studio`, `Cinema`), and total `(direct + reflections)` stays within
+    /// `±0.25 dB` (`Pure`, `Studio`) / `[-0.30, +0.55] dB` (`Cinema` mid-band room presence).
     #[test]
     fn diffuse_field_erb_is_flat_across_profiles() {
-        for profile in [PlusProfile::Pure, PlusProfile::Studio, PlusProfile::Cinema] {
-            let cfg = PlusCfg::from_profile(profile);
+        let nb = 4096 / 2 + 1;
+        let freqs: Vec<f64> = (0..nb).map(|k| k as f64 * 48_000.0 / 4096.0).collect();
+        let measure_erb_bounds = |cfg: PlusCfg| -> (f64, f64) {
             let bank = KernelBank::synthesize(cfg, 48_000);
-            let nb = 4096 / 2 + 1;
-            let freqs: Vec<f64> = (0..nb).map(|k| k as f64 * 48_000.0 / 4096.0).collect();
-
             let mut p_df = vec![0.0_f64; nb];
             for &ch in &DF_RING_SLOTS {
                 let sl = ir_spectrum_4096(&bank.ir_l[ch]);
@@ -1266,11 +1644,104 @@ mod tests {
                     max_db = max_db.max(db);
                 }
             }
+            (min_db, max_db)
+        };
+
+        for profile in [PlusProfile::Pure, PlusProfile::Studio, PlusProfile::Cinema] {
+            let mut direct = PlusCfg::from_profile(profile);
+            direct.externalize = 0.0;
+            direct.bass_trim_db = 0.0;
+            direct.phantom_decomb = 0.0;
+            let (d_min, d_max) = measure_erb_bounds(direct);
             assert!(
-                min_db >= -0.25 && max_db <= 0.25,
-                "{:?} DF ERB out of ±0.25 dB band: [{min_db:+.3}, {max_db:+.3}] dB",
+                d_min >= -0.20 && d_max <= 0.20,
+                "{:?} direct-path DF ERB out of ±0.20 dB band: [{d_min:+.3}, {d_max:+.3}] dB",
                 profile
             );
+
+            let mut neutral = PlusCfg::from_profile(profile);
+            neutral.bass_trim_db = 0.0;
+            neutral.phantom_decomb = 0.0;
+            let (t_min, t_max) = measure_erb_bounds(neutral);
+            let (lo, hi) = if profile == PlusProfile::Cinema {
+                (-0.30, 0.55)
+            } else {
+                (-0.25, 0.25)
+            };
+            assert!(
+                t_min >= lo && t_max <= hi,
+                "{:?} total neutral DF ERB out of [{lo:+.2}, {hi:+.2}] dB: [{t_min:+.3}, {t_max:+.3}] dB",
+                profile
+            );
+        }
+    }
+
+    /// Correlated `FL=FR` stereo playback on `Studio` and `Cinema` must tame coherent
+    /// low-frequency buildup (`50–100 Hz`) and Shirley–Kendrick phantom-center comb dip
+    /// (`1.5–2.5 kHz`) compared to `Pure`, keeping `50 Hz vs 2 kHz` tilt `<= 2.2 dB`.
+    #[test]
+    fn cinema_and_studio_tame_coherent_lf_bass_buildup() {
+        let nb = 4096 / 2 + 1;
+        let freqs: Vec<f64> = (0..nb).map(|k| k as f64 * 48_000.0 / 4096.0).collect();
+        let flfr_erb_db = |cfg: PlusCfg| -> Vec<f64> {
+            let bank = KernelBank::synthesize(cfg, 48_000);
+            let fl_l = ir_spectrum_4096(&bank.ir_l[SLOT_FL]);
+            let fl_r = ir_spectrum_4096(&bank.ir_r[SLOT_FL]);
+            let fr_l = ir_spectrum_4096(&bank.ir_l[SLOT_FR]);
+            let fr_r = ir_spectrum_4096(&bank.ir_r[SLOT_FR]);
+            let raw: Vec<f64> = (0..nb)
+                .map(|k| 0.5 * (fl_l[k].add(fr_l[k]).norm_sq() + fl_r[k].add(fr_r[k]).norm_sq()))
+                .collect();
+            let sm = roex_smooth_power(&freqs, &raw, 1.0);
+            sm.iter().map(|&p| 10.0 * p.max(1e-18).log10()).collect()
+        };
+        let bin = |hz: f64| -> usize { (hz * 4096.0 / 48_000.0).round() as usize };
+
+        let pure_db = flfr_erb_db(PlusCfg::from_profile(PlusProfile::Pure));
+        let studio_db = flfr_erb_db(PlusCfg::from_profile(PlusProfile::Studio));
+        let cinema_db = flfr_erb_db(PlusCfg::from_profile(PlusProfile::Cinema));
+
+        // Pure ITU DF sits ~+3 dB at 50 Hz and drops ~-2 dB at 2 kHz (> 4.5 dB tilt).
+        let pure_tilt = pure_db[bin(50.0)] - pure_db[bin(2_000.0)];
+        assert!(
+            pure_tilt > 4.0,
+            "Pure coherent FL=FR tilt expected > 4.0 dB, got {pure_tilt:+.2} dB"
+        );
+
+        // Cinema keeps sub-bass near Reference 0 dB and total 50 Hz-vs-2 kHz tilt <= 2.2 dB.
+        assert!(
+            cinema_db[bin(50.0)].abs() <= 1.2,
+            "Cinema FL=FR 50 Hz vs Ref out of ±1.2 dB: {:+.2} dB",
+            cinema_db[bin(50.0)]
+        );
+        let cinema_tilt = (cinema_db[bin(50.0)] - cinema_db[bin(2_000.0)]).abs();
+        assert!(
+            cinema_tilt <= 2.2,
+            "Cinema coherent LF-vs-2kHz tilt still too high: {cinema_tilt:.2} dB"
+        );
+        let studio_tilt = (studio_db[bin(50.0)] - studio_db[bin(2_000.0)]).abs();
+        assert!(
+            studio_tilt < pure_tilt - 1.5,
+            "Studio tilt ({studio_tilt:.2} dB) should improve cleanly over Pure ({pure_tilt:.2} dB)"
+        );
+    }
+
+    /// Coherent LF shelf trim (`bass_trim_db`) leaves discrete `SLOT_LFE` and L/R symmetry untouched.
+    #[test]
+    fn bass_trim_leaves_lfe_and_symmetry_untouched() {
+        let base = PlusCfg::from_profile(PlusProfile::Pure);
+        let mut trimmed = base;
+        trimmed.bass_trim_db = -4.0;
+        trimmed.phantom_decomb = 0.8;
+
+        let b0 = KernelBank::synthesize(base, 48_000);
+        let b1 = KernelBank::synthesize(trimmed, 48_000);
+
+        assert_eq!(b0.ir_l[SLOT_LFE], b1.ir_l[SLOT_LFE]);
+        assert_eq!(b0.ir_r[SLOT_LFE], b1.ir_r[SLOT_LFE]);
+        for i in 0..N_IR {
+            assert!((b1.ir_l[SLOT_FL][i] - b1.ir_r[SLOT_FR][i]).abs() < 1e-12);
+            assert!((b1.ir_r[SLOT_FL][i] - b1.ir_l[SLOT_FR][i]).abs() < 1e-12);
         }
     }
 
@@ -1311,7 +1782,9 @@ mod tests {
         let nb = 4096 / 2 + 1;
         let freqs: Vec<f64> = (0..nb).map(|k| k as f64 * 48_000.0 / 4096.0).collect();
 
-        for ch in [SLOT_FL, SLOT_FR, SLOT_FC, SLOT_LFE, SLOT_SL, SLOT_SR, SLOT_BL, SLOT_BR] {
+        for ch in [
+            SLOT_FL, SLOT_FR, SLOT_FC, SLOT_LFE, SLOT_SL, SLOT_SR, SLOT_BL, SLOT_BR,
+        ] {
             let sl = ir_spectrum_4096(&bank.ir_l[ch]);
             let sr = ir_spectrum_4096(&bank.ir_r[ch]);
             let mut num = 0.0_f64;
@@ -1406,10 +1879,10 @@ mod tests {
             let mut max_cc = 0.0_f64;
             for lag in -48_isize..=48_isize {
                 let mut sum = 0.0_f64;
-                for i in 0..N_IR {
+                for (i, &li) in l.iter().enumerate().take(N_IR) {
                     let j = i as isize + lag;
                     if j >= 0 && (j as usize) < N_IR {
-                        sum += l[i] * r[j as usize];
+                        sum += li * r[j as usize];
                     }
                 }
                 max_cc = max_cc.max((sum / den).abs());
@@ -1432,7 +1905,10 @@ mod tests {
         let (iacc_studio, drr_studio) = fc_iacc_and_drr(PlusProfile::Studio);
         let (iacc_cinema, drr_cinema) = fc_iacc_and_drr(PlusProfile::Cinema);
 
-        assert!(iacc_pure > 0.999, "Pure FC IACC should be ~1.0, got {iacc_pure:.4}");
+        assert!(
+            iacc_pure > 0.999,
+            "Pure FC IACC should be ~1.0, got {iacc_pure:.4}"
+        );
         assert!(
             iacc_studio < 0.96 && iacc_studio > 0.78,
             "Studio FC IACC out of dry externalized window: {iacc_studio:.4}"
@@ -1535,7 +2011,14 @@ mod tests {
                 let refs: [Option<&[f64]>; SLOTS] = std::array::from_fn(|ch| {
                     if matches!(
                         ch,
-                        SLOT_FL | SLOT_FR | SLOT_FC | SLOT_LFE | SLOT_BL | SLOT_BR | SLOT_SL | SLOT_SR
+                        SLOT_FL
+                            | SLOT_FR
+                            | SLOT_FC
+                            | SLOT_LFE
+                            | SLOT_BL
+                            | SLOT_BR
+                            | SLOT_SL
+                            | SLOT_SR
                     ) {
                         Some(&sigs[ch][pos..pos + n])
                     } else {
@@ -1616,7 +2099,45 @@ mod tests {
         let bin_400 = (400.0_f64 * 4096.0 / 48_000.0).round() as usize;
         let db_40 = 20.0 * (sp[bin_40].norm() / std::f64::consts::FRAC_1_SQRT_2).log10();
         let db_400 = 20.0 * (sp[bin_400].norm() / std::f64::consts::FRAC_1_SQRT_2).log10();
-        assert!(db_40.abs() < 0.3, "LFE 40 Hz passband drift: {db_40:+.2} dB");
-        assert!(db_400 < -35.0, "LFE 400 Hz stopband too weak: {db_400:+.2} dB");
+        assert!(
+            db_40.abs() < 0.3,
+            "LFE 40 Hz passband drift: {db_40:+.2} dB"
+        );
+        assert!(
+            db_400 < -35.0,
+            "LFE 400 Hz stopband too weak: {db_400:+.2} dB"
+        );
+    }
+
+    /// Discrete LFE gain offset (`lfe_gain_db`) and LF-shelf opt-in (`lfe_lf_trim`)
+    /// control `SLOT_LFE` cleanly while leaving the full-range channels untouched.
+    #[test]
+    fn lfe_gain_and_lf_trim_control_discrete_lfe() {
+        let bin_40 = (40.0_f64 * 4096.0 / 48_000.0).round() as usize;
+        let base = PlusCfg::from_profile(PlusProfile::Pure);
+        let b0 = KernelBank::synthesize(base, 48_000);
+        let ref_db40 = 20.0 * (ir_spectrum_4096(&b0.ir_l[SLOT_LFE])[bin_40].norm()).log10();
+
+        let mut boosted = base;
+        boosted.lfe_gain_db = 6.0;
+        let b_plus = KernelBank::synthesize(boosted, 48_000);
+        let plus_db40 = 20.0 * (ir_spectrum_4096(&b_plus.ir_l[SLOT_LFE])[bin_40].norm()).log10();
+        assert!(
+            ((plus_db40 - ref_db40) - 6.0).abs() < 0.05,
+            "LFE +6 dB gain offset drifted: {:+.3} dB",
+            plus_db40 - ref_db40
+        );
+        assert_eq!(b0.ir_l[SLOT_FL], b_plus.ir_l[SLOT_FL]);
+
+        let mut trimmed_lfe = base;
+        trimmed_lfe.bass_trim_db = -4.0;
+        trimmed_lfe.lfe_lf_trim = true;
+        let b_trim = KernelBank::synthesize(trimmed_lfe, 48_000);
+        let trim_db40 = 20.0 * (ir_spectrum_4096(&b_trim.ir_l[SLOT_LFE])[bin_40].norm()).log10();
+        assert!(
+            ((trim_db40 - ref_db40) - (-3.911)).abs() < 0.15,
+            "LFE LF-shelf trim at 40 Hz expected ~-3.91 dB, got {:+.3} dB",
+            trim_db40 - ref_db40
+        );
     }
 }
