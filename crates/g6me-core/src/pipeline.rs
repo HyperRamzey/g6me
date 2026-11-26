@@ -1873,11 +1873,20 @@ mod tests {
     /// A stalled pipe is the failure mode this crate has actually hit, and a
     /// stalled test hangs CI instead of reporting anything. So the stall itself is
     /// what these tests assert on.
-    fn with_watchdog<T, F>(budget: std::time::Duration, what: &str, f: F) -> T
+    ///
+    /// `budget` is the release-build deadline. The suite is unoptimised, and it
+    /// runs several media renders in parallel, so a correct render can take an
+    /// order of magnitude longer than its release timing. Scaling the deadline in
+    /// debug builds keeps this a stall detector rather than a throughput test: a
+    /// real stall never finishes at any scale, a slow machine does.
+    fn with_watchdog<T, F>(mut budget: std::time::Duration, what: &str, f: F) -> T
     where
         T: std::fmt::Debug + Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        if cfg!(debug_assertions) {
+            budget *= 8;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let label = what.to_string();
         std::thread::Builder::new()
@@ -2429,11 +2438,19 @@ mod tests {
         eprintln!("chain:\n  {}", r.chain.join("\n  "));
         assert!(r.frames > 100_000);
         assert!(r.output_bytes > 1_000_000);
-        assert!(
-            r.realtime_factor > 0.5,
-            "render should keep ahead of realtime, got {}",
-            r.realtime_factor
-        );
+        // Throughput is a property of the optimised binary, not of the routing this
+        // test is about. An unoptimised DSP runs many times slower and the suite runs
+        // other media renders in parallel, so a realtime floor here would fail on a
+        // loaded machine while the file was perfectly correct. The floor stays for
+        // release runs, where it means what it says; the correctness assertions above
+        // are the contract at every profile.
+        if !cfg!(debug_assertions) {
+            assert!(
+                r.realtime_factor > 0.5,
+                "render should keep ahead of realtime, got {}",
+                r.realtime_factor
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
