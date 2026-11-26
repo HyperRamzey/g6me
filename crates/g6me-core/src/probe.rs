@@ -102,17 +102,18 @@ fn is_executable(p: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(p) else {
         return false;
     };
-    if !meta.is_file() {
-        return false;
-    }
+    // Keep the cfg split as one expression per platform. Written as an early
+    // `if !meta.is_file() { return false }` followed by a literal, the non-unix
+    // build is exactly the shape `needless_bool` rejects, and the Windows CI job
+    // is the only place that compiles it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
+        meta.is_file() && (meta.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
-        true
+        meta.is_file()
     }
 }
 
