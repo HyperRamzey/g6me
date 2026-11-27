@@ -1018,9 +1018,11 @@ impl FmmBemSolver {
             return Err(Error::msg("BEM mesh has fewer than 4 valid triangles"));
         }
         let n = elements.len();
-        // Exact closed-surface static solid-angle diagonal: A_ii = 1 + sum_{j != i} K0_ij * A_j
-        let mut solid_angle_diag = vec![0.5_f64; n];
-        for i in 0..n {
+        // Exact closed-surface static solid-angle diagonal: A_ii = 1 + sum_{j != i} K0_ij * A_j.
+        // Each row is an independent sum over `j` in ascending order, so evaluating the rows
+        // in parallel leaves every row bit-identical to the serial loop while cutting the
+        // O(n^2) assembly to O(n^2 / cores).
+        let solid_angle_diag = crate::util::par_map_indexed(n, |i| {
             let xi = elements[i].centroid;
             let mut k0_sum = 0.0_f64;
             for (j, ej) in elements.iter().enumerate() {
@@ -1029,8 +1031,8 @@ impl FmmBemSolver {
                 }
                 k0_sum += laplace_dgreen_dny(xi, ej.centroid, ej.normal) * ej.area;
             }
-            solid_angle_diag[i] = 1.0 + k0_sum;
-        }
+            1.0 + k0_sum
+        });
 
         // Locate anatomical left (+y) and right (-y) ear-canal entrance elements near the
         // horizontal mid-plane (|z| small, slightly posterior x <= 0.02).

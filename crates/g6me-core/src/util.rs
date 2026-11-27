@@ -172,6 +172,44 @@ pub fn clamp_threads(n: usize) -> usize {
     n.clamp(1, max_threads())
 }
 
+/// Evaluate `f(i)` for every index in `0..n` across up to [`cpu_count`] scoped
+/// threads, returning the results in index order.
+///
+/// Each index is computed independently and performs exactly the arithmetic the
+/// serial `(0..n).map(f)` would, so the output is bit-identical to a
+/// single-threaded run: neither the worker count nor OS scheduling can change a
+/// result. That is what makes the helper usable in the numerically frozen DSP
+/// path, not only in tests.
+pub fn par_map_indexed<T, F>(n: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    if n == 0 {
+        return Vec::new();
+    }
+    let workers = cpu_count().min(n);
+    if workers <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let mut out: Vec<Option<T>> = (0..n).map(|_| None).collect();
+    let chunk = n.div_ceil(workers);
+    std::thread::scope(|s| {
+        for (ci, slot) in out.chunks_mut(chunk).enumerate() {
+            let f = &f;
+            s.spawn(move || {
+                let base = ci * chunk;
+                for (k, cell) in slot.iter_mut().enumerate() {
+                    *cell = Some(f(base + k));
+                }
+            });
+        }
+    });
+    out.into_iter()
+        .map(|v| v.expect("every slot is written exactly once"))
+        .collect()
+}
+
 pub fn replace_extension(p: &Path, ext: &str) -> std::path::PathBuf {
     let mut name = p
         .file_name()
@@ -289,5 +327,30 @@ mod tests {
             replace_extension(Path::new("noext"), "wav"),
             PathBuf::from("noext.wav")
         );
+    }
+
+    #[test]
+    fn par_map_indexed_matches_serial_bit_for_bit_and_in_order() {
+        // Integer order check: a worker writing slot `base + k` from the wrong
+        // base (or a collection that loses index order) changes the vector.
+        let n = 1000usize;
+        let serial: Vec<u64> = (0..n)
+            .map(|i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let parallel = par_map_indexed(n, |i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        assert_eq!(parallel, serial);
+
+        // Float check by bit pattern: the helper must not reassociate anything,
+        // so every value is the exact one the serial closure produces.
+        let fserial: Vec<u64> = (0..777)
+            .map(|i| ((i as f64).sqrt() * 1.000_000_1 + 0.1).to_bits())
+            .collect();
+        let fparallel: Vec<u64> =
+            par_map_indexed(777, |i| ((i as f64).sqrt() * 1.000_000_1 + 0.1).to_bits());
+        assert_eq!(fparallel, fserial);
+
+        // Boundary shapes the chunking has to survive.
+        assert!(par_map_indexed(0, |_| 0u8).is_empty());
+        assert_eq!(par_map_indexed(1, |i| i * 3), vec![0]);
     }
 }

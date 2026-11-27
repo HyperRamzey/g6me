@@ -1846,10 +1846,9 @@ fn read_fill(p: &mut Proc, buf: &mut [u8]) -> Result<usize> {
 /// exactly representable in `f64`, which is why the f64 path costs nothing.
 fn bytes_to_f64_into(src: &[u8], dst: &mut [f64]) {
     debug_assert_eq!(src.len() % 8, 0);
-    for (o, c) in dst.iter_mut().zip(src.chunks_exact(8)) {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(c);
-        *o = f64::from_le_bytes(a);
+    let (words, _) = src.as_chunks::<8>();
+    for (o, c) in dst.iter_mut().zip(words) {
+        *o = f64::from_le_bytes(*c);
     }
 }
 
@@ -2081,7 +2080,7 @@ mod tests {
         let mut got = Vec::new();
         for c in 0..8usize {
             let mut best = (0usize, 0.0f64);
-            for (frame, f) in samples.chunks_exact(8).enumerate() {
+            for (frame, f) in samples.as_chunks::<8>().0.iter().enumerate() {
                 if f[c].abs() > best.1 {
                     best = (frame, f[c].abs());
                 }
@@ -2124,7 +2123,9 @@ mod tests {
 
         let back = ffmpeg_to_f64(&tools, &out);
         let peak_frame = |c: usize| {
-            back.chunks_exact(2)
+            back.as_chunks::<2>()
+                .0
+                .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a[c].abs().total_cmp(&b[c].abs()))
                 .map(|(i, _)| i)
@@ -2149,12 +2150,10 @@ mod tests {
         }
         p.finish().unwrap();
         assert_eq!(raw.len() % 8, 0);
-        raw.chunks_exact(8)
-            .map(|c| {
-                let mut a = [0u8; 8];
-                a.copy_from_slice(c);
-                f64::from_le_bytes(a)
-            })
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect()
     }
 
@@ -2455,12 +2454,10 @@ mod tests {
         }
         p.finish().unwrap();
         assert_eq!(raw.len() % 8, 0);
-        raw.chunks_exact(8)
-            .map(|c| {
-                let mut a = [0u8; 8];
-                a.copy_from_slice(c);
-                f64::from_le_bytes(a)
-            })
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect()
     }
 
@@ -2765,8 +2762,10 @@ mod tests {
             .unwrap();
         let v: Vec<f64> = o
             .stdout
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
             .collect();
         let half = v.len() / 4; // skip the first half of the frames: all-pass settling
         let rms = |c: usize| {

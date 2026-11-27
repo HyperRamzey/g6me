@@ -175,7 +175,7 @@ mystery.
   FLAC — `g6me --caps` proves it on your build by encoding a known 24-bit block and
   decoding it back — and FLAC carries integers only, so 32-bit and float go to WAV.
   Compression levels are ffmpeg's own scale, 0 (fastest) to 12 (smallest).
-* **Rust 1.87+** to build (developed on 1.99). A C compiler only for
+* **Rust 1.100+** to build. A C compiler only for
   `g6me-verify`, which builds the reference binaries to compare against; without a
   compiler those checks are skipped rather than failing the build.
 * No audio device, ever, for the GUI. It has no cpal/ALSA/PipeWire/Pulse/JACK
