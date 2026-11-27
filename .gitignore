@@ -12,6 +12,9 @@ out/
 __pycache__/
 .DS_Store
 
+# AI Studio sandbox artefacts (patch scratch and todolist). Never part of the tree.
+.aistudio/
+
 # Rendered audio, wherever a run happens to write it. Test and demo fixtures are
 # the only audio that belongs in the repository.
 *.flac
