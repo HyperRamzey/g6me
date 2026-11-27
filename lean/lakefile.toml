@@ -1,0 +1,6 @@
+name = "g6me"
+version = "0.1.0"
+defaultTargets = ["G6ME"]
+
+[[lean_lib]]
+name = "G6ME"

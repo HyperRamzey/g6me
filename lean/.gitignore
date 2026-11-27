@@ -1,0 +1,9 @@
+# Lake's build directory: oleans, ileans and dependency caches. Reproducible
+# from the sources with `lake build`, and 9 MB of binary evidence does not
+# belong in the repository.
+.lake/
+
+# Transient files created by check_axioms.sh; its trap removes them, but an
+# interrupted run must not be able to stage them.
+_axiom_check.lean
+_axiom_check.out
