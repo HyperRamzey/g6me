@@ -25,9 +25,10 @@ use g6me_core::pipeline::RenderOpts;
 use g6me_core::pipeline::{self, Plan};
 use g6me_core::plus::{PhysicsEngine, PlusCfg, PlusProfile, RendererMode};
 use g6me_core::probe::{probe_caps, Caps, Tools};
-use g6me_core::room::RoomPreset;
+use g6me_core::room::{RoomPreset, RoomQuality};
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
 use g6me_core::tp::Ratio;
+use g6me_core::transducer::TransducerProfile;
 use g6me_core::unmask::UnmaskCfg;
 use g6me_core::upmix::UpmixCfg;
 use g6me_core::util;
@@ -171,6 +172,11 @@ pub struct Cli {
     #[arg(long, default_value = "anechoic", value_parser = parse_room_preset)]
     pub room: RoomPreset,
 
+    /// 3D Room synthesis quality tier: `preview` (fast 500 Hz 6-PPW FDTD + 2048 rays, default)
+    /// or `production` (670 Hz 6-PPW FDTD + 50,000 rays + extended UPOLA tail).
+    #[arg(long, default_value = "preview", value_parser = parse_room_quality)]
+    pub room_quality: RoomQuality,
+
     /// Optional JSON file defining custom 3D room dimensions, wall absorption, listener position, and desk baffle edges.
     #[arg(long)]
     pub room_json: Option<PathBuf>,
@@ -182,6 +188,16 @@ pub struct Cli {
     /// Execute G6+ binaural FIR convolution strictly inside the 64-bit Goldilocks prime field (Z/pZ, p=2^64-2^32+1) via NTT (0 ULP intermediate rounding error).
     #[arg(long)]
     pub exact_ntt: bool,
+
+    /// Opt-in zero-FMA CUDA GPU offload for 3D FDTD room acoustics when built with `--features cuda`
+    /// and an NVIDIA GPU is attached (falls back deterministically to CPU otherwise).
+    #[arg(long)]
+    pub cuda: bool,
+
+    /// Non-intrusive Klippel (2006) + King–Agerkvist (JAES 2018) electro-mechanical-thermal
+    /// transducer assessment: `none` (default), `headphone-dynamic`, `headphone-planar`, or `studio-monitor`.
+    #[arg(long, default_value = "none", value_parser = parse_transducer_profile)]
+    pub assess: TransducerProfile,
 
     /// Over-sampling ratio the true peak is measured at: 2, 4, 8, 16 or 32 ("x4" works
     /// too). Every render reports the result, quoted with this ratio, because a dBTP
@@ -668,6 +684,18 @@ fn parse_resample_depth(s: &str) -> Result<BitDepth, String> {
     Ok(d)
 }
 
+fn parse_room_quality(s: &str) -> Result<RoomQuality, String> {
+    RoomQuality::parse(s)
+}
+
+fn parse_transducer_profile(s: &str) -> Result<TransducerProfile, String> {
+    TransducerProfile::parse(s).ok_or_else(|| {
+        format!(
+            "unknown transducer profile '{s}' (none, headphone-dynamic, headphone-planar, studio-monitor)"
+        )
+    })
+}
+
 fn parse_dither(s: &str) -> Result<Dither, String> {
     let k = s.to_ascii_lowercase().replace(['-', ' '], "_");
     Ok(match k.as_str() {
@@ -675,6 +703,7 @@ fn parse_dither(s: &str) -> Result<Dither, String> {
         "rect" | "rectangular" => Dither::Rectangular,
         "tri" | "triangular" => Dither::Triangular,
         "tri_hp" | "triangular_hp" | "hp" => Dither::TriangularHp,
+        "wannamaker" | "psychoacoustic" => Dither::Wannamaker,
         "lipshitz" => Dither::Lipshitz,
         "shibata" => Dither::Shibata,
         "low_shibata" | "lowshibata" => Dither::LowShibata,
@@ -685,7 +714,7 @@ fn parse_dither(s: &str) -> Result<Dither, String> {
         other => {
             return Err(format!(
                 "unknown dither '{other}' (none, rectangular, triangular, triangular_hp, \
-                 lipshitz, shibata, low_shibata, high_shibata, f_weighted, \
+                 wannamaker, lipshitz, shibata, low_shibata, high_shibata, f_weighted, \
                  modified_e_weighted, improved_e_weighted)"
             ))
         }
@@ -963,6 +992,8 @@ impl Cli {
         plus.use_warped_decorr = self.plus_warped_decorr;
         plus.exact_ntt = self.exact_ntt;
         plus.room_preset = self.room;
+        plus.room_quality = self.room_quality;
+        plus.use_cuda = self.cuda;
         plus.atmosphere = AtmosphereCfg {
             temp_c: self.room_temp_c,
             rh_pct: self.room_rh,
@@ -1053,6 +1084,7 @@ impl Cli {
             queue_blocks: self.queue,
             stream: self.stream,
             sha256: self.sha256,
+            transducer: self.assess,
         };
         // Both halves at once, through the one function that defines what a setpoint is.
         if let Some(sp) = self.setpoint {
@@ -1840,8 +1872,35 @@ mod tests {
         assert_eq!(parse_dither("low_shibata").unwrap(), Dither::LowShibata);
         assert_eq!(parse_dither("Low-Shibata").unwrap(), Dither::LowShibata);
         assert_eq!(parse_dither("triangular").unwrap(), Dither::Triangular);
+        assert_eq!(parse_dither("wannamaker").unwrap(), Dither::Wannamaker);
+        assert_eq!(parse_dither("psychoacoustic").unwrap(), Dither::Wannamaker);
         assert_eq!(parse_dither("none").unwrap(), Dither::None);
         assert!(parse_dither("voodoo").is_err());
+    }
+
+    #[test]
+    fn room_quality_cuda_assess_and_wannamaker_reach_render_cfg() {
+        let c = Cli::try_parse_from([
+            "g6me",
+            "--mode",
+            "plus",
+            "--room",
+            "control-room",
+            "--room-quality",
+            "production",
+            "--cuda",
+            "--dither",
+            "wannamaker",
+            "--assess",
+            "studio-monitor",
+            "x.mka",
+        ])
+        .unwrap();
+        let cfg = c.render_cfg().unwrap();
+        assert_eq!(cfg.plus.room_quality, RoomQuality::Production);
+        assert!(cfg.plus.use_cuda);
+        assert_eq!(cfg.out.dither, Dither::Wannamaker);
+        assert_eq!(cfg.transducer, TransducerProfile::StudioMonitor5In);
     }
 
     #[test]

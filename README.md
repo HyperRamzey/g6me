@@ -29,7 +29,7 @@ multichannel file ──ffmpeg decode──► f64 samples ──► renderer (f
 |---|---|---|
 | What it is | A bit-exact port of the G6 `CMatrixEncoderEfxMod` matrix: the same all-pass cascade, the same gains, the same `f64` state. | A universal, non-personalized binaural renderer: physical head shadow and ITD, causal bass-mono, pinna shadow, diffuse-field equalization, BS.1116 lateral reflections, DEE-safe decorrelation. |
 | Sounds like | Direct and punchy; sharper surround phase contrast, no HRTF or room shaping. | Speakers in front of you: stable out-of-head width, natural interaural time and level, neutral 1-ERB tonality that stacks cleanly under headphone EQ. |
-| The claim | Bit-identical to binaries compiled from the vendored C reference (`g6me-verify`, 122 checks). | Designed, not cloned: every invariant it promises is a test in `plus.rs` (flat diffuse field, Woodworth ITD, bass coherence, symmetry, no pre-ringing, chunk-size invariance). |
+| The claim | Bit-identical to binaries compiled from the vendored C reference (`g6me-verify`, 129 checks). | Designed, not cloned: every invariant it promises is a test in `plus.rs` (flat diffuse field, Woodworth ITD, bass coherence, symmetry, no pre-ringing, chunk-size invariance). |
 | Verified arithmetic | `f64`, no FMA, no fast-math — proven by disassembly. | Same `f64` contract, zero FMA, deterministic. |
 | Unchanged by it | Every existing command line, GUI preset and verifier contract. | Opt-in. The default path never enters the plus code. |
 
@@ -42,7 +42,7 @@ provenance.
 
 | | |
 |---|---|
-| **Bit-exact to the reference** | The DSP is a port of `g6ct.c` (vendored under `vendor/g6ct/`) and is compared against binaries compiled from that exact C source by `g6me-verify`: 122 checks, all passing. |
+| **Bit-exact to the reference** | The DSP is a port of `g6ct.c` (vendored under `vendor/g6ct/`) and is compared against binaries compiled from that exact C source by `g6me-verify`: 129 checks, all passing. |
 | **f64 internals** | The downmixer runs in `f64` — the same precision as the reference's `-DG6CT_DOUBLE` build and mpv's `afir … precision=double`. Not configurable, on purpose: state precision is not a taste parameter. |
 | **No FMA, no fast-math, ever** | Contraction changes IIR state, and IIR state is phase. `g6me-verify` disassembles the shipped DSP and the reference builds and fails if a fused multiply-add appears; it also builds a deliberate `-ffp-contract=fast` counter-example and requires that it *does* diverge, so the guard is known to have teeth. |
 | **Resampleless by default** | Nothing touches the sample rate, bit depth or timing unless you ask. The default path is decode → f64 → downmix → encode. |
@@ -102,11 +102,12 @@ rather than sampled from a head:
     spherical-Hankel head scattering with a coupled snowman torso and order-7 HOA
     MagLS, alongside the fast Brown–Duda default. Head radius, torso spacing, pinna
     shelf and Webster ear-canal length are explicit controls.
-12. **Hybrid 3D room** (`--room anechoic|control-room|theater`, `--room-json`) —
-    FDTD + image-source + boundary-transmission + ray-traced late field, with
-    temperature, humidity, CO₂ and pressure driving Cramer (1993) speed of sound and
-    ISO 9613-1 air absorption. A JSON room file sets dimensions, wall absorption,
-    listener position and desk baffles.
+12. **Hybrid 3D room** (`--room anechoic|control-room|theater`, `--room-quality preview|production`, `--room-json`, `--cuda`) —
+    FDTD + image-source + boundary-transmission + parallel deterministic PCG64 ray-traced late field,
+    convolved via zero-latency UPOLA (341.3 ms Control Room, 682.7 ms Theater Stage at 48 kHz) with
+    SHA-256 kernel caching, and temperature, humidity, CO₂ and pressure driving Cramer (1993) speed of
+    sound and ISO 9613-1 air absorption. A JSON room file sets dimensions, wall absorption, listener
+    position and desk baffles.
 13. **Exact convolution** (`--exact-ntt`) — the binaural FIR runs in the 64-bit
     Goldilocks field (`p = 2^64 − 2^32 + 1`) by NTT, so intermediate rounding is zero
     ULP rather than merely small.
@@ -191,8 +192,8 @@ cargo run -p g6me-cli -- --caps
 
 ```sh
 cargo build --release            # g6me, g6me-scan and g6me-gui in target/release/
-cargo test --workspace           # 363 tests (283 core, 24 CLI, 43 GUI, 13 harness)
-cargo run -p g6me-verify         # the bit-exactness evidence (122 checks)
+cargo test --workspace           # 371 tests (289 core, 25 CLI, 43 GUI, 1 CUDA, 13 harness)
+cargo run -p g6me-verify         # the bit-exactness evidence (129 checks)
 scripts/build-install.sh         # optimized x86-64-v3 build, verified, installed
 ```
 
@@ -245,7 +246,7 @@ than folded.
 | `--plus-bass-mono`, `--plus-bass-trim`, `--plus-decomb` | G6+ low end and center: LR4 bass-mono crossover, 340 Hz coherent-LF shelf, phantom-center fill. |
 | `--plus-lfe-gain`, `--plus-lfe-lf-trim`, `--no-lfe-lpf` | G6+ `.1` handling: discrete LFE level, whether the LF shelf reaches LFE, and the 120 Hz LFE low-pass. |
 | `-r, --rate` | Rate conversion happens **before** the renderer, through libsoxr, and only when you pass it. Doing it afterwards would make the resampler part of the matrix's phase response. |
-| `--depth`, `--dither` | Depth reduction is a separate, explicit decision from rate conversion. `--dither low_shibata \| triangular \| none`, plus the full soxr dither set. |
+| `--depth`, `--dither` | Depth reduction is a separate, explicit decision from rate conversion. `--dither wannamaker \| low_shibata \| triangular \| none`, plus the full soxr dither set (`wannamaker` runs an in-app 9-tap psychoacoustic noise shaper for 16/24-bit output). |
 | `--ir` | Mono headphone-calibration impulse convolved into every input channel first, exactly the way mpv's `afir` does (`irnorm=-1`, `precision=double`), so the calibration you already use for listening is the one applied here. |
 | `--order FL,FR,FC,LFE,BL,BR,SL,SR` | Some containers mislabel their channel layout. This overrides it instead of guessing. |
 | `--queue` | The memory bound: `queue × block × channels × 8` bytes per file. |
@@ -256,11 +257,12 @@ than folded.
 | `--detail`, `--detail-intensity`, `--detail-bias`, `--detail-transients`, `--detail-tilt` | Sines+Transients micro-detail and presence enhancement. |
 | `--unmask`, `--unmask-recover`, `--unmask-tame`, `--unmask-max-db`, `--unmask-bias`, `--unmask-brighten` | Moore 2016 / ISO 532-2 perceptual unmasking dynamic EQ. |
 | `--plus-physics`, `--plus-distance`, `--plus-head-radius`, `--plus-torso-height`, `--plus-pinna-shelf`, `--ear-canal-mm` | Physical head/torso scattering model and near-field parallax. |
-| `--room`, `--room-json`, `--room-temp-c`, `--room-rh`, `--co2-ppm`, `--room-pressure-kpa` | Hybrid 3D room and ISO 9613-1/Cramer air absorption. |
-| `--head-mesh` | OBJ head/pinna scan for FMM-BEM personalised HRTF synthesis. |
+| `--room`, `--room-quality`, `--room-json`, `--room-temp-c`, `--room-rh`, `--co2-ppm`, `--room-pressure-kpa`, `--cuda` | Hybrid 3D room (`preview` or `production` 670 Hz FDTD + 50k rays), ISO 9613-1/Cramer air absorption, and optional `--features cuda` FDTD GPU offload. |
+| `--head-mesh` | OBJ head/pinna scan for CHIEF-regularized FMM-BEM personalised HRTF synthesis. |
 | `--exact-ntt` | Goldilocks-field NTT convolution with zero intermediate rounding. |
 | `--plus-slepian`, `--plus-fdn`, `--plus-warped-decorr` | Exact Slepian window, scattering FDN late tail, Bark-warped surround decorrelation. |
 | `--limit-style`, `--limit-clip-db` | Transparent or punchy limiter, plus ADAA2 soft-clipper drive. |
+| `--assess` | Non-intrusive Klippel + King–Agerkvist electro-mechanical-thermal transducer assessment (`none`, `headphone-dynamic`, `headphone-planar`, `studio-monitor`). |
 
 Full help: `g6me --help`. `--json` emits one object per finished file for scripts,
 including the renderer, the true peak with its ratio, the limiter report, the
@@ -272,11 +274,12 @@ delivered file measurement, DC offset and the full BS.1770-5 loudness block.
 into a watertight, FMM-BEM-ready head/pinna mesh and hands it to `--head-mesh`.
 Four stages, all in memory:
 
-1. **DNG 1.7 ingest** — uncompressed and Lossless-JPEG SOF3 (ITU-T T.81, predictors
-   1–7) strips and tiles decode natively in pure Rust; v7.0 zero-copy 50 MP MIPI
-   RAW10 bursts with OIS/IMU sidecars are unpacked; OpcodeList3 WarpRectilinear and
-   FixVignetteRadial are applied. JPEG-XL pixel tiles are refused with an explicit
-   error instead of fabricated pixels, and `--dng` prints the Honesty Report.
+1. **DNG 1.7 ingest** — uncompressed, Lossless-JPEG SOF3 (ITU-T T.81, predictors
+   1–7), and JPEG-XL (compression tag `52546`, via `jxl-oxide`, including
+   Row/Column interleave) strips and tiles decode natively; v7.0 zero-copy 50 MP
+   MIPI RAW10 bursts with OIS/IMU sidecars are unpacked; OpcodeList3
+   WarpRectilinear and FixVignetteRadial are applied, and `--dng` prints the
+   Honesty Report.
 2. **Metric anchor** — Russian ID-1 card (horizontal or vertical, GOST R ISO/IEC
    7810-2006), AprilTag3 tag36h11, or ChArUco. The detected anchor fixes metres per
    pixel, so the reconstruction is metric rather than scale-free.
@@ -284,8 +287,8 @@ Four stages, all in memory:
    crack-free marching tetrahedra; bundle adjustment runs in Ozaki-II FP4→FP64.
 4. **Watertight acoustic conditioning** — generalized winding numbers (Jacobson et
    al., SIGGRAPH 2013) close the surface, isotropic remeshing enforces
-   `h <= lambda_min / 6`, and the mesh goes directly into the FMM-BEM Helmholtz
-   solver without touching disk.
+   `h <= lambda_min / 6`, and the mesh goes directly into the CHIEF-regularized
+   FMM-BEM Helmholtz solver without touching disk.
 
 ```sh
 # inspect a DNG and print the Honesty Report
@@ -293,20 +296,19 @@ g6me-scan --dng capture.dng
 
 # metric multi-view reconstruction from a RAW10 burst
 g6me-scan --burst burst/ --anchor russian-card --max-edge-mm 2.5 -o head.obj
-
-# self-contained demonstration of all four stages
-g6me-scan --demo
 ```
 
 `--head-mesh head.obj` then uses that mesh for personalised FMM-BEM HRTF synthesis
-in the renderer. The CUDA sources embedded in `blackwell.rs`, `bem.rs`, `ntt.rs`
-and `scan.rs` (Stockham radix-4 FFT, 3D FDTD, Goldilocks NTT, dense ZNCC matcher,
-FMM-BEM near-field matvec) are compiled with `nvcc --fmad=false` and audited with
-`cuobjdump` on machines with the CUDA Toolkit; the pure-Rust CPU models remain the
-authoritative execution path.
+in the renderer. The optional `crates/g6me-cuda` crate (`--features cuda`) ships 6
+standalone `.cu` kernels (`fdtd_3d.cu`, `raytrace_hoa.cu`, `stockham_fft_f64.cu`,
+`goldilocks_ntt.cu`, `bem_matvec.cu`, `ozaki2_blackwell_mma.cu`) compiled with
+`nvcc --fmad=false` and audited for 0 contracted `fma.rn` in the PTX and 0 fused
+FMA in the `cuobjdump --dump-sass` hardware SASS (with a `--fmad=true` sabotage
+negative control) in `g6me-verify --group cuda`, plus dynamic `cudarc`
+GPU offload for 3D FDTD (`--cuda`) with deterministic pure-Rust CPU fallback.
 
 Design notes: `docs/G6ME_SCAN_FMM_BEM_NTT.md` (scan, FMM-BEM, NTT),
-`docs/ACADEMIC_NUKE_ACOUSTICS.md` (room and perceptual models), and
+`docs/ACADEMIC_NUKE_ACOUSTICS.md` (room, CUDA, noise shaping, transducer, and perceptual models), and
 `docs/PATENT_CLEAN_MASTERING_SUITE.md` (upmix, virtual bass, detail, unmasking).
 
 ## GUI
@@ -595,7 +597,7 @@ and runs:
   DSP and the canonical reference builds must contain no FMA.
 
 ```
-122 passed, 0 failed, 0 skipped
+129 passed, 0 failed, 0 skipped
 ```
 
 Run it through `cargo run -p g6me-verify` (or `cargo test -p g6me-verify`) rather
@@ -603,8 +605,8 @@ than a stale binary in `target/` — an out-of-date verifier is worse than none.
 check also runs per-group (`--group bitexact` …), so a failure can be reproduced
 without waiting for the whole suite.
 
-The workspace test suite covers what the verifier does not: 363 tests across the
-core (283), CLI (24), GUI (43) and harness (13). The G6+ invariants live there —
+The workspace test suite covers what the verifier does not: 371 tests across the
+core (289), CLI (25), GUI (43), CUDA (1) and harness (13). The G6+ invariants live there —
 a flat 1-ERB diffuse field across all three profiles, measured ITD against
 Woodworth, sub-bass coherence, exact L/R mirror symmetry, a clean kernel tail with
 no pre-ringing, chunk-size-invariant overlap-add streaming, stereo bypass, LFE gain
@@ -707,12 +709,18 @@ build() {
 
 v3 makes FMA *available*, and a single FMA inside a recursive biquad changes the filter
 state and drifts phase, so the optimized build is checked rather than trusted. Measured
-here on a Ryzen 7 5700X3D:
+here on a Ryzen 7 5700X3D with the current dependency set (the JPEG-XL decoder is linked
+into `g6me-scan`):
 
-| build | instructions | FMA | `%ymm` refs | verifier |
+| build | instructions | contracted FMA (DSP) | `%ymm` refs | verifier |
 |---|---|---|---|---|
-| generic (default) | 294,080 | **0** | 123 | 122/122 |
-| x86-64-v3 + thin LTO + O3 + unroll | 313,249 | **0** | 4,515 | 122/122 |
+| generic (default) | 490,656 | **0** | 123 | 129/129 |
+| x86-64-v3 + thin LTO + O3 + unroll | 534,463 | **0** | 13,928 | 129/129 |
+
+The FMA column is what `g6me-verify` enforces: it disassembles the `g6me*` symbols and
+fails on any FMA mnemonic. A whole-binary `objdump` additionally finds two `vfmaddsd`
+instructions inside `compiler_builtins::fma` — the implementation of an explicitly
+requested fused multiply-add, not a contraction of source `a*b+c`, and outside the DSP.
 
 For scale, the deliberate `-ffp-contract=fast` reference build contains 32 FMA
 instructions and fails the same comparison, so "no FMA found" means something.
@@ -731,13 +739,16 @@ do not make it the default you ship.
 ## Layout
 
 ```
-crates/g6me-core     DSP port, G6+ renderer, FFT/NTT, room, upmix, mastering stages,
-                     acoustic scan (DNG/LJPEG, metric anchors, TSDF, winding repair,
-                     FMM-BEM), pipeline (ffmpeg ⇄ renderer ⇄ encoder), batch engine,
-                     capabilities probe, meters, loudness, WAV I/O, monitoring
+crates/g6me-core     DSP port, G6+ renderer, FFT/NTT, room (UPOLA + FDTD + raytracing),
+                     upmix, mastering stages, Wannamaker noise shaping, Klippel
+                     transducer assessment, acoustic scan (DNG/LJPEG/JXL, metric
+                     anchors, TSDF, winding repair, CHIEF FMM-BEM), pipeline,
+                     batch engine, capabilities probe, meters, loudness, WAV I/O
+crates/g6me-cuda     optional `--features cuda` zero-FMA `.cu` kernels, `nvcc` +
+                     `cuobjdump --dump-sass` auditor, and `cudarc` FDTD offload
 crates/g6me-cli      `g6me` and `g6me-scan`
 crates/g6me-gui      `g6me-gui` — eframe, no audio backend
-crates/g6me-verify   bit-exactness harness; builds vendor/g6ct in 8 configurations
+crates/g6me-verify   bit-exactness, zero-FMA ASM/SASS, acoustics, mastering, and scan harness
 vendor/g6ct          the C reference, byte-identical to upstream (see UPSTREAM.md)
 packaging/linux      desktop entry, icon, AppRun for the AppImage
 scripts/             build-optimized.sh (verified v3 build), build-install.sh

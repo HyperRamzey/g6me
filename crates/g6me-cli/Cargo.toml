@@ -26,3 +26,4 @@ ctrlc = "3"
 [features]
 default = ["monitor"]
 monitor = ["g6me-core/monitor"]
+cuda = ["g6me-core/cuda"]

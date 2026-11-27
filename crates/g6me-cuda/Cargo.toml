@@ -1,0 +1,11 @@
+[package]
+name = "g6me-cuda"
+description = "Optional zero-FMA CUDA / Blackwell (sm_120) GPU backend and nvcc+cuobjdump SASS auditor for G6ME"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12080"] }

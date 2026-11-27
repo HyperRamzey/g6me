@@ -69,6 +69,46 @@ impl RoomPreset {
     }
 }
 
+/// Physical simulation fidelity for the 3D Hybrid Room solver (FDTD + Ray Tracing + UPOLA).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoomQuality {
+    /// Fast interactive/CI fidelity: 500 Hz FDTD (65k voxels, 0.165 s) + 2,048 parallel PCG64 rays.
+    #[default]
+    Preview,
+    /// Full mastering production fidelity: >= 670 Hz FDTD (`dx <= 0.085 m`, 0.35 s decay) +
+    /// 50,000 parallel deterministic PCG64 Monte Carlo rays across all CPU cores.
+    Production,
+}
+
+impl RoomQuality {
+    pub const ALL: [RoomQuality; 2] = [RoomQuality::Preview, RoomQuality::Production];
+
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "preview" | "fast" | "draft" => Ok(Self::Preview),
+            "production" | "prod" | "full" | "high" | "reference" => Ok(Self::Production),
+            other => Err(format!(
+                "unknown room quality `{other}` (expected: preview, production)"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Production => "production",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preview => "Preview (Fast, 2k rays / 500 Hz FDTD)",
+            Self::Production => "Production (50k rays / 670 Hz FDTD)",
+        }
+    }
+}
+
 /// Deterministic PCG64 (64-bit Permuted Congruential Generator, XSL-RR) PRNG
 /// for bit-exact reproducible Monte Carlo ray tracing & Velvet Noise sequences.
 #[derive(Debug, Clone, Copy)]
@@ -663,10 +703,10 @@ impl FdtdSolver3d {
     /// covering `geom.dims_m` with spatial step `dx_m` (`0.114 m` resolves up to `504 Hz` at
     /// `6` points-per-wavelength for ITU-R BS.1116 control rooms).
     pub fn new(geom: &RoomGeometry, c_m_s: f64, dx_m: f64) -> Self {
-        let dx = dx_m.clamp(0.08, 0.40);
-        let nx = ((geom.dims_m[0] / dx).round() as usize).clamp(8, 96);
-        let ny = ((geom.dims_m[1] / dx).round() as usize).clamp(8, 96);
-        let nz = ((geom.dims_m[2] / dx).round() as usize).clamp(6, 64);
+        let dx = dx_m.clamp(0.07, 0.40);
+        let nx = ((geom.dims_m[0] / dx).round() as usize).clamp(8, 128);
+        let ny = ((geom.dims_m[1] / dx).round() as usize).clamp(8, 128);
+        let nz = ((geom.dims_m[2] / dx).round() as usize).clamp(6, 96);
         let lambda = 0.55_f64; // Strictly below 3D SRL stability limit 1/sqrt(3) ≈ 0.57735
         let dt_s = lambda * dx / c_m_s;
         Self {
@@ -685,6 +725,8 @@ impl FdtdSolver3d {
     ///
     /// - For `ControlRoom` (`6.0 × 5.0 × 3.0 m = 90 m³`, `max_voxels = 65_000`), selects
     ///   `dx = 0.114 m` (`53 × 44 × 26 = 60,632` voxels, `f_6ppw = 504 Hz`!).
+    /// - For `ControlRoom` Production (`target_hz = 670 Hz`, `max_voxels = 260_000`), selects
+    ///   `dx = 0.085 m` (`71 × 59 × 35 = 146,615` voxels, `f_6ppw = 676 Hz`!).
     /// - For `TheaterStage` (`12.0 × 9.5 × 5.2 m = 593 m³`, Schroeder freq `53 Hz`), selects
     ///   `dx = 0.209 m` (`57 × 45 × 25 = 64,125` voxels, `f_6ppw = 275 Hz`, `> 5×` Schroeder!).
     pub fn for_room_budget(
@@ -693,7 +735,7 @@ impl FdtdSolver3d {
         target_hz: f64,
         max_voxels: usize,
     ) -> Self {
-        let dx_target = c_m_s / (6.0 * target_hz.clamp(100.0, 600.0));
+        let dx_target = c_m_s / (6.0 * target_hz.clamp(100.0, 720.0));
         let vol = geom.dims_m[0] * geom.dims_m[1] * geom.dims_m[2];
         let dx_budget = (vol / (max_voxels.max(4_096) as f64)).cbrt();
         Self::new(geom, c_m_s, dx_target.max(dx_budget))
@@ -724,6 +766,76 @@ impl FdtdSolver3d {
     /// By **Acoustic Reciprocity**, placing the source at the Left ear (run 1) and Right ear
     /// (run 2) records the low-frequency modal room response for ALL 12 virtual speakers
     /// in just 2 FDTD runs!
+    /// Run the 3D FDTD wave simulation, optionally offloading the zero-FMA 7-point SRL
+    /// stencil to a live NVIDIA GPU via `g6me-cuda` when `use_cuda` is true and `--features cuda`
+    /// is compiled in. Falls back deterministically to the bit-identical CPU solver when no GPU
+    /// is attached.
+    pub fn simulate_with_cuda(
+        &self,
+        src_voxel: (usize, usize, usize),
+        receivers: &[(usize, usize, usize)],
+        steps: usize,
+        use_cuda: bool,
+    ) -> Vec<Vec<f64>> {
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            if let Ok(rt) = crate::blackwell::try_init_cuda_runtime() {
+                if let Ok(out) = self.simulate_on_cuda(&rt, src_voxel, receivers, steps) {
+                    return out;
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = use_cuda;
+        self.simulate(src_voxel, receivers, steps)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn simulate_on_cuda(
+        &self,
+        rt: &g6me_cuda::G6meCudaRuntime,
+        src_voxel: (usize, usize, usize),
+        receivers: &[(usize, usize, usize)],
+        steps: usize,
+    ) -> std::result::Result<Vec<Vec<f64>>, String> {
+        let total = self.nx * self.ny * self.nz;
+        let mut p_prev = vec![0.0_f64; total];
+        let mut p_curr = vec![0.0_f64; total];
+        let lam2 = self.lambda * self.lambda;
+        let half_lam_beta = 0.5 * self.lambda * self.beta_wall;
+        let mut inv_den = [0.0_f64; 7];
+        for (kb, slot) in inv_den.iter_mut().enumerate() {
+            *slot = 1.0 / (1.0 + half_lam_beta * (kb as f64));
+        }
+        let src_id = self.idx(src_voxel.0, src_voxel.1, src_voxel.2);
+        let rec_ids: Vec<usize> = receivers
+            .iter()
+            .map(|&(i, j, k)| self.idx(i, j, k))
+            .collect();
+        let mut out: Vec<Vec<f64>> = vec![vec![0.0_f64; steps]; receivers.len()];
+        for step in 0..steps {
+            if step == 0 {
+                p_curr[src_id] += 1.0;
+            }
+            for (row, &rid) in out.iter_mut().zip(rec_ids.iter()) {
+                row[step] = p_curr[rid];
+            }
+            let p_next = rt.run_fdtd_3d_step(
+                &p_prev,
+                &p_curr,
+                &inv_den,
+                self.nx,
+                self.ny,
+                self.nz,
+                lam2,
+                half_lam_beta,
+            )?;
+            p_prev = p_curr;
+            p_curr = p_next;
+        }
+        Ok(out)
+    }
+
     pub fn simulate(
         &self,
         src_voxel: (usize, usize, usize),
@@ -755,8 +867,8 @@ impl FdtdSolver3d {
             if step == 0 {
                 p_curr[src_id] += 1.0;
             }
-            for (r, &rid) in rec_ids.iter().enumerate() {
-                out[r][step] = p_curr[rid];
+            for (row, &rid) in out.iter_mut().zip(rec_ids.iter()) {
+                row[step] = p_curr[rid];
             }
 
             // Fast branchless interior 7-point 3D SRL stencil (`1..nx-1, 1..ny-1, 1..nz-1`).
@@ -938,9 +1050,167 @@ pub fn image_sources_3d(
     taps
 }
 
+/// Trace one deterministic PCG64 ray (`ray_id`) through the shoebox room and return its
+/// Order-7 HOA hit tuples `(time_bin, energy_weight, sh_coeffs)` for orders `4..=max_bounces`.
+#[allow(clippy::too_many_arguments)]
+fn trace_single_ray(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    ray_id: usize,
+    ray_init_energy: f64,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> Vec<(usize, f64, [f64; HOA_CH])> {
+    let c = atm.speed_of_sound_m_s();
+    let l = geom.dims_m;
+    let rec = geom.listener_m;
+    let rec_rad = 0.45_f64; // Acoustic receiver sphere radius (m)
+    let rec_rad2 = rec_rad * rec_rad;
+    let stream_seq = 0x5241_5954_5241_4345u64 ^ (ray_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut rng = Pcg64::new(seed, stream_seq);
+    let mut hits = Vec::new();
+
+    // Uniform random direction on unit sphere.
+    let z = 2.0 * rng.next_f64() - 1.0;
+    let phi = 2.0 * PI * rng.next_f64();
+    let r_xy = (1.0 - z * z).max(0.0).sqrt();
+    let mut dir = [r_xy * phi.cos(), r_xy * phi.sin(), z];
+    let mut pos = src_m;
+    let mut dist_total = 0.0_f64;
+    let mut energy = ray_init_energy;
+
+    for bounce in 1..=max_bounces {
+        // Find earliest intersection with the 6 shoebox planes.
+        let mut t_min = f64::INFINITY;
+        let mut wall_idx = 0usize;
+        for axis in 0..3 {
+            if dir[axis] > 1e-12 {
+                let t = (l[axis] - pos[axis]) / dir[axis];
+                if t > 1e-9 && t < t_min {
+                    t_min = t;
+                    wall_idx = match axis {
+                        0 => 0, // +x front
+                        1 => 2, // +y left
+                        _ => 5, // +z ceiling
+                    };
+                }
+            } else if dir[axis] < -1e-12 {
+                let t = -pos[axis] / dir[axis];
+                if t > 1e-9 && t < t_min {
+                    t_min = t;
+                    wall_idx = match axis {
+                        0 => 1, // -x back
+                        1 => 3, // -y right
+                        _ => 4, // -z floor
+                    };
+                }
+            }
+        }
+        if !t_min.is_finite() {
+            break;
+        }
+
+        // Check if ray segment passes through the listener detection sphere (orders >= 4).
+        if bounce >= 4 {
+            let oc = [rec[0] - pos[0], rec[1] - pos[1], rec[2] - pos[2]];
+            let proj = oc[0] * dir[0] + oc[1] * dir[1] + oc[2] * dir[2];
+            if proj > 0.0 && proj < t_min {
+                let closest_sq = (oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2]) - proj * proj;
+                if closest_sq <= rec_rad2 {
+                    let d_hit = dist_total + proj;
+                    let t_hit = d_hit / c;
+                    let bin = (t_hit / bin_dt_s) as usize;
+                    if bin < n_time_bins {
+                        // Direction from listener back toward incoming ray (-dir).
+                        let inc = [-dir[0], -dir[1], -dir[2]];
+                        let az = inc[1].atan2(inc[0]);
+                        let el = inc[2].clamp(-1.0, 1.0).asin();
+                        let sh = eval_sh_order7(az, el);
+                        let air = atm.air_gain_linear(2_000.0, d_hit);
+                        let w = energy * air * air;
+                        hits.push((bin, w, sh));
+                    }
+                }
+            }
+        }
+
+        // Advance ray to hit point and apply wall reflection + Lambertian scattering.
+        pos[0] = (pos[0] + dir[0] * t_min).clamp(1e-6, l[0] - 1e-6);
+        pos[1] = (pos[1] + dir[1] * t_min).clamp(1e-6, l[1] - 1e-6);
+        pos[2] = (pos[2] + dir[2] * t_min).clamp(1e-6, l[2] - 1e-6);
+        dist_total += t_min;
+
+        let mat = geom.walls[wall_idx];
+        // Mid-band wall energy survival (1 - alpha_1k).
+        let refl = 1.0 - mat.absorption[3].clamp(0.01, 0.99);
+        energy *= refl;
+        if energy < 1e-7 * ray_init_energy {
+            break;
+        }
+
+        // Specular reflection vector.
+        let mut spec = dir;
+        let normal = match wall_idx {
+            0 => {
+                spec[0] = -spec[0];
+                [-1.0, 0.0, 0.0]
+            }
+            1 => {
+                spec[0] = -spec[0];
+                [1.0, 0.0, 0.0]
+            }
+            2 => {
+                spec[1] = -spec[1];
+                [0.0, -1.0, 0.0]
+            }
+            3 => {
+                spec[1] = -spec[1];
+                [0.0, 1.0, 0.0]
+            }
+            4 => {
+                spec[2] = -spec[2];
+                [0.0, 0.0, 1.0]
+            }
+            _ => {
+                spec[2] = -spec[2];
+                [0.0, 0.0, -1.0]
+            }
+        };
+
+        // ISO-17497 Lambertian diffuse scattering blend.
+        if rng.next_f64() < mat.scattering {
+            // Cosine-weighted hemisphere around wall normal.
+            let u1 = rng.next_f64();
+            let u2 = 2.0 * PI * rng.next_f64();
+            let r = u1.sqrt();
+            let lx = r * u2.cos();
+            let ly = r * u2.sin();
+            let lz = (1.0 - u1).max(0.0).sqrt();
+            let normal: [f64; 3] = normal;
+            dir = if normal[0].abs() > 0.5 {
+                [normal[0] * lz, lx, ly]
+            } else if normal[1].abs() > 0.5 {
+                [lx, normal[1] * lz, ly]
+            } else {
+                [lx, ly, normal[2] * lz]
+            };
+        } else {
+            dir = spec;
+        }
+    }
+    hits
+}
+
 /// Deterministic **PCG64** Monte Carlo Acoustic Ray Tracer (orders 4..=max_bounces) with
 /// Lambertian / ISO-17497 diffuse wall scattering, binning late directional energy into
-/// an Order-7 HOA (`64`-channel) impulse histogram ready for MagLS binaural decoding!
+/// an Order-7 HOA (`64`-channel) impulse histogram ready for MagLS binaural decoding.
+///
+/// Parallelized across logical CPU cores via [`crate::util::par_map_indexed`] with an
+/// independent per-ray PCG64 stream and fixed ascending `ray_id` reduction, so every
+/// output bit is **100% bit-identical** regardless of CPU core count or scheduling.
 #[allow(clippy::too_many_arguments)]
 pub fn raytrace_hoa_histogram(
     geom: &RoomGeometry,
@@ -956,144 +1226,63 @@ pub fn raytrace_hoa_histogram(
     if n_rays == 0 || n_time_bins == 0 {
         return hist;
     }
-    let c = atm.speed_of_sound_m_s();
-    let l = geom.dims_m;
-    let rec = geom.listener_m;
-    let rec_rad = 0.45_f64; // Acoustic receiver sphere radius (m)
-    let rec_rad2 = rec_rad * rec_rad;
-    let mut rng = Pcg64::new(seed, 0x5241_5954_5241_4345);
     let ray_init_energy = 1.0 / (n_rays as f64);
-
-    for _ in 0..n_rays {
-        // Uniform random direction on unit sphere.
-        let z = 2.0 * rng.next_f64() - 1.0;
-        let phi = 2.0 * PI * rng.next_f64();
-        let r_xy = (1.0 - z * z).max(0.0).sqrt();
-        let mut dir = [r_xy * phi.cos(), r_xy * phi.sin(), z];
-        let mut pos = src_m;
-        let mut dist_total = 0.0_f64;
-        let mut energy = ray_init_energy;
-
-        for bounce in 1..=max_bounces {
-            // Find earliest intersection with the 6 shoebox planes.
-            let mut t_min = f64::INFINITY;
-            let mut wall_idx = 0usize;
-            for axis in 0..3 {
-                if dir[axis] > 1e-12 {
-                    let t = (l[axis] - pos[axis]) / dir[axis];
-                    if t > 1e-9 && t < t_min {
-                        t_min = t;
-                        wall_idx = match axis {
-                            0 => 0, // +x front
-                            1 => 2, // +y left
-                            _ => 5, // +z ceiling
-                        };
-                    }
-                } else if dir[axis] < -1e-12 {
-                    let t = -pos[axis] / dir[axis];
-                    if t > 1e-9 && t < t_min {
-                        t_min = t;
-                        wall_idx = match axis {
-                            0 => 1, // -x back
-                            1 => 3, // -y right
-                            _ => 4, // -z floor
-                        };
-                    }
-                }
+    let per_ray = crate::util::par_map_indexed(n_rays, |ray_id| {
+        trace_single_ray(
+            geom,
+            atm,
+            src_m,
+            ray_id,
+            ray_init_energy,
+            max_bounces,
+            n_time_bins,
+            bin_dt_s,
+            seed,
+        )
+    });
+    for hits in per_ray {
+        for (bin, w, sh) in hits {
+            for c_idx in 0..HOA_CH {
+                hist[bin][c_idx] += w * sh[c_idx];
             }
-            if !t_min.is_finite() {
-                break;
-            }
+        }
+    }
+    hist
+}
 
-            // Check if ray segment passes through the listener detection sphere (orders >= 4).
-            if bounce >= 4 {
-                let oc = [rec[0] - pos[0], rec[1] - pos[1], rec[2] - pos[2]];
-                let proj = oc[0] * dir[0] + oc[1] * dir[1] + oc[2] * dir[2];
-                if proj > 0.0 && proj < t_min {
-                    let closest_sq = (oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2]) - proj * proj;
-                    if closest_sq <= rec_rad2 {
-                        let d_hit = dist_total + proj;
-                        let t_hit = d_hit / c;
-                        let bin = (t_hit / bin_dt_s) as usize;
-                        if bin < n_time_bins {
-                            // Direction from listener back toward incoming ray (-dir).
-                            let inc = [-dir[0], -dir[1], -dir[2]];
-                            let az = inc[1].atan2(inc[0]);
-                            let el = inc[2].clamp(-1.0, 1.0).asin();
-                            let sh = eval_sh_order7(az, el);
-                            let air = atm.air_gain_linear(2_000.0, d_hit);
-                            let w = energy * air * air;
-                            for c_idx in 0..HOA_CH {
-                                hist[bin][c_idx] += w * sh[c_idx];
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Advance ray to hit point and apply wall reflection + Lambertian scattering.
-            pos[0] = (pos[0] + dir[0] * t_min).clamp(1e-6, l[0] - 1e-6);
-            pos[1] = (pos[1] + dir[1] * t_min).clamp(1e-6, l[1] - 1e-6);
-            pos[2] = (pos[2] + dir[2] * t_min).clamp(1e-6, l[2] - 1e-6);
-            dist_total += t_min;
-
-            let mat = geom.walls[wall_idx];
-            // Mid-band wall energy survival (1 - alpha_1k).
-            let refl = 1.0 - mat.absorption[3].clamp(0.01, 0.99);
-            energy *= refl;
-            if energy < 1e-7 * ray_init_energy {
-                break;
-            }
-
-            // Specular reflection vector.
-            let mut spec = dir;
-            let normal = match wall_idx {
-                0 => {
-                    spec[0] = -spec[0];
-                    [-1.0, 0.0, 0.0]
-                }
-                1 => {
-                    spec[0] = -spec[0];
-                    [1.0, 0.0, 0.0]
-                }
-                2 => {
-                    spec[1] = -spec[1];
-                    [0.0, -1.0, 0.0]
-                }
-                3 => {
-                    spec[1] = -spec[1];
-                    [0.0, 1.0, 0.0]
-                }
-                4 => {
-                    spec[2] = -spec[2];
-                    [0.0, 0.0, 1.0]
-                }
-                _ => {
-                    spec[2] = -spec[2];
-                    [0.0, 0.0, -1.0]
-                }
-            };
-
-            // ISO-17497 Lambertian diffuse scattering blend.
-            if rng.next_f64() < mat.scattering {
-                // Cosine-weighted hemisphere around wall normal.
-                let u1 = rng.next_f64();
-                let u2 = 2.0 * PI * rng.next_f64();
-                let r = u1.sqrt();
-                let lx = r * u2.cos();
-                let ly = r * u2.sin();
-                let lz = (1.0 - u1).max(0.0).sqrt();
-                // Map local normal (0,0,1) to wall normal.
-                let normal: [f64; 3] = normal;
-                dir = if normal[0].abs() > 0.5 {
-                    [normal[0] * lz, lx, ly]
-                } else if normal[1].abs() > 0.5 {
-                    [lx, normal[1] * lz, ly]
-                } else {
-                    [lx, ly, normal[2] * lz]
-                };
-            } else {
-                dir = spec;
+/// Strictly single-threaded reference evaluation of [`raytrace_hoa_histogram`] (used to
+/// verify bit-for-bit thread-count invariance).
+#[allow(clippy::too_many_arguments)]
+pub fn raytrace_hoa_histogram_serial(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> Vec<[f64; HOA_CH]> {
+    let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
+    if n_rays == 0 || n_time_bins == 0 {
+        return hist;
+    }
+    let ray_init_energy = 1.0 / (n_rays as f64);
+    for ray_id in 0..n_rays {
+        let hits = trace_single_ray(
+            geom,
+            atm,
+            src_m,
+            ray_id,
+            ray_init_energy,
+            max_bounces,
+            n_time_bins,
+            bin_dt_s,
+            seed,
+        );
+        for (bin, w, sh) in hits {
+            for c_idx in 0..HOA_CH {
+                hist[bin][c_idx] += w * sh[c_idx];
             }
         }
     }
@@ -1121,6 +1310,8 @@ pub fn synthesize_hybrid_room_reflections(
     fdtd_r_low: Option<&[f64]>,
     fdtd_dt_s: f64,
     use_fdn_velvet: bool,
+    quality: RoomQuality,
+    tail_duration_s: f64,
     seed: u64,
     plan: &FftPlan,
 ) -> (Vec<Complex>, Vec<Complex>) {
@@ -1139,15 +1330,16 @@ pub fn synthesize_hybrid_room_reflections(
 
     // Compute physical FDTD 6-PPW crossover frequency directly from `fdtd_dt_s` (`lambda = 0.55`).
     let f_xover = if fdtd_l_low.is_some() && fdtd_dt_s > 1e-6 {
-        (0.55 / (6.0 * fdtd_dt_s)).clamp(150.0, 500.0)
+        (0.55 / (6.0 * fdtd_dt_s)).clamp(150.0, 680.0)
     } else {
         500.0
     };
+    let tail_dur = tail_duration_s.clamp(0.144, ((n_fft as f64) / fs) - pre_delay_s - 0.02);
 
     // 1. Layer 1a: 3D Image-Source Method (orders 1–3, closing the 3rd-order gap before ray tracing).
     let ism_taps = image_sources_3d(geom, src_m, c, 3);
     for tap in &ism_taps {
-        if tap.delay_s > 0.145 {
+        if tap.delay_s > tail_dur {
             continue;
         }
         // Geometric 1/r attenuation relative to direct sound.
@@ -1225,13 +1417,26 @@ pub fn synthesize_hybrid_room_reflections(
         }
     }
 
-    // 3. Layer 1b: Deterministic PCG64 Monte Carlo Ray Tracing (1024 rays, orders 4..48) ->
-    //    time-varying Order-7 HOA spatial-temporal histogram (`36 x 4 ms = 144 ms`) decoded
-    //    through MagLS in 4 directional time zones modulated by the measured ray-traced
-    //    energy envelope + Paraunitary Scattering FDN / ternary Velvet Noise diffusion!
+    // 3. Layer 1b: Parallel deterministic PCG64 Monte Carlo Ray Tracing ->
+    //    time-varying Order-7 HOA spatial-temporal histogram (`4 ms` bins across `tail_dur`)
+    //    decoded through MagLS in 4 directional time zones modulated by the measured ray-traced
+    //    energy envelope + Paraunitary Scattering FDN / ternary Velvet Noise diffusion.
     let bin_dt_s = 0.004; // 4 ms HOA energy histogram bins
-    let n_bins = 36usize; // 0..144 ms
-    let hist = raytrace_hoa_histogram(geom, atm, src_m, 1_024, 48, n_bins, bin_dt_s, seed);
+    let n_bins = ((tail_dur / bin_dt_s).round() as usize).clamp(36, 200);
+    let (n_rays, max_bounces) = match quality {
+        RoomQuality::Preview => (2_048usize, 48usize),
+        RoomQuality::Production => (50_000usize, 72usize),
+    };
+    let hist = raytrace_hoa_histogram(
+        geom,
+        atm,
+        src_m,
+        n_rays,
+        max_bounces,
+        n_bins,
+        bin_dt_s,
+        seed,
+    );
     let bin_energies: Vec<f64> = hist
         .iter()
         .map(|b| b.iter().map(|x| x * x).sum::<f64>().sqrt())
@@ -1239,7 +1444,7 @@ pub fn synthesize_hybrid_room_reflections(
     let max_bin_e = bin_energies.iter().copied().fold(0.0_f64, f64::max);
 
     if max_bin_e > 1e-12 {
-        let tail_len = ((0.144 * fs).round() as usize).min(n_fft / 2);
+        let tail_len = ((tail_dur * fs).round() as usize).min(n_fft.saturating_sub(512));
         let (base_l, base_r) = if use_fdn_velvet {
             let mut fdn =
                 ScatteringFdn::new(fs as u32, geom.target_rt60_s, geom.target_rt60_s * 0.55);
@@ -1341,7 +1546,8 @@ pub fn synthesize_hybrid_room_reflections(
     if let (Some(fl_raw), Some(fr_raw)) = (fdtd_l_low, fdtd_r_low) {
         let mut td_l = vec![0.0_f64; n_fft];
         let mut td_r = vec![0.0_f64; n_fft];
-        let max_len = (0.155 * fs).round() as usize;
+        let fdtd_dur = ((fl_raw.len() as f64) * fdtd_dt_s).min(tail_dur);
+        let max_len = (fdtd_dur * fs).round() as usize;
         let pre_smp = (pre_delay_s * fs).round() as usize;
         // Resample FDTD time series from dt_s to 1/fs via linear interpolation & strip direct arrival.
         let peak_l = fl_raw
@@ -1512,10 +1718,20 @@ mod tests {
         let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
         let atm = AtmosphereCfg::default();
         let src = [4.3, 3.5, 1.25];
-        let h1 = raytrace_hoa_histogram(&geom, &atm, src, 256, 20, 20, 0.004, 0xCAFE_BABE);
-        let h2 = raytrace_hoa_histogram(&geom, &atm, src, 256, 20, 20, 0.004, 0xCAFE_BABE);
-        assert_eq!(h1, h2, "PCG64 ray tracer must be bit-exact deterministic");
-        let tot_w: f64 = h1.iter().map(|b| b[0]).sum();
+        let h_par = raytrace_hoa_histogram(&geom, &atm, src, 512, 24, 24, 0.004, 0xCAFE_BABE);
+        let h_ser =
+            raytrace_hoa_histogram_serial(&geom, &atm, src, 512, 24, 24, 0.004, 0xCAFE_BABE);
+        assert_eq!(h_par.len(), h_ser.len());
+        for (b, (rp, rs)) in h_par.iter().zip(&h_ser).enumerate() {
+            for c in 0..HOA_CH {
+                assert_eq!(
+                    rp[c].to_bits(),
+                    rs[c].to_bits(),
+                    "parallel vs serial PCG64 raytracer bit mismatch at bin={b} ch={c}"
+                );
+            }
+        }
+        let tot_w: f64 = h_par.iter().map(|b| b[0]).sum();
         assert!(
             tot_w > 1e-6,
             "ray tracer recorded zero HOA W-channel energy"

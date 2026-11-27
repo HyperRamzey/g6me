@@ -42,8 +42,9 @@ use g6me_core::pipeline;
 use g6me_core::pipeline::Report;
 use g6me_core::plus::{woodworth_itd_s, PhysicsEngine, PlusCfg, PlusProfile, RendererMode};
 use g6me_core::probe::{probe_caps, Caps, Tools};
-use g6me_core::room::RoomPreset;
+use g6me_core::room::{RoomPreset, RoomQuality};
 use g6me_core::stages::Gtype;
+use g6me_core::transducer::TransducerProfile;
 use g6me_core::util;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -1519,14 +1520,16 @@ impl App {
                                 RoomPreset::ControlRoom => (
                                     "Control Room (3D FDTD+ISM+RT)",
                                     "ITU-R BS.1116 mastering control room (6×5×3 m, RT60 0.25 s): \
-                                     500 Hz 6-PPW reciprocal 3D FDTD + Order-3 ISM + Svensson BTM \
-                                     desk diffraction + 1024-ray time-varying HOA (170.7 ms BRIR).",
+                                     reciprocal 3D FDTD modal bass + Order-3 ISM + Svensson BTM \
+                                     desk diffraction + parallel PCG64 HOA raytracing, zero-latency \
+                                     UPOLA 341.3 ms BRIR with SHA-256 kernel cache.",
                                 ),
                                 RoomPreset::TheaterStage => (
                                     "Theater Stage (3D FDTD+ISM+RT)",
                                     "Reference theatrical mixing stage (12×9.5×5.2 m, RT60 0.42 s): \
                                      reciprocal 3D FDTD modal bass + Order-3 ISM + BTM console edge \
-                                     + 1024-ray time-varying HOA (170.7 ms BRIR).",
+                                     + parallel PCG64 HOA raytracing, zero-latency UPOLA 682.7 ms \
+                                     BRIR with SHA-256 kernel cache.",
                                 ),
                             };
                             if ui
@@ -1538,6 +1541,31 @@ impl App {
                             }
                         }
                     });
+                    if p.room_preset != RoomPreset::Anechoic || self.settings.use_room_json {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("room quality");
+                            for q in RoomQuality::ALL {
+                                let tip = match q {
+                                    RoomQuality::Preview => {
+                                        "Fast interactive tier: 500 Hz 6-PPW 3D FDTD (65k voxels, \
+                                         165 ms) + 2,048 parallel rays / 48 bounces."
+                                    }
+                                    RoomQuality::Production => {
+                                        "Archival mastering tier: 670 Hz 6-PPW 3D FDTD (dx ≤ 8.5 cm, \
+                                         260k voxels, 350 ms) + 50,000 parallel rays / 72 bounces \
+                                         (cached by SHA-256 across tracks)."
+                                    }
+                                };
+                                if ui
+                                    .selectable_value(&mut p.room_quality, q, q.label())
+                                    .on_hover_text(tip)
+                                    .changed()
+                                {
+                                    phys_changed = true;
+                                }
+                            }
+                        });
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.label("speaker distance");
                         if ui
@@ -1670,10 +1698,27 @@ impl App {
                         if ui
                             .checkbox(&mut p.exact_ntt, "Goldilocks NTT (0 ULP)")
                             .on_hover_text(
-                                "Executes binaural FIR convolution strictly inside the 64-bit \
-                                 Goldilocks prime field Z/(2^64-2^32+1)Z via radix-2 NTT \
+                                "Executes binaural FIR / UPOLA convolution strictly inside the \
+                                 64-bit Goldilocks prime field Z/(2^64-2^32+1)Z via radix-2 NTT \
                                  (--exact-ntt): bit-identical across x86, ARM, and RISC-V.",
                             )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
+                        let cuda_tip = match g6me_core::blackwell::cuda_hardware_summary() {
+                            Some(dev) => format!(
+                                "Offloads zero-FMA 3D FDTD room stepping to live NVIDIA GPU via \
+                                 g6me-cuda ({dev}); deterministic CPU fallback on error."
+                            ),
+                            None => "Opt-in zero-FMA CUDA GPU offload (--cuda, requires building \
+                                     with --features cuda + NVIDIA GPU). Falls back deterministically \
+                                     to CPU when no GPU is detected."
+                                .to_string(),
+                        };
+                        if ui
+                            .checkbox(&mut p.use_cuda, "CUDA GPU offload")
+                            .on_hover_text(cuda_tip)
                             .changed()
                         {
                             phys_changed = true;
@@ -2000,8 +2045,10 @@ impl App {
                 })
                 .response
                 .on_hover_text(
-                    "Applied when quantizing down to the output bit depth. Noise-shaping dithers \
-                     (Lipshitz, Shibata, E/F-weighted) are restricted to 16-bit by ffmpeg's libswresample.",
+                    "Applied when quantizing down to the output bit depth. `wannamaker (psychoacoustic)` \
+                     runs g6me's in-app 9-tap Wannamaker (1992) / Levinson–Durbin ISO-226 error-feedback \
+                     noise shaper at BOTH 16-bit and 24-bit across 44.1–384 kHz. Legacy ffmpeg shapers \
+                     (Lipshitz, Shibata, E/F-weighted) are 16-bit only.",
                 );
             if self.settings.dither != Dither::None {
                 if self.settings.depth == BitDepth::S24
@@ -2009,7 +2056,7 @@ impl App {
                 {
                     ui.colored_label(
                         egui::Color32::from_rgb(226, 110, 90),
-                        "24-bit supports rectangular / triangular / triangular_hp only",
+                        "24-bit supports rectangular / triangular / triangular_hp / wannamaker",
                     );
                 } else {
                     ui.weak("deterministic: the same input gives the same output every run");
@@ -2342,6 +2389,22 @@ impl App {
                 "Removes DC offset below 5 Hz without altering audible bass, mids, or treble. \
                  Prevents silent DC bias from prematurely triggering the limiter or clicking at edits.",
             );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("transducer assessment");
+            egui::ComboBox::from_id_salt("transducer-profile")
+                .selected_text(self.settings.transducer.label())
+                .show_ui(ui, |ui| {
+                    for prof in TransducerProfile::ALL {
+                        ui.selectable_value(&mut self.settings.transducer, prof, prof.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Non-intrusive Klippel (2006) + King–Agerkvist (JAES 2018) electro-mechanical-thermal \
+                     transducer simulator (--assess). Reports peak excursion (% Xmax), voice-coil ΔT (°C), \
+                     and nonlinear THD% in the finished-file summary without modifying a single output sample.",
+                );
+        });
         ui.add_space(6.0);
         ui.checkbox(&mut self.settings.limiter, "limit the true peak")
             .on_hover_text(
@@ -2761,13 +2824,16 @@ impl App {
                     .selected_text(self.settings.resample_dither.label())
                     .show_ui(ui, |ui| {
                         for d in Dither::ALL {
+                            if d.is_in_app_only() {
+                                continue;
+                            }
                             ui.selectable_value(&mut self.settings.resample_dither, d, d.label());
                         }
                     })
                     .response
                     .on_hover_text(
                         "Dither applied inside the input resampler when quantizing before the downmix \
-                         (separate from output dither on the Output tab).",
+                         (separate from output dither on the Output tab; Wannamaker is output-only).",
                     );
                 if self.settings.resample_dither != Dither::None {
                     ui.weak("deterministic: the same input gives the same output every run");

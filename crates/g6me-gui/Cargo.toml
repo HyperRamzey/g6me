@@ -34,3 +34,4 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 # no portal — see `g6me_core::meter::MeterTap`.
 default = ["native-dialogs"]
 native-dialogs = ["dep:rfd"]
+cuda = ["g6me-core/cuda"]

@@ -21,10 +21,11 @@
 //!    (`SENSOR_INFO_TIMESTAMP_SOURCE == 1`, `rolling_shutter_skew > 20 ms`, 400+ Hz uncalibrated
 //!    IMU strictly bracketing the burst), and supports stealing factory `OpcodeList3` from a
 //!    single `reference_lens56_opcodes.dng`.
-//! 5. **Real Pixel Decode**: decodes Uncompressed (`Compression = 1`, 8/10/12/14/16-bit) and
-//!    Lossless JPEG (`Compression = 7`, ITU-T T.81 SOF3 Huffman + predictors 1..7) strips and
-//!    tiles natively in pure Rust. JPEG-XL (`Compression = 52546`) headers and `OpcodeList2/3`
-//!    parse fully, while pixel decode returns an explicit diagnostic (no silent synthetic fallback).
+//! 5. **Real Pixel Decode**: decodes Uncompressed (`Compression = 1`, 8/10/12/14/16-bit),
+//!    Lossless JPEG (`Compression = 7`, ITU-T T.81 SOF3 Huffman + predictors 1..7), and
+//!    DNG 1.7 JPEG-XL (`Compression = 52546`, decoded natively via `jxl-oxide` including
+//!    `RowInterleaveFactor` 50975 / `ColumnInterleaveFactor` 52547 de-interleaving) strips
+//!    and tiles directly in Rust.
 
 use std::fs;
 use std::path::Path;
@@ -61,9 +62,11 @@ pub const TAG_WHITE_LEVEL: u16 = 50717;
 pub const TAG_DEFAULT_CROP_ORIGIN: u16 = 50719;
 pub const TAG_DEFAULT_CROP_SIZE: u16 = 50720;
 pub const TAG_ACTIVE_AREA: u16 = 50829;
+pub const TAG_ROW_INTERLEAVE_FACTOR: u16 = 50975;
 pub const TAG_OPCODE_LIST_1: u16 = 51008;
 pub const TAG_OPCODE_LIST_2: u16 = 51009;
 pub const TAG_OPCODE_LIST_3: u16 = 51022;
+pub const TAG_COLUMN_INTERLEAVE_FACTOR: u16 = 52547;
 
 pub const PHOTOMETRIC_CFA: u16 = 32803;
 pub const PHOTOMETRIC_LINEAR_RAW: u16 = 34892;
@@ -465,7 +468,7 @@ impl DngMetadata {
             ),
         }
         if self.compression == COMPRESSION_JPEG_XL {
-            s.push_str("  Pixel Codec     : Compression=52546 (JPEG-XL) — headers & OpcodeList2/3 parsed natively; JXL tile pixel decode requires converting to Lossless JPEG / Uncompressed DNG or using v7.0 RAW10 burst.\n");
+            s.push_str("  Pixel Codec     : Compression=52546 (JPEG-XL) — headers, OpcodeList2/3, and JXL pixel tiles/strips decoded natively via jxl-oxide.\n");
         } else if self.compression == COMPRESSION_LOSSLESS_JPEG {
             s.push_str("  Pixel Codec     : Compression=7 (Lossless JPEG SOF3) — native pure-Rust pixel decode supported.\n");
         } else if self.compression == COMPRESSION_UNCOMPRESSED {
@@ -508,6 +511,8 @@ pub struct DngPixelLayout {
     pub active_area: Option<[u32; 4]>,
     pub default_crop_origin: Option<[f64; 2]>,
     pub default_crop_size: Option<[f64; 2]>,
+    pub row_interleave_factor: u32,
+    pub column_interleave_factor: u32,
 }
 
 /// Decoded linear `f64` image extracted from a DNG file (with GainMap + Vignette applied).
@@ -1039,6 +1044,8 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
         active_area: None,
         default_crop_origin: None,
         default_crop_size: None,
+        row_interleave_factor: 1,
+        column_interleave_factor: 1,
     };
 
     // Inspect both IFD0 and chosen SubIFD for OpcodeList1/2/3 (avoid duplicate parsing if same).
@@ -1126,6 +1133,12 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
                 if vals.len() >= 2 {
                     layout.default_crop_size = Some([vals[0], vals[1]]);
                 }
+            }
+            TAG_ROW_INTERLEAVE_FACTOR => {
+                layout.row_interleave_factor = entry_scalar_u32(buf, e, le)?.max(1);
+            }
+            TAG_COLUMN_INTERLEAVE_FACTOR => {
+                layout.column_interleave_factor = entry_scalar_u32(buf, e, le)?.max(1);
             }
             _ => {}
         }
@@ -1681,6 +1694,86 @@ fn unpack_uncompressed_block(raw: &[u8], count: usize, bps: u16, le: bool) -> Re
     Ok(out)
 }
 
+/// Decode a DNG 1.7 JPEG-XL (`Compression = 52546`) strip or tile codestream via `jxl-oxide`.
+fn decode_jpeg_xl_block(
+    slice: &[u8],
+    bw: usize,
+    bh: usize,
+    spp: usize,
+    bps: u16,
+) -> Result<Vec<u16>> {
+    let image = jxl_oxide::JxlImage::builder()
+        .read(std::io::Cursor::new(slice))
+        .map_err(|e| Error::msg(format!("JPEG-XL DNG header decode failed: {e}")))?;
+    let render = image
+        .render_frame(0)
+        .map_err(|e| Error::msg(format!("JPEG-XL DNG frame render failed: {e}")))?;
+    let fb = render.image_all_channels();
+    let jw = fb.width();
+    let jh = fb.height();
+    let jc = fb.channels();
+    let samples = fb.buf();
+
+    if jw == 0 || jh == 0 || jc == 0 {
+        return Err(Error::msg("JPEG-XL DNG decoded empty frame"));
+    }
+    let max_code = ((1u32 << bps.clamp(8, 16)) - 1) as f64;
+    let mut out = vec![0u16; bw * bh * spp];
+    let copy_h = bh.min(jh);
+    let copy_w = bw.min(jw);
+    for y in 0..copy_h {
+        for x in 0..copy_w {
+            for c in 0..spp {
+                let sc = c.min(jc - 1);
+                let v = f64::from(samples[(y * jw + x) * jc + sc]).clamp(0.0, 1.0);
+                out[(y * bw + x) * spp + c] = (v * max_code).round_ties_even() as u16;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Undo DNG 1.7.1 `RowInterleaveFactor` (tag `50975`) and `ColumnInterleaveFactor`
+/// (tag `52547`) planar sub-image interleaving on a decoded `(bw x bh x spp)` block.
+fn deinterleave_block(
+    src: &[u16],
+    bw: usize,
+    bh: usize,
+    spp: usize,
+    row_factor: usize,
+    col_factor: usize,
+) -> Vec<u16> {
+    let rf = row_factor.max(1);
+    let cf = col_factor.max(1);
+    if rf == 1 && cf == 1 {
+        return src.to_vec();
+    }
+    // Precompute starting row offset for each row phase `0..rf`, and col offset for `0..cf`.
+    let mut row_off = vec![0usize; rf];
+    let mut acc = 0usize;
+    for (p, off) in row_off.iter_mut().enumerate() {
+        *off = acc;
+        acc += (bh + rf - 1 - p) / rf;
+    }
+    let mut col_off = vec![0usize; cf];
+    let mut acc_c = 0usize;
+    for (p, off) in col_off.iter_mut().enumerate() {
+        *off = acc_c;
+        acc_c += (bw + cf - 1 - p) / cf;
+    }
+    let mut dst = vec![0u16; bw * bh * spp];
+    for y in 0..bh {
+        let ey = row_off[y % rf] + (y / rf);
+        for x in 0..bw {
+            let ex = col_off[x % cf] + (x / cf);
+            let s_idx = (ey * bw + ex) * spp;
+            let d_idx = (y * bw + x) * spp;
+            dst[d_idx..d_idx + spp].copy_from_slice(&src[s_idx..s_idx + spp]);
+        }
+    }
+    dst
+}
+
 /// Decode full linear RGB + luminance pixels directly from a binary DNG file buffer,
 /// applying parsed `OpcodeList2` (`GainMap`) and `OpcodeList3` (`FixVignetteRadial`)
 /// radiometrically while keeping `WarpRectilinear` strictly analytical (zero pixel warping!).
@@ -1688,26 +1781,21 @@ fn unpack_uncompressed_block(raw: &[u8], count: usize, bps: u16, le: bool) -> Re
 /// Supports:
 /// - `Compression = 1` (Uncompressed 8/10/12/14/16-bit, strips or tiles)
 /// - `Compression = 7` (Lossless JPEG SOF3 ITU-T T.81, strips or tiles)
+/// - `Compression = 52546` (DNG 1.7 JPEG-XL strips or tiles via `jxl-oxide`, including
+///   `RowInterleaveFactor` 50975 / `ColumnInterleaveFactor` 52547 de-interleaving)
 /// - `Photometric = 32803` (CFA Bayer, demosaiced via Malvar–He–Cutler `f64`) and
 ///   `Photometric = 34892` (LinearRaw 1-ch gray or 3-ch RGB)
-///
-/// Explicitly returns an informative error for `Compression = 52546` (JPEG-XL).
 pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
     let (meta, layout) = parse_dng_with_layout(buf)?;
     if meta.main_width == 0 || meta.main_height == 0 {
         return Err(Error::msg("DNG has zero image dimensions"));
     }
-    if meta.compression == COMPRESSION_JPEG_XL {
-        return Err(Error::msg(
-            "DNG uses JPEG-XL pixel tiles (Compression=52546): headers and OpcodeList2/3 were parsed, \
-             but zero-dependency built-in pixel decoding supports Uncompressed (1) and Lossless JPEG SOF3 (7) DNGs \
-             (or v7.0 MIPI RAW10 bursts). Convert JXL DNGs with Adobe DNG Converter (Lossless JPEG) or capture RAW10.",
-        ));
-    }
-    if meta.compression != COMPRESSION_UNCOMPRESSED && meta.compression != COMPRESSION_LOSSLESS_JPEG
+    if meta.compression != COMPRESSION_UNCOMPRESSED
+        && meta.compression != COMPRESSION_LOSSLESS_JPEG
+        && meta.compression != COMPRESSION_JPEG_XL
     {
         return Err(Error::msg(format!(
-            "unsupported DNG compression={} (supported: 1=Uncompressed, 7=Lossless JPEG SOF3)",
+            "unsupported DNG compression={} (supported: 1=Uncompressed, 7=Lossless JPEG SOF3, 52546=JPEG-XL)",
             meta.compression
         )));
     }
@@ -1715,28 +1803,37 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
     let w = meta.main_width as usize;
     let h = meta.main_height as usize;
     let spp = layout.samples_per_pixel.max(1) as usize;
+    let row_if = layout.row_interleave_factor.max(1) as usize;
+    let col_if = layout.column_interleave_factor.max(1) as usize;
     let mut raw_u16 = vec![0u16; w * h * spp];
 
     let decode_block_to_u16 = |slice: &[u8], bw: usize, bh: usize| -> Result<Vec<u16>> {
-        if meta.compression == COMPRESSION_UNCOMPRESSED {
+        let block = if meta.compression == COMPRESSION_UNCOMPRESSED {
             unpack_uncompressed_block(
                 slice,
                 bw * bh * spp,
                 meta.bits_per_sample,
                 layout.little_endian,
-            )
+            )?
+        } else if meta.compression == COMPRESSION_JPEG_XL {
+            decode_jpeg_xl_block(slice, bw, bh, spp, meta.bits_per_sample)?
         } else {
             let (jw, jh, jc, jdata) = decode_lossless_jpeg_sof3(slice)?;
             let expected = bw * bh * spp;
             if jdata.len() == expected {
-                Ok(jdata)
+                jdata
             } else if jw * jc == bw * spp && jh >= bh {
-                Ok(jdata[..expected].to_vec())
+                jdata[..expected].to_vec()
             } else {
-                Err(Error::msg(format!(
+                return Err(Error::msg(format!(
                     "Lossless JPEG block size mismatch: decoded {jw}x{jh}x{jc}, expected {bw}x{bh}x{spp}"
-                )))
+                )));
             }
+        };
+        if row_if > 1 || col_if > 1 {
+            Ok(deinterleave_block(&block, bw, bh, spp, row_if, col_if))
+        } else {
+            Ok(block)
         }
     };
 
@@ -3015,13 +3112,189 @@ mod tests {
             }
         }
 
-        // 3. JPEG-XL (52546) must parse metadata cleanly and fail pixel decode honestly (never fake pixels!)
+        // 3. Header-only JPEG-XL (52546) without StripOffsets/TileOffsets must fail honestly
         let mut jxl_meta = base_meta.clone();
         jxl_meta.compression = COMPRESSION_JPEG_XL;
         let jxl_bytes = build_synthetic_dng_17(&jxl_meta);
         let err = decode_dng_bytes(&jxl_bytes)
-            .expect_err("JXL 52546 pixel decode must fail honestly without synthetic fallback");
-        assert!(err.to_string().contains("52546"));
+            .expect_err("header-only JXL DNG must fail honestly without synthetic fallback");
+        assert!(err.to_string().contains("StripOffsets"));
+    }
+
+    #[test]
+    fn real_dng_17_jpeg_xl_52546_and_row_col_interleave_decode_matches_uncompressed() {
+        // Real 16x12 lossless 16-bit JPEG-XL codestreams generated by libjxl `cjxl -d 0`:
+        // - JXL_PLAIN: standard 16x12 RGGB CFA pattern
+        // - JXL_INTER: identical 16x12 RGGB CFA with RowInterleaveFactor=2 & ColumnInterleaveFactor=2
+        const JXL_PLAIN: &[u8] = &[
+            0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0x00, 0x00,
+            0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00,
+            0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x09, 0x6a, 0x78, 0x6c, 0x6c, 0x0a, 0x00,
+            0x00, 0x01, 0x12, 0x6a, 0x78, 0x6c, 0x63, 0xff, 0x0a, 0x58, 0x30, 0xfc, 0x00, 0xc5,
+            0x85, 0x08, 0x02, 0x01, 0x00, 0xf0, 0x03, 0x4b, 0x28, 0x25, 0xd6, 0x81, 0x82, 0x82,
+            0x49, 0x46, 0xc6, 0x9b, 0x68, 0x46, 0x3c, 0xd1, 0x5e, 0x0c, 0xee, 0x77, 0x0c, 0x86,
+            0x63, 0x8c, 0x88, 0x31, 0x86, 0x31, 0x46, 0xc5, 0xe0, 0xd4, 0x60, 0xf0, 0x69, 0x00,
+            0x90, 0x8c, 0xc1, 0xa4, 0x40, 0xa7, 0x40, 0xa7, 0x40, 0x47, 0x5c, 0xb7, 0x40, 0xa7,
+            0x40, 0xa7, 0x40, 0xa7, 0x40, 0x87, 0x2a, 0xbc, 0x20, 0x3f, 0x11, 0x24, 0x11, 0x24,
+            0x11, 0x24, 0x11, 0x24, 0x11, 0x24, 0x11, 0x24, 0x11, 0x24, 0x11, 0x36, 0xb0, 0x11,
+            0x44, 0x07, 0xa2, 0x03, 0xd1, 0x81, 0xe8, 0x40, 0x74, 0x20, 0x7b, 0x76, 0x3a, 0x10,
+            0x1d, 0x48, 0x7e, 0x22, 0x48, 0x22, 0x48, 0x22, 0x48, 0x22, 0xc8, 0xb5, 0x7d, 0x22,
+            0x48, 0x22, 0x48, 0x22, 0x48, 0x22, 0x23, 0x88, 0x0e, 0x44, 0x07, 0xa2, 0x03, 0xf9,
+            0x1b, 0xd3, 0x81, 0xe8, 0x40, 0x74, 0x20, 0x3a, 0x90, 0xfc, 0x44, 0x90, 0x44, 0x90,
+            0x44, 0x90, 0x44, 0x46, 0xf4, 0x90, 0x44, 0x90, 0x44, 0x90, 0x44, 0x90, 0x44, 0x46,
+            0x10, 0x1d, 0x88, 0x0e, 0x44, 0x07, 0xd2, 0x00, 0xab, 0x03, 0xd1, 0x81, 0xe8, 0x40,
+            0x74, 0x20, 0xf9, 0x89, 0x20, 0x89, 0x20, 0x89, 0x20, 0x16, 0xb9, 0x89, 0x20, 0x89,
+            0x20, 0x89, 0x20, 0x89, 0x20, 0x89, 0x8c, 0x20, 0x3a, 0x10, 0x1d, 0x88, 0x4e, 0x84,
+            0x3e, 0x44, 0x07, 0xa2, 0x03, 0xd1, 0x81, 0xe8, 0x40, 0xf2, 0x13, 0x41, 0x12, 0x41,
+            0x12, 0xe9, 0xd5, 0x42, 0x12, 0x41, 0x12, 0x41, 0x12, 0x41, 0x12, 0x41, 0x12, 0x19,
+            0x41, 0x74, 0x20, 0x3a, 0x90, 0x2a, 0x14, 0x1d, 0x88, 0x0e, 0x44, 0x07, 0xa2, 0x03,
+            0xd1, 0x81, 0xe4, 0x27, 0x82, 0x24, 0x82, 0xd8, 0x08, 0x25, 0x82, 0x24, 0x82, 0x24,
+            0x82, 0x24, 0x82, 0x24, 0x82, 0xa4, 0x06,
+        ];
+        const JXL_INTER: &[u8] = &[
+            0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0x00, 0x00,
+            0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00,
+            0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x09, 0x6a, 0x78, 0x6c, 0x6c, 0x0a, 0x00,
+            0x00, 0x00, 0xab, 0x6a, 0x78, 0x6c, 0x63, 0xff, 0x0a, 0x58, 0x30, 0xfc, 0x00, 0xc5,
+            0x85, 0x08, 0x02, 0x01, 0x00, 0x54, 0x02, 0x4b, 0x38, 0x68, 0x18, 0xc2, 0xdb, 0xa1,
+            0x0a, 0x0a, 0x26, 0x19, 0x19, 0xd1, 0x89, 0x63, 0x0c, 0x6e, 0x41, 0x8c, 0xc1, 0x44,
+            0xa2, 0xbd, 0x30, 0xc6, 0xe0, 0x96, 0x30, 0xc6, 0x18, 0xc6, 0x60, 0xb6, 0x63, 0x8c,
+            0x8d, 0xc1, 0xd9, 0xc9, 0xff, 0x99, 0x06, 0x80, 0x09, 0x99, 0x66, 0x12, 0x11, 0x11,
+            0xc5, 0x51, 0xc3, 0x24, 0x22, 0x22, 0x22, 0x46, 0x44, 0x44, 0xd4, 0x0b, 0x4e, 0x44,
+            0x44, 0x44, 0xc4, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x18, 0x11, 0x11, 0x11,
+            0x7d, 0x94, 0x13, 0x11, 0x11, 0x11, 0x23, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x62,
+            0x44, 0x44, 0x44, 0x64, 0xc6, 0x47, 0x44, 0x44, 0x44, 0x75, 0xd4, 0x35, 0x02, 0x94,
+            0x50, 0x30, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x46, 0x44, 0x44, 0x44, 0x44,
+            0x44, 0x44, 0x74, 0x87, 0xc8, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x18, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x23, 0x22, 0x22, 0x50, 0x44, 0x22, 0x22, 0x22,
+            0xa2, 0x75,
+        ];
+
+        let w = 16u32;
+        let h = 12u32;
+        let pat = CfaPattern::Rggb;
+        let mut cfa_u16 = Vec::with_capacity((w * h) as usize);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let ch = pat.color_at(x, y);
+                let base = match ch {
+                    0 => 2200u16,
+                    1 => 1800u16,
+                    _ => 1200u16,
+                };
+                cfa_u16.push(base + ((x * 13 + y * 19) % 400) as u16);
+            }
+        }
+        let ref_meta = DngMetadata {
+            dng_version: [1, 7, 1, 0],
+            preview_width: 4,
+            preview_height: 4,
+            main_width: w,
+            main_height: h,
+            bits_per_sample: 14,
+            compression: COMPRESSION_UNCOMPRESSED,
+            photometric: PHOTOMETRIC_CFA,
+            new_subfile_type: 0,
+            subifd_routed: true,
+            cfa_pattern: Some(pat),
+            black_level: 256.0,
+            white_level: 16383.0,
+            gain_maps: Vec::new(),
+            vignette: None,
+            warp_rectilinear: None,
+        };
+        let raw_dng = build_synthetic_dng_with_pixels(&ref_meta, &cfa_u16, 1, false);
+        let dec_raw = decode_dng_bytes(&raw_dng).expect("decode uncompressed 14-bit DNG");
+
+        let build_jxl_dng = |payload: &[u8], rf: u16, cf: u16| -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"II");
+            buf.extend_from_slice(&42u16.to_le_bytes());
+            buf.extend_from_slice(&8u32.to_le_bytes());
+            let n_tags: u16 = if rf > 1 || cf > 1 { 14 } else { 12 };
+            let strip_off = 8u32 + 2 + (n_tags as u32) * 12 + 4;
+            let write_e = |dst: &mut Vec<u8>, tag: u16, typ: u16, cnt: u32, val: [u8; 4]| {
+                dst.extend_from_slice(&tag.to_le_bytes());
+                dst.extend_from_slice(&typ.to_le_bytes());
+                dst.extend_from_slice(&cnt.to_le_bytes());
+                dst.extend_from_slice(&val);
+            };
+            buf.extend_from_slice(&n_tags.to_le_bytes());
+            write_e(&mut buf, TAG_IMAGE_WIDTH, 4, 1, w.to_le_bytes());
+            write_e(&mut buf, TAG_IMAGE_LENGTH, 4, 1, h.to_le_bytes());
+            write_e(&mut buf, TAG_BITS_PER_SAMPLE, 3, 1, 14u32.to_le_bytes());
+            write_e(
+                &mut buf,
+                TAG_COMPRESSION,
+                3,
+                1,
+                (COMPRESSION_JPEG_XL as u32).to_le_bytes(),
+            );
+            write_e(
+                &mut buf,
+                TAG_PHOTOMETRIC,
+                3,
+                1,
+                (PHOTOMETRIC_CFA as u32).to_le_bytes(),
+            );
+            write_e(&mut buf, TAG_STRIP_OFFSETS, 4, 1, strip_off.to_le_bytes());
+            write_e(&mut buf, TAG_SAMPLES_PER_PIXEL, 3, 1, 1u32.to_le_bytes());
+            write_e(&mut buf, TAG_ROWS_PER_STRIP, 4, 1, h.to_le_bytes());
+            write_e(
+                &mut buf,
+                TAG_STRIP_BYTE_COUNTS,
+                4,
+                1,
+                (payload.len() as u32).to_le_bytes(),
+            );
+            write_e(&mut buf, TAG_CFA_PATTERN, 1, 4, [0, 1, 1, 2]);
+            write_e(&mut buf, TAG_BLACK_LEVEL, 4, 1, 256u32.to_le_bytes());
+            write_e(&mut buf, TAG_WHITE_LEVEL, 4, 1, 16383u32.to_le_bytes());
+            if rf > 1 || cf > 1 {
+                write_e(
+                    &mut buf,
+                    TAG_ROW_INTERLEAVE_FACTOR,
+                    3,
+                    1,
+                    (rf as u32).to_le_bytes(),
+                );
+                write_e(
+                    &mut buf,
+                    TAG_COLUMN_INTERLEAVE_FACTOR,
+                    3,
+                    1,
+                    (cf as u32).to_le_bytes(),
+                );
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            assert_eq!(buf.len(), strip_off as usize);
+            buf.extend_from_slice(payload);
+            buf
+        };
+
+        let dec_jxl = decode_dng_bytes(&build_jxl_dng(JXL_PLAIN, 1, 1))
+            .expect("decode real DNG 1.7 JPEG-XL (52546) strip");
+        let dec_jxl_inter = decode_dng_bytes(&build_jxl_dng(JXL_INTER, 2, 2))
+            .expect("decode real DNG 1.7.1 interleaved JPEG-XL (52546 + 50975/52547) strip");
+
+        assert_eq!(dec_jxl.rgb.len(), dec_raw.rgb.len());
+        assert_eq!(dec_jxl_inter.rgb.len(), dec_raw.rgb.len());
+        for i in 0..dec_raw.rgb.len() {
+            for c in 0..3 {
+                assert!(
+                    (dec_jxl.rgb[i][c] - dec_raw.rgb[i][c]).abs() < 2e-4,
+                    "JXL plain mismatch at px {i} ch {c}: {} vs {}",
+                    dec_jxl.rgb[i][c],
+                    dec_raw.rgb[i][c]
+                );
+                assert!(
+                    (dec_jxl_inter.rgb[i][c] - dec_jxl.rgb[i][c]).abs() < 1e-12,
+                    "JXL 2x2 de-interleaved mismatch at px {i} ch {c}: {} vs {}",
+                    dec_jxl_inter.rgb[i][c],
+                    dec_jxl.rgb[i][c]
+                );
+            }
+        }
     }
 
     #[test]

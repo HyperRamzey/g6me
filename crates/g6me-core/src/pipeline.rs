@@ -18,13 +18,14 @@ use crate::error::{Error, Result};
 use crate::limiter::{Limiter, Report as LimiterReport};
 use crate::loudness::{LoudnessMeter, LoudnessReport};
 use crate::mask::{format_order, is_downmixable, mask_of, order_from_layout, Slot};
-use crate::pcm::{Grid24, Sha256};
+use crate::pcm::{PcmQuantizer, Sha256};
 use crate::plus::{Renderer, RendererMode};
 use crate::probe::{probe_audio, AudioInfo, Caps, Tools};
 use crate::stages::{
     effective_input_rate, input_args, input_stage, loss_chain, output_args, InputStage, RenderCfg,
 };
 use crate::tp::{db_from_peak, Ratio, TruePeak};
+use crate::transducer::{TransducerAssessment, TransducerMonitor};
 use crate::unmask::UnmaskEq;
 use crate::upmix::Upmixer;
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,9 @@ pub struct Report {
     /// EBU Tech 3342 LRA, AES TD1008 PLR, and EBU Tech 3205-E stereo phase correlation.
     #[serde(default)]
     pub loudness: Option<LoudnessReport>,
+    /// Optional Klippel + King–Agerkvist electro-mechanical-thermal transducer assessment.
+    #[serde(default)]
+    pub transducer: Option<TransducerAssessment>,
 }
 
 impl Report {
@@ -343,6 +347,10 @@ impl Report {
             s.push('\n');
             s.push_str(&l.detail_line());
         }
+        if let Some(t) = &self.transducer {
+            s.push('\n');
+            s.push_str(&t.detail_line());
+        }
         if let Some(n) = &self.delivered_note {
             s.push_str(&format!("\nWARNING: {n}"));
         }
@@ -394,6 +402,7 @@ struct PeakSummary {
     dc_offset: Vec<f64>,
     limiter: Option<LimiterReport>,
     loudness: LoudnessReport,
+    transducer: Option<TransducerAssessment>,
 }
 
 /// The last thing to touch a sample, and the pair of numbers that describe it.
@@ -416,6 +425,8 @@ struct PeakStage {
     accum: [Accum; 2],
     /// ITU-R BS.1770-5 / EBU R128 loudness + LRA + stereo phase correlation meter.
     loudness: LoudnessMeter,
+    /// Optional non-invasive Klippel + King–Agerkvist transducer assessment monitor.
+    transducer: Option<TransducerMonitor>,
 }
 
 /// Peak and mean-square, held per channel for the whole file.
@@ -555,6 +566,7 @@ impl PeakStage {
             dc,
             accum: std::array::from_fn(|_| Accum::default()),
             loudness: LoudnessMeter::new(rate),
+            transducer: TransducerMonitor::new(cfg.transducer, rate),
         }
     }
 
@@ -591,6 +603,9 @@ impl PeakStage {
             self.tp.push_ch(1, right);
         }
         self.loudness.push(left, right);
+        if let Some(t) = self.transducer.as_mut() {
+            t.push(left, right);
+        }
         // Sample peak and mean-square are always accumulated, shared meter or not: two
         // passes over a block that is already in cache, and they are the numbers the
         // history panel is built from.
@@ -620,6 +635,9 @@ impl PeakStage {
                 self.tp.push_ch(1, right);
             }
             self.loudness.push(left, right);
+            if let Some(t) = self.transducer.as_mut() {
+                t.push(left, right);
+            }
             for (acc, buf) in self
                 .accum
                 .iter_mut()
@@ -658,6 +676,7 @@ impl PeakStage {
             dc_offset: self.accum.iter().map(Accum::dc).collect(),
             limiter: report,
             loudness,
+            transducer: self.transducer.as_ref().map(TransducerMonitor::summarize),
         }
     }
 }
@@ -886,10 +905,10 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     let mut frames: u64 = 0;
     let mut decoded_in: u64 = 0;
     let mut pipe_bytes_in: u64 = 0;
-    // Rounds onto the 24-bit grid after the meter, where the encoder's own s32->s24
-    // step would otherwise truncate (`OutCfg::grid24`).
-    let mut grid = if cfg.out.grid24(work_rate) {
-        Grid24::new(cfg.out.dither)
+    // Rounds/dithers onto the 24-bit grid (or 16-bit grid for Wannamaker psychoacoustic
+    // noise shaping) after the meter, where ffmpeg would otherwise truncate (`OutCfg::in_app_quantize`).
+    let mut grid = if cfg.out.in_app_quantize(work_rate) {
+        PcmQuantizer::new(cfg.out.depth, cfg.out.dither, work_rate)
     } else {
         None
     };
@@ -1325,6 +1344,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         rms_dbfs: peak_summary.rms_dbfs,
         dc_offset: peak_summary.dc_offset,
         loudness: Some(peak_summary.loudness),
+        transducer: peak_summary.transducer,
     })
 }
 

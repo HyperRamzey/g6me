@@ -75,6 +75,7 @@ pub mod stage;
 pub mod stages;
 pub mod stn;
 pub mod tp;
+pub mod transducer;
 pub mod unmask;
 pub mod upmix;
 pub mod util;

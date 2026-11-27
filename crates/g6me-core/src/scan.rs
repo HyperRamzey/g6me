@@ -1218,10 +1218,94 @@ fn sobel_gradients(luma: &[f64], width: usize, height: usize) -> (Vec<f64>, Vec<
     (gx, gy, mag)
 }
 
+/// 2D Andrew's monotone-chain convex hull (counter-clockwise, no duplicate endpoints).
+fn convex_hull_2d(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    if pts.len() <= 2 {
+        return pts.to_vec();
+    }
+    let mut p = pts.to_vec();
+    p.sort_by(|a, b| a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])));
+    p.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9);
+    if p.len() <= 2 {
+        return p;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| -> f64 {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    let mut lower: Vec<[f64; 2]> = Vec::new();
+    for &pt in &p {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], pt) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(pt);
+    }
+    let mut upper: Vec<[f64; 2]> = Vec::new();
+    for &pt in p.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], pt) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(pt);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+/// `(center, u_axis, v_axis, half_w, half_h)` of a 2-D oriented bounding box.
+type Obb2D = ([f64; 2], [f64; 2], [f64; 2], f64, f64);
+
+/// Minimum-area oriented bounding rectangle of a 2D convex hull via edge-aligned calipers.
+/// Returns the [`Obb2D`] with right-handed `(u_axis, v_axis)`.
+fn min_area_obb_2d(hull: &[[f64; 2]]) -> Option<Obb2D> {
+    if hull.len() < 3 {
+        return None;
+    }
+    let mut best_area = f64::INFINITY;
+    let mut best = None;
+    let m = hull.len();
+    for i in 0..m {
+        let a = hull[i];
+        let b = hull[(i + 1) % m];
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let len = dx.hypot(dy);
+        if len < 1e-9 {
+            continue;
+        }
+        let u = [dx / len, dy / len];
+        let v = [-u[1], u[0]];
+        let mut min_u = f64::INFINITY;
+        let mut max_u = f64::NEG_INFINITY;
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
+        for &pt in hull {
+            let pu = pt[0] * u[0] + pt[1] * u[1];
+            let pv = pt[0] * v[0] + pt[1] * v[1];
+            min_u = min_u.min(pu);
+            max_u = max_u.max(pu);
+            min_v = min_v.min(pv);
+            max_v = max_v.max(pv);
+        }
+        let w = max_u - min_u;
+        let h = max_v - min_v;
+        let area = w * h;
+        if area < best_area && w > 1e-6 && h > 1e-6 {
+            best_area = area;
+            let cu = 0.5 * (min_u + max_u);
+            let cv = 0.5 * (min_v + max_v);
+            let center = [cu * u[0] + cv * v[0], cu * u[1] + cv * v[1]];
+            best = Some((center, u, v, 0.5 * w, 0.5 * h));
+        }
+    }
+    best
+}
+
 /// Extract the best high-contrast rectangular quad candidate matching `target_aspect` (`w / h`)
-/// from a linear luminance image by connected-component labeling of foreground edge/region masks,
-/// sub-pixel parabolic edge refinement along the 4 straight sides (excluding corner rounding zones),
-/// and returning `[top_pts, right_pts, bottom_pts, left_pts]`.
+/// at arbitrary in-plane rotation from a linear luminance image using connected-component
+/// boundary extraction, convex-hull minimum-area oriented bounding rectangle (rotating calipers),
+/// and sub-pixel parabolic edge refinement along the outward normals of all 4 straight sides
+/// (excluding corner rounding zones). Returns `[top_pts, right_pts, bottom_pts, left_pts]`.
 fn detect_rect_edge_points(
     luma: &[f64],
     width: usize,
@@ -1240,106 +1324,126 @@ fn detect_rect_edge_points(
         ));
     }
 
-    // Try both bright-on-dark and dark-on-bright foreground segmentation + edge component bbox.
+    // Try both bright-on-dark and dark-on-bright foreground segmentation + OBB aspect scoring.
     let mut sorted = luma.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let p20 = sorted[sorted.len() / 5];
     let p80 = sorted[(sorted.len() * 4) / 5];
     let mid = 0.5 * (p20 + p80);
-    let edge_thr = max_mag * 0.28;
+    let edge_thr = max_mag * 0.25;
 
-    let mut best_bbox: Option<(usize, usize, usize, usize, f64)> = None;
+    struct BestObb {
+        center: [f64; 2],
+        u_axis: [f64; 2],
+        v_axis: [f64; 2],
+        half_w: f64,
+        half_h: f64,
+        score: f64,
+    }
+    let mut best_obb: Option<BestObb> = None;
 
     for bright_fg in [true, false] {
         let mut visited = vec![false; width * height];
         let mut stack = Vec::new();
+        let is_fg_at = |idx: usize| -> bool {
+            if bright_fg {
+                luma[idx] > mid + 0.05 * (p80 - p20)
+            } else {
+                luma[idx] < mid - 0.05 * (p80 - p20)
+            }
+        };
         for sy in 1..(height - 1) {
             for sx in 1..(width - 1) {
                 let sidx = sy * width + sx;
-                if visited[sidx] {
-                    continue;
-                }
-                let is_fg = if bright_fg {
-                    luma[sidx] > mid + 0.05 * (p80 - p20)
-                } else {
-                    luma[sidx] < mid - 0.05 * (p80 - p20)
-                };
-                if !is_fg {
+                if visited[sidx] || !is_fg_at(sidx) {
                     continue;
                 }
                 visited[sidx] = true;
                 stack.clear();
                 stack.push((sx, sy));
-                let mut min_x = sx;
-                let mut max_x = sx;
-                let mut min_y = sy;
-                let mut max_y = sy;
+                let mut boundary = Vec::new();
                 let mut count = 0usize;
                 let mut touches_border = false;
 
                 while let Some((cx, cy)) = stack.pop() {
                     count += 1;
-                    min_x = min_x.min(cx);
-                    max_x = max_x.max(cx);
-                    min_y = min_y.min(cy);
-                    max_y = max_y.max(cy);
                     if cx <= 1 || cy <= 1 || cx >= width - 2 || cy >= height - 2 {
                         touches_border = true;
                     }
+                    let mut on_boundary = false;
                     for (nx, ny) in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)] {
                         let nidx = ny * width + nx;
-                        if visited[nidx] {
-                            continue;
-                        }
-                        let n_fg = if bright_fg {
-                            luma[nidx] > mid + 0.05 * (p80 - p20)
+                        if is_fg_at(nidx) {
+                            if !visited[nidx] {
+                                visited[nidx] = true;
+                                stack.push((nx, ny));
+                            }
                         } else {
-                            luma[nidx] < mid - 0.05 * (p80 - p20)
-                        };
-                        if n_fg {
-                            visited[nidx] = true;
-                            stack.push((nx, ny));
+                            on_boundary = true;
                         }
+                    }
+                    if on_boundary {
+                        boundary.push([cx as f64, cy as f64]);
                     }
                 }
 
-                if touches_border {
+                if touches_border || count < 100 || boundary.len() < 8 {
                     continue;
                 }
-                let bw = (max_x - min_x + 1) as f64;
-                let bh = (max_y - min_y + 1) as f64;
-                if bw < 10.0 || bh < 10.0 {
+                let hull = convex_hull_2d(&boundary);
+                let Some((center, mut u_axis, mut v_axis, mut half_w, mut half_h)) =
+                    min_area_obb_2d(&hull)
+                else {
+                    continue;
+                };
+                if 2.0 * half_w < 10.0 || 2.0 * half_h < 10.0 {
                     continue;
                 }
-                let fill = (count as f64) / (bw * bh);
-                let aspect = bw / bh;
-                let aspect_err = (aspect - target_aspect).abs() / target_aspect;
+                // Match either OBB axis orientation to `target_aspect`.
+                let asp_direct = half_w / half_h;
+                let asp_swapped = half_h / half_w;
+                let err_direct = (asp_direct - target_aspect).abs() / target_aspect;
+                let err_swapped = (asp_swapped - target_aspect).abs() / target_aspect;
+                let aspect_err = if err_swapped < err_direct {
+                    std::mem::swap(&mut half_w, &mut half_h);
+                    u_axis = v_axis;
+                    err_swapped
+                } else {
+                    err_direct
+                };
+                // Canonicalize frame so u_axis points generally +x and v_axis = [-u_y, u_x] (+y down).
+                if u_axis[0] < 0.0 || (u_axis[0].abs() < 1e-6 && u_axis[1] < 0.0) {
+                    u_axis = [-u_axis[0], -u_axis[1]];
+                }
+                v_axis = [-u_axis[1], u_axis[0]];
+
+                let obb_area = 4.0 * (half_w + 0.5) * (half_h + 0.5);
+                let fill = (count as f64) / obb_area;
                 if fill > 0.72 && aspect_err <= aspect_tol {
                     let score = (count as f64) * fill / (1.0 + 4.0 * aspect_err);
-                    if best_bbox.map(|b| score > b.4).unwrap_or(true) {
-                        best_bbox = Some((min_x, max_x, min_y, max_y, score));
+                    if best_obb.as_ref().map(|b| score > b.score).unwrap_or(true) {
+                        best_obb = Some(BestObb {
+                            center,
+                            u_axis,
+                            v_axis,
+                            half_w,
+                            half_h,
+                            score,
+                        });
                     }
                 }
             }
         }
     }
 
-    let (min_x, max_x, min_y, max_y, _) = best_bbox.ok_or_else(|| {
+    let obb = best_obb.ok_or_else(|| {
         Error::msg(format!(
             "no calibration target matching aspect ratio {target_aspect:.3} detected in {width}x{height} image"
         ))
     })?;
 
-    // Sample sub-pixel edge positions along the 4 straight sides, strictly excluding the outer
-    // 16% near each corner (which safely excludes the 3.18 mm rounded corners on GOST ID-1 cards!).
-    let bw = (max_x - min_x) as f64;
-    let bh = (max_y - min_y) as f64;
-    let x_lo = (min_x as f64 + 0.16 * bw).ceil() as usize;
-    let x_hi = (max_x as f64 - 0.16 * bw).floor() as usize;
-    let y_lo = (min_y as f64 + 0.16 * bh).ceil() as usize;
-    let y_hi = (max_y as f64 - 0.16 * bh).floor() as usize;
-    let band = 3usize;
-
+    // Sample sub-pixel edge positions along the outward normal of each of the 4 oriented sides,
+    // strictly excluding the outer 16% near each corner (excludes 3.18 mm GOST ID-1 rounded corners).
     let refine_1d = |v_prev: f64, v_cur: f64, v_next: f64| -> f64 {
         let denom = v_prev - 2.0 * v_cur + v_next;
         if denom.abs() > 1e-12 {
@@ -1349,89 +1453,69 @@ fn detect_rect_edge_points(
         }
     };
 
-    let mut top_pts = Vec::new();
-    let mut bot_pts = Vec::new();
-    for x in x_lo..=x_hi {
-        // Top edge near min_y
-        let mut best_y = min_y;
-        let mut best_m = -1.0_f64;
-        for y in min_y.saturating_sub(band)..=(min_y + band).min(height - 2) {
-            let m = mag[y * width + x];
-            if m > best_m {
-                best_m = m;
-                best_y = y;
+    let sample_side = |p_start: [f64; 2], p_end: [f64; 2], outward_n: [f64; 2]| -> Vec<[f64; 2]> {
+        let dx = p_end[0] - p_start[0];
+        let dy = p_end[1] - p_start[1];
+        let side_len = dx.hypot(dy);
+        let n_steps = (side_len * 0.68).round().clamp(6.0, 200.0) as usize;
+        let mut pts = Vec::with_capacity(n_steps);
+        for i in 0..n_steps {
+            let frac = 0.16 + 0.68 * ((i as f64) / ((n_steps - 1).max(1) as f64));
+            let bx = p_start[0] + frac * dx;
+            let by = p_start[1] + frac * dy;
+            let mut best_s = 0isize;
+            let mut best_m = -1.0_f64;
+            for s in -4isize..=4 {
+                let sx = bx + (s as f64) * outward_n[0];
+                let sy = by + (s as f64) * outward_n[1];
+                if sx >= 1.0 && sy >= 1.0 && sx < (width - 2) as f64 && sy < (height - 2) as f64 {
+                    let m = bilinear_luma(&mag, width, height, sx, sy);
+                    if m > best_m {
+                        best_m = m;
+                        best_s = s;
+                    }
+                }
+            }
+            if best_m >= edge_thr {
+                let sm = (best_s - 1) as f64;
+                let s0 = best_s as f64;
+                let sp = (best_s + 1) as f64;
+                let vm = bilinear_luma(
+                    &mag,
+                    width,
+                    height,
+                    bx + sm * outward_n[0],
+                    by + sm * outward_n[1],
+                );
+                let v0 = best_m;
+                let vp = bilinear_luma(
+                    &mag,
+                    width,
+                    height,
+                    bx + sp * outward_n[0],
+                    by + sp * outward_n[1],
+                );
+                let ds = s0 + refine_1d(vm, v0, vp);
+                pts.push([bx + ds * outward_n[0], by + ds * outward_n[1]]);
             }
         }
-        if best_m >= edge_thr && best_y > 0 && best_y + 1 < height {
-            let dy = refine_1d(
-                mag[(best_y - 1) * width + x],
-                mag[best_y * width + x],
-                mag[(best_y + 1) * width + x],
-            );
-            top_pts.push([x as f64, (best_y as f64) + dy]);
-        }
+        pts
+    };
 
-        // Bottom edge near max_y
-        let mut best_by = max_y;
-        let mut best_bm = -1.0_f64;
-        for y in max_y.saturating_sub(band)..=(max_y + band).min(height - 2) {
-            let m = mag[y * width + x];
-            if m > best_bm {
-                best_bm = m;
-                best_by = y;
-            }
-        }
-        if best_bm >= edge_thr && best_by > 0 && best_by + 1 < height {
-            let dy = refine_1d(
-                mag[(best_by - 1) * width + x],
-                mag[best_by * width + x],
-                mag[(best_by + 1) * width + x],
-            );
-            bot_pts.push([x as f64, (best_by as f64) + dy]);
-        }
-    }
+    let c = obb.center;
+    let u = obb.u_axis;
+    let v = obb.v_axis;
+    let hw = obb.half_w;
+    let hh = obb.half_h;
+    let tl = [c[0] - hw * u[0] - hh * v[0], c[1] - hw * u[1] - hh * v[1]];
+    let tr = [c[0] + hw * u[0] - hh * v[0], c[1] + hw * u[1] - hh * v[1]];
+    let br = [c[0] + hw * u[0] + hh * v[0], c[1] + hw * u[1] + hh * v[1]];
+    let bl = [c[0] - hw * u[0] + hh * v[0], c[1] - hw * u[1] + hh * v[1]];
 
-    let mut left_pts = Vec::new();
-    let mut right_pts = Vec::new();
-    for y in y_lo..=y_hi {
-        // Left edge near min_x
-        let mut best_x = min_x;
-        let mut best_m = -1.0_f64;
-        for x in min_x.saturating_sub(band)..=(min_x + band).min(width - 2) {
-            let m = mag[y * width + x];
-            if m > best_m {
-                best_m = m;
-                best_x = x;
-            }
-        }
-        if best_m >= edge_thr && best_x > 0 && best_x + 1 < width {
-            let dx = refine_1d(
-                mag[y * width + (best_x - 1)],
-                mag[y * width + best_x],
-                mag[y * width + (best_x + 1)],
-            );
-            left_pts.push([(best_x as f64) + dx, y as f64]);
-        }
-
-        // Right edge near max_x
-        let mut best_rx = max_x;
-        let mut best_rm = -1.0_f64;
-        for x in max_x.saturating_sub(band)..=(max_x + band).min(width - 2) {
-            let m = mag[y * width + x];
-            if m > best_rm {
-                best_rm = m;
-                best_rx = x;
-            }
-        }
-        if best_rm >= edge_thr && best_rx > 0 && best_rx + 1 < width {
-            let dx = refine_1d(
-                mag[y * width + (best_rx - 1)],
-                mag[y * width + best_rx],
-                mag[y * width + (best_rx + 1)],
-            );
-            right_pts.push([(best_rx as f64) + dx, y as f64]);
-        }
-    }
+    let top_pts = sample_side(tl, tr, [-v[0], -v[1]]);
+    let right_pts = sample_side(tr, br, u);
+    let bot_pts = sample_side(bl, br, v);
+    let left_pts = sample_side(tl, bl, [-u[0], -u[1]]);
 
     if top_pts.len() < 3 || right_pts.len() < 3 || bot_pts.len() < 3 || left_pts.len() < 3 {
         return Err(Error::msg(
@@ -1897,9 +1981,38 @@ pub fn triangulate_dlt(
     }
 }
 
+/// Hartley (IEEE TPAMI 1997) isotropic normalization of a 2D point set so centroid = 0
+/// and mean distance from origin = sqrt(2). Returns `(normalized_points, T)`.
+fn hartley_normalize_2d(pts: &[[f64; 2]]) -> (Vec<[f64; 2]>, Mat3) {
+    let n = pts.len().max(1) as f64;
+    let mut mx = 0.0_f64;
+    let mut my = 0.0_f64;
+    for p in pts {
+        mx += p[0];
+        my += p[1];
+    }
+    mx /= n;
+    my /= n;
+    let mut mean_d = 0.0_f64;
+    for p in pts {
+        mean_d += (p[0] - mx).hypot(p[1] - my);
+    }
+    mean_d = (mean_d / n).max(1e-9);
+    let s = std::f64::consts::SQRT_2 / mean_d;
+    let t = [[s, 0.0, -s * mx], [0.0, s, -s * my], [0.0, 0.0, 1.0]];
+    let out = pts
+        .iter()
+        .map(|p| [s * (p[0] - mx), s * (p[1] - my)])
+        .collect();
+    (out, t)
+}
+
 fn essential_from_8_normalized(a_pts: &[[f64; 2]], b_pts: &[[f64; 2]]) -> Mat3 {
+    // Hartley isotropic pre-conditioning eliminates ill-conditioning in the 9x9 normal matrix.
+    let (ha, ta) = hartley_normalize_2d(a_pts);
+    let (hb, tb) = hartley_normalize_2d(b_pts);
     let mut ata = vec![vec![0.0_f64; 9]; 9];
-    for (&pa, &pb) in a_pts.iter().zip(b_pts.iter()) {
+    for (&pa, &pb) in ha.iter().zip(hb.iter()) {
         let row = [
             pb[0] * pa[0],
             pb[0] * pa[1],
@@ -1919,11 +2032,13 @@ fn essential_from_8_normalized(a_pts: &[[f64; 2]], b_pts: &[[f64; 2]]) -> Mat3 {
     }
     let (_, vecs) = jacobi_symmetric_eigen(ata);
     let e_vec = &vecs[0];
-    let e_raw = [
+    let e_hat = [
         [e_vec[0], e_vec[1], e_vec[2]],
         [e_vec[3], e_vec[4], e_vec[5]],
         [e_vec[6], e_vec[7], e_vec[8]],
     ];
+    // Unnormalize: E = T_b^T E_hat T_a
+    let e_raw = mat3_mul(&mat3_mul(&mat3_transpose(&tb), &e_hat), &ta);
     // Project onto Essential manifold: E = U diag(1, 1, 0) V^T via eigendecomposition of E^T E.
     let et = mat3_transpose(&e_raw);
     let ete = mat3_mul(&et, &e_raw);
@@ -2116,10 +2231,10 @@ pub fn estimate_essential_ransac_and_pose(
     Ok((best_pose.0, best_pose.1, best_inliers))
 }
 
-/// Real differentiable **2DGS / PGSR** surfel optimizer: minimizes multi-view photometric
-/// variance across observing cameras + normal-depth consistency by iteratively updating each
-/// surfel's position along its outward normal, tangent orientation, and diffuse albedo.
-/// Returns `(initial_loss, final_loss)`.
+/// Real differentiable **2DGS / PGSR** surfel optimizer: minimizes multi-view planar-disk
+/// photometric variance across observing cameras + normal-depth consistency by jointly optimizing
+/// each surfel's center depth along its normal, its tangent-plane normal orientation (2-DOF tilt),
+/// and its diffuse albedo. Returns `(initial_loss, final_loss)`.
 pub fn optimize_2dgs_pgsr_surfels(
     surfels: &mut [PlanarSurfel2D],
     cams: &[RollingShutterCamera],
@@ -2133,28 +2248,60 @@ pub fn optimize_2dgs_pgsr_surfels(
     }
 
     let eval_surfel_loss = |s: &PlanarSurfel2D| -> f64 {
-        let mut samples = Vec::with_capacity(cams.len());
+        // 5-point planar disk stencil on the surfel's tangent plane (PGSR multi-view patch consistency)
+        let du = v3_scale(s.tangent_u, 0.5 * s.scale_u);
+        let dv = v3_scale(s.tangent_v, 0.5 * s.scale_v);
+        let stencil = [
+            s.center,
+            v3_add(s.center, du),
+            v3_sub(s.center, du),
+            v3_add(s.center, dv),
+            v3_sub(s.center, dv),
+        ];
+
+        let mut patches: Vec<[f64; 5]> = Vec::with_capacity(cams.len());
         let mut ray_hits = Vec::with_capacity(cams.len());
         for (ci, cam) in cams.iter().enumerate() {
-            let p_cam = v3_add(mat3_vec(&cam.rot, s.center), cam.trans);
-            if p_cam[2] <= 1e-4 {
-                continue;
+            let mut vals = [0.0_f64; 5];
+            let mut ok = true;
+            let mut z_center = 0.0_f64;
+            for (si, &pt) in stencil.iter().enumerate() {
+                let p_cam = v3_add(mat3_vec(&cam.rot, pt), cam.trans);
+                if p_cam[2] <= 1e-4 {
+                    ok = false;
+                    break;
+                }
+                if si == 0 {
+                    z_center = p_cam[2];
+                }
+                let u = cam.fx * cam.vcm_focal_scale * (p_cam[0] / p_cam[2])
+                    + cam.cx
+                    + cam.ois_shift_px[0];
+                let v = cam.fy * cam.vcm_focal_scale * (p_cam[1] / p_cam[2])
+                    + cam.cy
+                    + cam.ois_shift_px[1];
+                if u >= 2.0 && v >= 2.0 && u < (width as f64 - 2.0) && v < (height as f64 - 2.0) {
+                    vals[si] = bilinear_luma(frames_luma[ci], width, height, u, v);
+                } else {
+                    ok = false;
+                    break;
+                }
             }
-            let u =
-                cam.fx * cam.vcm_focal_scale * (p_cam[0] / p_cam[2]) + cam.cx + cam.ois_shift_px[0];
-            let v =
-                cam.fy * cam.vcm_focal_scale * (p_cam[1] / p_cam[2]) + cam.cy + cam.ois_shift_px[1];
-            if u >= 2.0 && v >= 2.0 && u < (width as f64 - 2.0) && v < (height as f64 - 2.0) {
-                samples.push(bilinear_luma(frames_luma[ci], width, height, u, v));
-                ray_hits.push((p_cam[2], s.opacity, s.normal));
+            if ok {
+                patches.push(vals);
+                ray_hits.push((z_center, s.opacity, s.normal));
             }
         }
-        if samples.len() < 2 {
+        if patches.len() < 2 {
             return 0.0;
         }
-        let mean = samples.iter().sum::<f64>() / (samples.len() as f64);
-        let photo_var =
-            samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (samples.len() as f64);
+        let inv_k = 1.0 / (patches.len() as f64);
+        let mut photo_var = 0.0_f64;
+        for si in 0..5 {
+            let mean = patches.iter().map(|p| p[si]).sum::<f64>() * inv_k;
+            photo_var += patches.iter().map(|p| (p[si] - mean).powi(2)).sum::<f64>() * inv_k;
+        }
+        photo_var *= 0.2;
         let (_, l_dist, l_norm) = evaluate_2dgs_pgsr_ray_losses(&ray_hits, s.normal);
         photo_var + 0.05 * l_dist + 0.02 * l_norm
     };
@@ -2165,23 +2312,50 @@ pub fn optimize_2dgs_pgsr_surfels(
     let initial_loss = total_loss(surfels);
 
     let mut step = 0.0025_f64;
+    let mut ang_step = 0.08_f64;
     for _ in 0..iters {
         for s in surfels.iter_mut() {
-            let base = eval_surfel_loss(s);
+            // 1. Center depth refinement along surfel normal.
+            let mut base = eval_surfel_loss(s);
             let orig_center = s.center;
-            // Central-difference normal-axis line search (depth refinement along surface normal).
             s.center = v3_add(orig_center, v3_scale(s.normal, step));
             let l_plus = eval_surfel_loss(s);
             s.center = v3_sub(orig_center, v3_scale(s.normal, step));
             let l_minus = eval_surfel_loss(s);
             if l_plus < base && l_plus <= l_minus {
                 s.center = v3_add(orig_center, v3_scale(s.normal, step));
+                base = l_plus;
             } else if l_minus < base {
                 s.center = v3_sub(orig_center, v3_scale(s.normal, step));
+                base = l_minus;
             } else {
                 s.center = orig_center;
             }
-            // Update diffuse albedo estimate from multi-view mean luminance.
+
+            // 2. Joint 2-DOF tangent-plane normal orientation refinement (PGSR planar disk tilt).
+            let axes = [s.tangent_u, s.tangent_v];
+            for axis in axes {
+                let n0 = s.normal;
+                let try_tilt = |dir: f64| -> PlanarSurfel2D {
+                    let cand_n = v3_add(n0, v3_scale(axis, dir * ang_step));
+                    PlanarSurfel2D::from_normal(
+                        s.center, cand_n, s.scale_u, s.scale_v, s.opacity, s.albedo,
+                    )
+                };
+                let sp = try_tilt(1.0);
+                let lp = eval_surfel_loss(&sp);
+                let sm = try_tilt(-1.0);
+                let lm = eval_surfel_loss(&sm);
+                if lp < base && lp <= lm {
+                    *s = sp;
+                    base = lp;
+                } else if lm < base {
+                    *s = sm;
+                    base = lm;
+                }
+            }
+
+            // 3. Update diffuse albedo estimate from multi-view mean luminance.
             let mut sum_l = 0.0_f64;
             let mut cnt = 0usize;
             for (ci, cam) in cams.iter().enumerate() {
@@ -2202,6 +2376,7 @@ pub fn optimize_2dgs_pgsr_surfels(
             }
         }
         step *= 0.72;
+        ang_step *= 0.72;
     }
 
     let final_loss = total_loss(surfels);
@@ -2302,11 +2477,13 @@ pub fn reconstruct_from_multiview_images(
         ois_shift_px: [0.0, 0.0],
     });
 
-    // Track per-kp0 observations across all views.
+    // Track per-kp0 observations across all views + store per-view keypoints for loop closures.
     let mut track_obs: Vec<Vec<(usize, [f64; 2])>> =
         kp0.iter().map(|&p| vec![(0usize, p)]).collect();
     let mut rel_edges = Vec::new();
     let mut init_rots = vec![MAT3_ID];
+    let mut all_kps: Vec<Vec<[f64; 2]>> = Vec::with_capacity(n_views);
+    all_kps.push(kp0.clone());
 
     for vi in 1..n_views {
         let kpv = extract_harris_keypoints(&luma_work[vi], width, height, 120);
@@ -2356,9 +2533,44 @@ pub fn reconstruct_from_multiview_images(
             let (ia, ib, _) = matches[mi];
             track_obs[ia].push((vi, kpv[ib]));
         }
+        all_kps.push(kpv);
     }
 
-    // 3. GLOMAP SO(3) global rotation averaging.
+    // Add adjacent-view and ring loop-closure rotation edges for genuine GLOMAP cycle averaging.
+    if n_views >= 3 {
+        let mut loop_pairs: Vec<(usize, usize)> = (1..(n_views - 1)).map(|i| (i, i + 1)).collect();
+        loop_pairs.push((n_views - 1, 1));
+        for (va, vb) in loop_pairs {
+            let matches = match_keypoints_zncc(
+                &luma_work[va],
+                &luma_work[vb],
+                width,
+                height,
+                &all_kps[va],
+                &all_kps[vb],
+                4,
+                0.55,
+            );
+            if matches.len() >= 8 {
+                let pa: Vec<[f64; 2]> = matches.iter().map(|&(ia, _, _)| all_kps[va][ia]).collect();
+                let pb: Vec<[f64; 2]> = matches.iter().map(|&(_, ib, _)| all_kps[vb][ib]).collect();
+                if let Ok((r_ab, _, inliers)) =
+                    estimate_essential_ransac_and_pose(&pa, &pb, cfg.fx, cfg.fy, cfg.cx, cfg.cy)
+                {
+                    if inliers.len() >= 8 {
+                        rel_edges.push(RelativeRotationEdge {
+                            cam_i: va,
+                            cam_j: vb,
+                            r_ij: r_ab,
+                            weight: (inliers.len() as f64).max(1.0),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. GLOMAP SO(3) global rotation averaging with cycle closure.
     let avg_rots = glomap_so3_rotation_averaging(n_views, &rel_edges, &init_rots, 20);
     for (ci, r) in avg_rots.into_iter().enumerate() {
         cams[ci].rot = r;
@@ -2371,8 +2583,8 @@ pub fn reconstruct_from_multiview_images(
         [0.0, 1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0, 0.0],
     ];
-    let mut pts_3d = Vec::new();
-    let mut ba_obs = Vec::new();
+    let mut raw_pts_3d = Vec::new();
+    let mut raw_tracks: Vec<Vec<(usize, [f64; 2])>> = Vec::new();
 
     for obs_list in &track_obs {
         if obs_list.len() < 2 {
@@ -2391,41 +2603,103 @@ pub fn reconstruct_from_multiview_images(
         ];
         let n1 = [(uv1[0] - cfg.cx) / cfg.fx, (uv1[1] - cfg.cy) / cfg.fy];
         if let Some(pt) = triangulate_dlt(&p0, &p1, n0, n1) {
-            if pt[2] > 1e-3 && pt[2].is_finite() {
-                let pt_idx = pts_3d.len();
-                pts_3d.push(pt);
-                for &(vi, uv) in obs_list {
-                    ba_obs.push(BaObservation {
-                        cam_idx: vi,
-                        pt_idx,
-                        u_px: uv[0],
-                        v_px: uv[1],
-                    });
-                }
+            if pt[2] > 1e-3 && pt.iter().all(|v| v.is_finite()) {
+                raw_pts_3d.push(pt);
+                raw_tracks.push(obs_list.clone());
             }
         }
     }
 
-    if pts_3d.len() < 8 {
+    if raw_pts_3d.len() < 8 {
         return Err(Error::msg(format!(
             "multi-view triangulation recovered only {} valid 3D points (need >= 8)",
-            pts_3d.len()
+            raw_pts_3d.len()
         )));
     }
 
     // Rescale camera translations and 3D points so median scene depth matches the metric anchor.
-    let mut zs: Vec<f64> = pts_3d.iter().map(|p| p[2]).collect();
+    let mut zs: Vec<f64> = raw_pts_3d.iter().map(|p| p[2]).collect();
     zs.sort_by(|a, b| a.total_cmp(b));
     let med_z = zs[zs.len() / 2].max(1e-4);
     let metric_scale = z_anchor_m / med_z;
-    for p in &mut pts_3d {
+    for p in &mut raw_pts_3d {
         *p = v3_scale(*p, metric_scale);
     }
     for cam in &mut cams {
         cam.trans = v3_scale(cam.trans, metric_scale);
     }
 
-    // Metric gauge from two farthest triangulated points (locks global scale in Ozaki-II BA).
+    // Robust MAD/IQR 3D outlier filter before BA & TSDF fusion (eliminates distant triangulation
+    // outliers that would otherwise explode the TSDF bounding box and remesh face count).
+    let median_val = |vals: &mut [f64]| -> f64 {
+        vals.sort_by(|a, b| a.total_cmp(b));
+        vals[vals.len() / 2]
+    };
+    let mut xs: Vec<f64> = raw_pts_3d.iter().map(|p| p[0]).collect();
+    let mut ys: Vec<f64> = raw_pts_3d.iter().map(|p| p[1]).collect();
+    let mut zs_s: Vec<f64> = raw_pts_3d.iter().map(|p| p[2]).collect();
+    let med_c = [
+        median_val(&mut xs),
+        median_val(&mut ys),
+        median_val(&mut zs_s),
+    ];
+    let dists: Vec<f64> = raw_pts_3d
+        .iter()
+        .map(|&p| v3_norm(v3_sub(p, med_c)))
+        .collect();
+    let mut dists_sorted = dists.clone();
+    let med_r = median_val(&mut dists_sorted);
+    let mut devs: Vec<f64> = dists.iter().map(|&d| (d - med_r).abs()).collect();
+    let mad_r = median_val(&mut devs).max(0.015);
+    let max_r = (med_r + 3.5 * mad_r).clamp(0.18, 0.45);
+
+    let mut pts_3d = Vec::with_capacity(raw_pts_3d.len());
+    let mut ba_obs = Vec::new();
+    for (idx, (&pt, obs_list)) in raw_pts_3d.iter().zip(raw_tracks.iter()).enumerate() {
+        let z_ok = pt[2] >= 0.25 * z_anchor_m && pt[2] <= 3.0 * z_anchor_m;
+        if z_ok && dists[idx] <= max_r {
+            let pt_idx = pts_3d.len();
+            pts_3d.push(pt);
+            for &(vi, uv) in obs_list {
+                ba_obs.push(BaObservation {
+                    cam_idx: vi,
+                    pt_idx,
+                    u_px: uv[0],
+                    v_px: uv[1],
+                });
+            }
+        }
+    }
+    if pts_3d.len() < 8 {
+        // Fallback: retain the closest points to the median centroid so BA always has >= 8 points.
+        let mut order: Vec<usize> = (0..raw_pts_3d.len()).collect();
+        order.sort_by(|&a, &b| dists[a].total_cmp(&dists[b]));
+        pts_3d.clear();
+        ba_obs.clear();
+        for &idx in order.iter().take(raw_pts_3d.len().min(16)) {
+            let pt_idx = pts_3d.len();
+            pts_3d.push(raw_pts_3d[idx]);
+            for &(vi, uv) in &raw_tracks[idx] {
+                ba_obs.push(BaObservation {
+                    cam_idx: vi,
+                    pt_idx,
+                    u_px: uv[0],
+                    v_px: uv[1],
+                });
+            }
+        }
+    }
+
+    // Enforce metric gauge in Ozaki-II BA anchored to the calibrated physical scale (anchor width/height).
+    let anchor_diag_m = match cfg.anchor_kind {
+        MetricAnchorKind::RussianDebitCardId1 { .. } => {
+            (RUSSIAN_ID1_WIDTH_MM * 1e-3).hypot(RUSSIAN_ID1_HEIGHT_MM * 1e-3)
+        }
+        MetricAnchorKind::AprilTag3 { side_mm }
+        | MetricAnchorKind::ChArUco { square_mm: side_mm } => {
+            (side_mm * 1e-3) * std::f64::consts::SQRT_2
+        }
+    };
     let mut gauge_a = 0usize;
     let mut gauge_b = 1usize;
     let mut max_d = 0.0_f64;
@@ -2442,7 +2716,7 @@ pub fn reconstruct_from_multiview_images(
     let gauges = vec![MetricGaugeConstraint {
         pt_a: gauge_a,
         pt_b: gauge_b,
-        target_dist_m: max_d.max(0.02),
+        target_dist_m: max_d.max(anchor_diag_m * 0.25),
         weight: 1e3,
     }];
 
@@ -2457,9 +2731,27 @@ pub fn reconstruct_from_multiview_images(
         8,
     );
 
-    // 6. Build oriented 2DGS/PGSR surfels from reconstructed 3D points (+ optional dense micro-depth)
-    //    centered around the reconstructed object centroid with outward radial/PCA normals.
-    let mut cloud: Vec<[f64; 3]> = pts_3d.clone();
+    // 6. Build oriented 2DGS/PGSR surfels from reconstructed 3D points (+ optional dense micro-depth),
+    //    rejecting any post-BA stray outliers before computing the TSDF domain.
+    let mut cloud: Vec<[f64; 3]> = Vec::with_capacity(pts_3d.len());
+    {
+        let mut pxs: Vec<f64> = pts_3d.iter().map(|p| p[0]).collect();
+        let mut pys: Vec<f64> = pts_3d.iter().map(|p| p[1]).collect();
+        let mut pzs: Vec<f64> = pts_3d.iter().map(|p| p[2]).collect();
+        let post_med = [
+            median_val(&mut pxs),
+            median_val(&mut pys),
+            median_val(&mut pzs),
+        ];
+        for &p in &pts_3d {
+            if p.iter().all(|v| v.is_finite()) && v3_norm(v3_sub(p, post_med)) <= 0.35 {
+                cloud.push(p);
+            }
+        }
+        if cloud.len() < 8 {
+            cloud = pts_3d.clone();
+        }
+    }
     if let Some(depth_map) = dense_depth_hint {
         if depth_map.len() == width * height {
             let stride_x = (width / 16).max(1);
@@ -2909,5 +3201,46 @@ mod tests {
         // 4. Negative / Sabotage check: blank image MUST fail card detection cleanly (never fake!)
         let blank = vec![0.1_f64; w * h];
         assert!(detect_russian_card_in_image(&blank, w, h, false).is_err());
+    }
+
+    #[test]
+    fn rotated_russian_debit_card_detects_accurately_with_rotating_calipers() {
+        let w = 220usize;
+        let h = 180usize;
+        let px_per_mm = 1.0_f64;
+        let card_w = RUSSIAN_ID1_WIDTH_MM * px_per_mm;
+        let card_h = RUSSIAN_ID1_HEIGHT_MM * px_per_mm;
+        let card_r = RUSSIAN_ID1_CORNER_RADIUS_MM * px_per_mm;
+        let angle = 21.0_f64.to_radians();
+        let (ca, sa) = (angle.cos(), angle.sin());
+        let cx0 = 110.0_f64;
+        let cy0 = 90.0_f64;
+        let mut luma = vec![0.08_f64; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let dx_w = (x as f64) - cx0;
+                let dy_w = (y as f64) - cy0;
+                let lx = ca * dx_w + sa * dy_w + 0.5 * card_w;
+                let ly = -sa * dx_w + ca * dy_w + 0.5 * card_h;
+                if lx >= 0.0 && lx <= card_w && ly >= 0.0 && ly <= card_h {
+                    let rx = (card_r - lx).max(0.0).max(lx - (card_w - card_r));
+                    let ry = (card_r - ly).max(0.0).max(ly - (card_h - card_r));
+                    if rx * rx + ry * ry <= card_r * card_r {
+                        luma[y * w + x] = 0.88;
+                    }
+                }
+            }
+        }
+        let det = detect_russian_card_in_image(&luma, w, h, false)
+            .expect("detect 21-degree rotated GOST ID-1 card");
+        let true_m_per_px = 1e-3 / px_per_mm;
+        let rel_err = (det.meters_per_pixel - true_m_per_px).abs() / true_m_per_px;
+        assert!(
+            rel_err < 0.04,
+            "rotated ID-1 card scale {:.6} vs true {:.6} (err {:.2}%)",
+            det.meters_per_pixel,
+            true_m_per_px,
+            rel_err * 100.0
+        );
     }
 }

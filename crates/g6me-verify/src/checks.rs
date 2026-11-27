@@ -973,7 +973,26 @@ pub fn asm_guard(builds: &[RefBuild]) -> Vec<Check> {
         Err(e) => return vec![skip("asm", "current executable", e.to_string())],
     };
     let mut out = Vec::new();
-    out.push(scan_binary("rust dsp", &exe, &["g6me"], ExpectFma::No));
+    out.push(scan_binary(
+        "rust dsp (verify)",
+        &exe,
+        &["g6me"],
+        ExpectFma::No,
+    ));
+    // Also scan the shipped sibling `g6me` binary when built in the same profile directory
+    // so every production DSP module (dsp, stn, enhance, unmask, upmix, plus, limiter,
+    // room, scattering, ntt, hoa, bem, pcm, transducer) is audited end-to-end.
+    if let Some(dir) = exe.parent() {
+        let cli_bin = dir.join(if cfg!(windows) { "g6me.exe" } else { "g6me" });
+        if cli_bin.is_file() {
+            out.push(scan_binary(
+                "rust dsp (g6me cli)",
+                &cli_bin,
+                &["g6me"],
+                ExpectFma::No,
+            ));
+        }
+    }
     for b in contract_builds(builds, "f64") {
         // The reference must show no FMA either: that is what `-ffp-contract=off`
         // is for, and it is the assumption every bit-exact result above rests on.
@@ -2276,6 +2295,40 @@ pub fn bem() -> Vec<Check> {
         }),
     ));
 
+    // 4. Schenck (JASA 1968) CHIEF interior-point regularization at exact ka = pi irregular frequency.
+    let f_irreg = c / (2.0 * 0.0875); // ka = pi (~1965.7 Hz)
+    let h_chief_d = solver.solve_direct_hrtf(f_irreg, c, r_src, solver.left_ear_elem, false);
+    let h_chief_r =
+        solver.solve_reciprocal_hrtfs(f_irreg, c, &[r_src], solver.left_ear_elem, false)[0];
+    let chief_recip = h_chief_d.sub(h_chief_r).norm() / h_chief_d.norm().max(1e-12);
+    let k_irreg = 2.0 * PI * f_irreg / c;
+    let g_ref_irreg = helmholtz_green(k_irreg, [0.0, 0.0, 0.0], r_src);
+    let h_mie_irreg =
+        rigid_sphere_green(k_irreg, 0.0875, r_s, norm3(ear_l), cos_l).div(g_ref_irreg);
+    let chief_mie_db = (20.0 * (h_chief_r.norm() / h_mie_irreg.norm()).log10()).abs();
+    out.push(with_metric(
+        if chief_recip < 1e-11 && chief_mie_db < 1.5 && h_chief_r.norm().is_finite() {
+            pass(
+                "bem",
+                "CHIEF interior-point irregular-frequency suppression (ka = pi)",
+                format!(
+                    "f={f_irreg:.1} Hz (ka=pi): recip={chief_recip:.2e}, |H_CHIEF| vs Mie err={chief_mie_db:.2} dB"
+                ),
+            )
+        } else {
+            fail(
+                "bem",
+                "CHIEF interior-point irregular-frequency suppression (ka = pi)",
+                format!("chief_recip={chief_recip:.2e}, chief_mie_db={chief_mie_db:.2} dB"),
+            )
+        },
+        json!({
+            "f_irreg_hz": f_irreg,
+            "chief_recip_rel": chief_recip,
+            "chief_mie_err_db": chief_mie_db,
+        }),
+    ));
+
     out
 }
 
@@ -2865,6 +2918,419 @@ pub fn scan() -> Vec<Check> {
         }),
     ));
 
+    out
+}
+
+/// `mastering`: Wannamaker (1992) / Levinson–Durbin psychoacoustic noise shaping,
+/// Klippel (2006) + King–Agerkvist (JAES 2018) transducer assessment, PAE upmixer,
+/// Shared-STN Virtual Bass + Micro-Detail, Moore 2016 Unmasking EQ, Punchy ADAA2
+/// limiter, parallel raytrace determinism, and UPOLA SHA-256 kernel caching.
+///
+/// Running every DSP stage here also guarantees their symbols are linked into
+/// `g6me-verify` and audited for zero FMA by `asm_guard`.
+pub fn mastering() -> Vec<Check> {
+    use g6me_core::atmosphere::AtmosphereCfg;
+    use g6me_core::enhance::{DetailCfg, EnhanceCfg, EnhanceProcessor, VirtualBassCfg};
+    use g6me_core::limiter::{Cfg as LimiterCfg, Limiter, LimiterStyle};
+    use g6me_core::pcm::{BitDepth, Dither, PcmQuantizer};
+    use g6me_core::plus::{KernelBank, PlusCfg, PlusProfile, N_IR_ROOM};
+    use g6me_core::room::{
+        raytrace_hoa_histogram, raytrace_hoa_histogram_serial, RoomGeometry, RoomPreset,
+        RoomQuality,
+    };
+    use g6me_core::tp::Ratio;
+    use g6me_core::transducer::{TransducerMonitor, TransducerProfile};
+    use g6me_core::unmask::{UnmaskCfg, UnmaskEq};
+    use g6me_core::upmix::{UpmixCfg, Upmixer};
+    use std::f64::consts::PI;
+    use std::sync::Arc;
+
+    let mut out = Vec::new();
+    let sr = 48_000u32;
+
+    // 1. Wannamaker (1992) & Levinson–Durbin ISO-226 psychoacoustic noise shaping (48/96/192 kHz).
+    let band_power_db = |err: &[f64], rate: u32| -> f64 {
+        let start = 4096usize;
+        let len = 4096usize;
+        let mut sum_p = 0.0;
+        let mut cnt = 0usize;
+        for f in (1100..5000).step_by(100) {
+            let w = 2.0 * PI * (f as f64) / (rate as f64);
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for (k, &v) in err[start..start + len].iter().enumerate() {
+                let ang = w * (k as f64);
+                re += v * ang.cos();
+                im += v * ang.sin();
+            }
+            sum_p += (re * re + im * im) / ((len as f64) * (len as f64));
+            cnt += 1;
+        }
+        10.0 * (sum_p / (cnt as f64) + 1e-30).log10()
+    };
+    let mut drops = Vec::new();
+    let mut wan_ok = true;
+    for &(rate, min_drop) in &[(48_000u32, 15.0f64), (96_000, 18.0), (192_000, 20.0)] {
+        let n = 12_288usize;
+        let amp = 10.0_f64.powf(-90.0 / 20.0);
+        let src: Vec<f64> = (0..n)
+            .map(|i| amp * (2.0 * PI * 1000.0 * (i as f64) / (rate as f64)).sin())
+            .collect();
+        let (mut lw, mut rw) = (src.clone(), src.clone());
+        PcmQuantizer::new(BitDepth::S16, Dither::Wannamaker, rate)
+            .unwrap()
+            .process(&mut lw, &mut rw);
+        let (mut lt, mut rt) = (src.clone(), src.clone());
+        PcmQuantizer::new(BitDepth::S16, Dither::Triangular, rate)
+            .unwrap()
+            .process(&mut lt, &mut rt);
+        let ew: Vec<f64> = lw
+            .iter()
+            .zip(&src)
+            .map(|(&q, &x)| (q - x) * 32_768.0)
+            .collect();
+        let et: Vec<f64> = lt
+            .iter()
+            .zip(&src)
+            .map(|(&q, &x)| (q - x) * 32_768.0)
+            .collect();
+        let drop = band_power_db(&et, rate) - band_power_db(&ew, rate);
+        drops.push((rate, drop));
+        if drop < min_drop {
+            wan_ok = false;
+        }
+    }
+    out.push(with_metric(
+        if wan_ok {
+            pass(
+                "mastering",
+                "Wannamaker & Levinson-Durbin psychoacoustic noise shaping",
+                format!(
+                    "1-5 kHz floor drop vs TPDF: 48k={:.1} dB, 96k={:.1} dB, 192k={:.1} dB",
+                    drops[0].1, drops[1].1, drops[2].1
+                ),
+            )
+        } else {
+            fail(
+                "mastering",
+                "Wannamaker & Levinson-Durbin psychoacoustic noise shaping",
+                format!("noise floor drop below spec: {drops:?}"),
+            )
+        },
+        json!({ "drop_48k_db": drops[0].1, "drop_96k_db": drops[1].1, "drop_192k_db": drops[2].1 }),
+    ));
+
+    // 2. Klippel (2006) + King–Agerkvist (JAES 2018) electro-mechanical-thermal transducer ODE.
+    let mut mon_lo = TransducerMonitor::new(TransducerProfile::StudioMonitor5In, sr).unwrap();
+    let mut mon_hi = TransducerMonitor::new(TransducerProfile::StudioMonitor5In, sr).unwrap();
+    let n_tr = 48_000usize;
+    let tone_lo: Vec<f64> = (0..n_tr)
+        .map(|i| 0.05 * (2.0 * PI * 55.0 * (i as f64) / (sr as f64)).sin())
+        .collect();
+    let tone_hi: Vec<f64> = (0..n_tr)
+        .map(|i| 0.85 * (2.0 * PI * 55.0 * (i as f64) / (sr as f64)).sin())
+        .collect();
+    mon_lo.push(&tone_lo, &tone_lo);
+    mon_hi.push(&tone_hi, &tone_hi);
+    let r_lo = mon_lo.summarize();
+    let r_hi = mon_hi.summarize();
+    let tr_ok = r_hi.peak_excursion_mm > r_lo.peak_excursion_mm * 5.0
+        && r_hi.thermal_rise_c > r_lo.thermal_rise_c * 10.0
+        && r_hi.est_thd_pct > r_lo.est_thd_pct * 3.0;
+    out.push(with_metric(
+        if tr_ok {
+            pass(
+                "mastering",
+                "Klippel + King-Agerkvist nonlinear transducer assessment",
+                format!(
+                    "55 Hz drive: excursion {:.2}->{:.2} mm ({:.0}% Xmax), dT={:.2} C, THD {:.2}%->{:.2}%",
+                    r_lo.peak_excursion_mm,
+                    r_hi.peak_excursion_mm,
+                    r_hi.peak_excursion_pct_xmax,
+                    r_hi.thermal_rise_c,
+                    r_lo.est_thd_pct,
+                    r_hi.est_thd_pct
+                ),
+            )
+        } else {
+            fail(
+                "mastering",
+                "Klippel + King-Agerkvist nonlinear transducer assessment",
+                format!("unexpected response: lo={r_lo:?} hi={r_hi:?}"),
+            )
+        },
+        json!({
+            "peak_excursion_mm": r_hi.peak_excursion_mm,
+            "thermal_rise_c": r_hi.thermal_rise_c,
+            "thd_pct": r_hi.est_thd_pct,
+        }),
+    ));
+
+    // 3. Full opt-in mastering chain (PAE upmix + Shared-STN VBass/Detail + Moore Unmask + Punchy ADAA2 Limiter).
+    let n_sig = 8192usize;
+    let mut l: Vec<f64> = (0..n_sig)
+        .map(|i| {
+            let t = (i as f64) / (sr as f64);
+            0.45 * (2.0 * PI * 65.0 * t).sin()
+                + 0.35 * (2.0 * PI * 440.0 * t).sin()
+                + 0.30 * (2.0 * PI * 2800.0 * t).sin()
+        })
+        .collect();
+    let mut r: Vec<f64> = (0..n_sig)
+        .map(|i| {
+            let t = (i as f64) / (sr as f64);
+            0.45 * (2.0 * PI * 65.0 * t).sin()
+                + 0.35 * (2.0 * PI * 440.0 * t + 0.25).sin()
+                + 0.28 * (2.0 * PI * 3100.0 * t).sin()
+        })
+        .collect();
+    let mut upmix = Upmixer::new(
+        UpmixCfg {
+            enable: true,
+            ..UpmixCfg::default()
+        },
+        sr,
+    );
+    let mut up_out = [
+        vec![0.0; n_sig],
+        vec![0.0; n_sig],
+        vec![0.0; n_sig],
+        vec![0.0; n_sig],
+        vec![0.0; n_sig],
+        vec![0.0; n_sig],
+        vec![0.0; n_sig],
+        vec![0.0; n_sig],
+    ];
+    upmix.process(&l, &r, &mut up_out);
+    let up_ok = up_out.iter().all(|ch| ch.iter().all(|v| v.is_finite()));
+
+    let enh_cfg = EnhanceCfg {
+        vbass: VirtualBassCfg {
+            enable: true,
+            ..VirtualBassCfg::default()
+        },
+        detail: DetailCfg {
+            enable: true,
+            ..DetailCfg::default()
+        },
+    };
+    let mut stn_enh = EnhanceProcessor::new(sr, enh_cfg);
+    stn_enh.process(&mut l, &mut r);
+    // Shared-STN is causal with ~8.8 k samples of latency at 48 kHz; drain the pipeline so the
+    // check sees the signal rather than the pre-roll. Core uses the same process+flush pattern.
+    let (stn_tail_l, stn_tail_r) = stn_enh.flush();
+    l.extend_from_slice(&stn_tail_l);
+    r.extend_from_slice(&stn_tail_r);
+
+    let mut unmask = UnmaskEq::new(
+        UnmaskCfg {
+            enable: true,
+            ..UnmaskCfg::default()
+        },
+        sr,
+    );
+    let mut unm_l = Vec::with_capacity(n_sig);
+    let mut unm_r = Vec::with_capacity(n_sig);
+    unmask.process(&l, &r, &mut unm_l, &mut unm_r);
+    unmask.flush(&mut unm_l, &mut unm_r);
+
+    let lim_cfg = LimiterCfg {
+        enable: true,
+        ceiling_db: -1.0,
+        ratio: Ratio::X8,
+        style: LimiterStyle::Punchy,
+        clip_drive_db: 2.0,
+        ..LimiterCfg::default()
+    };
+    let mut lim = Limiter::enabled(lim_cfg, sr, 2);
+    lim.process(&mut [&mut unm_l[..], &mut unm_r[..]]);
+    let tail = lim.flush();
+    let peak = unm_l
+        .iter()
+        .chain(&unm_r)
+        .chain(tail[0].iter())
+        .chain(tail[1].iter())
+        .fold(0.0f64, |m, &v| m.max(v.abs()));
+    let ceiling_lin = 10.0_f64.powf(-1.0 / 20.0);
+    let chain_ok = up_ok
+        && unm_l.iter().chain(&unm_r).all(|v| v.is_finite())
+        && tail[0].iter().chain(&tail[1]).all(|v| v.is_finite())
+        && peak > 0.05
+        && peak <= ceiling_lin + 1e-3;
+    out.push(with_metric(
+        if chain_ok {
+            pass(
+                "mastering",
+                "PAE Upmix + Shared-STN + Moore Unmask + Punchy ADAA2",
+                format!("all stages finite, sample peak={peak:.4} <= -1.0 dBTP ceiling ({ceiling_lin:.4})"),
+            )
+        } else {
+            fail(
+                "mastering",
+                "PAE Upmix + Shared-STN + Moore Unmask + Punchy ADAA2",
+                format!("up_ok={up_ok}, peak={peak:.4} vs ceiling {ceiling_lin:.4}"),
+            )
+        },
+        json!({ "peak": peak, "ceiling_lin": ceiling_lin }),
+    ));
+
+    // 4. Parallel PCG64 HOA raytracing bit-exactness + UPOLA room tail + SHA-256 KernelBank cache.
+    let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+    let atm = AtmosphereCfg::default();
+    let src = [4.2, 3.6, 1.35];
+    let h_par = raytrace_hoa_histogram(&geom, &atm, src, 256, 24, 128, 0.002, 0xCAFE_BABE);
+    let h_ser = raytrace_hoa_histogram_serial(&geom, &atm, src, 256, 24, 128, 0.002, 0xCAFE_BABE);
+    let rt_exact = h_par.len() == h_ser.len()
+        && h_par.iter().zip(&h_ser).all(|(a, b)| {
+            a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+        });
+
+    let mut cfg_room = PlusCfg::from_profile(PlusProfile::Studio);
+    cfg_room.room_preset = RoomPreset::ControlRoom;
+    cfg_room.room_quality = RoomQuality::Preview;
+    let b1 = KernelBank::synthesize_cached(cfg_room, sr, None, None);
+    let b2 = KernelBank::synthesize_cached(cfg_room, sr, None, None);
+    let n_ir = b1.ir_l[0].len();
+    let cache_hit = Arc::ptr_eq(&b1, &b2) && n_ir == N_IR_ROOM;
+    out.push(with_metric(
+        if rt_exact && cache_hit {
+            pass(
+                "mastering",
+                "Parallel PCG64 raytracing + UPOLA SHA-256 KernelBank cache",
+                format!(
+                    "parallel vs serial raytrace 0-bit diff, ControlRoom N_IR={} ({:.1} ms), Arc::ptr_eq cache hit",
+                    n_ir,
+                    (n_ir as f64) * 1000.0 / (sr as f64)
+                ),
+            )
+        } else {
+            fail(
+                "mastering",
+                "Parallel PCG64 raytracing + UPOLA SHA-256 KernelBank cache",
+                format!("rt_exact={rt_exact}, cache_hit={cache_hit}, n_ir={n_ir}"),
+            )
+        },
+        json!({ "rt_bit_exact": rt_exact, "cache_hit": cache_hit, "n_ir": n_ir }),
+    ));
+
+    out
+}
+
+/// `cuda`: real CUDA `.cu` -> `.cubin` (`nvcc --fmad=false`) -> `cuobjdump --dump-sass`
+/// zero-FMA audit + `--fmad=true` sabotage negative control.
+pub fn cuda() -> Vec<Check> {
+    let mut out = Vec::new();
+    #[cfg(feature = "cuda")]
+    {
+        let arch = "sm_75";
+        match g6me_cuda::audit_all_cuda_kernels_sass(Some(arch)) {
+            Ok(reports) => {
+                let total_instrs: usize = reports.iter().map(|r| r.sass_instructions).sum();
+                let used_arch = reports.first().map(|r| r.arch.as_str()).unwrap_or(arch);
+                out.push(with_metric(
+                    if reports.len() == 6 && total_instrs > 0 {
+                        pass(
+                            "cuda",
+                            "6 CUDA kernels nvcc --fmad=false PTX + SASS audit",
+                            format!(
+                                "{}/6 .cu kernels compiled ({used_arch}): 0 contracted fma.rn in \
+                                 nvcc PTX, 0 contracted FMA in {total_instrs} cuobjdump --dump-sass \
+                                 SASS instrs (IEEE div/sqrt MUFU microcode allowed for raytrace_hoa)",
+                                reports.len()
+                            ),
+                        )
+                    } else {
+                        fail(
+                            "cuda",
+                            "6 CUDA kernels nvcc --fmad=false PTX + SASS audit",
+                            format!("kernels={}, instrs={total_instrs}", reports.len()),
+                        )
+                    },
+                    json!({
+                        "arch": used_arch,
+                        "kernels": reports.len(),
+                        "total_sass_instructions": total_instrs,
+                        "ptx_fma_hits": 0,
+                        "fma_hits": 0,
+                    }),
+                ));
+                match g6me_cuda::verify_sass_auditor_catches_fmad_sabotage(Some(arch)) {
+                    Ok(hits) => out.push(with_metric(
+                        pass(
+                            "cuda",
+                            "CUDA PTX/SASS auditor --fmad=true sabotage control",
+                            format!(
+                                "sabotaged nvcc --fmad=true caught fma.rn in PTX and {hits} real \
+                                 DFMA SASS hit(s)"
+                            ),
+                        ),
+                        json!({ "sabotage_fma_hits": hits }),
+                    )),
+                    Err(e) => out.push(fail(
+                        "cuda",
+                        "CUDA PTX/SASS auditor --fmad=true sabotage control",
+                        e,
+                    )),
+                }
+            }
+            Err(e) => {
+                if e.contains("not found")
+                    || e.contains("not installed")
+                    || e.contains("unavailable")
+                {
+                    out.push(info(
+                        "cuda",
+                        "6 CUDA kernels nvcc --fmad=false SASS audit",
+                        format!("CUDA toolkit probe: {e}"),
+                    ));
+                } else {
+                    out.push(fail(
+                        "cuda",
+                        "6 CUDA kernels nvcc --fmad=false SASS audit",
+                        e,
+                    ));
+                }
+            }
+        }
+        let hw = g6me_core::blackwell::cuda_hardware_summary()
+            .unwrap_or_else(|| "no live NVIDIA GPU detected (CPU fallback active)".to_string());
+        out.push(info("cuda", "live NVIDIA GPU runtime", hw));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        use g6me_core::blackwell::{compile_and_audit_cuda_sass, CudaAuditStatus};
+        match compile_and_audit_cuda_sass("sm_75") {
+            CudaAuditStatus::VerifiedSass {
+                arch,
+                sass_instructions,
+            } => out.push(with_metric(
+                pass(
+                    "cuda",
+                    "CUDA SASS zero-FMA audit (rebuild with --features cuda for all 6 kernels)",
+                    format!(
+                        "compiled Blackwell kernel ({arch}) via nvcc --fmad=false & audited {sass_instructions} SASS instrs (0 FMA)"
+                    ),
+                ),
+                json!({ "arch": arch, "sass_instructions": sass_instructions }),
+            )),
+            CudaAuditStatus::ToolchainUnavailable {
+                ptx_reference_instructions,
+            } => out.push(info(
+                "cuda",
+                "CUDA SASS zero-FMA audit",
+                format!(
+                    "nvcc/cuobjdump not installed; verified {ptx_reference_instructions} reference PTX instrs (0 FMA)"
+                ),
+            )),
+            CudaAuditStatus::Failed(msg) => out.push(fail(
+                "cuda",
+                "CUDA SASS zero-FMA audit",
+                msg,
+            )),
+        }
+    }
     out
 }
 

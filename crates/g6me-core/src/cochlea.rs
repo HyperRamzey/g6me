@@ -1,14 +1,15 @@
-//! Biophysical Human Cochlea, Auditory Nerve Neurogram (NSIM), Bayesian Auditory
+//! Phenomenological Human Cochlea, Auditory Nerve Neurogram (NSIM), Bayesian Auditory
 //! Externalization, and Bayesian Active Personalization Loop.
 //!
-//! 1. **Zilany, Bruce & Carney (JASA 2014) / Bruce, Erfani & Zilany (Hearing Research 2018)**
-//!    Biophysical Cochlea & Auditory Nerve Model:
-//!    - 28-channel ERB-spaced gammatone basilar-membrane filterbank with OHC nonlinear
-//!      compressive gain (`~0.3` slope above 30 dB SPL),
+//! 1. **Phenomenological Cochlea & Auditory Nerve Model** (inspired by Zilany, Bruce &
+//!    Carney, JASA 2014; Bruce, Erfani & Zilany, Hearing Research 2018):
+//!    - Deterministic continuous-rate approximation (not a full stochastic IHC/AN
+//!      synapse pool simulator): 28-channel ERB-spaced 4th-order gammatone basilar-membrane
+//!      filterbank with OHC compressive nonlinearity (`~0.35` slope above knee),
 //!    - Asymmetric Boltzmann Inner Hair Cell (IHC) mechano-transduction + `3.0 kHz`
 //!      membrane low-pass (phase-locking rolloff),
-//!    - Power-law ribbon-synapse adaptation producing auditory-nerve discharge-rate
-//!      neurograms (`sp/s`),
+//!    - Dual-time-constant exponential + power-law adaptation producing deterministic
+//!      auditory-nerve discharge-rate neurograms (`sp/s`),
 //!    - **Neurogram Similarity Index (NSIM)** (Hines & Harte 2010 / Bruce et al. 2018):
 //!      mean luminance × structural similarity `NSIM in [0, 1]` between reference and
 //!      processed auditory-nerve neurograms.

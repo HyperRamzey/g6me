@@ -1291,6 +1291,30 @@ pub fn compile_and_audit_cuda_sass(arch: &str) -> CudaAuditStatus {
     }
 }
 
+/// Probe for a live NVIDIA CUDA device when built with `--features cuda`.
+/// Returns `None` on CPU-only builds or machines without an active NVIDIA driver/GPU.
+pub fn cuda_hardware_summary() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    {
+        g6me_cuda::cuda_device_info().map(|info| {
+            format!(
+                "{} (sm_{}{}, dev #{})",
+                info.name, info.compute_capability.0, info.compute_capability.1, info.index
+            )
+        })
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
+/// Initialize the real zero-FMA CUDA Driver runtime (`g6me-cuda`) on device 0.
+#[cfg(feature = "cuda")]
+pub fn try_init_cuda_runtime() -> std::result::Result<g6me_cuda::G6meCudaRuntime, String> {
+    g6me_cuda::G6meCudaRuntime::init()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

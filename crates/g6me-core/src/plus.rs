@@ -46,9 +46,12 @@
 //!     to `PRE_DELAY`, mono `1/sqrt(2)` in-phase to both ears; `N_IR = 2048`,
 //!     `N_FFT = 8192`, `HOP = 6144`, deterministic zero-FMA `f64` arithmetic.
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use crate::atmosphere::AtmosphereCfg;
 use crate::bem::{watertight_winding_repair, FmmBemSolver, TriangleMesh};
@@ -62,7 +65,9 @@ use crate::ntt::{
     field_to_i128, i64_to_field, mod_add, mod_mul, NttPlan, GOLDILOCKS_P, NTT_KERNEL_SCALE,
     NTT_PCM_SCALE,
 };
-use crate::room::{synthesize_hybrid_room_reflections, FdtdSolver3d, RoomGeometry, RoomPreset};
+use crate::room::{
+    synthesize_hybrid_room_reflections, FdtdSolver3d, RoomGeometry, RoomPreset, RoomQuality,
+};
 use crate::scattering::{
     ear_canal_compensation_mag, snowman_hrtf, sph_to_cart, SnowmanGeom, DEFAULT_EAR_CANAL_MM,
     DEFAULT_HEAD_RADIUS_M,
@@ -73,8 +78,12 @@ use crate::scattering::{
 pub const N_SYNTH: usize = 16_384;
 /// Final windowed anechoic FIR kernel length (`42.67 ms` at 48 kHz).
 pub const N_IR: usize = 2_048;
-/// Final windowed 3D Hybrid Room BRIR kernel length (`170.67 ms` at 48 kHz).
-pub const N_IR_ROOM: usize = 8_192;
+/// Final windowed ControlRoom 3D Hybrid Room BRIR length (`341.33 ms` at 48 kHz = 8 UPOLA partitions).
+pub const N_IR_ROOM: usize = 16_384;
+/// Final windowed TheaterStage / long-RT60 3D Hybrid Room BRIR length (`682.67 ms` at 48 kHz = 16 UPOLA partitions).
+pub const N_IR_THEATER: usize = 32_768;
+/// Uniform Partitioned Overlap-Add (UPOLA) partition length at 48 kHz (`42.67 ms`).
+pub const UPOLA_PART: usize = 2_048;
 /// Streaming overlap-add FFT size for anechoic kernels (`HOP + N_IR - 1 = 8191 < 8192`).
 pub const N_FFT: usize = 8_192;
 /// Maximum input chunk per single OLA transform (`8192 - 2048 = 6144`).
@@ -271,6 +280,8 @@ pub struct PlusCfg {
     pub atmosphere: AtmosphereCfg,
     /// Hybrid 3D Room Acoustics engine preset (`Anechoic`, `ControlRoom`, `TheaterStage`).
     pub room_preset: RoomPreset,
+    /// Physical simulation fidelity for the 3D Hybrid Room solver (`Preview` vs `Production`).
+    pub room_quality: RoomQuality,
     /// Replace Half-Kaiser tail taper with exact Slepian DPSS eigenvector window (`Slepian 1961`).
     pub use_slepian_tail: bool,
     /// Engage Paraunitary Scattering FDN (Schlecht & Habets) + Velvet Noise late externalization.
@@ -281,6 +292,9 @@ pub struct PlusCfg {
     /// prime field (`Z / pZ`, `p = 2^64 - 2^32 + 1`) via Number-Theoretic Transforms (`--exact-ntt`,
     /// 0 ULPs of intermediate floating-point rounding error!).
     pub exact_ntt: bool,
+    /// Optional NVIDIA CUDA GPU offload (`--cuda`, requires `--features cuda` & CUDA driver;
+    /// falls back cleanly to deterministic CPU `f64` when no GPU is present).
+    pub use_cuda: bool,
 }
 
 impl Default for PlusCfg {
@@ -338,10 +352,12 @@ impl PlusCfg {
                 ear_canal_mm,
                 atmosphere,
                 room_preset,
+                room_quality: RoomQuality::Preview,
                 use_slepian_tail,
                 use_fdn_velvet,
                 use_warped_decorr,
                 exact_ntt: false,
+                use_cuda: false,
             },
             PlusProfile::Studio => Self {
                 profile: PlusProfile::Studio,
@@ -363,10 +379,12 @@ impl PlusCfg {
                 ear_canal_mm,
                 atmosphere,
                 room_preset,
+                room_quality: RoomQuality::Preview,
                 use_slepian_tail,
                 use_fdn_velvet,
                 use_warped_decorr,
                 exact_ntt: false,
+                use_cuda: false,
             },
             PlusProfile::Cinema => Self {
                 profile: PlusProfile::Cinema,
@@ -388,10 +406,12 @@ impl PlusCfg {
                 ear_canal_mm,
                 atmosphere,
                 room_preset,
+                room_quality: RoomQuality::Preview,
                 use_slepian_tail,
                 use_fdn_velvet,
                 use_warped_decorr,
                 exact_ntt: false,
+                use_cuda: false,
             },
             PlusProfile::Custom => Self {
                 profile: PlusProfile::Custom,
@@ -421,6 +441,7 @@ impl PlusCfg {
                 && (self.pinna_shelf_db - r.pinna_shelf_db).abs() < 1e-3
                 && (self.ear_canal_mm - r.ear_canal_mm).abs() < 1e-2
                 && self.room_preset == r.room_preset
+                && self.room_quality == r.room_quality
                 && self.use_slepian_tail == r.use_slepian_tail
                 && self.use_fdn_velvet == r.use_fdn_velvet
                 && self.use_warped_decorr == r.use_warped_decorr
@@ -645,7 +666,85 @@ pub struct KernelBank {
     pub pre_delay_samples: usize,
 }
 
+static KERNEL_CACHE: OnceLock<Mutex<HashMap<[u8; 32], Arc<KernelBank>>>> = OnceLock::new();
+
+fn kernel_cache_key(
+    cfg: &PlusCfg,
+    sample_rate: u32,
+    custom_room: Option<&RoomGeometry>,
+    custom_head_mesh: Option<&TriangleMesh>,
+) -> [u8; 32] {
+    let mut h = sha2::Sha256::new();
+    h.update(sample_rate.to_le_bytes());
+    if let Ok(cfg_json) = serde_json::to_vec(cfg) {
+        h.update((cfg_json.len() as u64).to_le_bytes());
+        h.update(&cfg_json);
+    }
+    if let Some(room) = custom_room {
+        h.update([1u8]);
+        if let Ok(rj) = serde_json::to_vec(room) {
+            h.update((rj.len() as u64).to_le_bytes());
+            h.update(&rj);
+        }
+    } else {
+        h.update([0u8]);
+    }
+    if let Some(mesh) = custom_head_mesh {
+        h.update([1u8]);
+        h.update((mesh.vertices.len() as u64).to_le_bytes());
+        for v in &mesh.vertices {
+            for &c in v {
+                h.update(c.to_bits().to_le_bytes());
+            }
+        }
+        h.update((mesh.faces.len() as u64).to_le_bytes());
+        for f in &mesh.faces {
+            for &idx in f {
+                h.update((idx as u64).to_le_bytes());
+            }
+        }
+    } else {
+        h.update([0u8]);
+    }
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 impl KernelBank {
+    /// Return a cached `Arc<KernelBank>` keyed by the exact SHA-256 of
+    /// `(PlusCfg, sample_rate, custom_room, custom_head_mesh)` so batch album renders
+    /// compute FDTD/Ray-Tracing/FMM-BEM only once per unique acoustic configuration.
+    pub fn synthesize_cached(
+        cfg: PlusCfg,
+        sample_rate: u32,
+        custom_room: Option<&RoomGeometry>,
+        custom_head_mesh: Option<&TriangleMesh>,
+    ) -> Arc<Self> {
+        let key = kernel_cache_key(&cfg, sample_rate, custom_room, custom_head_mesh);
+        let map_mutex = KERNEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = map_mutex.lock() {
+            if let Some(existing) = guard.get(&key) {
+                return Arc::clone(existing);
+            }
+        }
+        let bank = Arc::new(Self::synthesize_with_assets(
+            cfg,
+            sample_rate,
+            custom_room,
+            custom_head_mesh,
+        ));
+        if let Ok(mut guard) = map_mutex.lock() {
+            // Cap cache to 16 entries to bound memory across interactive GUI sweeps.
+            if guard.len() >= 16 {
+                guard.clear();
+            }
+            guard.insert(key, Arc::clone(&bank));
+        }
+        bank
+    }
+
     /// Synthesize all 12×2 binaural FIR kernels deterministically in `f64`.
     pub fn synthesize(cfg: PlusCfg, sample_rate: u32) -> Self {
         Self::synthesize_with_room(cfg, sample_rate, None)
@@ -671,15 +770,32 @@ impl KernelBank {
     ) -> Self {
         let fs = (sample_rate.max(8_000)) as f64;
         let scale = sr_scale(sample_rate);
-        let n_synth = N_SYNTH * scale;
-        let has_room = custom_room.is_some() || cfg.room_preset != RoomPreset::Anechoic;
-        let n_ir = if has_room {
+        let active_room_preview: Option<RoomGeometry> = if let Some(r) = custom_room {
+            Some(r.clone())
+        } else if cfg.room_preset != RoomPreset::Anechoic {
+            Some(RoomGeometry::from_preset(cfg.room_preset))
+        } else {
+            None
+        };
+        let has_room = active_room_preview.is_some();
+        let is_long_room = active_room_preview
+            .as_ref()
+            .map(|r| cfg.room_preset == RoomPreset::TheaterStage || r.target_rt60_s > 0.35)
+            .unwrap_or(false);
+        let n_ir = if is_long_room {
+            N_IR_THEATER * scale
+        } else if has_room {
             N_IR_ROOM * scale
         } else {
             N_IR * scale
         };
+        let n_synth = if has_room {
+            (n_ir * 2).max(N_SYNTH * scale)
+        } else {
+            N_SYNTH * scale
+        };
         let kaiser_tail = if has_room {
-            (KAISER_TAIL * 2) * scale
+            (KAISER_TAIL * 4) * scale
         } else {
             KAISER_TAIL * scale
         };
@@ -725,13 +841,7 @@ impl KernelBank {
                 (ap.clone(), ap)
             };
 
-        let active_room: Option<RoomGeometry> = if let Some(r) = custom_room {
-            Some(r.clone())
-        } else if cfg.room_preset != RoomPreset::Anechoic {
-            Some(RoomGeometry::from_preset(cfg.room_preset))
-        } else {
-            None
-        };
+        let active_room = active_room_preview;
 
         // Build Order-7 HOA MagLS decoder once when exact wave-scattering or hybrid room is active.
         let snowman_geom = SnowmanGeom::from_head_and_torso(cfg.head_radius_m, cfg.torso_height_m);
@@ -890,8 +1000,15 @@ impl KernelBank {
             }
 
             // Acoustic Reciprocity shortcut: only 2 3D FDTD runs (L ear + R ear) record all 12 speakers!
-            // Targets 500 Hz @ 6 PPW (`dx = 0.114 m` on ControlRoom) within a 65k-voxel budget.
-            let fdtd = FdtdSolver3d::for_room_budget(room_geom, c_air, 500.0, 65_000);
+            // Preview: 500 Hz @ 6 PPW (65k voxel budget, 0.165 s).
+            // Production: 670 Hz @ 6 PPW (`dx <= 0.085 m`, 260k voxel budget, 0.35 s decay).
+            let (fdtd_target_hz, fdtd_voxel_cap, fdtd_dur_s, fdtd_max_steps) =
+                match cfg.room_quality {
+                    RoomQuality::Preview => (500.0, 65_000usize, 0.165_f64, 1_100usize),
+                    RoomQuality::Production => (670.0, 260_000usize, 0.35_f64, 3_200usize),
+                };
+            let fdtd =
+                FdtdSolver3d::for_room_budget(room_geom, c_air, fdtd_target_hz, fdtd_voxel_cap);
             let ear_l_v = fdtd.coord_to_voxel([
                 room_geom.listener_m[0],
                 room_geom.listener_m[1] + cfg.head_radius_m,
@@ -904,9 +1021,12 @@ impl KernelBank {
             ]);
             let spk_voxels: Vec<(usize, usize, usize)> =
                 spk_coords.iter().map(|&p| fdtd.coord_to_voxel(p)).collect();
-            let fdtd_steps = ((0.165 / fdtd.dt_s).ceil() as usize).clamp(120, 1_100);
-            let fdtd_l_all = fdtd.simulate(ear_l_v, &spk_voxels, fdtd_steps);
-            let fdtd_r_all = fdtd.simulate(ear_r_v, &spk_voxels, fdtd_steps);
+            let fdtd_steps = ((fdtd_dur_s / fdtd.dt_s).ceil() as usize).clamp(120, fdtd_max_steps);
+            let fdtd_l_all =
+                fdtd.simulate_with_cuda(ear_l_v, &spk_voxels, fdtd_steps, cfg.use_cuda);
+            let fdtd_r_all =
+                fdtd.simulate_with_cuda(ear_r_v, &spk_voxels, fdtd_steps, cfg.use_cuda);
+            let tail_duration_s = ((n_ir as f64) / fs - pre_delay_s - 0.015).max(0.144);
 
             let ext_mix = cfg.externalize.max(0.55);
             for ch in 0..SLOTS {
@@ -930,6 +1050,8 @@ impl KernelBank {
                     Some(&fdtd_r_all[ch]),
                     fdtd.dt_s,
                     cfg.use_fdn_velvet,
+                    cfg.room_quality,
+                    tail_duration_s,
                     0x6736_4D45_0000_0001u64.wrapping_add(ch as u64 * 0x9E37_79B9),
                     &plan,
                 );
@@ -1937,9 +2059,11 @@ fn itu_bs1116_reflections(ch: usize) -> [ReflectionTap; 6] {
 
 /// Streaming overlap-add `G6+` binaural renderer.
 ///
-/// Processes arbitrary block sizes `n` with 1:1 immediate frame emission
-/// (`1.0 ms` causal FIR pre-delay, zero block-buffering latency) and exposes
-/// [`Self::flush`] to drain the remaining `N_IR - 1` impulse tail at EOF.
+/// Uses single-partition OLA (`N_IR = 2048`, `N_FFT = 8192`) for anechoic presets and
+/// **Zero-Latency Frequency-Domain Delay-Line Uniform Partitioned Overlap-Add (FDL-UPOLA)**
+/// (`B = 2048`, `N_FFT = 4096`, `P = 8..16` partitions covering `341..683 ms` at 48 kHz)
+/// for 3D Hybrid Room BRIRs — supporting BOTH FP64 Stockham FFT and 64-bit Goldilocks
+/// `--exact-ntt` with strict 1:1 immediate frame emission and arbitrary chunk-size invariance.
 #[derive(Debug, Clone)]
 pub struct BinauralPlus {
     mask: u32,
@@ -1947,14 +2071,24 @@ pub struct BinauralPlus {
     cfg: PlusCfg,
     pre_delay_samples: usize,
     n_ir: usize,
+    /// Number of uniform partitions (`1` for anechoic single-block OLA, `> 1` for FDL-UPOLA).
+    n_parts: usize,
+    /// Partition block size `B` (for UPOLA) or max OLA hop (for single-partition).
     ola_hop: usize,
     plan: FftPlan,
-    /// Pre-transformed `n_fft/2 + 1` frequency-domain kernels for each slot.
-    kern_l: Vec<Vec<Complex>>,
-    kern_r: Vec<Vec<Complex>>,
-    /// Overlap tails (`n_ir - 1` samples) carried between blocks.
+    /// Pre-transformed frequency-domain kernels `[part][slot][bin]` (`n_parts` partitions).
+    kern_l: Vec<Vec<Vec<Complex>>>,
+    kern_r: Vec<Vec<Vec<Complex>>>,
+    /// Overlap tails (`n_ir - 1` for single-part, `2 * B - 1` for FDL-UPOLA).
     ov_l: Vec<f64>,
     ov_r: Vec<f64>,
+    /// UPOLA Frequency-Domain Delay Line `[fdl_slot][ch][bin]` storing last `n_parts - 1`
+    /// completed `B`-sample input spectra (FFT path).
+    fdl_fft: Vec<Vec<Vec<Complex>>>,
+    /// UPOLA per-channel current-block accumulation buffer `[ch][0..B]` for sub-block invariance.
+    cur_in: Vec<Vec<f64>>,
+    cur_fill: usize,
+    fdl_head: usize,
     /// Reusable per-block scratch buffers (zero allocation in `process`).
     in_pad: Vec<f64>,
     fft_scratch: Vec<Complex>,
@@ -1963,10 +2097,11 @@ pub struct BinauralPlus {
     acc_r: Vec<Complex>,
     y_l: Vec<f64>,
     y_r: Vec<f64>,
-    /// Optional 64-bit Goldilocks prime-field NTT OLA engine (`--exact-ntt`).
+    /// Optional 64-bit Goldilocks prime-field NTT OLA / FDL-UPOLA engine (`--exact-ntt`).
     ntt_plan: Option<NttPlan>,
-    ntt_kern_l: Vec<Vec<u64>>,
-    ntt_kern_r: Vec<Vec<u64>>,
+    ntt_kern_l: Vec<Vec<Vec<u64>>>,
+    ntt_kern_r: Vec<Vec<Vec<u64>>>,
+    ntt_fdl: Vec<Vec<Vec<u64>>>,
     ntt_ov_l: Vec<i128>,
     ntt_ov_r: Vec<i128>,
     ntt_x: Vec<u64>,
@@ -1997,31 +2132,45 @@ impl BinauralPlus {
         custom_room: Option<&RoomGeometry>,
         custom_head_mesh: Option<&TriangleMesh>,
     ) -> Self {
-        let bank =
-            KernelBank::synthesize_with_assets(cfg, sample_rate, custom_room, custom_head_mesh);
+        let bank = KernelBank::synthesize_cached(cfg, sample_rate, custom_room, custom_head_mesh);
         let scale = sr_scale(sample_rate);
         let n_ir = bank.ir_l[0].len();
-        let n_fft = if n_ir <= N_IR * scale {
-            N_FFT * scale
+        let use_upola = n_ir > N_IR * scale;
+        let (n_parts, ola_hop, n_fft, ov_len) = if use_upola {
+            let b = UPOLA_PART * scale;
+            let p = n_ir.div_ceil(b);
+            (p, b, 2 * b, 2 * b - 1)
         } else {
-            (n_ir * 2).next_power_of_two()
+            let nf = N_FFT * scale;
+            (1usize, nf - n_ir, nf, n_ir - 1)
         };
-        let ola_hop = n_fft - n_ir;
         let plan = FftPlan::new(n_fft);
         let nb = n_fft / 2 + 1;
         let mut scratch = vec![Complex::ZERO; n_fft];
         let mut pad = vec![0.0_f64; n_fft];
-        let mut kern_l = vec![vec![Complex::ZERO; nb]; SLOTS];
-        let mut kern_r = vec![vec![Complex::ZERO; nb]; SLOTS];
+        let mut kern_l = vec![vec![vec![Complex::ZERO; nb]; SLOTS]; n_parts];
+        let mut kern_r = vec![vec![vec![Complex::ZERO; nb]; SLOTS]; n_parts];
 
-        for ch in 0..SLOTS {
-            pad.fill(0.0);
-            pad[..n_ir].copy_from_slice(&bank.ir_l[ch]);
-            plan.rfft(&pad, &mut scratch, &mut kern_l[ch]);
+        for p in 0..n_parts {
+            let start = p * ola_hop;
+            let len = if use_upola {
+                ola_hop.min(n_ir.saturating_sub(start))
+            } else {
+                n_ir
+            };
+            for ch in 0..SLOTS {
+                pad.fill(0.0);
+                if len > 0 {
+                    pad[..len].copy_from_slice(&bank.ir_l[ch][start..start + len]);
+                }
+                plan.rfft(&pad, &mut scratch, &mut kern_l[p][ch]);
 
-            pad.fill(0.0);
-            pad[..n_ir].copy_from_slice(&bank.ir_r[ch]);
-            plan.rfft(&pad, &mut scratch, &mut kern_r[ch]);
+                pad.fill(0.0);
+                if len > 0 {
+                    pad[..len].copy_from_slice(&bank.ir_r[ch][start..start + len]);
+                }
+                plan.rfft(&pad, &mut scratch, &mut kern_r[p][ch]);
+            }
         }
 
         // Choose exact power-of-two NTT kernel quantization scale with guaranteed >= 4x headroom
@@ -2043,43 +2192,79 @@ impl BinauralPlus {
             }
         }
 
-        let (ntt_plan, ntt_kern_l, ntt_kern_r, ntt_ov_l, ntt_ov_r, ntt_x, ntt_acc_l, ntt_acc_r) =
-            if cfg.exact_ntt {
-                let np = NttPlan::new(n_fft);
-                let mut nkl = vec![vec![0u64; n_fft]; SLOTS];
-                let mut nkr = vec![vec![0u64; n_fft]; SLOTS];
+        let fdl_slots = n_parts.saturating_sub(1);
+        let fdl_fft = if !cfg.exact_ntt && fdl_slots > 0 {
+            vec![vec![vec![Complex::ZERO; nb]; SLOTS]; fdl_slots]
+        } else {
+            Vec::new()
+        };
+        let cur_in = if n_parts > 1 {
+            vec![vec![0.0_f64; ola_hop]; SLOTS]
+        } else {
+            Vec::new()
+        };
+
+        let (
+            ntt_plan,
+            ntt_kern_l,
+            ntt_kern_r,
+            ntt_fdl,
+            ntt_ov_l,
+            ntt_ov_r,
+            ntt_x,
+            ntt_acc_l,
+            ntt_acc_r,
+        ) = if cfg.exact_ntt {
+            let np = NttPlan::new(n_fft);
+            let mut nkl = vec![vec![vec![0u64; n_fft]; SLOTS]; n_parts];
+            let mut nkr = vec![vec![vec![0u64; n_fft]; SLOTS]; n_parts];
+            for p in 0..n_parts {
+                let start = p * ola_hop;
+                let len = if use_upola {
+                    ola_hop.min(n_ir.saturating_sub(start))
+                } else {
+                    n_ir
+                };
                 for ch in 0..SLOTS {
-                    for i in 0..n_ir {
-                        let ql = (bank.ir_l[ch][i] * ntt_kernel_scale).round() as i64;
-                        let qr = (bank.ir_r[ch][i] * ntt_kernel_scale).round() as i64;
-                        nkl[ch][i] = i64_to_field(ql);
-                        nkr[ch][i] = i64_to_field(qr);
+                    for i in 0..len {
+                        let ql = (bank.ir_l[ch][start + i] * ntt_kernel_scale).round() as i64;
+                        let qr = (bank.ir_r[ch][start + i] * ntt_kernel_scale).round() as i64;
+                        nkl[p][ch][i] = i64_to_field(ql);
+                        nkr[p][ch][i] = i64_to_field(qr);
                     }
-                    np.forward(&mut nkl[ch]);
-                    np.forward(&mut nkr[ch]);
+                    np.forward(&mut nkl[p][ch]);
+                    np.forward(&mut nkr[p][ch]);
                 }
-                (
-                    Some(np),
-                    nkl,
-                    nkr,
-                    vec![0i128; n_ir - 1],
-                    vec![0i128; n_ir - 1],
-                    vec![0u64; n_fft],
-                    vec![0u64; n_fft],
-                    vec![0u64; n_fft],
-                )
+            }
+            let nfdl = if fdl_slots > 0 {
+                vec![vec![vec![0u64; n_fft]; SLOTS]; fdl_slots]
             } else {
-                (
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
+                Vec::new()
             };
+            (
+                Some(np),
+                nkl,
+                nkr,
+                nfdl,
+                vec![0i128; ov_len],
+                vec![0i128; ov_len],
+                vec![0u64; n_fft],
+                vec![0u64; n_fft],
+                vec![0u64; n_fft],
+            )
+        } else {
+            (
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
 
         Self {
             mask,
@@ -2087,12 +2272,17 @@ impl BinauralPlus {
             cfg,
             pre_delay_samples: bank.pre_delay_samples,
             n_ir,
+            n_parts,
             ola_hop,
             plan,
             kern_l,
             kern_r,
-            ov_l: vec![0.0_f64; n_ir - 1],
-            ov_r: vec![0.0_f64; n_ir - 1],
+            ov_l: vec![0.0_f64; ov_len],
+            ov_r: vec![0.0_f64; ov_len],
+            fdl_fft,
+            cur_in,
+            cur_fill: 0,
+            fdl_head: 0,
             in_pad: vec![0.0_f64; n_fft],
             fft_scratch: vec![Complex::ZERO; n_fft],
             x_bins: vec![Complex::ZERO; nb],
@@ -2103,6 +2293,7 @@ impl BinauralPlus {
             ntt_plan,
             ntt_kern_l,
             ntt_kern_r,
+            ntt_fdl,
             ntt_ov_l,
             ntt_ov_r,
             ntt_x,
@@ -2137,7 +2328,8 @@ impl BinauralPlus {
 
     /// Process `frames` samples of planar input slots into stereo `(out_l, out_r)`.
     /// Mirrors `Dsp::process` exactly: stereo input (`MASK_STEREO`) passes through
-    /// untouched; multi-channel inputs are convolved with exact streaming overlap-add.
+    /// untouched; multi-channel inputs are convolved with exact streaming overlap-add
+    /// (single-partition OLA for anechoic, Zero-Latency FDL-UPOLA for long room BRIRs).
     pub fn process(
         &mut self,
         inputs: &[Option<&[f64]>; SLOTS],
@@ -2170,7 +2362,12 @@ impl BinauralPlus {
 
         let mut offset = 0usize;
         while offset < frames {
-            let m = (frames - offset).min(self.ola_hop);
+            let max_step = if self.n_parts > 1 {
+                self.ola_hop - self.cur_fill
+            } else {
+                self.ola_hop
+            };
+            let m = (frames - offset).min(max_step);
             self.process_hop(
                 inputs,
                 offset,
@@ -2182,6 +2379,114 @@ impl BinauralPlus {
         }
     }
 
+    /// Push the completed `B`-sample `cur_in` block into the UPOLA Frequency-Domain Delay Line
+    /// and accumulate partitions `p = 1..n_parts` directly into `ov_l`/`ov_r` (or `ntt_ov_l`/`ntt_ov_r`).
+    fn push_completed_upola_block(&mut self) {
+        let fdl_len = self.n_parts - 1;
+        let head = self.fdl_head;
+        let b = self.ola_hop;
+        let ov_len = 2 * b - 1;
+
+        if let Some(ref np) = self.ntt_plan {
+            let n_fft = np.len();
+            // Transform completed B-sample block for each active channel into ntt_fdl[head][ch].
+            for ch in 0..SLOTS {
+                if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                    continue;
+                }
+                let dst = &mut self.ntt_fdl[head][ch];
+                dst.fill(0);
+                let src = &self.cur_in[ch];
+                if src.iter().any(|&v| v != 0.0) {
+                    for (d, &s) in dst.iter_mut().take(b).zip(src.iter()) {
+                        let q = (s * NTT_PCM_SCALE).round().clamp(-8_388_608.0, 8_388_607.0) as i64;
+                        *d = i64_to_field(q);
+                    }
+                    np.forward(dst);
+                }
+            }
+
+            // Accumulate all tail partitions p = 1..n_parts with ONE inverse NTT per ear!
+            self.ntt_acc_l.fill(0);
+            self.ntt_acc_r.fill(0);
+            for p in 1..self.n_parts {
+                let slot_idx = (head + fdl_len - (p - 1)) % fdl_len;
+                for ch in 0..SLOTS {
+                    if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                        continue;
+                    }
+                    let xf = &self.ntt_fdl[slot_idx][ch];
+                    if !xf.iter().any(|&v| v != 0) {
+                        continue;
+                    }
+                    let kl = &self.ntt_kern_l[p][ch];
+                    let kr = &self.ntt_kern_r[p][ch];
+                    for k in 0..n_fft {
+                        let xv = xf[k];
+                        self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
+                        self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+                    }
+                }
+            }
+            np.inverse(&mut self.ntt_acc_l);
+            np.inverse(&mut self.ntt_acc_r);
+            for i in 0..ov_len {
+                self.ntt_ov_l[i] += field_to_i128(self.ntt_acc_l[i]);
+                self.ntt_ov_r[i] += field_to_i128(self.ntt_acc_r[i]);
+            }
+        } else {
+            let nb = self.plan.len() / 2 + 1;
+            for ch in 0..SLOTS {
+                if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                    continue;
+                }
+                let src = &self.cur_in[ch];
+                if src.iter().any(|&v| v != 0.0) {
+                    self.in_pad[..b].copy_from_slice(src);
+                    self.in_pad[b..].fill(0.0);
+                    self.plan.rfft(
+                        &self.in_pad,
+                        &mut self.fft_scratch,
+                        &mut self.fdl_fft[head][ch],
+                    );
+                } else {
+                    self.fdl_fft[head][ch].fill(Complex::ZERO);
+                }
+            }
+
+            // Accumulate all tail partitions p = 1..n_parts with ONE inverse FFT per ear!
+            self.acc_l.fill(Complex::ZERO);
+            self.acc_r.fill(Complex::ZERO);
+            for p in 1..self.n_parts {
+                let slot_idx = (head + fdl_len - (p - 1)) % fdl_len;
+                for ch in 0..SLOTS {
+                    if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                        continue;
+                    }
+                    let xf = &self.fdl_fft[slot_idx][ch];
+                    let kl = &self.kern_l[p][ch];
+                    let kr = &self.kern_r[p][ch];
+                    for k in 0..nb {
+                        let xv = xf[k];
+                        self.acc_l[k] = self.acc_l[k].add(xv.mul(kl[k]));
+                        self.acc_r[k] = self.acc_r[k].add(xv.mul(kr[k]));
+                    }
+                }
+            }
+            self.plan
+                .irfft(&self.acc_l, &mut self.fft_scratch, &mut self.y_l);
+            self.plan
+                .irfft(&self.acc_r, &mut self.fft_scratch, &mut self.y_r);
+            for i in 0..ov_len {
+                self.ov_l[i] += self.y_l[i];
+                self.ov_r[i] += self.y_r[i];
+            }
+        }
+
+        self.fdl_head = (head + 1) % fdl_len;
+        self.cur_fill = 0;
+    }
+
     fn process_hop(
         &mut self,
         inputs: &[Option<&[f64]>; SLOTS],
@@ -2191,17 +2496,36 @@ impl BinauralPlus {
         m: usize,
     ) {
         debug_assert!((1..=self.ola_hop).contains(&m));
+        let use_upola = self.n_parts > 1;
+        let full_aligned_upola = use_upola && self.cur_fill == 0 && m == self.ola_hop;
+
         if let Some(ref np) = self.ntt_plan {
             let n_fft = np.len();
+            let head = self.fdl_head;
             self.ntt_acc_l.fill(0);
             self.ntt_acc_r.fill(0);
             for (ch, slot) in inputs.iter().enumerate() {
                 if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
                     continue;
                 }
-                let Some(buf) = slot else { continue };
-                let slice = &buf[offset..offset + m];
+                let slice_opt = slot.map(|buf| &buf[offset..offset + m]);
+                if use_upola && !full_aligned_upola {
+                    if let Some(sl) = slice_opt {
+                        self.cur_in[ch][self.cur_fill..self.cur_fill + m].copy_from_slice(sl);
+                    } else {
+                        self.cur_in[ch][self.cur_fill..self.cur_fill + m].fill(0.0);
+                    }
+                }
+                let Some(slice) = slice_opt else {
+                    if full_aligned_upola {
+                        self.ntt_fdl[head][ch].fill(0);
+                    }
+                    continue;
+                };
                 if !slice.iter().any(|&v| v != 0.0) {
+                    if full_aligned_upola {
+                        self.ntt_fdl[head][ch].fill(0);
+                    }
                     continue;
                 }
                 self.ntt_x.fill(0);
@@ -2212,8 +2536,11 @@ impl BinauralPlus {
                     *dst = i64_to_field(q);
                 }
                 np.forward(&mut self.ntt_x);
-                let kl = &self.ntt_kern_l[ch];
-                let kr = &self.ntt_kern_r[ch];
+                if full_aligned_upola {
+                    self.ntt_fdl[head][ch].copy_from_slice(&self.ntt_x);
+                }
+                let kl = &self.ntt_kern_l[0][ch];
+                let kr = &self.ntt_kern_r[0][ch];
                 for k in 0..n_fft {
                     let xv = self.ntt_x[k];
                     self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
@@ -2224,7 +2551,7 @@ impl BinauralPlus {
             np.inverse(&mut self.ntt_acc_r);
 
             let inv_scale = 1.0 / (NTT_PCM_SCALE * self.ntt_kernel_scale);
-            let ov_len = self.n_ir - 1;
+            let ov_len = self.ntt_ov_l.len();
             for i in 0..m {
                 let ol = if i < ov_len { self.ntt_ov_l[i] } else { 0 };
                 let or = if i < ov_len { self.ntt_ov_r[i] } else { 0 };
@@ -2236,17 +2563,71 @@ impl BinauralPlus {
                 out_l[i] = vl;
                 out_r[i] = vr;
             }
+            let y_len = if use_upola {
+                m + self.ola_hop - 1
+            } else {
+                n_fft
+            };
             for j in 0..ov_len {
                 let src = m + j;
                 let prev_l = if src < ov_len { self.ntt_ov_l[src] } else { 0 };
                 let prev_r = if src < ov_len { self.ntt_ov_r[src] } else { 0 };
-                self.ntt_ov_l[j] = prev_l + field_to_i128(self.ntt_acc_l[src]);
-                self.ntt_ov_r[j] = prev_r + field_to_i128(self.ntt_acc_r[src]);
+                let add_l = if src < y_len {
+                    field_to_i128(self.ntt_acc_l[src])
+                } else {
+                    0
+                };
+                let add_r = if src < y_len {
+                    field_to_i128(self.ntt_acc_r[src])
+                } else {
+                    0
+                };
+                self.ntt_ov_l[j] = prev_l + add_l;
+                self.ntt_ov_r[j] = prev_r + add_r;
+            }
+
+            if full_aligned_upola {
+                // Fast path: ntt_fdl[head] is already transformed — sum p = 1..n_parts in 1 INTT/ear!
+                let fdl_len = self.n_parts - 1;
+                self.ntt_acc_l.fill(0);
+                self.ntt_acc_r.fill(0);
+                for p in 1..self.n_parts {
+                    let slot_idx = (head + fdl_len - (p - 1)) % fdl_len;
+                    for ch in 0..SLOTS {
+                        if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                            continue;
+                        }
+                        let xf = &self.ntt_fdl[slot_idx][ch];
+                        if !xf.iter().any(|&v| v != 0) {
+                            continue;
+                        }
+                        let kl = &self.ntt_kern_l[p][ch];
+                        let kr = &self.ntt_kern_r[p][ch];
+                        for k in 0..n_fft {
+                            let xv = xf[k];
+                            self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
+                            self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+                        }
+                    }
+                }
+                np.inverse(&mut self.ntt_acc_l);
+                np.inverse(&mut self.ntt_acc_r);
+                for i in 0..ov_len {
+                    self.ntt_ov_l[i] += field_to_i128(self.ntt_acc_l[i]);
+                    self.ntt_ov_r[i] += field_to_i128(self.ntt_acc_r[i]);
+                }
+                self.fdl_head = (head + 1) % fdl_len;
+            } else if use_upola {
+                self.cur_fill += m;
+                if self.cur_fill == self.ola_hop {
+                    self.push_completed_upola_block();
+                }
             }
             return;
         }
 
         let nb = self.plan.len() / 2 + 1;
+        let head = self.fdl_head;
         self.acc_l.fill(Complex::ZERO);
         self.acc_r.fill(Complex::ZERO);
 
@@ -2254,19 +2635,37 @@ impl BinauralPlus {
             if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
                 continue;
             }
-            let Some(buf) = slot else { continue };
-            let slice = &buf[offset..offset + m];
+            let slice_opt = slot.map(|buf| &buf[offset..offset + m]);
+            if use_upola && !full_aligned_upola {
+                if let Some(sl) = slice_opt {
+                    self.cur_in[ch][self.cur_fill..self.cur_fill + m].copy_from_slice(sl);
+                } else {
+                    self.cur_in[ch][self.cur_fill..self.cur_fill + m].fill(0.0);
+                }
+            }
+            let Some(slice) = slice_opt else {
+                if full_aligned_upola {
+                    self.fdl_fft[head][ch].fill(Complex::ZERO);
+                }
+                continue;
+            };
             // Fast silence skip per channel.
             if !slice.iter().any(|&v| v != 0.0) {
+                if full_aligned_upola {
+                    self.fdl_fft[head][ch].fill(Complex::ZERO);
+                }
                 continue;
             }
             self.in_pad[..m].copy_from_slice(slice);
             self.in_pad[m..].fill(0.0);
             self.plan
                 .rfft(&self.in_pad, &mut self.fft_scratch, &mut self.x_bins);
+            if full_aligned_upola {
+                self.fdl_fft[head][ch].copy_from_slice(&self.x_bins);
+            }
 
-            let kl = &self.kern_l[ch];
-            let kr = &self.kern_r[ch];
+            let kl = &self.kern_l[0][ch];
+            let kr = &self.kern_r[0][ch];
             for k in 0..nb {
                 let x = self.x_bins[k];
                 self.acc_l[k] = self.acc_l[k].add(x.mul(kl[k]));
@@ -2279,7 +2678,7 @@ impl BinauralPlus {
         self.plan
             .irfft(&self.acc_r, &mut self.fft_scratch, &mut self.y_r);
 
-        let ov_len = self.n_ir - 1;
+        let ov_len = self.ov_l.len();
         for i in 0..m {
             let ol = if i < ov_len { self.ov_l[i] } else { 0.0 };
             let or = if i < ov_len { self.ov_r[i] } else { 0.0 };
@@ -2292,14 +2691,57 @@ impl BinauralPlus {
             out_r[i] = vr;
         }
 
-        // Shift overlap buffer left by `m` and add the new block's convolution tail.
-        // Since `m >= 1`, `m + j > j`, so ascending `j` is strictly safe in-place.
+        // Shift overlap buffer left by `m` and add partition 0's convolution tail.
+        let y_len = if use_upola {
+            m + self.ola_hop - 1
+        } else {
+            self.y_l.len()
+        };
         for j in 0..ov_len {
             let src = m + j;
             let prev_l = if src < ov_len { self.ov_l[src] } else { 0.0 };
             let prev_r = if src < ov_len { self.ov_r[src] } else { 0.0 };
-            self.ov_l[j] = prev_l + self.y_l[src];
-            self.ov_r[j] = prev_r + self.y_r[src];
+            let add_l = if src < y_len { self.y_l[src] } else { 0.0 };
+            let add_r = if src < y_len { self.y_r[src] } else { 0.0 };
+            self.ov_l[j] = prev_l + add_l;
+            self.ov_r[j] = prev_r + add_r;
+        }
+
+        if full_aligned_upola {
+            // Fast path: fdl_fft[head] is already transformed — sum p = 1..n_parts in 1 IFFT/ear!
+            let fdl_len = self.n_parts - 1;
+            self.acc_l.fill(Complex::ZERO);
+            self.acc_r.fill(Complex::ZERO);
+            for p in 1..self.n_parts {
+                let slot_idx = (head + fdl_len - (p - 1)) % fdl_len;
+                for ch in 0..SLOTS {
+                    if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                        continue;
+                    }
+                    let xf = &self.fdl_fft[slot_idx][ch];
+                    let kl = &self.kern_l[p][ch];
+                    let kr = &self.kern_r[p][ch];
+                    for k in 0..nb {
+                        let xv = xf[k];
+                        self.acc_l[k] = self.acc_l[k].add(xv.mul(kl[k]));
+                        self.acc_r[k] = self.acc_r[k].add(xv.mul(kr[k]));
+                    }
+                }
+            }
+            self.plan
+                .irfft(&self.acc_l, &mut self.fft_scratch, &mut self.y_l);
+            self.plan
+                .irfft(&self.acc_r, &mut self.fft_scratch, &mut self.y_r);
+            for i in 0..ov_len {
+                self.ov_l[i] += self.y_l[i];
+                self.ov_r[i] += self.y_r[i];
+            }
+            self.fdl_head = (head + 1) % fdl_len;
+        } else if use_upola {
+            self.cur_fill += m;
+            if self.cur_fill == self.ola_hop {
+                self.push_completed_upola_block();
+            }
         }
     }
 
@@ -2308,6 +2750,34 @@ impl BinauralPlus {
     pub fn flush(&mut self) -> (Vec<f64>, Vec<f64>) {
         if self.mask == MASK_STEREO {
             return (Vec::new(), Vec::new());
+        }
+        if self.n_parts > 1 {
+            let tail_len = self.n_ir - 1;
+            let mut tl = vec![0.0_f64; tail_len];
+            let mut tr = vec![0.0_f64; tail_len];
+            let zeros: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+            self.process(&zeros, &mut tl, &mut tr, tail_len);
+            // Reset all FDL and overlap state cleanly.
+            self.ov_l.fill(0.0);
+            self.ov_r.fill(0.0);
+            self.ntt_ov_l.fill(0);
+            self.ntt_ov_r.fill(0);
+            for s in &mut self.fdl_fft {
+                for c in s {
+                    c.fill(Complex::ZERO);
+                }
+            }
+            for s in &mut self.ntt_fdl {
+                for c in s {
+                    c.fill(0);
+                }
+            }
+            for c in &mut self.cur_in {
+                c.fill(0.0);
+            }
+            self.cur_fill = 0;
+            self.fdl_head = 0;
+            return (tl, tr);
         }
         if self.ntt_plan.is_some() {
             let inv_scale = 1.0 / (NTT_PCM_SCALE * self.ntt_kernel_scale);
@@ -3188,19 +3658,25 @@ mod tests {
         cfg.room_preset = RoomPreset::ControlRoom;
         cfg.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
 
-        let bank = KernelBank::synthesize(cfg, 48_000);
+        let bank1 = KernelBank::synthesize_cached(cfg, 48_000, None, None);
+        let bank2 = KernelBank::synthesize_cached(cfg, 48_000, None, None);
+        assert!(
+            Arc::ptr_eq(&bank1, &bank2),
+            "SHA-256 BRIR cache must return identical Arc on repeat synthesis"
+        );
         assert_eq!(
-            bank.ir_l[SLOT_FL].len(),
+            bank1.ir_l[SLOT_FL].len(),
             N_IR_ROOM,
-            "3D Hybrid ControlRoom must synthesize full 8192-tap (170.7 ms) BRIR"
+            "3D Hybrid ControlRoom must synthesize full 16384-tap (341.3 ms) UPOLA BRIR"
         );
 
         let mut cfg_ntt = cfg;
         cfg_ntt.exact_ntt = true;
         let mut eng_fft = BinauralPlus::new(crate::dsp::MASK_5_1, cfg, 48_000);
+        let mut eng_fft_chunked = BinauralPlus::new(crate::dsp::MASK_5_1, cfg, 48_000);
         let mut eng_ntt = BinauralPlus::new(crate::dsp::MASK_5_1, cfg_ntt, 48_000);
 
-        let n = 4096usize;
+        let n = 5000usize;
         let fl: Vec<f64> = (0..n)
             .map(|i| 0.45 * (2.0 * PI * 320.0 * i as f64 / 48_000.0).sin())
             .collect();
@@ -3224,6 +3700,38 @@ mod tests {
         l_ntt.extend_from_slice(&tl_ntt);
         r_ntt.extend_from_slice(&tr_ntt);
 
+        // Also feed odd 317-sample chunks to verify UPOLA arbitrary chunk-size invariance!
+        let mut l_chk = vec![0.0_f64; n];
+        let mut r_chk = vec![0.0_f64; n];
+        let mut pos = 0usize;
+        while pos < n {
+            let step = (n - pos).min(317);
+            let mut sub: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+            sub[SLOT_FL] = Some(&fl[pos..pos + step]);
+            sub[SLOT_FR] = Some(&fr[pos..pos + step]);
+            eng_fft_chunked.process(
+                &sub,
+                &mut l_chk[pos..pos + step],
+                &mut r_chk[pos..pos + step],
+                step,
+            );
+            pos += step;
+        }
+        let (tl_chk, tr_chk) = eng_fft_chunked.flush();
+        l_chk.extend_from_slice(&tl_chk);
+        r_chk.extend_from_slice(&tr_chk);
+
+        let chunk_diff = l_fft
+            .iter()
+            .zip(&l_chk)
+            .chain(r_fft.iter().zip(&r_chk))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            chunk_diff < 1e-11,
+            "FDL-UPOLA chunk-size invariance violated: max_diff={chunk_diff:e}"
+        );
+
         let max_diff = l_fft
             .iter()
             .zip(&l_ntt)
@@ -3231,8 +3739,8 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         assert!(
-            max_diff < 2e-6,
-            "ControlRoom 8192-tap --exact-ntt diverged from f64 FFT: max_diff={max_diff:e}"
+            max_diff < 3e-6,
+            "ControlRoom 16384-tap UPOLA --exact-ntt diverged from f64 FFT: max_diff={max_diff:e}"
         );
     }
 }

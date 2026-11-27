@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Bit-exactness, phase and drift verification of the G6ME downmixer against the reference C port"
 
+[features]
+cuda = ["g6me-core/cuda", "dep:g6me-cuda"]
+
 [dependencies]
 g6me-core = { workspace = true }
+g6me-cuda = { workspace = true, optional = true }
 serde_json = { workspace = true }

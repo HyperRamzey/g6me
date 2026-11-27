@@ -11,13 +11,17 @@ repository.workspace = true
 default = ["monitor"]
 # Live monitoring through an output device (WASAPI on Windows, ALSA/PipeWire on Linux).
 monitor = ["dep:cpal"]
+# Optional CUDA / Blackwell (sm_120) GPU offload and nvcc+cuobjdump SASS auditor.
+cuda = ["dep:g6me-cuda"]
 
 [dependencies]
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 sha2.workspace = true
+jxl-oxide = "0.12"
 cpal = { version = "0.18", optional = true }
+g6me-cuda = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # cpal uses the windows crate for WASAPI; nothing extra needed here, this only

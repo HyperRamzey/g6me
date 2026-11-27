@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/g6me-core",
+    "crates/g6me-cuda",
     "crates/g6me-cli",
     "crates/g6me-gui",
     "crates/g6me-verify",
@@ -16,6 +17,7 @@ repository = "https://github.com/HyperRamzey/g6me"
 
 [workspace.dependencies]
 g6me-core = { path = "crates/g6me-core" }
+g6me-cuda = { path = "crates/g6me-cuda" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

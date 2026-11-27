@@ -5,12 +5,13 @@ A core-Lean-4 formalization of the exact integer and rational mathematics in
 
 - Toolchain: Lean 4.27.0 and Lake 5.0.0 (already installed at `/usr/bin`).
 - Build: `cd lean && lake build`
-- Purity gate: `./check_axioms.sh` (forbidden-token scan, full build, and
-  `#print axioms` for every headline theorem).
+- Purity gate: `./check_axioms.sh` (forbidden-token scan, full build, theorem
+  coverage against the EXPECTED registry, and `#print axioms` for every
+  registered theorem).
 - The gate permits only `propext` and `Quot.sound`.  It rejects
   `Classical.choice`, `sorryAx`, `Lean.ofReduceBool` and
-  `Lean.trustCompiler`.  Current result: 59 theorems checked, axioms limited
-  to `propext` and `Quot.sound`.
+  `Lean.trustCompiler`.  Current result: 266 public theorems checked, axioms
+  limited to `propext` and `Quot.sound`.
 
 The Rust tree is untouched.  Everything here lives under `lean/`.
 
@@ -312,8 +313,17 @@ Not modelled: the `f64` EVD (`disc = sqrt((r11-r22)² + 4|r12|²)`, `λ1`,
 
 ## Purity
 
-`check_axioms.sh` enforces the gate.  Its source-token scan strips nested
-block comments and line comments first, because the module headers name the
-forbidden tokens in prose.  The `#print axioms` list is explicit in the
-script and covers 59 theorems; the script prints every axiom line it checks
-and fails unless every line contains only `propext` and `Quot.sound`.
+`check_axioms.sh` enforces the gate in four phases.  (1) The source-token scan
+strips nested block comments and line comments first, because the module
+headers name the forbidden tokens in prose.  (2) `lake build`.  (3) A coverage
+check enumerates every public `theorem`/`lemma` declared at column 0 in
+`G6ME/*.lean` and `G6ME.lean`, resolves its namespace, and requires the result
+to equal the EXPECTED registry in the script exactly: a declared theorem that
+is missing from EXPECTED fails, and an EXPECTED name with no declaration
+fails.  Private and protected declarations are not matched (Lean mangles
+private names, so `#print axioms` cannot address them); the sources currently
+contain none.  (4) The `#print axioms` probe is generated from EXPECTED itself,
+so the registry is the single source of truth, and the script prints every
+axiom line it checks and fails unless every line contains only `propext` and
+`Quot.sound`.  The registry currently covers 266 theorems, matching the
+source enumeration exactly.

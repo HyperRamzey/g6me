@@ -36,10 +36,11 @@ $$(\nabla^2 + k^2) p(\mathbf{r}) = -\delta(\mathbf{r} - \mathbf{r}_s), \qquad \l
 2. **Generalized Winding Number Watertight Repair** (Jacobson et al., SIGGRAPH 2013): Computes the exact solid-angle winding field $w(\mathbf{x}) = \frac{1}{4\pi}\sum_j \Omega_j(\mathbf{x})$ across a 3D grid and extracts the closed $w(\mathbf{x}) = 0.5$ isosurface via Marching Tetrahedra, repairing missing neck caps, ear-canal holes, and hair dropouts into a 0-boundary-edge manifold with $w(\mathbf{0}) = 1.0$.
 3. **Isotropic Acoustic Remeshing**: Enforces the acoustic discretization bound $h \le \lambda_{\min} / 6$ ($\le 2.5\text{ mm}$ at $20\text{ kHz}$, $c \approx 344.8\text{ m/s}$) via adaptive longest-edge bisection and tangential smoothing while preserving 0 boundary edges.
 
-### 3D Octree FMM + Gumerov Acoustic Reciprocity
+### 3D Octree FMM, Gumerov Acoustic Reciprocity & CHIEF Regularization
 - Following Gumerov, O'Donovan, Duraiswami & Zotkin (JASA 2006 / 2010), solving the **adjoint** boundary integral equation $(C + K^T)\lambda = e_{\text{ear}}$ once per ear per frequency yields the exact free-field-normalized HRTF $H(\mathbf{r}_s \to \mathbf{r}_{\text{ear}})$ for every loudspeaker azimuth/elevation simultaneously via a single boundary inner product $\langle \lambda, p_{\text{inc}}(\mathbf{r}_s)\rangle$.
+- **Schenck (JASA 1968) CHIEF Irregular-Frequency Regularization**: Augmented interior-point Helmholtz constraints ($12$ deterministic non-nodal interior points inside the skull volume) are folded into the normal equations with rank-1 updates, suppressing spurious interior Dirichlet eigenfrequency spikes (e.g. $ka = \pi$) while preserving exact adjoint reciprocity.
 - The boundary operator is accelerated by a 3D spatial octree (`FmmOctree`) that evaluates near-field leaf interactions exactly and compresses well-separated far-field clusters via multipole-to-local (M2L) Green's-function expansions, solved via preconditioned restarted GMRES.
-- Both CPU Rust and `BLACKWELL_FMM_BEM_CUDA` strictly prohibit FMA contraction (`__dmul_rn` / `__dadd_rn`).
+- Both CPU Rust and `crates/g6me-cuda/kernels/bem_matvec.cu` strictly prohibit FMA contraction (`__dmul_rn` / `__dadd_rn`, `nvcc --fmad=false`).
 
 Usage:
 ```bash
@@ -53,7 +54,7 @@ g6me --mode plus --head-mesh myhead.obj input.flac output.wav
 `g6me-scan` (`crates/g6me-core/src/dng.rs`, `burst3d.rs`, `scan.rs`, `crates/g6me-cli/src/scan_main.rs`) converts raw smartphone DNG 1.7 captures or v7.0 zero-copy 50 MP MIPI `RAW10` + OIS/IMU bursts into a sub-millimeter, watertight, acoustically remeshed head model handed directly in memory to `FmmBemSolver`.
 
 ### Optical & Sensor Physics Ingest (`dng.rs` & `burst3d.rs`)
-- **DNG 1.7 SubIFD & `OpcodeList2/3` Zero-Resampling**: Bypasses the low-resolution IFD0 preview trap into the full-resolution `SubIFD`, parses `OpcodeList2` (`GainMap`, ID 9) and `OpcodeList3` (`FixVignetteRadial`, ID 3; 3-plane RGB `WarpRectilinear`, ID 1), and applies radial/tangential undistortion analytically to `f64` feature rays via Newton–Raphson inversion. Zero image resampling occurs and 3-plane lateral chromatic aberration is cancelled to $< 0.008\text{ px}$.
+- **DNG 1.7 SubIFD, Pixel Decode & `OpcodeList2/3` Zero-Resampling**: Bypasses the low-resolution IFD0 preview trap into the full-resolution `SubIFD`, decodes uncompressed strips/tiles, Lossless-JPEG SOF3 (ITU-T T.81 predictors 1–7), and **JPEG-XL (`Compression = 52546`)** strips/tiles via `jxl-oxide` (including DNG `RowInterleaveFactor` / `ColumnInterleaveFactor` de-interleaving used by Samsung Expert RAW / Apple ProRAW), parses `OpcodeList2` (`GainMap`, ID 9) and `OpcodeList3` (`FixVignetteRadial`, ID 3; 3-plane RGB `WarpRectilinear`, ID 1), and applies radial/tangential undistortion analytically to `f64` feature rays via Newton–Raphson inversion. Zero image resampling occurs and 3-plane lateral chromatic aberration is cancelled to $< 0.008\text{ px}$.
 - **Multi-Frame Honesty Report**: Inspects TIFF `NewSubFileType` (`0x00FE`), explicitly flagging computational multi-frame merges (`NewSubFileType == 16`) vs. true single-exposure raw frames.
 - **v7.0 MIPI `RAW10` + `meta.json` Hardware Integrity Gates**: Unpacks packed 5-byte/4-pixel MIPI CSI-2 `RAW10` bursts, enforces the **Distinct-Frame Gate** (FNV-1a hash + pairwise pixel difference across all 6 frames to catch aliased ring-buffer frames) and the **Clock-Bracket Gate** (verifying OIS Hall-sensor timestamps bracket the entire burst readout window with non-zero variance), and loads optical polynomials from `reference_lens56_opcodes.dng`.
 - **Handheld 6-Frame Burst 3D Physics**:
@@ -64,7 +65,7 @@ g6me --mode plus --head-mesh myhead.obj input.flac output.wav
   - **Chugunov et al. (CVPR 2024)** diffuse/specular layer separation to remove oily ear-skin glare before multi-view matching.
 
 ### Stage 1: Dense Skin-Proof Matching & Metric Anchor (`scan.rs`)
-- **Skin-Proof Dense Matching**: Sub-pixel ZNCC patch refinement with quadratic peak interpolation (and `BLACKWELL_SCAN_MATCHER_CUDA` kernel template).
+- **Skin-Proof Dense Matching**: Sub-pixel ZNCC patch refinement with quadratic peak interpolation.
 - **Metric Anchor Options**:
   1. **Russian Debit Card (`GOST R ISO/IEC 7810-2006 ID-1`)**: Exact physical dimensions $85.60 \times 53.98\text{ mm}$ ($\pm 0.05\text{ mm}$), supporting both **Horizontal** and **Vertical** orientation. Fits 4 straight edge tangents via Total Least Squares away from the $3.18\text{ mm}$ rounded corners and intersects them to eliminate the $2.634\text{ mm}$ ($2.60\%$) corner-rounding scale bias; optionally verifies the ISO/IEC 7816-2 contact-chip orientation landmark at $(16.25, 23.89)\text{ mm}$; automatically scrubs the card face (PAN/CVV/holder name) from image buffers prior to reconstruction.
   2. **AprilTag3 / ChArUco fiducial** (`--anchor apriltag --tag-mm 50`).
@@ -76,13 +77,11 @@ g6me --mode plus --head-mesh myhead.obj input.flac output.wav
 ### Stage 3 & Stage 4: 2DGS / PGSR → Winding Repair → Direct FMM-BEM Handoff
 - **2D Gaussian Splatting (SIGGRAPH 2024) & PGSR (IEEE TVCG 2025)**: Represents the ear and skull with oriented planar surfels (`OrientedSurfel2D`), computing exact ray-plane depth, depth-distortion loss $\mathcal{L}_d$, and normal-consistency loss $\mathcal{L}_n$, followed by dense TSDF Marching Tetrahedra extraction.
 - **Zero-Disk Handoff**: Conditions the extracted surface via Generalized Winding Number repair and isotropic acoustic remeshing and passes the watertight mesh directly in memory to `FmmBemSolver::new(&mesh)`.
+- The CLI has no synthetic path: `g6me-scan` processes only real `--dng` / `--burst` inputs. A capture that fails validation, decode, anchor detection or reconstruction exits honestly instead of fabricating a procedural dummy mesh.
 
 Usage:
 ```bash
-# End-to-end synthetic demo with GOST ID-1 Russian debit card anchor
-g6me-scan --demo --anchor russian-card --out myhead.obj
-
-# Inspect DNG 1.7 SubIFD and OpcodeList2/3
+# Inspect DNG 1.7 SubIFD, OpcodeList2/3, and decoded pixel stats (incl. JXL 52546)
 g6me-scan --dng frame0.dng
 
 # Verify and process a v7.0 MIPI RAW10 + OIS/IMU burst folder
@@ -93,7 +92,10 @@ g6me-scan --burst ./burst_capture_01 --ref-opcodes reference_lens56_opcodes.dng 
 
 ## 4. Verification Gates (`g6me-verify`)
 
-All subsystems are continuously verified under `--require-all` with zero FMA contraction:
+All subsystems are continuously verified under `--require-all` with zero FMA contraction across both `g6me-verify` and the sibling `g6me` CLI binary:
 - `g6me-verify --group ntt`: Goldilocks radix-2 NTT invertibility, 0-ULP integer convolution vs. `i128` reference, streaming OLA & `BinauralPlus --exact-ntt` parity.
-- `g6me-verify --group bem`: Generalized Winding Number open-hole repair (`0` boundary edges, $w(\mathbf{0}) = 1.0$), isotropic acoustic remeshing ($h \le h_{\text{target}}$), Gumerov FMM-BEM adjoint reciprocity ($< 10^{-10}$), analytical Mie sphere ILD agreement ($< 0.75\text{ dB}$), and zero-FMA CUDA audit.
+- `g6me-verify --group bem`: Generalized Winding Number open-hole repair (`0` boundary edges, $w(\mathbf{0}) = 1.0$), isotropic acoustic remeshing ($h \le h_{\text{target}}$), Gumerov FMM-BEM adjoint reciprocity ($< 10^{-10}$), analytical Mie sphere ILD agreement ($< 0.75\text{ dB}$), and Schenck CHIEF irregular-frequency ($ka = \pi$) regularization suppression.
 - `g6me-verify --group scan`: DNG 1.7 SubIFD + analytical 3-plane `WarpRectilinear` lateral CA ($< 0.008\text{ px}$), v7.0 `RAW10` Distinct-Frame & Clock-Bracket gates (positive + aliased-buffer negative control), GOST ID-1 horizontal/vertical calibration + privacy masking, Forster $SO(3)$ IMU + Wronski/OISSR + Chugunov glare separation, Ozaki-II FP4→FP64 Rolling-Shutter BA convergence, and Stage 3→4→FMM-BEM direct handoff.
+- `g6me-verify --group mastering`: Wannamaker & Levinson–Durbin psychoacoustic noise shaping (48/96/192 kHz), Klippel + King–Agerkvist nonlinear transducer ODE assessment, full opt-in mastering chain (PAE Upmix + Shared-STN + Moore Unmask + Punchy ADAA2 Limiter), parallel vs. serial PCG64 raytracing 0-bit parity, and UPOLA SHA-256 `KernelBank` cache hit verification.
+- `g6me-verify --group cuda`: When built with `--features cuda` on a CUDA Toolkit host, compiles all 6 `.cu` kernels with `nvcc --fmad=false`, verifies the PTX contains 0 contracted `fma.rn` instructions, audits every `.cubin` via `cuobjdump --dump-sass` for 0 contracted FMA instructions (the IEEE `div.rn`/`sqrt.rn` MUFU+DFMA microcode in `raytrace_hoa` is one correctly-rounded op, not a contraction), and runs the `--fmad=true` sabotage negative control on both layers.
+

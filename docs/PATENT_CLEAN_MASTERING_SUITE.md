@@ -93,11 +93,17 @@ Based on **He, Tan & Gan (IEEE/ACM TASLP 2014/2015)**, **Song et al. (IEEE TCE J
   - Two moving-average stages of lengths `L1 = ceil((ramp + 1)/2)` and `L2 = (ramp + 1) - L1 + 1` (`L1 + L2 - 1 == ramp + 1`) convolving the sliding lookahead minimum `min_{m in [j..=j+ramp]} sched[m]` (including pre-roll feeds from `j_signed = -ramp`) to produce a `C^1` parabolic S-curve with zero true-peak overshoot on sample 0 through end-of-file.
 - **Giannoulis, Massberg & Reiss (JAES 2012) Log-Domain Smooth Branching**: Slow-stage attack/release smoothing runs in the log-gain domain in `Punchy` mode for constant dB/s musical release.
 
+### 3.6 Wannamaker (1992) & Levinson–Durbin Psychoacoustic Noise Shaping (`crates/g6me-core/src/pcm.rs`)
+- `--dither wannamaker` runs an in-app 9-tap error-feedback psychoacoustic quantizer (`PcmQuantizer` / `Grid24`) with TPDF dither at 16-bit and 24-bit output depths (Wannamaker F-weighted taps at 44.1/48 kHz; Levinson–Durbin ISO-226 minimum-phase taps at 88.2–384 kHz), lowering the 1–5 kHz noise floor by $> 15\text{–}20\text{ dB}$ vs. flat TPDF.
+
+### 3.7 Non-Intrusive Klippel (2006) & King–Agerkvist (JAES 2018) Transducer Assessment (`crates/g6me-core/src/transducer.rs`)
+- `--assess studio-5|studio-8|sub-12|headphone|iem` feeds the post-limiter output stream through a 4×-substepped electro-mechanical-thermal ODE ($Bl(x)$, $K_{ms}(x)$, $L_e(x)$ reluctance, 5-pole viscoelastic creep, and voice-coil $\Delta T$) and reports excursion (% $X_{\max}$), thermal rise, $Bl$ compression, and estimated nonlinear THD% without modifying a single output sample.
+
 ---
 
 ## 4. Verification & `/AGENTS.md` Sabotage Proofs
 
-All invariants are verified by deterministic unit tests, `g6me-verify --require-all` (0 failures, 0 skips, 0 FMA instructions), and `/AGENTS.md` Sabotage Rule checks proving each test discriminates against regression:
+All invariants are verified by deterministic unit tests, `g6me-verify --require-all` (0 failures, 0 skips, 0 FMA instructions across both `g6me-verify` and `g6me`), and `/AGENTS.md` Sabotage Rule checks proving each test discriminates against regression:
 
 | Module / Invariant | Verification Test | Sabotage Proof (Feature Disabled / Broken → Test Fails) |
 | --- | --- | --- |
@@ -107,6 +113,7 @@ All invariants are verified by deterministic unit tests, `g6me-verify --require-
 | **Moore 2016 Binaural Inhibition** | `moore_2016_sone_calibration_and_binaural_inhibition_exact` | Removing `INHIB_ipsi` division turns diotic/monaural summation from `1.500x` to `2.000x` (FAIL). |
 | **PAE Center Lock & Decorrelation** | `center_mono_vocal_locks_to_fc_with_negligible_rear_leakage`, `kraft_zolzer_allpass_decorrelators_are_unit_magnitude_and_uncorrelated` | Setting identical delays across surround decorrelators drives pairwise `|ICC|` from `< 0.06` to `1.000` (FAIL). |
 | **ADAA2 Aliasing Suppression & Hard Ceiling** | `adaa2_clipper_zero_passband_error_and_aliasing_suppression`, `punchy_limiter_holds_hard_true_peak_ceiling_and_shaves_transients` | Bypassing ADAA2 to memoryless `f(x)` drops aliasing suppression to `0.0 dB` (FAIL); gating `Punchy` smoother on `if live` breaks sample-0 ceiling by `+3.86 dB` (FAIL). |
+| **Wannamaker Noise Shaping** | `g6me-verify --group mastering` (`1-5 kHz floor drop >= 15/18/20 dB`) | Zeroing feedback taps reverts floor drop to `0.0 dB` vs. TPDF (FAIL). |
 
 ---
 
@@ -120,8 +127,10 @@ g6me input_stereo.flac \
   --vbass --vbass-cutoff 100 --vbass-amount 0.45 --vbass-punch 0.60 \
   --detail --detail-intensity 0.35 --detail-tilt 2.0 \
   --unmask --unmask-recover 0.35 --unmask-tame 0.35 --unmask-max-db 4.5 \
-  --limit-style punchy --limit-clip-db 2.0 --ceiling -1.0
+  --limit-style punchy --limit-clip-db 2.0 --ceiling -1.0 \
+  --depth s16 --dither wannamaker --assess studio-5
 
 # Verify bit-exact default path (all new stages off, Transparent limiter):
 g6me input_7_1.flac --dry-run
 ```
+

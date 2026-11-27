@@ -22,6 +22,7 @@ use g6me_core::plus::{PlusCfg, RendererMode};
 use g6me_core::probe::Caps;
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
 use g6me_core::tp::Ratio;
+use g6me_core::transducer::TransducerProfile;
 use g6me_core::unmask::UnmaskCfg;
 use g6me_core::upmix::UpmixCfg;
 use g6me_core::util;
@@ -176,6 +177,8 @@ pub struct Settings {
     /// limiter rather than inside it because it earns its keep with the limiter off too:
     /// an offset ships in the file either way.
     pub dc_block: bool,
+    /// Non-intrusive Klippel + King–Agerkvist electro-mechanical-thermal transducer assessment.
+    pub transducer: TransducerProfile,
 
     // ---- mastering & spatial suite (all opt-in, default off) ---------------
     /// 2.0 → 7.1 Primary-Ambient Extraction upmixer (He PCA+ASE + APES + Kraft-Zölzer decorrelators).
@@ -261,6 +264,7 @@ impl Default for Settings {
             limit_style: LimiterStyle::Transparent,
             limit_clip_db: 0.0,
             dc_block: false,
+            transducer: TransducerProfile::None,
             upmix: UpmixCfg::default(),
             enhance: EnhanceCfg::default(),
             unmask: UnmaskCfg::default(),
@@ -472,6 +476,7 @@ impl Settings {
             queue_blocks: self.queue_blocks as usize,
             stream: self.stream as usize,
             sha256: self.sha256,
+            transducer: self.transducer,
         }
     }
 
@@ -573,6 +578,12 @@ impl Settings {
                  resample step is to land on integer samples. {}",
                 self.resample_depth.label(),
                 BitDepth::quantize_note()
+            ));
+        }
+        if self.resample && self.resample_dither.is_in_app_only() {
+            p.push(format!(
+                "Resample dither '{}' is an in-app output quantizer only (choose it on the Output tab, not Resample).",
+                self.resample_dither.label()
             ));
         }
         if self.renderer == RendererMode::Plus {
@@ -729,6 +740,9 @@ pub fn describe(s: &Settings) -> String {
         } else {
             "Punchy".to_string()
         });
+    }
+    if s.transducer != TransducerProfile::None {
+        v.push(format!("assess:{}", s.transducer.as_str()));
     }
     v.join(" · ")
 }
@@ -1136,6 +1150,10 @@ mod tests {
         s.plus.torso_height_m = 0.340;
         s.plus.pinna_shelf_db = 1.5;
         s.plus.exact_ntt = true;
+        s.plus.room_quality = g6me_core::room::RoomQuality::Production;
+        s.plus.use_cuda = true;
+        s.dither = Dither::Wannamaker;
+        s.transducer = TransducerProfile::HeadphoneDynamic32;
 
         let cfg = s.render_cfg();
         assert_eq!(
@@ -1146,11 +1164,19 @@ mod tests {
             cfg.plus.room_preset,
             g6me_core::room::RoomPreset::ControlRoom
         );
+        assert_eq!(
+            cfg.plus.room_quality,
+            g6me_core::room::RoomQuality::Production
+        );
+        assert!(cfg.plus.use_cuda);
+        assert_eq!(cfg.out.dither, Dither::Wannamaker);
+        assert_eq!(cfg.transducer, TransducerProfile::HeadphoneDynamic32);
         assert!((cfg.plus.head_radius_m - 0.092).abs() < 1e-9);
         assert!((cfg.plus.torso_height_m - 0.340).abs() < 1e-9);
         assert!((cfg.plus.pinna_shelf_db - 1.5).abs() < 1e-9);
         assert!(cfg.plus.exact_ntt);
         assert_eq!(cfg.room_json, Some(PathBuf::from("/tmp/custom_room.json")));
         assert_eq!(cfg.head_mesh, Some(PathBuf::from("/tmp/myhead.obj")));
+        assert!(describe(&s).contains("assess:headphone-dynamic"));
     }
 }

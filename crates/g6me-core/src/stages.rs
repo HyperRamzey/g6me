@@ -31,6 +31,7 @@ use crate::pcm::{BitDepth, Dither, Grid24};
 use crate::plus::{PlusCfg, RendererMode};
 use crate::probe::{AudioInfo, Caps};
 use crate::tp::Ratio;
+use crate::transducer::TransducerProfile;
 use crate::unmask::UnmaskCfg;
 use crate::upmix::UpmixCfg;
 use serde::{Deserialize, Serialize};
@@ -241,16 +242,33 @@ impl OutCfg {
             && !self.resample.is_some_and(|r| r != work_rate)
     }
 
+    /// True when g6me runs its own in-app [`crate::pcm::PcmQuantizer`] (all non-resampled
+    /// 24-bit outputs, plus non-resampled 16-bit outputs using `Dither::Wannamaker`).
+    pub fn in_app_quantize(&self, work_rate: u32) -> bool {
+        if self.format.is_null() || self.resample.is_some_and(|r| r != work_rate) {
+            return false;
+        }
+        self.depth == BitDepth::S24 || (self.depth == BitDepth::S16 && self.dither.is_in_app_only())
+    }
+
     /// Validate a format/depth pair against what is actually available.
     pub fn validate(&self, caps: &Caps) -> Result<()> {
         if self.format.is_null() {
             return Ok(());
         }
+        if self.dither.is_in_app_only() && !matches!(self.depth, BitDepth::S16 | BitDepth::S24) {
+            return Err(Error::msg(format!(
+                "dither '{}' is an integer psychoacoustic noise shaper for 16-bit or 24-bit \
+                 output (not {}).",
+                self.dither.ffmpeg_name(),
+                self.depth.label()
+            )));
+        }
         if self.depth == BitDepth::S24 && !Grid24::supports(self.dither) {
             return Err(Error::msg(format!(
                 "dither '{}' is not available for 24-bit output: ffmpeg's noise-shaped \
-                 dithers go unstable at 24 bits. Use none, rectangular, triangular or \
-                 triangular_hp, or 16-bit output for noise shaping.",
+                 dithers go unstable at 24 bits. Use none, rectangular, triangular, \
+                 triangular_hp or wannamaker, or 16-bit output for ffmpeg noise shaping.",
                 self.dither.ffmpeg_name()
             )));
         }
@@ -371,6 +389,9 @@ pub struct RenderCfg {
     /// both, so the level work belongs here and the limiter keeps only the peaks.
     #[serde(default)]
     pub output_gain_db: f64,
+    /// Optional Klippel + King–Agerkvist electro-mechanical-thermal transducer assessment.
+    #[serde(default)]
+    pub transducer: TransducerProfile,
     /// Hash every finished output, twice over: the samples handed to the encoder
     /// (container-independent, so a WAV and a FLAC of one render agree) and the file on
     /// disk (what `sha256sum` prints, so the number is checkable with a tool the user
@@ -471,11 +492,14 @@ pub fn input_stage(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> (InputStage,
             // Without this, an integer source reaches soxr as float32 and the
             // precision asked for below is not the one delivered.
             steps.push("aformat=sample_fmts=dbl".into());
+            let dither_arg = if cfg.resample.dither.is_in_app_only() {
+                "triangular"
+            } else {
+                cfg.resample.dither.ffmpeg_name()
+            };
             let mut s = format!(
                 "aresample={}:resampler=soxr:precision={}:dither_method={}",
-                cfg.resample.rate,
-                cfg.resample.precision,
-                cfg.resample.dither.ffmpeg_name()
+                cfg.resample.rate, cfg.resample.precision, dither_arg
             );
             if cfg.resample.cheby {
                 s.push_str(":cheby=true");
@@ -483,10 +507,12 @@ pub fn input_stage(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> (InputStage,
             steps.push(s);
         }
         InputStage::DepthOnly => {
-            steps.push(format!(
-                "aresample=dither_method={}",
+            let dither_arg = if cfg.resample.dither.is_in_app_only() {
+                "triangular"
+            } else {
                 cfg.resample.dither.ffmpeg_name()
-            ));
+            };
+            steps.push(format!("aresample=dither_method={dither_arg}"));
         }
     }
 
@@ -668,21 +694,26 @@ pub fn encoder_pump_args(work_rate: u32) -> Vec<String> {
 /// lands on) belongs to the dither rather than to either.
 fn encoder_filter(o: &OutCfg, work_rate: u32) -> Option<String> {
     let need_resample = o.resample.is_some_and(|r| r != work_rate);
-    // At 24 bits without an output resample the dither is applied in-app with the
-    // rounding (`OutCfg::grid24`), so ffmpeg must not add a second one.
-    let need_dither = o.dither != Dither::None && !o.grid24(work_rate);
+    // When g6me quantizes and dithers in-app (`OutCfg::in_app_quantize`), ffmpeg must not
+    // add a second dither pass.
+    let need_dither =
+        o.dither != Dither::None && !o.in_app_quantize(work_rate) && !o.dither.is_in_app_only();
     if !(need_resample || need_dither) {
         return None;
     }
     let rate = o.resample.unwrap_or(work_rate);
+    let ffmpeg_dither = if o.dither.is_in_app_only() {
+        "none"
+    } else {
+        o.dither.ffmpeg_name()
+    };
     let mut s = if need_resample {
         format!(
-            "aresample={rate}:resampler=soxr:precision={}:dither_method={}",
+            "aresample={rate}:resampler=soxr:precision={}:dither_method={ffmpeg_dither}",
             o.precision,
-            o.dither.ffmpeg_name()
         )
     } else {
-        format!("aresample=dither_method={}", o.dither.ffmpeg_name())
+        format!("aresample=dither_method={ffmpeg_dither}")
     };
     // Dither belongs at the depth the file will actually carry.
     //
@@ -901,9 +932,10 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
         }
         _ => "no resample".to_string(),
     };
-    let grid = if o.grid24(work_rate) {
+    let grid = if o.in_app_quantize(work_rate) {
         format!(
-            " (rounded to the 24-bit grid by g6me, dither {})",
+            " (quantized in-app by g6me to {}, dither {})",
+            o.depth.label(),
             o.dither.label()
         )
     } else {
@@ -919,6 +951,12 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
             format!(", {rate}")
         },
     ));
+    if cfg.transducer != TransducerProfile::None {
+        v.push(format!(
+            "7. transducer assessment: {} (Klippel + King-Agerkvist ODE, monitor-only)",
+            cfg.transducer.label()
+        ));
+    }
     v
 }
 

@@ -798,7 +798,11 @@ pub fn isotropic_acoustic_remesh(
     let mut cur = mesh.clone();
     let h_limit = h_max_m.max(1e-4);
 
+    const MAX_REMESH_FACES: usize = 16_384;
     for _ in 0..max_rounds {
+        if cur.faces.len().saturating_mul(4) > MAX_REMESH_FACES {
+            break;
+        }
         let mut need_split = false;
         for &[a, b, c] in &cur.faces {
             let l0 = v3_norm(v3_sub(cur.vertices[a], cur.vertices[b]));
@@ -999,7 +1003,10 @@ fn build_octree_node(
     my_idx
 }
 
-/// FMM-BEM Helmholtz Acoustic Solver operating on any watertight `TriangleMesh`.
+/// FMM-BEM Helmholtz Acoustic Solver operating on any watertight `TriangleMesh`,
+/// with Schenck (JASA 1968) CHIEF interior-point collocation regularization to
+/// eliminate exterior non-uniqueness spikes at interior Dirichlet eigenfrequencies
+/// (`ka = pi, 4.493, 5.763, ...`) while preserving exact algebraic reciprocity.
 #[derive(Debug, Clone)]
 pub struct FmmBemSolver {
     pub elements: Vec<BemElement>,
@@ -1007,6 +1014,10 @@ pub struct FmmBemSolver {
     pub octree: FmmOctree,
     pub left_ear_elem: usize,
     pub right_ear_elem: usize,
+    /// Strictly interior CHIEF collocation points (`generalized_winding_number >= 0.85`).
+    pub chief_points: Vec<[f64; 3]>,
+    /// Effective spherical radius `sqrt(area / (4 pi))` in meters.
+    pub eff_radius_m: f64,
 }
 
 impl FmmBemSolver {
@@ -1039,6 +1050,44 @@ impl FmmBemSolver {
         let left_ear_elem = find_ear_element(&elements, 1.0);
         let right_ear_elem = find_ear_element(&elements, -1.0);
 
+        // Compute area-weighted center & effective spherical radius for CHIEF placement.
+        let mut total_area = 0.0_f64;
+        let mut center = [0.0_f64; 3];
+        for e in &elements {
+            total_area += e.area;
+            center = v3_add(center, v3_scale(e.centroid, e.area));
+        }
+        if total_area > 1e-12 {
+            center = v3_scale(center, 1.0 / total_area);
+        }
+        let eff_radius_m = (total_area / (4.0 * PI)).sqrt().max(1e-3);
+
+        // Select asymmetric interior CHIEF points verified strictly inside the closed mesh.
+        // Twelve points (Schenck 1968 recommends oversampling the interior) keep the
+        // augmented system well conditioned at the first interior Dirichlet eigenmode;
+        // six were too few to meet the gate's ka = pi suppression bound.
+        const CHIEF_OFFSETS: [[f64; 3]; 12] = [
+            [0.0, 0.0, 0.0],
+            [0.23, 0.11, -0.07],
+            [-0.19, 0.21, 0.13],
+            [0.07, -0.25, 0.17],
+            [-0.13, -0.17, -0.23],
+            [0.17, -0.09, 0.27],
+            [0.29, 0.05, 0.02],
+            [0.02, 0.31, -0.05],
+            [-0.27, 0.03, 0.18],
+            [0.11, 0.27, 0.09],
+            [-0.05, -0.29, 0.14],
+            [0.19, 0.12, -0.27],
+        ];
+        let mut chief_points = Vec::new();
+        for off in CHIEF_OFFSETS {
+            let pt = v3_add(center, v3_scale(off, eff_radius_m));
+            if generalized_winding_number(mesh, pt) >= 0.85 {
+                chief_points.push(pt);
+            }
+        }
+
         let octree = FmmOctree::build(&elements, 16, 0.35);
 
         Ok(Self {
@@ -1047,7 +1096,55 @@ impl FmmBemSolver {
             octree,
             left_ear_elem,
             right_ear_elem,
+            chief_points,
+            eff_radius_m,
         })
+    }
+
+    /// CHIEF regularization weight `alpha` for wavenumber `k`.
+    /// Active above `ka >= 2.5` (below the first interior Dirichlet eigenmode `ka = pi`),
+    /// where `M = A + alpha * C^H C` uniquely pins the exterior solution without affecting
+    /// low-frequency acoustics.
+    #[inline]
+    pub fn chief_alpha(&self, k: f64) -> f64 {
+        if !self.chief_points.is_empty() && k * self.eff_radius_m >= 2.5 {
+            0.5
+        } else {
+            0.0
+        }
+    }
+
+    /// Assemble the `M x N` interior CHIEF collocation matrix `C_{m, j} = -A_j * dG(x_m, y_j)/dn_y`.
+    fn chief_matrix(&self, k: f64) -> Vec<Vec<Complex>> {
+        self.chief_points
+            .iter()
+            .map(|&xm| {
+                self.elements
+                    .iter()
+                    .map(|ej| helmholtz_dgreen_dny(k, xm, ej.centroid, ej.normal).scale(-ej.area))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Evaluate the interior CHIEF residual `||C p - g_int|| / ||g_int||` for a surface pressure `p`.
+    pub fn chief_interior_residual(&self, k: f64, p: &[Complex], r_src: [f64; 3]) -> f64 {
+        if self.chief_points.is_empty() {
+            return 0.0;
+        }
+        let c_mat = self.chief_matrix(k);
+        let mut num_sq = 0.0_f64;
+        let mut den_sq = 0.0_f64;
+        for (m, &xm) in self.chief_points.iter().enumerate() {
+            let mut cp = Complex::ZERO;
+            for (j, &pj) in p.iter().enumerate() {
+                cp = cp.add(c_mat[m][j].mul(pj));
+            }
+            let g_int = helmholtz_green(k, xm, r_src);
+            num_sq += cp.sub(g_int).norm_sq();
+            den_sq += g_int.norm_sq();
+        }
+        (num_sq / den_sq.max(1e-30)).sqrt()
     }
 
     /// Exact dense matrix-vector product `y = (0.5 I - K) x` (or adjoint `A^T x` when `adjoint = true`).
@@ -1250,7 +1347,9 @@ impl FmmBemSolver {
     }
 
     /// Solve `(0.5 I - K) x = rhs` (or `A^T x = rhs`) using Diagonal-Preconditioned Restarted
-    /// Complex GMRES accelerated by the 3D FMM Octree!
+    /// Complex GMRES accelerated by the 3D FMM Octree, optionally adding the Hermitian CHIEF
+    /// penalty `alpha * C^H C` (forward) or its exact algebraic transpose `alpha * C^T conj(C)`
+    /// (adjoint).
     pub fn solve_gmres(
         &self,
         k: f64,
@@ -1260,6 +1359,21 @@ impl FmmBemSolver {
         tol: f64,
         max_iters: usize,
     ) -> Vec<Complex> {
+        self.solve_gmres_with_chief(k, rhs, adjoint, use_fmm, tol, max_iters, 0.0, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn solve_gmres_with_chief(
+        &self,
+        k: f64,
+        rhs: &[Complex],
+        adjoint: bool,
+        use_fmm: bool,
+        tol: f64,
+        max_iters: usize,
+        chief_alpha: f64,
+        chief_mat: &[Vec<Complex>],
+    ) -> Vec<Complex> {
         let n = rhs.len();
         let inv_diag: Vec<f64> = self
             .solid_angle_diag
@@ -1268,11 +1382,38 @@ impl FmmBemSolver {
             .collect();
 
         let matvec = |v: &[Complex]| -> Vec<Complex> {
-            let raw = if use_fmm {
+            let mut raw = if use_fmm {
                 self.matvec_fmm(k, v, adjoint)
             } else {
                 self.matvec_exact(k, v, adjoint)
             };
+            if chief_alpha > 0.0 && !chief_mat.is_empty() {
+                if !adjoint {
+                    // Forward: add alpha * C^H (C v)
+                    for row in chief_mat {
+                        let mut cv = Complex::ZERO;
+                        for (j, &cij) in row.iter().enumerate() {
+                            cv = cv.add(cij.mul(v[j]));
+                        }
+                        let w = cv.scale(chief_alpha);
+                        for (j, &cij) in row.iter().enumerate() {
+                            raw[j] = raw[j].add(cij.conj().mul(w));
+                        }
+                    }
+                } else {
+                    // Exact algebraic transpose: (C^H C)^T v = C^T (conj(C) v)
+                    for row in chief_mat {
+                        let mut ccv = Complex::ZERO;
+                        for (j, &cij) in row.iter().enumerate() {
+                            ccv = ccv.add(cij.conj().mul(v[j]));
+                        }
+                        let w = ccv.scale(chief_alpha);
+                        for (j, &cij) in row.iter().enumerate() {
+                            raw[j] = raw[j].add(cij.mul(w));
+                        }
+                    }
+                }
+            }
             raw.iter()
                 .enumerate()
                 .map(|(i, &c)| c.scale(inv_diag[i]))
@@ -1391,7 +1532,8 @@ impl FmmBemSolver {
     }
 
     /// Direct forward BEM solve: evaluate complex free-field-normalized HRTF
-    /// `H(r_src -> ear_elem; f)` for a single source position `r_src`.
+    /// `H(r_src -> ear_elem; f)` for a single source position `r_src`, with automatic
+    /// CHIEF interior-point regularization above `ka >= 2.5`.
     pub fn solve_direct_hrtf(
         &self,
         f_hz: f64,
@@ -1404,19 +1546,34 @@ impl FmmBemSolver {
             return Complex::ONE;
         }
         let k = 2.0 * PI * f_hz / c_m_s;
-        let rhs: Vec<Complex> = self
+        let alpha = self.chief_alpha(k);
+        let chief_mat = if alpha > 0.0 {
+            self.chief_matrix(k)
+        } else {
+            Vec::new()
+        };
+        let mut rhs: Vec<Complex> = self
             .elements
             .iter()
             .map(|e| helmholtz_green(k, e.centroid, r_src))
             .collect();
-        let p = self.solve_gmres(k, &rhs, false, use_fmm, 1e-12, 80);
+        if alpha > 0.0 {
+            for (m, &xm) in self.chief_points.iter().enumerate() {
+                let g_int = helmholtz_green(k, xm, r_src).scale(alpha);
+                for (j, &cmj) in chief_mat[m].iter().enumerate() {
+                    rhs[j] = rhs[j].add(cmj.conj().mul(g_int));
+                }
+            }
+        }
+        let p = self.solve_gmres_with_chief(k, &rhs, false, use_fmm, 1e-12, 120, alpha, &chief_mat);
         let g_ref = helmholtz_green(k, [0.0, 0.0, 0.0], r_src);
         c_div(p[ear_elem], g_ref)
     }
 
     /// **Gumerov (JASA 2006 / 2010) Reciprocal Adjoint Solve**: solve ONCE per frequency
-    /// (`A^T q = e_ear`) for `ear_elem`, then evaluate complex HRTFs for ALL source positions
-    /// `sources` simultaneously via `H(r_s) = (sum_j q_j G(y_j, r_s)) / G(0, r_s)`!
+    /// (`M^T q = e_ear`, including exact CHIEF adjoint when `ka >= 2.5`) for `ear_elem`,
+    /// then evaluate complex HRTFs for ALL source positions `sources` simultaneously via
+    /// `H(r_s) = (q^T g_surf + alpha * (conj(C) q)^T g_int) / G(0, r_s)`!
     pub fn solve_reciprocal_hrtfs(
         &self,
         f_hz: f64,
@@ -1429,9 +1586,32 @@ impl FmmBemSolver {
             return vec![Complex::ONE; sources.len()];
         }
         let k = 2.0 * PI * f_hz / c_m_s;
+        let alpha = self.chief_alpha(k);
+        let chief_mat = if alpha > 0.0 {
+            self.chief_matrix(k)
+        } else {
+            Vec::new()
+        };
         let mut e_vec = vec![Complex::ZERO; self.elements.len()];
         e_vec[ear_elem] = Complex::ONE;
-        let q = self.solve_gmres(k, &e_vec, true, use_fmm, 1e-12, 80);
+        let q =
+            self.solve_gmres_with_chief(k, &e_vec, true, use_fmm, 1e-12, 120, alpha, &chief_mat);
+
+        // Precompute CHIEF adjoint weights w_m = alpha * sum_j conj(C_{m,j}) * q_j once per frequency.
+        let chief_weights: Vec<Complex> = if alpha > 0.0 {
+            chief_mat
+                .iter()
+                .map(|row| {
+                    let mut acc = Complex::ZERO;
+                    for (j, &cmj) in row.iter().enumerate() {
+                        acc = acc.add(cmj.conj().mul(q[j]));
+                    }
+                    acc.scale(alpha)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         sources
             .iter()
@@ -1439,6 +1619,11 @@ impl FmmBemSolver {
                 let mut acc = Complex::ZERO;
                 for (j, ej) in self.elements.iter().enumerate() {
                     acc = acc.add(q[j].mul(helmholtz_green(k, ej.centroid, r_src)));
+                }
+                for (m, &xm) in self.chief_points.iter().enumerate() {
+                    if let Some(&wm) = chief_weights.get(m) {
+                        acc = acc.add(wm.mul(helmholtz_green(k, xm, r_src)));
+                    }
                 }
                 let g_ref = helmholtz_green(k, [0.0, 0.0, 0.0], r_src);
                 c_div(acc, g_ref)
@@ -1810,6 +1995,61 @@ mod tests {
         assert!(
             rel < 1e-10,
             "FMM-BEM adjoint reciprocity error too large: {rel:e}"
+        );
+    }
+
+    #[test]
+    fn chief_regularization_suppresses_ka_pi_irregular_frequency_and_preserves_reciprocity() {
+        let sphere = TriangleMesh::sphere(0.0875, 2); // 128 elements
+        let solver = FmmBemSolver::new(&sphere).expect("build BEM solver");
+        assert!(
+            solver.chief_points.len() >= 4,
+            "expected >= 4 strictly interior CHIEF points, got {}",
+            solver.chief_points.len()
+        );
+
+        let c = 344.0;
+        // First interior Dirichlet eigenfrequency: k * a_eff = pi
+        let f_eig = c / (2.0 * solver.eff_radius_m);
+        let k = 2.0 * PI * f_eig / c;
+        let r_src = sph_to_cart(40.0, 15.0, 2.0);
+        assert!(solver.chief_alpha(k) > 0.0, "CHIEF must engage at ka = pi");
+
+        // Compare interior residual WITH CHIEF vs WITHOUT CHIEF (sabotage baseline).
+        let rhs_raw: Vec<Complex> = solver
+            .elements
+            .iter()
+            .map(|e| helmholtz_green(k, e.centroid, r_src))
+            .collect();
+        let p_no_chief = solver.solve_gmres(k, &rhs_raw, false, false, 1e-12, 120);
+        let res_no_chief = solver.chief_interior_residual(k, &p_no_chief, r_src);
+
+        let alpha = solver.chief_alpha(k);
+        let c_mat = solver.chief_matrix(k);
+        let mut rhs_chief = rhs_raw;
+        for (m, &xm) in solver.chief_points.iter().enumerate() {
+            let g_int = helmholtz_green(k, xm, r_src).scale(alpha);
+            for (j, &cmj) in c_mat[m].iter().enumerate() {
+                rhs_chief[j] = rhs_chief[j].add(cmj.conj().mul(g_int));
+            }
+        }
+        let p_chief =
+            solver.solve_gmres_with_chief(k, &rhs_chief, false, false, 1e-12, 120, alpha, &c_mat);
+        let res_chief = solver.chief_interior_residual(k, &p_chief, r_src);
+
+        assert!(
+            res_chief < res_no_chief * 0.35 && res_chief < 0.08,
+            "CHIEF failed to suppress ka=pi resonance: with_chief={res_chief:.4}, without_chief={res_no_chief:.4}"
+        );
+
+        // Verify exact algebraic reciprocity holds right at ka = pi with CHIEF active!
+        let h_dir = solver.solve_direct_hrtf(f_eig, c, r_src, solver.left_ear_elem, false);
+        let h_rec =
+            solver.solve_reciprocal_hrtfs(f_eig, c, &[r_src], solver.left_ear_elem, false)[0];
+        let rel = h_dir.sub(h_rec).norm() / h_dir.norm().max(1e-12);
+        assert!(
+            rel < 1e-11,
+            "CHIEF-regularized reciprocity failed at ka=pi: rel={rel:e}"
         );
     }
 }

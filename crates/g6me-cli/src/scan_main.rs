@@ -1,20 +1,18 @@
 //! `g6me-scan` — 4-Stage Pure-Rust + Blackwell-Ready Smartphone Photogrammetry-to-FMM-BEM CLI.
 //!
-//! Turns multi-view DNG 1.7 captures (bypassing IFD0 preview traps & evaluating `OpcodeList2/3`
-//! analytically with zero resampled pixels) or v7.0 zero-copy 50MP `RAW10` + OIS/IMU `.burst`
-//! bundles into a watertight, acoustically conditioned (`h <= lambda_min / 6`) `.obj` head/pinna
-//! mesh ready for `g6me --mode plus --head-mesh <FILE.obj>` (or direct in-memory FMM-BEM
-//! Helmholtz synthesis!).
+//! Turns multi-view DNG 1.7 captures (bypassing IFD0 preview traps, decoding Uncompressed /
+//! Lossless JPEG SOF3 / JPEG-XL 52546 pixel tiles, and evaluating `OpcodeList2/3` analytically
+//! with zero resampled pixels) or v7.0 zero-copy 50MP `RAW10` + OIS/IMU `.burst` bundles into a
+//! watertight, acoustically conditioned (`h <= lambda_min / 6`) `.obj` head/pinna mesh ready for
+//! `g6me --mode plus --head-mesh <FILE.obj>` (or direct in-memory FMM-BEM Helmholtz synthesis).
 //!
 //! Supports AprilTag3, ChArUco, AND **Russian Debit Cards (GOST R ISO/IEC 7810-2006 ID-1
 //! `85.60 × 53.98 mm`, horizontal & vertical)** with `3.18 mm` rounded-corner tangent extrapolation,
 //! ISO/IEC 7816-2 contact-chip orientation anchoring, and automatic in-place card-face privacy
 //! scrubbing.
 //!
-//! **Honesty guarantee**: all synthetic fixtures (`build_synthetic_dng_17`, synthetic card
-//! coordinates, `TriangleMesh::procedural_head_with_pinnae`) are strictly isolated inside
-//! `--demo`. Real `--dng` and `--burst` inputs NEVER silently fall back to a procedural dummy
-//! mesh — if a live capture fails validation, pixel decode, anchor detection, or multi-view
+//! **Zero synthetic fallback**: `g6me-scan` processes ONLY real `--dng` and `--burst` inputs.
+//! If a live capture fails validation, pixel decode, anchor detection, or multi-view
 //! reconstruction, `g6me-scan` exits honestly with exit code `2`.
 
 use std::fs;
@@ -23,23 +21,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use g6me_core::atmosphere::AtmosphereCfg;
-use g6me_core::bem::TriangleMesh;
 use g6me_core::burst3d::{
-    mat3_mul, preintegrate_imu_manifold, separate_specular_and_micro_depth, so3_exp,
-    wronski_oissr_zero_demosaic_fuse, MAT3_ID,
+    preintegrate_imu_manifold, separate_specular_and_micro_depth, wronski_oissr_zero_demosaic_fuse,
 };
 use g6me_core::dng::{
-    build_synthetic_dng_17, decode_dng_file, demosaic_malvar_he_cutler, parse_dng_file,
-    unpack_mipi_raw10_to_f64, verify_burst_gates, BurstMetaSidecar, CfaPattern, DngMetadata,
-    FixVignetteRadialOpcode, GainMapOpcode, WarpPlaneCoeffs, WarpRectilinearOpcode,
-    COMPRESSION_JPEG_XL, PHOTOMETRIC_LINEAR_RAW,
+    decode_dng_file, demosaic_malvar_he_cutler, parse_dng_file, unpack_mipi_raw10_to_f64,
+    verify_burst_gates, BurstMetaSidecar, CfaPattern, DngMetadata,
 };
 use g6me_core::scan::{
-    bundle_adjust_ozaki2_fp4_schur, calibrate_apriltag3_anchor, calibrate_russian_debit_card_id1,
-    reconstruct_from_multiview_images, run_stage3_to_stage4_to_fmm_bem, sample_surfels_from_mesh,
-    BaObservation, MetricAnchorKind, MetricGaugeConstraint, MultiViewScanConfig,
-    RollingShutterCamera, ScanPipelineOutput, ISO7816_CHIP_CENTER_X_MM, ISO7816_CHIP_CENTER_Y_MM,
-    RUSSIAN_ID1_HEIGHT_MM, RUSSIAN_ID1_WIDTH_MM,
+    reconstruct_from_multiview_images, MetricAnchorKind, MultiViewScanConfig, ScanPipelineOutput,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -102,13 +92,13 @@ struct Cli {
     #[arg(long, default_value_t = 25.0)]
     max_edge_mm: f64,
 
+    /// TSDF and generalized-winding voxel grid resolution per axis (10..=48, default 24).
+    #[arg(long, default_value_t = 24)]
+    grid_res: usize,
+
     /// Output path for the conditioned watertight Wavefront `.obj` head/pinna mesh.
     #[arg(short, long)]
     out: Option<PathBuf>,
-
-    /// Run a strictly isolated synthetic 4-stage pipeline self-test/demonstration (cannot be combined with real `--dng` or `--burst` inputs).
-    #[arg(long)]
-    demo: bool,
 }
 
 enum ScanError {
@@ -225,13 +215,7 @@ fn print_and_export_result(
 fn run(cli: &Cli) -> Result<(), ScanError> {
     let atm = AtmosphereCfg::default();
     let c_air = atm.speed_of_sound_m_s();
-
-    let has_real_input = !cli.dng.is_empty() || cli.burst.is_some();
-    if cli.demo && has_real_input {
-        return Err(ScanError::RealInputRefused(
-            "`--demo` cannot be combined with real `--dng` or `--burst` inputs; remove `--demo` to process real captures honestly.".into(),
-        ));
-    }
+    let grid_res = cli.grid_res.clamp(10, 48);
 
     // 1. Optional factory optical calibration profile (`--ref-opcodes`)
     let mut ref_meta: Option<DngMetadata> = None;
@@ -250,8 +234,6 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
     let dng_files = collect_dng_paths(&cli.dng)?;
     if !dng_files.is_empty() {
         let first_meta = parse_dng_file(&dng_files[0])?;
-        // Honest inspect report: computes real CA residual from parsed WarpRectilinear,
-        // and reports VCM focus breathing as N/A until multi-view BA executes.
         print!(
             "{}",
             first_meta.honesty_report_measured(dng_files.len(), None, None)
@@ -265,7 +247,7 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 return Err(ScanError::RealInputRefused(format!(
                     "cannot reconstruct a 3D head mesh from a single DNG (`{}`). \
                      Provide >= 2 multi-view DNG files (`--dng v1.dng --dng v2.dng ...` or `--dng <dir>`) \
-                     or a v7.0 RAW10 burst (`--burst <dir>`). Refusing to write a synthetic dummy head.",
+                     or a v7.0 RAW10 burst (`--burst <dir>`).",
                     dng_files[0].display()
                 )));
             }
@@ -303,8 +285,8 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 fy: f_est,
                 cx: (width as f64) * 0.5,
                 cy: (height as f64) * 0.5,
-                tsdf_res: 14,
-                winding_res: 14,
+                tsdf_res: grid_res,
+                winding_res: grid_res,
                 max_edge_m: (cli.max_edge_mm * 1e-3).max(0.0025),
                 speed_of_sound_m_s: c_air,
             };
@@ -328,7 +310,7 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
         }
     }
 
-    // 3. Real v7.0 RAW10 + OIS/IMU burst path (ACTUALLY unpacks RAW10 & runs burst3d + scan.rs!)
+    // 3. Real v7.0 RAW10 + OIS/IMU burst path
     if let Some(ref burst_dir) = cli.burst {
         let meta_path = burst_dir.join("meta.json");
         let meta_txt = fs::read_to_string(&meta_path).map_err(|e| {
@@ -384,15 +366,16 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
         }
 
         if let Some(ref out_path) = cli.out {
-            // Real burst3d ingest: unpack RAW10 -> Forster SO(3) IMU + OIS shifts ->
-            // Wronski/OISSR zero-demosaic fuse + Chugunov specular/micro-depth -> real SfM/BA/2DGS!
             let pat = CfaPattern::parse_str(&sidecar.cfa);
             let width = sidecar.frames[0].width;
             let height = sidecar.frames[0].height;
-            let white_level = if sidecar.white_level > 1023.0 {
-                1023.0
+            // Proportionally scale black_level alongside white_level if sidecar reported 12/14/16-bit
+            // sensor levels for a 10-bit MIPI RAW10 bitstream.
+            let (black_level, white_level) = if sidecar.white_level > 1023.0 {
+                let scale = 1023.0 / sidecar.white_level;
+                (sidecar.black_level * scale, 1023.0)
             } else {
-                sidecar.white_level
+                (sidecar.black_level, sidecar.white_level)
             };
             let mut cfa_frames = Vec::with_capacity(sidecar.frames.len());
             let mut frames_rgb = Vec::with_capacity(sidecar.frames.len());
@@ -419,7 +402,7 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                     fm.width,
                     fm.height,
                     fm.row_stride,
-                    sidecar.black_level,
+                    black_level,
                     white_level,
                 )?;
                 let rgb = demosaic_malvar_he_cutler(&cfa, width, height, pat);
@@ -455,7 +438,6 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 .iter()
                 .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
                 .collect();
-            // Replace frame 0 with the OISSR super-resolved frame for cleaner anchor edge fitting.
             frames_rgb[0] = oissr_rgb;
             frames_luma[0] = oissr_luma;
 
@@ -477,7 +459,6 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 (height as f64) * 0.5
             };
 
-            // Estimate Chugunov specular separation + micro-baseline depth if IMU translation > 0.2 mm.
             let max_base = baselines
                 .iter()
                 .map(|&(bx, by)| bx.hypot(by))
@@ -500,8 +481,8 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 fy,
                 cx,
                 cy,
-                tsdf_res: 14,
-                winding_res: 14,
+                tsdf_res: grid_res,
+                winding_res: grid_res,
                 max_edge_m: (cli.max_edge_mm * 1e-3).max(0.0025),
                 speed_of_sound_m_s: c_air,
             };
@@ -524,216 +505,16 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
         return Ok(());
     }
 
-    // 4. Strictly isolated `--demo` synthetic self-test (ONLY reachable when `--demo` is explicit!)
-    if cli.demo {
-        run_synthetic_demo(cli, c_air)?;
-        return Ok(());
-    }
-
     if cli.out.is_some() {
         return Err(ScanError::RealInputRefused(
-            "`--out` requires real multi-view `--dng` captures, a `--burst` directory, or explicit `--demo`.".into(),
+            "`--out` requires real multi-view `--dng` captures or a `--burst` directory.".into(),
         ));
     }
 
     if ref_meta.is_none() {
         println!(
-            "Run `g6me-scan --demo` for a synthetic self-test, or pass `--dng <FILE_OR_DIR>`, `--burst <DIR>`, and `--out <mesh.obj>`. Use `--help` for options."
+            "Pass `--dng <FILE_OR_DIR>` or `--burst <DIR>` (and `--out <mesh.obj>` for 3D reconstruction). Use `--help` for options."
         );
     }
     Ok(())
-}
-
-/// Strictly isolated synthetic demonstration (`--demo` ONLY).
-/// Runs the real `bundle_adjust_ozaki2_fp4_schur` solver (never hardcoded RMS literals!)
-/// and demonstrates Stages 1..4 -> FMM-BEM on a synthetic head mesh.
-fn run_synthetic_demo(cli: &Cli, c_air: f64) -> Result<(), ScanError> {
-    println!("=== g6me-scan SYNTHETIC DEMO MODE (--demo) ===");
-    let synth = DngMetadata {
-        dng_version: [1, 7, 0, 0],
-        preview_width: 1024,
-        preview_height: 768,
-        main_width: 8160,
-        main_height: 6120,
-        bits_per_sample: 16,
-        compression: COMPRESSION_JPEG_XL,
-        photometric: PHOTOMETRIC_LINEAR_RAW,
-        new_subfile_type: 16,
-        subifd_routed: true,
-        cfa_pattern: Some(CfaPattern::Gbrg),
-        black_level: 256.0,
-        white_level: 4095.0,
-        gain_maps: vec![GainMapOpcode {
-            top: 0,
-            left: 0,
-            bottom: 6120,
-            right: 8160,
-            plane: 0,
-            planes: 4,
-            row_pitch: 2,
-            col_pitch: 2,
-            map_points_v: 2,
-            map_points_h: 2,
-            map_spacing_v: 1.0,
-            map_spacing_h: 1.0,
-            map_origin_v: 0.0,
-            map_origin_h: 0.0,
-            map_planes: 1,
-            gains: vec![1.15, 1.15, 1.15, 1.15],
-        }],
-        vignette: Some(FixVignetteRadialOpcode {
-            k: [0.16, 0.03, 0.01, 0.0, 0.0],
-            cx_hat: 0.5,
-            cy_hat: 0.5,
-        }),
-        warp_rectilinear: Some(WarpRectilinearOpcode {
-            planes: vec![
-                WarpPlaneCoeffs {
-                    k: [1.0005, -0.022, 0.006, 0.0],
-                    m: [1e-4, -1e-4],
-                },
-                WarpPlaneCoeffs {
-                    k: [1.0000, -0.020, 0.005, 0.0],
-                    m: [1e-4, -1e-4],
-                },
-                WarpPlaneCoeffs {
-                    k: [0.9994, -0.018, 0.004, 0.0],
-                    m: [1e-4, -1e-4],
-                },
-            ],
-            cx_hat: 0.5,
-            cy_hat: 0.5,
-        }),
-    };
-    let synth_bytes = build_synthetic_dng_17(&synth);
-    let parsed = g6me_core::dng::parse_dng_bytes(&synth_bytes)?;
-    let ca_res = parsed.measure_analytical_ca_residual_px();
-
-    // Stage 1 (Synthetic Demo): Metric Anchor Calibration
-    let anchor = match cli.anchor {
-        AnchorArg::RussianCard | AnchorArg::RussianCardVertical => {
-            let vertical = matches!(cli.anchor, AnchorArg::RussianCardVertical);
-            let (w_mm, h_mm) = if vertical {
-                (RUSSIAN_ID1_HEIGHT_MM, RUSSIAN_ID1_WIDTH_MM)
-            } else {
-                (RUSSIAN_ID1_WIDTH_MM, RUSSIAN_ID1_HEIGHT_MM)
-            };
-            let s = 12.0;
-            let top = [
-                [100.0 + 10.0 * s, 100.0],
-                [100.0 + (w_mm - 10.0) * s, 100.0],
-            ];
-            let bot = [
-                [100.0 + 10.0 * s, 100.0 + h_mm * s],
-                [100.0 + (w_mm - 10.0) * s, 100.0 + h_mm * s],
-            ];
-            let left = [
-                [100.0, 100.0 + 10.0 * s],
-                [100.0, 100.0 + (h_mm - 10.0) * s],
-            ];
-            let right = [
-                [100.0 + w_mm * s, 100.0 + 10.0 * s],
-                [100.0 + w_mm * s, 100.0 + (h_mm - 10.0) * s],
-            ];
-            let chip = [
-                100.0 + ISO7816_CHIP_CENTER_X_MM * s,
-                100.0 + ISO7816_CHIP_CENTER_Y_MM * s,
-            ];
-            calibrate_russian_debit_card_id1([&top, &right, &bot, &left], Some(chip), vertical)?
-        }
-        AnchorArg::Apriltag3 | AnchorArg::Charuco => calibrate_apriltag3_anchor(
-            [
-                [100.0, 100.0],
-                [500.0, 100.0],
-                [500.0, 500.0],
-                [100.0, 500.0],
-            ],
-            cli.anchor_mm,
-            matches!(cli.anchor, AnchorArg::Charuco),
-        )?,
-    };
-
-    // Stage 2 (Synthetic Demo): actually invoke Ozaki-II FP4 -> FP64 Rolling-Shutter Schur BA!
-    let gt_rots = [
-        MAT3_ID,
-        so3_exp([0.04, 0.22, -0.03]),
-        so3_exp([-0.05, -0.20, 0.02]),
-    ];
-    let gt_trans = [[0.0, 0.0, 0.35], [-0.08, 0.01, 0.36], [0.08, -0.01, 0.34]];
-    let gt_pts = vec![
-        [0.0, 0.0, 0.0],
-        [0.08560, 0.0, 0.0],
-        [0.08560, 0.05398, 0.0],
-        [0.0, 0.05398, 0.0],
-        [-0.04, -0.03, 0.02],
-        [0.03, -0.04, -0.02],
-        [-0.03, 0.06, 0.03],
-        [0.06, 0.07, -0.03],
-    ];
-    let mut gt_cams = Vec::new();
-    for c in 0..3 {
-        gt_cams.push(RollingShutterCamera {
-            rot: gt_rots[c],
-            trans: gt_trans[c],
-            omega_rad_s: [0.05, -0.08, 0.02],
-            vel_m_s: [0.01, -0.005, 0.0],
-            fx: 3000.0,
-            fy: 3000.0,
-            cx: 2040.0,
-            cy: 1530.0,
-            width: 4080.0,
-            height: 3060.0,
-            vcm_focal_scale: if c == 1 { 1.003 } else { 1.0 },
-            rolling_shutter_skew_s: 0.038,
-            ois_shift_px: [1.2 * (c as f64), -0.8 * (c as f64)],
-        });
-    }
-    let mut obs = Vec::new();
-    for (ci, cam) in gt_cams.iter().enumerate() {
-        for (pi, &pt) in gt_pts.iter().enumerate() {
-            let rough = cam.project_at_row(pt, 1530.0, None);
-            let exact = cam.project_at_row(pt, rough[1], None);
-            obs.push(BaObservation {
-                cam_idx: ci,
-                pt_idx: pi,
-                u_px: exact[0],
-                v_px: exact[1],
-            });
-        }
-    }
-    let mut cams = gt_cams.clone();
-    cams[1].trans[0] += 0.004;
-    cams[1].rot = mat3_mul(&so3_exp([0.012, -0.010, 0.008]), &cams[1].rot);
-    cams[1].vcm_focal_scale = 1.0;
-    cams[2].trans[1] -= 0.003;
-    let mut pts = gt_pts.clone();
-    for (i, p) in pts.iter_mut().enumerate().skip(2) {
-        p[0] += 0.0015 * (i as f64).sin();
-        p[2] -= 0.0020 * (i as f64).cos();
-    }
-    let gauges = vec![MetricGaugeConstraint {
-        pt_a: 0,
-        pt_b: 1,
-        target_dist_m: RUSSIAN_ID1_WIDTH_MM * 1e-3,
-        weight: 1e5,
-    }];
-    let ba = bundle_adjust_ozaki2_fp4_schur(&mut cams, &mut pts, &obs, &gauges, None, 10.0, 12);
-    print!(
-        "{}",
-        parsed.honesty_report_measured(cams.len(), Some(ba.max_vcm_breathing_pct), ca_res)
-    );
-
-    // Stage 3..4 (Synthetic Demo): procedural head -> surfels -> TSDF -> Winding Repair -> FMM-BEM
-    let head = TriangleMesh::procedural_head_with_pinnae(0.0875, 2);
-    let surfels = sample_surfels_from_mesh(&head);
-    let out = run_stage3_to_stage4_to_fmm_bem(
-        anchor,
-        ba,
-        &surfels,
-        14,
-        14,
-        (cli.max_edge_mm * 1e-3).max(0.0025),
-        c_air,
-    )?;
-    print_and_export_result(&out, c_air, cli.out.as_deref(), "synthetic --demo")
 }

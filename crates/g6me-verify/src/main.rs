@@ -136,6 +136,12 @@ fn main() {
     if wanted(&args, "scan") {
         all.extend(checks::scan());
     }
+    if wanted(&args, "mastering") {
+        all.extend(checks::mastering());
+    }
+    if wanted(&args, "cuda") {
+        all.extend(checks::cuda());
+    }
 
     let fails = all.iter().filter(|c| c.status == Status::Fail).count();
     let skips = all.iter().filter(|c| c.status == Status::Skip).count();
@@ -295,7 +301,7 @@ fn parse() -> Result<Args, String> {
                 println!(
                     "usage: g6me-verify [--json] [--group NAME] [--seconds N] [--frames N] \
                      [--require-all] [--audit-cochlea [WAV]]\ngroups: bitexact builds width chunk \
-                     continuity phase drift contraction asm acoustics cochlea blackwell ntt bem scan"
+                     continuity phase drift contraction asm acoustics cochlea blackwell ntt bem scan mastering cuda"
                 );
                 std::process::exit(0);
             }
@@ -355,6 +361,8 @@ mod suite {
         all.extend(checks::ntt());
         all.extend(checks::bem());
         all.extend(checks::scan());
+        all.extend(checks::mastering());
+        all.extend(checks::cuda());
 
         let failed: Vec<&Check> = all.iter().filter(|c| c.status == Status::Fail).collect();
         let skipped: Vec<&Check> = all.iter().filter(|c| c.status == Status::Skip).collect();
