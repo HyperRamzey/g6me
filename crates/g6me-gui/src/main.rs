@@ -1471,102 +1471,309 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.strong("Acoustic Physics, Atmosphere & Hybrid 3D Room");
+                ui.weak(
+                    "Optional first-principles acoustics: spherical-Hankel + Snowman torso diffraction, \
+                     3D FDTD+ISM+BTM+Ray-Traced rooms (170.7 ms BRIR), and 0-ULP Goldilocks NTT.",
+                );
+                ui.add_space(4.0);
+                let mut phys_changed = false;
                 ui.add_enabled_ui(!running, |ui| {
+                    {
                     let p = &mut self.settings.plus;
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("wave solver");
                         for eng in PhysicsEngine::ALL {
-                            ui.selectable_value(&mut p.physics_engine, eng, eng.label());
+                            let tip = match eng {
+                                PhysicsEngine::BrownDuda => {
+                                    "Classic fast analytical Brown–Duda spherical head shadow + \
+                                     Kulkarni excess Woodworth ITD (lowest CPU cost, universal timbre)."
+                                }
+                                PhysicsEngine::HankelSnowmanMagLs => {
+                                    "Exact multipole Rayleigh spherical-Hankel head + Snowman torso \
+                                     diffraction + Order-7 HOA MagLS decoding (true near-field ILD/ITD \
+                                     and shoulder bounce)."
+                                }
+                            };
+                            if ui
+                                .selectable_value(&mut p.physics_engine, eng, eng.label())
+                                .on_hover_text(tip)
+                                .changed()
+                            {
+                                phys_changed = true;
+                            }
                         }
                     });
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("virtual room");
                         for preset in [
                             RoomPreset::Anechoic,
                             RoomPreset::ControlRoom,
                             RoomPreset::TheaterStage,
                         ] {
-                            let label = match preset {
-                                RoomPreset::Anechoic => "Anechoic",
-                                RoomPreset::ControlRoom => "Control Room (3D FDTD+ISM+RT)",
-                                RoomPreset::TheaterStage => "Theater Stage (3D FDTD+ISM+RT)",
+                            let (label, tip) = match preset {
+                                RoomPreset::Anechoic => (
+                                    "Anechoic",
+                                    "Free-field direct speaker sphere (42.7 ms FIR); no 3D room \
+                                     modes or desk diffraction.",
+                                ),
+                                RoomPreset::ControlRoom => (
+                                    "Control Room (3D FDTD+ISM+RT)",
+                                    "ITU-R BS.1116 mastering control room (6×5×3 m, RT60 0.25 s): \
+                                     500 Hz 6-PPW reciprocal 3D FDTD + Order-3 ISM + Svensson BTM \
+                                     desk diffraction + 1024-ray time-varying HOA (170.7 ms BRIR).",
+                                ),
+                                RoomPreset::TheaterStage => (
+                                    "Theater Stage (3D FDTD+ISM+RT)",
+                                    "Reference theatrical mixing stage (12×9.5×5.2 m, RT60 0.42 s): \
+                                     reciprocal 3D FDTD modal bass + Order-3 ISM + BTM console edge \
+                                     + 1024-ray time-varying HOA (170.7 ms BRIR).",
+                                ),
                             };
-                            ui.selectable_value(&mut p.room_preset, preset, label);
+                            if ui
+                                .selectable_value(&mut p.room_preset, preset, label)
+                                .on_hover_text(tip)
+                                .changed()
+                            {
+                                phys_changed = true;
+                            }
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("distance");
-                        ui.add(
-                            egui::Slider::new(&mut p.distance_m, 0.25..=10.0)
-                                .step_by(0.05)
-                                .fixed_decimals(2)
-                                .suffix(" m"),
-                        );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("speaker distance");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.distance_m, 0.25..=10.0)
+                                    .step_by(0.05)
+                                    .fixed_decimals(2)
+                                    .suffix(" m"),
+                            )
+                            .on_hover_text(
+                                "Distance from listener head center to the virtual speaker ring \
+                                 (0.25–10.0 m). Controls near-field acoustic parallax ILD, parallax \
+                                 ITD, and ISO 9613-1 air absorption.",
+                            )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
                         ui.label("ear canal");
-                        ui.add(
-                            egui::Slider::new(&mut p.ear_canal_mm, 15.0..=38.0)
-                                .step_by(0.5)
-                                .fixed_decimals(1)
-                                .suffix(" mm"),
-                        );
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.ear_canal_mm, 15.0..=38.0)
+                                    .step_by(0.5)
+                                    .fixed_decimals(1)
+                                    .suffix(" mm"),
+                            )
+                            .on_hover_text(
+                                "1D Webster Horn ear-canal length personalization (default 25.0 mm = \
+                                 neutral bypass). Shifts quarter-wave canal resonance compensation \
+                                 for deeper/shallower IEM or headphone coupling.",
+                            )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
                     });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut p.use_slepian_tail, "Slepian DPSS tail")
+
+                    // Direct Anatomical Geometry Sliders (synced with Hear-to-Hear Bayesian personalizer)
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("head radius");
+                        let mut head_mm = p.head_radius_m * 1_000.0;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut head_mm, 65.0..=115.0)
+                                    .step_by(0.5)
+                                    .fixed_decimals(1)
+                                    .suffix(" mm"),
+                            )
                             .on_hover_text(
-                                "Replaces Half-Kaiser tail taper with exact Slepian DPSS eigenvector (Heisenberg-optimal).",
-                            );
-                        ui.checkbox(&mut p.use_fdn_velvet, "Paraunitary FDN + Velvet")
+                                "Anthropometric head radius (default 87.5 mm = KEMAR average). \
+                                 Directly scales Woodworth/Rayleigh ITD delay and head-shadow \
+                                 diffraction cutoff frequency.",
+                            )
+                            .changed()
+                        {
+                            p.head_radius_m = (head_mm * 1e-3).clamp(0.065, 0.115);
+                            phys_changed = true;
+                        }
+                        ui.label("torso spacing");
+                        let mut torso_mm = p.torso_height_m * 1_000.0;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut torso_mm, 150.0..=450.0)
+                                    .step_by(5.0)
+                                    .fixed_decimals(0)
+                                    .suffix(" mm"),
+                            )
                             .on_hover_text(
-                                "Engages Schlecht-Habets lossless paraunitary scattering FDN + ternary Velvet Noise tail.",
-                            );
-                        ui.checkbox(&mut p.use_warped_decorr, "Bark-warped AP")
+                                "Head-center to torso-center vertical spacing for the Snowman \
+                                 multipole solver (default 315 mm). Governs the 700 Hz–2.5 kHz \
+                                 shoulder reflection elevation cue.",
+                            )
+                            .changed()
+                        {
+                            p.torso_height_m = (torso_mm * 1e-3).clamp(0.15, 0.45);
+                            phys_changed = true;
+                        }
+                        ui.label("pinna shelf");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut p.pinna_shelf_db, -4.0..=4.0)
+                                    .step_by(0.1)
+                                    .fixed_decimals(1)
+                                    .suffix(" dB"),
+                            )
                             .on_hover_text(
-                                "Engages Kermit-Canfield & Abel Bark-warped all-pass decorrelator (0.000 dB ripple).",
-                            );
-                        ui.checkbox(&mut p.exact_ntt, "Goldilocks NTT (0 ULP)")
-                            .on_hover_text(
-                                "Executes binaural FIR convolution strictly inside the 64-bit Goldilocks prime field Z/(2^64-2^32+1)Z via NTT (--exact-ntt).",
-                            );
+                                "High-frequency pinna brightness offset (-4 to +4 dB; 0 dB = \
+                                 neutral universal pinna contour). Tune to match your own ear \
+                                 front/back coloration or apply from the Bayesian A/B loop below.",
+                            )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
                     });
+
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .checkbox(&mut p.use_slepian_tail, "Slepian DPSS tail")
+                            .on_hover_text(
+                                "Replaces Half-Kaiser FIR tail taper with an exact Slepian DPSS \
+                                 prolate eigenvector for Heisenberg-optimal stopband sidelobes.",
+                            )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut p.use_fdn_velvet, "Paraunitary FDN + Velvet")
+                            .on_hover_text(
+                                "Engages Schlecht–Habets lossless paraunitary scattering FDN + \
+                                 ternary {-1,0,+1} Velvet Noise late diffuse tail.",
+                            )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut p.use_warped_decorr, "Bark-warped AP")
+                            .on_hover_text(
+                                "Engages Kermit-Canfield & Abel Bark-warped 4-stage all-pass rear \
+                                 decorrelator (0.000 dB magnitude ripple, prevents Atmos height comb).",
+                            )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut p.exact_ntt, "Goldilocks NTT (0 ULP)")
+                            .on_hover_text(
+                                "Executes binaural FIR convolution strictly inside the 64-bit \
+                                 Goldilocks prime field Z/(2^64-2^32+1)Z via radix-2 NTT \
+                                 (--exact-ntt): bit-identical across x86, ARM, and RISC-V.",
+                            )
+                            .changed()
+                        {
+                            phys_changed = true;
+                        }
+                    });
+                    }
+
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.settings.use_room_json, "custom --room-json");
+                        ui.checkbox(&mut self.settings.use_room_json, "custom --room-json")
+                            .on_hover_text(
+                                "Load a custom 3D shoebox room geometry, 6-band octave wall \
+                                 materials, bass-trap admittance, and BTM diffraction edges from JSON.",
+                            );
                         if self.settings.use_room_json {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.room_json_text)
-                                    .desired_width(240.0)
-                                    .hint_text("path/to/room.json"),
-                            );
+                            let resp = ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.room_json_text)
+                                        .desired_width((ui.available_width() - 96.0).max(160.0))
+                                        .font(egui::FontId::monospace(11.0))
+                                        .hint_text("path/to/room.json"),
+                                )
+                                .on_hover_text("Path to a custom g6me RoomGeometry JSON file.");
                             if resp.changed() {
                                 self.settings.room_json =
                                     widgets::clean_pasted_path(&self.room_json_text);
                             }
+                            if ui
+                                .button("…")
+                                .on_hover_text("Browse for a custom room JSON file")
+                                .clicked()
+                            {
+                                let ctx = ui.ctx().clone();
+                                self.open_picker(&ctx, PickTarget::RoomJson, Mode::AnyFile);
+                            }
+                            #[cfg(feature = "native-dialogs")]
+                            if ui
+                                .button("in-app")
+                                .on_hover_text("Open built-in file browser for room JSON")
+                                .clicked()
+                            {
+                                self.open_in_app_picker(PickTarget::RoomJson, Mode::AnyFile);
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.settings.use_head_mesh, "3D --head-mesh (.obj)");
-                        if self.settings.use_head_mesh {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.head_mesh_text)
-                                    .desired_width(240.0)
-                                    .hint_text("path/to/myhead.obj (FMM-BEM)"),
+                        ui.checkbox(&mut self.settings.use_head_mesh, "3D --head-mesh (.obj)")
+                            .on_hover_text(
+                                "Load a scanned 3D head/pinna Wavefront .obj mesh (e.g. from \
+                                 g6me-scan) and solve exact personalized HRTFs via reciprocal \
+                                 Helmholtz FMM-BEM (auto-repaired if non-watertight).",
                             );
+                        if self.settings.use_head_mesh {
+                            let resp = ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.head_mesh_text)
+                                        .desired_width((ui.available_width() - 96.0).max(160.0))
+                                        .font(egui::FontId::monospace(11.0))
+                                        .hint_text("path/to/myhead.obj (FMM-BEM)"),
+                                )
+                                .on_hover_text("Path to a Wavefront .obj 3D head/pinna mesh.");
                             if resp.changed() {
                                 self.settings.head_mesh =
                                     widgets::clean_pasted_path(&self.head_mesh_text);
                             }
+                            if ui
+                                .button("…")
+                                .on_hover_text("Browse for a Wavefront .obj 3D head mesh")
+                                .clicked()
+                            {
+                                let ctx = ui.ctx().clone();
+                                self.open_picker(&ctx, PickTarget::HeadMesh, Mode::AnyFile);
+                            }
+                            #[cfg(feature = "native-dialogs")]
+                            if ui
+                                .button("in-app")
+                                .on_hover_text("Open built-in file browser for .obj head mesh")
+                                .clicked()
+                            {
+                                self.open_in_app_picker(PickTarget::HeadMesh, Mode::AnyFile);
+                            }
                         }
                     });
 
+                    {
+                    let p = &mut self.settings.plus;
                     egui::CollapsingHeader::new("Atmosphere (Cramer 1993 + ISO 9613-1 O2/N2)")
                         .default_open(false)
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("temp");
                                 ui.add(
                                     egui::Slider::new(&mut p.atmosphere.temp_c, -20.0..=50.0)
                                         .step_by(0.5)
                                         .fixed_decimals(1)
                                         .suffix(" °C"),
+                                )
+                                .on_hover_text(
+                                    "Ambient air temperature (-20 to +50 °C). Updates Cramer \
+                                     speed of sound c(T, RH, P, CO2) and thermal relaxation.",
                                 );
                                 ui.label("RH");
                                 ui.add(
@@ -1574,15 +1781,23 @@ impl App {
                                         .step_by(1.0)
                                         .fixed_decimals(0)
                                         .suffix(" %"),
+                                )
+                                .on_hover_text(
+                                    "Relative humidity (0–100%). Dry air strongly increases \
+                                     high-frequency molecular O2/N2 attenuation over distance.",
                                 );
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("CO₂");
                                 ui.add(
                                     egui::Slider::new(&mut p.atmosphere.co2_ppm, 0.0..=10_000.0)
                                         .step_by(10.0)
                                         .fixed_decimals(0)
                                         .suffix(" ppm"),
+                                )
+                                .on_hover_text(
+                                    "Ambient CO2 concentration in ppm (typical indoor room: \
+                                     420–1000 ppm).",
                                 );
                                 ui.label("pressure");
                                 ui.add(
@@ -1590,6 +1805,9 @@ impl App {
                                         .step_by(0.1)
                                         .fixed_decimals(2)
                                         .suffix(" kPa"),
+                                )
+                                .on_hover_text(
+                                    "Barometric pressure in kPa (sea level standard: 101.325 kPa).",
                                 );
                             });
                             let c_air = p.atmosphere.speed_of_sound_m_s();
@@ -1600,7 +1818,11 @@ impl App {
                                 p.distance_m
                             ));
                         });
+                    }
                 });
+                if phys_changed {
+                    self.settings.plus.sync_profile();
+                }
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(format!(
@@ -1628,14 +1850,26 @@ impl App {
                         cand_b.pinna_shelf_db
                     ));
                     ui.horizontal(|ui| {
-                        if ui.button("Prefer A").clicked() {
+                        if ui
+                            .button("Prefer A")
+                            .on_hover_text("Update Bayesian posterior favoring Candidate A.")
+                            .clicked()
+                        {
                             self.personalizer.record_choice(true);
                         }
-                        if ui.button("Prefer B").clicked() {
+                        if ui
+                            .button("Prefer B")
+                            .on_hover_text("Update Bayesian posterior favoring Candidate B.")
+                            .clicked()
+                        {
                             self.personalizer.record_choice(false);
                         }
                         if ui
                             .add_enabled(!running, egui::Button::new("Apply Posterior to G6+"))
+                            .on_hover_text(
+                                "Copies the MMSE head radius, torso spacing, and pinna shelf into \
+                                 the G6+ sliders above and activates the Hankel+Snowman solver.",
+                            )
                             .clicked()
                         {
                             self.settings.plus.head_radius_m = est.head_radius_m;
@@ -1644,7 +1878,11 @@ impl App {
                             self.settings.plus.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
                             self.settings.plus.sync_profile();
                         }
-                        if ui.button("Reset Loop").clicked() {
+                        if ui
+                            .button("Reset Loop")
+                            .on_hover_text("Restart the Bayesian A/B personalization prior.")
+                            .clicked()
+                        {
                             self.personalizer = PersonalizationSession::new();
                         }
                     });
@@ -1825,26 +2063,44 @@ impl App {
             );
             if st.upmix.enable {
                 ui.indent("upmix-indent", |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("center lock");
-                        ui.add(egui::Slider::new(&mut st.upmix.center_extract, 0.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.upmix.center_extract, 0.0..=1.0))
+                            .on_hover_text(
+                                "Strength of center-channel extraction from correlated L/R vocals \
+                                 and dialogue (0.0 = stereo phantom, 1.0 = tight FC lock).",
+                            );
                         ui.label("side");
-                        ui.add(egui::Slider::new(&mut st.upmix.surround_level, 0.0..=1.5));
+                        ui.add(egui::Slider::new(&mut st.upmix.surround_level, 0.0..=1.5))
+                            .on_hover_text(
+                                "Ambient energy routed to side surround channels SL/SR.",
+                            );
                         ui.label("rear");
-                        ui.add(egui::Slider::new(&mut st.upmix.rear_level, 0.0..=1.5));
+                        ui.add(egui::Slider::new(&mut st.upmix.rear_level, 0.0..=1.5))
+                            .on_hover_text(
+                                "Decorrelated ambient energy routed to rear surround channels BL/BR.",
+                            );
                     });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut st.upmix.lfe_extract, "LR4 LFE");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut st.upmix.lfe_extract, "LR4 LFE")
+                            .on_hover_text(
+                                "Derives a phase-coherent sub-bass `.1` LFE feed below the cutoff.",
+                            );
                         if st.upmix.lfe_extract {
                             ui.add(
                                 egui::DragValue::new(&mut st.upmix.lfe_cutoff_hz)
                                     .range(60.0..=160.0)
                                     .speed(1.0)
                                     .suffix(" Hz"),
-                            );
+                            )
+                            .on_hover_text("4th-order Linkwitz–Riley crossover for derived LFE.");
                         }
                         ui.label("decorrelation");
-                        ui.add(egui::Slider::new(&mut st.upmix.decorrelate, 0.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.upmix.decorrelate, 0.0..=1.0))
+                            .on_hover_text(
+                                "Kraft–Zölzer all-pass surround decorrelation blend (higher widens \
+                                 envelopment without phasiness).",
+                            );
                     });
                 });
             }
@@ -1861,35 +2117,51 @@ impl App {
             );
             if st.enhance.vbass.enable {
                 ui.indent("vbass-indent", |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("cutoff");
                         ui.add(
                             egui::DragValue::new(&mut st.enhance.vbass.cutoff_hz)
                                 .range(40.0..=180.0)
                                 .speed(1.0)
                                 .suffix(" Hz"),
+                        )
+                        .on_hover_text(
+                            "Sub-bass upper boundary (Hz) below which missing-fundamental \
+                             upper harmonics are synthesized.",
                         );
                         ui.label("amount");
-                        ui.add(egui::Slider::new(&mut st.enhance.vbass.amount, 0.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.enhance.vbass.amount, 0.0..=1.0))
+                            .on_hover_text(
+                                "Wet mix of synthesized upper bass harmonics (0.0 = null bypass).",
+                            );
                         ui.label("gain");
                         ui.add(
                             egui::DragValue::new(&mut st.enhance.vbass.gain_db)
                                 .range(-12.0..=12.0)
                                 .speed(0.1)
                                 .suffix(" dB"),
-                        );
+                        )
+                        .on_hover_text("Trim applied to the synthesized virtual-bass harmonic bus.");
                     });
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("harmonic decay");
                         ui.add(egui::Slider::new(
                             &mut st.enhance.vbass.harmonic_decay,
                             0.2..=1.5,
-                        ));
+                        ))
+                        .on_hover_text(
+                            "Spectral tilt across 2nd/3rd/4th harmonics: higher sounds warmer and \
+                             darker; lower adds brighter upper-bass articulation.",
+                        );
                         ui.label("transient punch");
                         ui.add(egui::Slider::new(
                             &mut st.enhance.vbass.transient_punch,
                             0.0..=1.5,
-                        ));
+                        ))
+                        .on_hover_text(
+                            "FEXP1 nonlinear harmonic punch applied strictly to isolated kick/drum \
+                             transients (tonal chords remain IMD-free).",
+                        );
                     });
                 });
             }
@@ -1906,24 +2178,39 @@ impl App {
             );
             if st.enhance.detail.enable {
                 ui.indent("detail-indent", |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("intensity");
-                        ui.add(egui::Slider::new(&mut st.enhance.detail.intensity, 0.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.enhance.detail.intensity, 0.0..=1.0))
+                            .on_hover_text(
+                                "Upward soft-knee lift on quiet tonal and transient micro-details \
+                                 (0.0 = exact null bypass; background noise stays untouched).",
+                            );
                         ui.label("bias");
-                        ui.add(egui::Slider::new(&mut st.enhance.detail.bias, 0.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.enhance.detail.bias, 0.0..=1.0))
+                            .on_hover_text(
+                                "Knee threshold bias: higher focuses lift deeper into quiet tails \
+                                 and micro-textures.",
+                            );
                     });
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("transients");
                         ui.add(egui::Slider::new(
                             &mut st.enhance.detail.transient_weight,
                             0.0..=1.5,
-                        ));
+                        ))
+                        .on_hover_text(
+                            "Relative micro-detail emphasis on plucked/percussive attacks vs \
+                             sustained harmonic overtones.",
+                        );
                         ui.label("presence tilt");
                         ui.add(
                             egui::DragValue::new(&mut st.enhance.detail.presence_tilt_db)
                                 .range(-3.0..=6.0)
                                 .speed(0.1)
                                 .suffix(" dB"),
+                        )
+                        .on_hover_text(
+                            "High-shelf presence contour applied only to the lifted detail delta.",
                         );
                     });
                 });
@@ -1941,24 +2228,40 @@ impl App {
             );
             if st.unmask.enable {
                 ui.indent("unmask-indent", |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("recover");
-                        ui.add(egui::Slider::new(&mut st.unmask.recover, 0.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.unmask.recover, 0.0..=1.0))
+                            .on_hover_text(
+                                "Lifts masked quiet spectral bands where adjacent louder bands \
+                                 suppress auditory excitation.",
+                            );
                         ui.label("tame");
-                        ui.add(egui::Slider::new(&mut st.unmask.tame, 0.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.unmask.tame, 0.0..=1.0))
+                            .on_hover_text(
+                                "Gently attenuates overly dominant masking resonances (harsh \
+                                 upper mids or muddy low-mid peaks).",
+                            );
                         ui.label("max ±dB");
                         ui.add(
                             egui::DragValue::new(&mut st.unmask.max_gain_db)
                                 .range(0.5..=12.0)
                                 .speed(0.1)
                                 .suffix(" dB"),
-                        );
+                        )
+                        .on_hover_text("Hard cap on per-band dynamic EQ boost/cut excursion.");
                     });
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("bias");
-                        ui.add(egui::Slider::new(&mut st.unmask.bias, -1.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.unmask.bias, -1.0..=1.0))
+                            .on_hover_text(
+                                "Shifts the equal-information target reference toward fuller lows \
+                                 (negative) or leaner mids/highs (positive).",
+                            );
                         ui.label("brighten");
-                        ui.add(egui::Slider::new(&mut st.unmask.brighten, -1.0..=1.0));
+                        ui.add(egui::Slider::new(&mut st.unmask.brighten, -1.0..=1.0))
+                            .on_hover_text(
+                                "Spectral tilt of the unmasking target curve (-1.0 warm to +1.0 airy).",
+                            );
                     });
                 });
             }
@@ -2722,6 +3025,9 @@ impl App {
                 self.settings.reset_preserving_queue();
                 self.out_dir_text = self.settings.out_dir.display().to_string();
                 self.ir_file_text = self.settings.ir_file.display().to_string();
+                self.room_json_text = self.settings.room_json.display().to_string();
+                self.head_mesh_text = self.settings.head_mesh.display().to_string();
+                self.personalizer = PersonalizationSession::new();
                 self.rebuild_queue();
                 self.push_log(Level::Info, "reset settings to defaults (queue preserved)");
             }
@@ -2772,6 +3078,8 @@ impl App {
                 PickTarget::Queue => "Add to queue",
                 PickTarget::OutDir => "Choose output folder",
                 PickTarget::Ir => "Choose impulse response",
+                PickTarget::RoomJson => "Choose custom room JSON",
+                PickTarget::HeadMesh => "Choose 3D head mesh (.obj)",
             };
             let mut open = true;
             let mut done: Option<Vec<PathBuf>> = None;
@@ -2872,6 +3180,18 @@ impl App {
                     .parent()
                     .filter(|p| p.is_dir())
                     .map(PathBuf::from),
+                PickTarget::RoomJson => self
+                    .settings
+                    .room_json
+                    .parent()
+                    .filter(|p| p.is_dir())
+                    .map(PathBuf::from),
+                PickTarget::HeadMesh => self
+                    .settings
+                    .head_mesh
+                    .parent()
+                    .filter(|p| p.is_dir())
+                    .map(PathBuf::from),
                 _ => None,
             };
             std::thread::spawn(move || {
@@ -2908,6 +3228,20 @@ impl App {
                         .pick_file()
                         .into_iter()
                         .collect(),
+                    (PickTarget::RoomJson, _) => dlg
+                        .set_title("Choose custom 3D room JSON")
+                        .add_filter("Room Geometry JSON", &["json"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                        .into_iter()
+                        .collect(),
+                    (PickTarget::HeadMesh, _) => dlg
+                        .set_title("Choose 3D head/pinna Wavefront OBJ")
+                        .add_filter("Wavefront OBJ Mesh", &["obj"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                        .into_iter()
+                        .collect(),
                     _ => dlg.pick_files().unwrap_or_default(),
                 };
                 if !paths.is_empty() {
@@ -2929,6 +3263,12 @@ impl App {
         match target {
             PickTarget::Queue => self.browser.set_single(None),
             PickTarget::Ir => self.browser.set_single(Some(self.settings.ir_file.clone())),
+            PickTarget::RoomJson => self
+                .browser
+                .set_single(Some(self.settings.room_json.clone())),
+            PickTarget::HeadMesh => self
+                .browser
+                .set_single(Some(self.settings.head_mesh.clone())),
             PickTarget::OutDir => {}
         }
     }
@@ -2966,8 +3306,22 @@ impl App {
                     self.settings.ir_file = path;
                 }
             }
+            PickTarget::RoomJson => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.settings.use_room_json = true;
+                    self.room_json_text = path.display().to_string();
+                    self.settings.room_json = path;
+                }
+            }
+            PickTarget::HeadMesh => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.settings.use_head_mesh = true;
+                    self.head_mesh_text = path.display().to_string();
+                    self.settings.head_mesh = path;
+                }
+            }
         }
-        if target != PickTarget::Ir {
+        if matches!(target, PickTarget::Queue | PickTarget::OutDir) {
             self.rebuild_queue();
         }
     }

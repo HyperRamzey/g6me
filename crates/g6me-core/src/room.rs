@@ -117,6 +117,10 @@ pub struct DiffractionEdge {
     pub p1: [f64; 3],
     /// Exterior wedge angle `theta_w` in radians (e.g. `1.5 * PI` for a 90° desk edge).
     pub wedge_angle_rad: f64,
+    /// Optional unit tangent direction lying along wedge face 0 (perpendicular to edge `p1 - p0`).
+    /// When omitted, defaults to the horizontal normal perpendicular to the edge (e.g. `+x` tabletop).
+    #[serde(default)]
+    pub face0_dir: Option<[f64; 3]>,
 }
 
 /// 6-band octave wall acoustic material (`125, 250, 500, 1k, 2k, 4k Hz`).
@@ -217,6 +221,7 @@ impl RoomGeometry {
                         p0: [3.35, 1.65, 0.85],
                         p1: [3.35, 3.35, 0.85],
                         wedge_angle_rad: 1.5 * PI,
+                        face0_dir: Some([1.0, 0.0, 0.0]),
                     }],
                 }
             }
@@ -244,6 +249,7 @@ impl RoomGeometry {
                         p0: [6.2, 3.4, 0.90],
                         p1: [6.2, 6.1, 0.90],
                         wedge_angle_rad: 1.5 * PI,
+                        face0_dir: Some([1.0, 0.0, 0.0]),
                     }],
                 }
             }
@@ -511,9 +517,39 @@ pub fn add_btm_edge_diffraction(
         return;
     }
     let e_hat = [ex / edge_len, ey / edge_len, ez / edge_len];
-    let nu = PI / edge.wedge_angle_rad.clamp(1.05 * PI, 1.99 * PI);
+    let theta_w = edge.wedge_angle_rad.clamp(1.05 * PI, 1.99 * PI);
+    let nu = PI / theta_w;
 
-    const N_SEG: usize = 32;
+    // Construct an orthonormal cylindrical frame `(u_hat, v_hat, e_hat)` around the wedge edge
+    // where `u_hat` points along wedge face 0 (`theta = 0`) and `v_hat = normalize(u_hat x e_hat)`
+    // sweeps through the exterior air region `theta in [0, theta_w]`.
+    let cross3 = |a: [f64; 3], b: [f64; 3]| -> [f64; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let norm3 = |a: [f64; 3]| -> [f64; 3] {
+        let n = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().max(1e-12);
+        [a[0] / n, a[1] / n, a[2] / n]
+    };
+    let u_raw = if let Some(f0) = edge.face0_dir {
+        let proj = f0[0] * e_hat[0] + f0[1] * e_hat[1] + f0[2] * e_hat[2];
+        [
+            f0[0] - proj * e_hat[0],
+            f0[1] - proj * e_hat[1],
+            f0[2] - proj * e_hat[2],
+        ]
+    } else if e_hat[2].abs() < 0.9 {
+        cross3(e_hat, [0.0, 0.0, 1.0])
+    } else {
+        cross3(e_hat, [1.0, 0.0, 0.0])
+    };
+    let u_hat = norm3(u_raw);
+    let v_hat = norm3(cross3(u_hat, e_hat));
+
+    const N_SEG: usize = 48;
     let dz = edge_len / (N_SEG as f64);
 
     // Distance from direct path for relative level normalization.
@@ -550,7 +586,7 @@ pub fn add_btm_edge_diffraction(
         }
         let frac = smp_f - (i0 as f64);
 
-        // Cylindrical angles around edge axis for the BTM beta directivity kernel.
+        // Cylindrical coordinates `(zs, rs, theta_s)` and `(zr, rr, theta_r)` around the wedge edge.
         let zs = vs[0] * e_hat[0] + vs[1] * e_hat[1] + vs[2] * e_hat[2];
         let zr = vr[0] * e_hat[0] + vr[1] * e_hat[1] + vr[2] * e_hat[2];
         let rs_v = [
@@ -569,17 +605,27 @@ pub fn add_btm_edge_diffraction(
         let rr = (rr_v[0] * rr_v[0] + rr_v[1] * rr_v[1] + rr_v[2] * rr_v[2])
             .sqrt()
             .max(1e-5);
-        let cos_dphi = ((rs_v[0] * rr_v[0] + rs_v[1] * rr_v[1] + rs_v[2] * rr_v[2]) / (rs * rr))
-            .clamp(-1.0, 1.0);
-        let dphi = cos_dphi.acos();
 
-        // Svensson (1999) cosh(nu * eta) factor where cosh(eta) = (m*l + zs*zr)/(rs*rr).
+        let su = rs_v[0] * u_hat[0] + rs_v[1] * u_hat[1] + rs_v[2] * u_hat[2];
+        let sv = rs_v[0] * v_hat[0] + rs_v[1] * v_hat[1] + rs_v[2] * v_hat[2];
+        let ru = rr_v[0] * u_hat[0] + rr_v[1] * u_hat[1] + rr_v[2] * u_hat[2];
+        let rv = rr_v[0] * v_hat[0] + rr_v[1] * v_hat[1] + rr_v[2] * v_hat[2];
+        let theta_s = sv.atan2(su).rem_euclid(2.0 * PI).clamp(0.0, theta_w);
+        let theta_r = rv.atan2(ru).rem_euclid(2.0 * PI).clamp(0.0, theta_w);
+
+        // Svensson, Fred & Vanderkooy (JASA 1999) Eq. (6)-(8):
+        // cosh(eta) = (m*l + zs*zr) / (rs*rr), and the 4 symmetric wedge face angles
+        // `pi +- theta_s +- theta_r` (preserving exact Helmholtz reciprocity!).
         let cosh_eta = ((m_dist * l_dist + zs * zr) / (rs * rr)).max(1.000_001);
         let eta = cosh_eta.acosh();
         let cosh_nu_eta = (nu * eta).cosh();
 
-        // Sum over the 4 BTM angle combinations (bounded away from shadow-boundary pole).
-        let angles = [PI + dphi, PI - dphi, PI + 0.5 * dphi, PI - 0.5 * dphi];
+        let angles = [
+            PI + theta_s + theta_r,
+            PI + theta_s - theta_r,
+            PI - theta_s + theta_r,
+            PI - theta_s - theta_r,
+        ];
         let mut beta = 0.0_f64;
         for &phi in &angles {
             let den = (cosh_nu_eta - (nu * phi).cos()).max(0.08);
@@ -614,13 +660,13 @@ pub struct FdtdSolver3d {
 
 impl FdtdSolver3d {
     /// Construct a Courant-stable (`lambda = c * dt / dx = 0.55 < 1/sqrt(3)`) 3D FDTD grid
-    /// covering `geom.dims_m` with spatial step `dx_m` (e.g. `0.20 m` gives `> 3.4` PPW
-    /// at `500 Hz` and runs a 0.25 s 3D wave simulation in milliseconds!).
+    /// covering `geom.dims_m` with spatial step `dx_m` (`0.114 m` resolves up to `504 Hz` at
+    /// `6` points-per-wavelength for ITU-R BS.1116 control rooms).
     pub fn new(geom: &RoomGeometry, c_m_s: f64, dx_m: f64) -> Self {
         let dx = dx_m.clamp(0.08, 0.40);
-        let nx = ((geom.dims_m[0] / dx).round() as usize).clamp(8, 80);
-        let ny = ((geom.dims_m[1] / dx).round() as usize).clamp(8, 80);
-        let nz = ((geom.dims_m[2] / dx).round() as usize).clamp(6, 48);
+        let nx = ((geom.dims_m[0] / dx).round() as usize).clamp(8, 96);
+        let ny = ((geom.dims_m[1] / dx).round() as usize).clamp(8, 96);
+        let nz = ((geom.dims_m[2] / dx).round() as usize).clamp(6, 64);
         let lambda = 0.55_f64; // Strictly below 3D SRL stability limit 1/sqrt(3) ≈ 0.57735
         let dt_s = lambda * dx / c_m_s;
         Self {
@@ -632,6 +678,31 @@ impl FdtdSolver3d {
             lambda,
             beta_wall: geom.bass_trap_admittance.clamp(0.01, 0.98),
         }
+    }
+
+    /// Construct a 3D FDTD grid targeting `target_hz` at `6` points-per-wavelength while
+    /// keeping the total voxel count within `max_voxels` for large theatrical halls.
+    ///
+    /// - For `ControlRoom` (`6.0 × 5.0 × 3.0 m = 90 m³`, `max_voxels = 65_000`), selects
+    ///   `dx = 0.114 m` (`53 × 44 × 26 = 60,632` voxels, `f_6ppw = 504 Hz`!).
+    /// - For `TheaterStage` (`12.0 × 9.5 × 5.2 m = 593 m³`, Schroeder freq `53 Hz`), selects
+    ///   `dx = 0.209 m` (`57 × 45 × 25 = 64,125` voxels, `f_6ppw = 275 Hz`, `> 5×` Schroeder!).
+    pub fn for_room_budget(
+        geom: &RoomGeometry,
+        c_m_s: f64,
+        target_hz: f64,
+        max_voxels: usize,
+    ) -> Self {
+        let dx_target = c_m_s / (6.0 * target_hz.clamp(100.0, 600.0));
+        let vol = geom.dims_m[0] * geom.dims_m[1] * geom.dims_m[2];
+        let dx_budget = (vol / (max_voxels.max(4_096) as f64)).cbrt();
+        Self::new(geom, c_m_s, dx_target.max(dx_budget))
+    }
+
+    /// Exact 6 points-per-wavelength valid bandwidth of this 3D FDTD grid in Hz.
+    #[inline]
+    pub fn max_freq_6ppw(&self, c_m_s: f64) -> f64 {
+        c_m_s / (6.0 * self.dx_m)
     }
 
     #[inline]
@@ -664,6 +735,7 @@ impl FdtdSolver3d {
         let mut p_curr = vec![0.0_f64; total];
         let mut p_next = vec![0.0_f64; total];
         let lam2 = self.lambda * self.lambda;
+        let center_c = 2.0 - 6.0 * lam2;
         let half_lam_beta = 0.5 * self.lambda * self.beta_wall;
 
         let src_id = self.idx(src_voxel.0, src_voxel.1, src_voxel.2);
@@ -673,6 +745,7 @@ impl FdtdSolver3d {
             .collect();
         let mut out: Vec<Vec<f64>> = vec![vec![0.0_f64; steps]; receivers.len()];
 
+        let nx = self.nx;
         let ny = self.ny;
         let nz = self.nz;
         let stride_x = ny * nz;
@@ -686,57 +759,86 @@ impl FdtdSolver3d {
                 out[r][step] = p_curr[rid];
             }
 
-            for i in 0..self.nx {
+            // Fast branchless interior 7-point 3D SRL stencil (`1..nx-1, 1..ny-1, 1..nz-1`).
+            for i in 1..(nx - 1) {
                 let i_off = i * stride_x;
-                for j in 0..ny {
+                for j in 1..(ny - 1) {
                     let ij_off = i_off + j * nz;
-                    for k in 0..nz {
+                    for k in 1..(nz - 1) {
                         let id = ij_off + k;
-                        let pc = p_curr[id];
-                        let mut lap = 0.0_f64;
-                        let mut k_bnd = 0u32;
-
-                        if i > 0 {
-                            lap += p_curr[id - stride_x] - pc;
-                        } else {
-                            k_bnd += 1;
-                        }
-                        if i + 1 < self.nx {
-                            lap += p_curr[id + stride_x] - pc;
-                        } else {
-                            k_bnd += 1;
-                        }
-                        if j > 0 {
-                            lap += p_curr[id - nz] - pc;
-                        } else {
-                            k_bnd += 1;
-                        }
-                        if j + 1 < ny {
-                            lap += p_curr[id + nz] - pc;
-                        } else {
-                            k_bnd += 1;
-                        }
-                        if k > 0 {
-                            lap += p_curr[id - 1] - pc;
-                        } else {
-                            k_bnd += 1;
-                        }
-                        if k + 1 < nz {
-                            lap += p_curr[id + 1] - pc;
-                        } else {
-                            k_bnd += 1;
-                        }
-
-                        if k_bnd == 0 {
-                            p_next[id] = 2.0 * pc - p_prev[id] + lam2 * lap;
-                        } else {
-                            let g = half_lam_beta * (k_bnd as f64);
-                            p_next[id] =
-                                (2.0 * pc + lam2 * lap - (1.0 - g) * p_prev[id]) / (1.0 + g);
-                        }
+                        let sum_nb = p_curr[id - stride_x]
+                            + p_curr[id + stride_x]
+                            + p_curr[id - nz]
+                            + p_curr[id + nz]
+                            + p_curr[id - 1]
+                            + p_curr[id + 1];
+                        p_next[id] = center_c * p_curr[id] - p_prev[id] + lam2 * sum_nb;
                     }
                 }
             }
+
+            // Locally-reacting porous bass-trap boundary planes (Hamilton & Bilbao 2017).
+            let update_bnd = |i: usize, j: usize, k: usize, p_next: &mut [f64]| {
+                let id = (i * ny + j) * nz + k;
+                let pc = p_curr[id];
+                let mut lap = 0.0_f64;
+                let mut k_bnd = 0u32;
+                if i > 0 {
+                    lap += p_curr[id - stride_x] - pc;
+                } else {
+                    k_bnd += 1;
+                }
+                if i + 1 < nx {
+                    lap += p_curr[id + stride_x] - pc;
+                } else {
+                    k_bnd += 1;
+                }
+                if j > 0 {
+                    lap += p_curr[id - nz] - pc;
+                } else {
+                    k_bnd += 1;
+                }
+                if j + 1 < ny {
+                    lap += p_curr[id + nz] - pc;
+                } else {
+                    k_bnd += 1;
+                }
+                if k > 0 {
+                    lap += p_curr[id - 1] - pc;
+                } else {
+                    k_bnd += 1;
+                }
+                if k + 1 < nz {
+                    lap += p_curr[id + 1] - pc;
+                } else {
+                    k_bnd += 1;
+                }
+                let g = half_lam_beta * (k_bnd as f64);
+                p_next[id] = (2.0 * pc + lam2 * lap - (1.0 - g) * p_prev[id]) / (1.0 + g);
+            };
+
+            // x = 0 and x = nx - 1 faces
+            for j in 0..ny {
+                for k in 0..nz {
+                    update_bnd(0, j, k, &mut p_next);
+                    update_bnd(nx - 1, j, k, &mut p_next);
+                }
+            }
+            // y = 0 and y = ny - 1 faces (excluding already-updated x faces)
+            for i in 1..(nx - 1) {
+                for k in 0..nz {
+                    update_bnd(i, 0, k, &mut p_next);
+                    update_bnd(i, ny - 1, k, &mut p_next);
+                }
+            }
+            // z = 0 and z = nz - 1 faces (excluding already-updated x and y faces)
+            for i in 1..(nx - 1) {
+                for j in 1..(ny - 1) {
+                    update_bnd(i, j, 0, &mut p_next);
+                    update_bnd(i, j, nz - 1, &mut p_next);
+                }
+            }
+
             std::mem::swap(&mut p_prev, &mut p_curr);
             std::mem::swap(&mut p_curr, &mut p_next);
         }
@@ -1035,10 +1137,17 @@ pub fn synthesize_hybrid_room_reflections(
     .max(0.1);
     let t_dir = d_dir / c;
 
-    // 1. Layer 1a: 3D Image-Source Method (orders 1–2, exact wall spectra + O2/N2 air).
-    let ism_taps = image_sources_3d(geom, src_m, c, 2);
+    // Compute physical FDTD 6-PPW crossover frequency directly from `fdtd_dt_s` (`lambda = 0.55`).
+    let f_xover = if fdtd_l_low.is_some() && fdtd_dt_s > 1e-6 {
+        (0.55 / (6.0 * fdtd_dt_s)).clamp(150.0, 500.0)
+    } else {
+        500.0
+    };
+
+    // 1. Layer 1a: 3D Image-Source Method (orders 1–3, closing the 3rd-order gap before ray tracing).
+    let ism_taps = image_sources_3d(geom, src_m, c, 3);
     for tap in &ism_taps {
-        if tap.delay_s > 0.085 {
+        if tap.delay_s > 0.145 {
             continue;
         }
         // Geometric 1/r attenuation relative to direct sound.
@@ -1047,8 +1156,8 @@ pub fn synthesize_hybrid_room_reflections(
         let (hl_dir, hr_dir) = magls.decode_direction(tap.az_deg, tap.el_deg);
         let delay_total = pre_delay_s + tap.delay_s;
         for (k, &f) in freqs.iter().enumerate() {
-            // High-pass ISM above 500 Hz where FDTD owns the modal bass when present.
-            let x_hp = f / 500.0;
+            // High-pass ISM above `f_xover` where FDTD owns the modal bass when present.
+            let x_hp = f / f_xover;
             let hp = if fdtd_l_low.is_some() {
                 (x_hp * x_hp) / (1.0 + x_hp * x_hp)
             } else {
@@ -1116,75 +1225,123 @@ pub fn synthesize_hybrid_room_reflections(
         }
     }
 
-    // 3. Layer 1b: Deterministic PCG64 Monte Carlo Ray Tracing (orders 4..24) -> Order-7 HOA -> MagLS
-    //    modulated by ternary Velvet Noise / Paraunitary Scattering FDN for smooth late diffusion.
+    // 3. Layer 1b: Deterministic PCG64 Monte Carlo Ray Tracing (1024 rays, orders 4..48) ->
+    //    time-varying Order-7 HOA spatial-temporal histogram (`36 x 4 ms = 144 ms`) decoded
+    //    through MagLS in 4 directional time zones modulated by the measured ray-traced
+    //    energy envelope + Paraunitary Scattering FDN / ternary Velvet Noise diffusion!
     let bin_dt_s = 0.004; // 4 ms HOA energy histogram bins
-    let n_bins = 20usize; // up to 80 ms
-    let hist = raytrace_hoa_histogram(geom, atm, src_m, 160, 24, n_bins, bin_dt_s, seed);
-    let mut sh_late = [0.0_f64; HOA_CH];
-    for bin in &hist {
-        for c_idx in 0..HOA_CH {
-            sh_late[c_idx] += bin[c_idx];
-        }
-    }
-    let sh_norm = sh_late.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if sh_norm > 1e-12 {
-        for x in &mut sh_late {
-            *x /= sh_norm;
-        }
-        let (hl_hoa, hr_hoa) = magls.decode_sh_spectrum(&sh_late);
-        let tail_len = ((0.08 * fs).round() as usize).min(n_fft / 2);
-        let mut late_l = vec![0.0_f64; n_fft];
-        let mut late_r = vec![0.0_f64; n_fft];
-        if use_fdn_velvet {
+    let n_bins = 36usize; // 0..144 ms
+    let hist = raytrace_hoa_histogram(geom, atm, src_m, 1_024, 48, n_bins, bin_dt_s, seed);
+    let bin_energies: Vec<f64> = hist
+        .iter()
+        .map(|b| b.iter().map(|x| x * x).sum::<f64>().sqrt())
+        .collect();
+    let max_bin_e = bin_energies.iter().copied().fold(0.0_f64, f64::max);
+
+    if max_bin_e > 1e-12 {
+        let tail_len = ((0.144 * fs).round() as usize).min(n_fft / 2);
+        let (base_l, base_r) = if use_fdn_velvet {
             let mut fdn =
                 ScatteringFdn::new(fs as u32, geom.target_rt60_s, geom.target_rt60_s * 0.55);
             let (fl, fr) = fdn.synthesize_stereo_tail(tail_len);
             let vl = generate_velvet_noise(tail_len, fs as u32, 2_200.0, seed ^ 0xA1);
             let vr = generate_velvet_noise(tail_len, fs as u32, 2_200.0, seed ^ 0xB2);
-            let pre_smp = ((pre_delay_s + 0.012) * fs).round() as usize;
+            let mut bl = vec![0.0_f64; tail_len];
+            let mut br = vec![0.0_f64; tail_len];
             for i in 0..tail_len {
-                let dst = pre_smp + i;
-                if dst >= n_fft {
-                    break;
-                }
                 let env = (-6.907_755 * (i as f64) / (geom.target_rt60_s * fs)).exp();
-                late_l[dst] = 0.65 * fl[i] + 0.35 * vl[i] * env * 0.04;
-                late_r[dst] = 0.65 * fr[i] + 0.35 * vr[i] * env * 0.04;
+                bl[i] = 0.65 * fl[i] + 0.35 * vl[i] * env * 0.04;
+                br[i] = 0.65 * fr[i] + 0.35 * vr[i] * env * 0.04;
             }
+            (bl, br)
         } else {
             let vl = generate_velvet_noise(tail_len, fs as u32, 2_200.0, seed ^ 0xC3);
             let vr = generate_velvet_noise(tail_len, fs as u32, 2_200.0, seed ^ 0xD4);
-            let pre_smp = ((pre_delay_s + 0.015) * fs).round() as usize;
+            let mut bl = vec![0.0_f64; tail_len];
+            let mut br = vec![0.0_f64; tail_len];
             for i in 0..tail_len {
+                let env = (-6.907_755 * (i as f64) / (geom.target_rt60_s * fs)).exp();
+                bl[i] = vl[i] * env * 0.03;
+                br[i] = vr[i] * env * 0.03;
+            }
+            (bl, br)
+        };
+
+        const N_ZONES: usize = 4;
+        let bins_per_zone = n_bins / N_ZONES;
+        let pre_smp = ((pre_delay_s + 0.012) * fs).round() as usize;
+        let mut scratch = vec![Complex::ZERO; n_fft];
+        let mut sl_zone = vec![Complex::ZERO; nb];
+        let mut sr_zone = vec![Complex::ZERO; nb];
+        let mut zone_l = vec![0.0_f64; n_fft];
+        let mut zone_r = vec![0.0_f64; n_fft];
+
+        for z in 0..N_ZONES {
+            let b0 = z * bins_per_zone;
+            let b1 = if z + 1 == N_ZONES {
+                n_bins
+            } else {
+                (z + 1) * bins_per_zone
+            };
+            let mut sh_zone = [0.0_f64; HOA_CH];
+            for row in hist.iter().take(b1).skip(b0) {
+                for (acc, &val) in sh_zone.iter_mut().zip(row.iter()) {
+                    *acc += val;
+                }
+            }
+            let z_norm = sh_zone.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if z_norm <= 1e-12 {
+                continue;
+            }
+            for x in &mut sh_zone {
+                *x /= z_norm;
+            }
+            let (hl_hoa, hr_hoa) = magls.decode_sh_spectrum(&sh_zone);
+
+            zone_l.fill(0.0);
+            zone_r.fill(0.0);
+            let s0 = ((b0 as f64) * bin_dt_s * fs).round() as usize;
+            let s1 = (((b1 as f64) * bin_dt_s * fs).round() as usize).min(tail_len);
+            let xfade = ((0.004 * fs).round() as usize).max(16);
+            for i in s0..s1 {
                 let dst = pre_smp + i;
                 if dst >= n_fft {
                     break;
                 }
-                let env = (-6.907_755 * (i as f64) / (geom.target_rt60_s * fs)).exp();
-                late_l[dst] = vl[i] * env * 0.03;
-                late_r[dst] = vr[i] * env * 0.03;
+                let bin_idx = (((i as f64) / fs) / bin_dt_s).floor() as usize;
+                let e_rel = (bin_energies[bin_idx.min(n_bins - 1)] / max_bin_e)
+                    .sqrt()
+                    .clamp(0.15, 1.0);
+                // Raised-cosine zone edge fade prevents clicks between HOA spatial zones.
+                let mut win = 1.0_f64;
+                if z > 0 && i - s0 < xfade {
+                    win *= 0.5 * (1.0 - (PI * ((i - s0) as f64) / (xfade as f64)).cos());
+                }
+                if z + 1 < N_ZONES && s1 - i <= xfade {
+                    win *= 0.5 * (1.0 - (PI * ((s1 - i) as f64) / (xfade as f64)).cos());
+                }
+                zone_l[dst] = base_l[i] * e_rel * win;
+                zone_r[dst] = base_r[i] * e_rel * win;
             }
-        }
-        let mut scratch = vec![Complex::ZERO; n_fft];
-        let mut sl_late = vec![Complex::ZERO; nb];
-        let mut sr_late = vec![Complex::ZERO; nb];
-        plan.rfft(&late_l, &mut scratch, &mut sl_late);
-        plan.rfft(&late_r, &mut scratch, &mut sr_late);
-        for (k, &f) in freqs.iter().enumerate() {
-            let x_hp = f / 450.0;
-            let hp = (x_hp * x_hp) / (1.0 + x_hp * x_hp);
-            let air = atm.air_gain_linear(f, 4.0);
-            out_l[k] = out_l[k].add(sl_late[k].mul(hl_hoa[k]).scale(0.18 * hp * air));
-            out_r[k] = out_r[k].add(sr_late[k].mul(hr_hoa[k]).scale(0.18 * hp * air));
+
+            plan.rfft(&zone_l, &mut scratch, &mut sl_zone);
+            plan.rfft(&zone_r, &mut scratch, &mut sr_zone);
+            let zone_dist_m = d_dir + (0.5 * ((b0 + b1) as f64) * bin_dt_s) * c;
+            for (k, &f) in freqs.iter().enumerate() {
+                let x_hp = f / f_xover.max(200.0);
+                let hp = (x_hp * x_hp) / (1.0 + x_hp * x_hp);
+                let air = atm.air_gain_linear(f, zone_dist_m.min(60.0));
+                out_l[k] = out_l[k].add(sl_zone[k].mul(hl_hoa[k]).scale(0.18 * hp * air));
+                out_r[k] = out_r[k].add(sr_zone[k].mul(hr_hoa[k]).scale(0.18 * hp * air));
+            }
         }
     }
 
-    // 4. Layer 3 (< 500 Hz): Stitch reciprocal 3D FDTD modal response via LR4-like lowpass.
+    // 4. Layer 3 (< f_xover): Stitch reciprocal 3D FDTD modal response via 4th-order lowpass.
     if let (Some(fl_raw), Some(fr_raw)) = (fdtd_l_low, fdtd_r_low) {
         let mut td_l = vec![0.0_f64; n_fft];
         let mut td_r = vec![0.0_f64; n_fft];
-        let max_len = (0.08 * fs).round() as usize;
+        let max_len = (0.155 * fs).round() as usize;
         let pre_smp = (pre_delay_s * fs).round() as usize;
         // Resample FDTD time series from dt_s to 1/fs via linear interpolation & strip direct arrival.
         let peak_l = fl_raw
@@ -1218,8 +1375,8 @@ pub fn synthesize_hybrid_room_reflections(
         plan.rfft(&td_l, &mut scratch, &mut fl_spec);
         plan.rfft(&td_r, &mut scratch, &mut fr_spec);
         for (k, &f) in freqs.iter().enumerate() {
-            // 4th-order low-pass below 500 Hz (modal regime) and DC high-pass above 25 Hz.
-            let x_lp = f / 500.0;
+            // 4th-order low-pass below `f_xover` (modal regime) and DC high-pass above 25 Hz.
+            let x_lp = f / f_xover;
             let lp = 1.0 / (1.0 + x_lp * x_lp);
             let x_dc = f / 25.0;
             let dc = (x_dc * x_dc) / (1.0 + x_dc * x_dc);
@@ -1362,6 +1519,56 @@ mod tests {
         assert!(
             tot_w > 1e-6,
             "ray tracer recorded zero HOA W-channel energy"
+        );
+    }
+
+    #[test]
+    fn btm_svensson_wedge_angles_obey_helmholtz_reciprocity_and_fdtd_resolves_500hz() {
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let src: [f64; 3] = [4.35, 3.25, 1.30];
+        let rec: [f64; 3] = [2.55, 2.15, 1.15];
+        let d_dir =
+            ((src[0] - rec[0]).powi(2) + (src[1] - rec[1]).powi(2) + (src[2] - rec[2]).powi(2))
+                .sqrt();
+        let t_dir = d_dir / 344.854;
+        let mut ir_sr = vec![0.0_f64; 1024];
+        let mut ir_rs = vec![0.0_f64; 1024];
+        add_btm_edge_diffraction(
+            &geom.edges[0],
+            src,
+            rec,
+            344.854,
+            48_000,
+            t_dir,
+            0.005,
+            &mut ir_sr,
+        );
+        add_btm_edge_diffraction(
+            &geom.edges[0],
+            rec,
+            src,
+            344.854,
+            48_000,
+            t_dir,
+            0.005,
+            &mut ir_rs,
+        );
+        let max_diff = ir_sr
+            .iter()
+            .zip(&ir_rs)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-13,
+            "Svensson BTM diffraction violated Helmholtz reciprocity: max_diff={max_diff:e}"
+        );
+
+        let fdtd = FdtdSolver3d::for_room_budget(&geom, 344.854, 500.0, 65_000);
+        assert!(
+            fdtd.max_freq_6ppw(344.854) >= 499.0,
+            "ControlRoom FDTD 6-PPW bandwidth must reach 500 Hz, got {:.1} Hz (dx={:.3} m)",
+            fdtd.max_freq_6ppw(344.854),
+            fdtd.dx_m
         );
     }
 }

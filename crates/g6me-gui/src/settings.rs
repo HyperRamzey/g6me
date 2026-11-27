@@ -1119,4 +1119,38 @@ mod tests {
         assert_eq!(s.out_dir, PathBuf::from("/out"));
         assert!(!s.recursive);
     }
+
+    #[test]
+    fn physics_anatomy_and_external_assets_forward_to_render_cfg() {
+        let mut s = Settings {
+            renderer: RendererMode::Plus,
+            use_room_json: true,
+            room_json: PathBuf::from("/tmp/custom_room.json"),
+            use_head_mesh: true,
+            head_mesh: PathBuf::from("/tmp/myhead.obj"),
+            ..Settings::default()
+        };
+        s.plus.physics_engine = g6me_core::plus::PhysicsEngine::HankelSnowmanMagLs;
+        s.plus.room_preset = g6me_core::room::RoomPreset::ControlRoom;
+        s.plus.head_radius_m = 0.092;
+        s.plus.torso_height_m = 0.340;
+        s.plus.pinna_shelf_db = 1.5;
+        s.plus.exact_ntt = true;
+
+        let cfg = s.render_cfg();
+        assert_eq!(
+            cfg.plus.physics_engine,
+            g6me_core::plus::PhysicsEngine::HankelSnowmanMagLs
+        );
+        assert_eq!(
+            cfg.plus.room_preset,
+            g6me_core::room::RoomPreset::ControlRoom
+        );
+        assert!((cfg.plus.head_radius_m - 0.092).abs() < 1e-9);
+        assert!((cfg.plus.torso_height_m - 0.340).abs() < 1e-9);
+        assert!((cfg.plus.pinna_shelf_db - 1.5).abs() < 1e-9);
+        assert!(cfg.plus.exact_ntt);
+        assert_eq!(cfg.room_json, Some(PathBuf::from("/tmp/custom_room.json")));
+        assert_eq!(cfg.head_mesh, Some(PathBuf::from("/tmp/myhead.obj")));
+    }
 }

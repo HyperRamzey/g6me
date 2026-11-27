@@ -15,11 +15,16 @@
 //! 3. **Honesty Reporting**: flags `NewSubFileType = 16` (computational multi-frame LinearRaw
 //!    merge) and recommends single-exposure CFA Bayer or unmerged v7.0 `RAW10` burst dumps.
 //! 4. **v7.0 Zero-Copy 50MP MIPI `RAW10` + `meta.json` Sidecar**: unpacks CSI-2 packed 10-bit
-//!    `GBRG` frames (`8160×6120`, stride `10200`, `black_level = 256`, `white_level = 4095`),
-//!    enforces the **Distinct-Frame Gate** (SHA-256 uniqueness across all 6 frames + valid
-//!    10-bit GBRG distribution) and **Clock-Bracket Gate** (`SENSOR_INFO_TIMESTAMP_SOURCE == 1`,
-//!    `rolling_shutter_skew > 20 ms`, 400+ Hz uncalibrated IMU strictly bracketing the burst),
-//!    and supports stealing factory `OpcodeList3` from a single `reference_lens56_opcodes.dng`.
+//!    `GBRG` frames (`8160×6120`, stride `10200`, 10-bit range `0..=1023`, e.g. `black_level = 64`,
+//!    `white_level = 1023`), enforces the **Distinct-Frame Gate** (SHA-256 uniqueness across all
+//!    burst frames + valid 10-bit GBRG distribution) and **Clock-Bracket Gate**
+//!    (`SENSOR_INFO_TIMESTAMP_SOURCE == 1`, `rolling_shutter_skew > 20 ms`, 400+ Hz uncalibrated
+//!    IMU strictly bracketing the burst), and supports stealing factory `OpcodeList3` from a
+//!    single `reference_lens56_opcodes.dng`.
+//! 5. **Real Pixel Decode**: decodes Uncompressed (`Compression = 1`, 8/10/12/14/16-bit) and
+//!    Lossless JPEG (`Compression = 7`, ITU-T T.81 SOF3 Huffman + predictors 1..7) strips and
+//!    tiles natively in pure Rust. JPEG-XL (`Compression = 52546`) headers and `OpcodeList2/3`
+//!    parse fully, while pixel decode returns an explicit diagnostic (no silent synthetic fallback).
 
 use std::fs;
 use std::path::Path;
@@ -39,12 +44,24 @@ pub const TAG_IMAGE_LENGTH: u16 = 257;
 pub const TAG_BITS_PER_SAMPLE: u16 = 258;
 pub const TAG_COMPRESSION: u16 = 259;
 pub const TAG_PHOTOMETRIC: u16 = 262;
+pub const TAG_STRIP_OFFSETS: u16 = 273;
+pub const TAG_SAMPLES_PER_PIXEL: u16 = 277;
+pub const TAG_ROWS_PER_STRIP: u16 = 278;
+pub const TAG_STRIP_BYTE_COUNTS: u16 = 279;
+pub const TAG_TILE_WIDTH: u16 = 322;
+pub const TAG_TILE_LENGTH: u16 = 323;
+pub const TAG_TILE_OFFSETS: u16 = 324;
+pub const TAG_TILE_BYTE_COUNTS: u16 = 325;
 pub const TAG_SUB_IFDS: u16 = 330;
 pub const TAG_CFA_REPEAT_PATTERN_DIM: u16 = 33421;
 pub const TAG_CFA_PATTERN: u16 = 33422;
 pub const TAG_DNG_VERSION: u16 = 50706;
 pub const TAG_BLACK_LEVEL: u16 = 50714;
 pub const TAG_WHITE_LEVEL: u16 = 50717;
+pub const TAG_DEFAULT_CROP_ORIGIN: u16 = 50719;
+pub const TAG_DEFAULT_CROP_SIZE: u16 = 50720;
+pub const TAG_ACTIVE_AREA: u16 = 50829;
+pub const TAG_OPCODE_LIST_1: u16 = 51008;
 pub const TAG_OPCODE_LIST_2: u16 = 51009;
 pub const TAG_OPCODE_LIST_3: u16 = 51022;
 
@@ -340,12 +357,45 @@ pub struct DngMetadata {
 }
 
 impl DngMetadata {
-    /// Format the classic diagnostic DNG Ingest Honesty Report.
-    pub fn honesty_report(
+    /// Measure actual analytical lateral chromatic aberration cancellation residual (in pixels)
+    /// across a deterministic grid of off-axis rays using the parsed `WarpRectilinear` opcode.
+    /// Returns `None` if no multi-plane `WarpRectilinear` opcode is present.
+    pub fn measure_analytical_ca_residual_px(&self) -> Option<f64> {
+        let warp = self.warp_rectilinear.as_ref()?;
+        if warp.planes.len() < 2 || self.main_width == 0 || self.main_height == 0 {
+            return None;
+        }
+        let w = self.main_width as f64;
+        let h = self.main_height as f64;
+        let cx = warp.cx_hat * w;
+        let cy = warp.cy_hat * h;
+        let m = cx.max(w - cx).hypot(cy.max(h - cy)).max(1e-12);
+        let test_rays = [(0.25, 0.20), (-0.35, 0.25), (0.40, -0.30), (-0.45, -0.35)];
+        let mut max_err = 0.0_f64;
+        for &(ux, uy) in &test_rays {
+            let (gx, gy) = warp.distort_norm(ux, uy, 1);
+            let g_px = (cx + gx * m, cy + gy * m);
+            for plane in [0usize, 2usize] {
+                if plane >= warp.planes.len() {
+                    continue;
+                }
+                let (px_n, py_n) = warp.distort_norm(ux, uy, plane);
+                let (corr_x, corr_y) =
+                    warp.cancel_lateral_ca_px(cx + px_n * m, cy + py_n * m, w, h, plane);
+                max_err = max_err.max((corr_x - g_px.0).hypot(corr_y - g_px.1));
+            }
+        }
+        Some(max_err)
+    }
+
+    /// Format an honest DNG Ingest Report for single-file or multi-file inspection
+    /// (computes CA residual directly from parsed `WarpRectilinear`, and reports `N/A` for
+    /// Bundle Adjustment VCM focus breathing when BA has not yet been executed).
+    pub fn honesty_report_measured(
         &self,
         capture_count: usize,
-        vcm_breathing_pct: f64,
-        ca_residual_px: f64,
+        vcm_breathing_pct: Option<f64>,
+        ca_residual_px: Option<f64>,
     ) -> String {
         let mode_str = match (self.photometric, self.compression) {
             (PHOTOMETRIC_LINEAR_RAW, COMPRESSION_JPEG_XL) => "LinearRaw JXL",
@@ -356,9 +406,14 @@ impl DngMetadata {
             (PHOTOMETRIC_CFA, _) => "CFA Bayer",
             _ => "RAW",
         };
+        let ver_str = if self.dng_version == [0, 0, 0, 0] {
+            "TIFF (no DNGVersion tag)".to_string()
+        } else {
+            format!("DNG {}.{}", self.dng_version[0], self.dng_version[1])
+        };
         let mut s = format!(
-            "=== DNG Ingest ({capture_count} captures, DNG {}.{}, {}x{} {mode_str}) ===\n",
-            self.dng_version[0], self.dng_version[1], self.main_width, self.main_height
+            "=== DNG Ingest ({capture_count} captures, {ver_str}, {}x{} {mode_str}) ===\n",
+            self.main_width, self.main_height
         );
         if self.subifd_routed {
             s.push_str(&format!(
@@ -392,12 +447,30 @@ impl DngMetadata {
         s.push_str(&format!(
             "  OpcodeList2/3   : {op_gm} + {op_vig} + {op_warp}\n"
         ));
-        s.push_str(&format!(
-            "  Pixel Integrity : 0 resampled pixels — WarpRectilinear evaluated analytically on f64 rays; RGB lateral CA cancelled (<{ca_residual_px:.4} px)\n"
-        ));
-        s.push_str(&format!(
-            "  VCM Breathing   : OpcodeList3 polynomial used as Tikhonov prior; per-frame focus breathing refined in Ozaki-II FP4->FP64 BA (+-{vcm_breathing_pct:.2}% f)\n"
-        ));
+        let measured_ca = ca_residual_px.or_else(|| self.measure_analytical_ca_residual_px());
+        match measured_ca {
+            Some(ca) => s.push_str(&format!(
+                "  Pixel Integrity : 0 resampled pixels — WarpRectilinear evaluated analytically on f64 rays; RGB lateral CA residual={ca:.2e} px\n"
+            )),
+            None => s.push_str(
+                "  Pixel Integrity : 0 resampled pixels — no multi-plane WarpRectilinear opcode present in file\n",
+            ),
+        }
+        match vcm_breathing_pct {
+            Some(vcm) => s.push_str(&format!(
+                "  VCM Breathing   : OpcodeList3 polynomial used as Tikhonov prior; per-frame focus breathing refined in Ozaki-II FP4->FP64 BA (+-{vcm:.2}% f)\n"
+            )),
+            None => s.push_str(
+                "  VCM Breathing   : N/A (single-file inspect — requires multi-view Bundle Adjustment)\n",
+            ),
+        }
+        if self.compression == COMPRESSION_JPEG_XL {
+            s.push_str("  Pixel Codec     : Compression=52546 (JPEG-XL) — headers & OpcodeList2/3 parsed natively; JXL tile pixel decode requires converting to Lossless JPEG / Uncompressed DNG or using v7.0 RAW10 burst.\n");
+        } else if self.compression == COMPRESSION_LOSSLESS_JPEG {
+            s.push_str("  Pixel Codec     : Compression=7 (Lossless JPEG SOF3) — native pure-Rust pixel decode supported.\n");
+        } else if self.compression == COMPRESSION_UNCOMPRESSED {
+            s.push_str("  Pixel Codec     : Compression=1 (Uncompressed RAW) — native pure-Rust pixel decode supported.\n");
+        }
         if self.new_subfile_type == 16 {
             s.push_str("  Honesty Note    : NewSubFileType=16 (multi-frame LinearRaw merge). Lock shutter >= 1/250s or use single-exposure CFA / v7.0 unmerged RAW10 burst to avoid burst micro-parallax.\n");
         } else if self.photometric == PHOTOMETRIC_CFA {
@@ -405,6 +478,48 @@ impl DngMetadata {
         }
         s
     }
+
+    /// Format the classic diagnostic DNG Ingest Honesty Report with explicit BA measurements.
+    pub fn honesty_report(
+        &self,
+        capture_count: usize,
+        vcm_breathing_pct: f64,
+        ca_residual_px: f64,
+    ) -> String {
+        self.honesty_report_measured(capture_count, Some(vcm_breathing_pct), Some(ca_residual_px))
+    }
+}
+
+/// Physical pixel-storage layout parsed from the selected TIFF/DNG IFD (strips or tiles).
+#[derive(Debug, Clone)]
+pub struct DngPixelLayout {
+    pub little_endian: bool,
+    pub samples_per_pixel: u16,
+    pub bits_per_sample_per_ch: Vec<u16>,
+    pub black_levels: Vec<f64>,
+    pub white_levels: Vec<f64>,
+    pub rows_per_strip: u32,
+    pub strip_offsets: Vec<u32>,
+    pub strip_byte_counts: Vec<u32>,
+    pub tile_width: u32,
+    pub tile_length: u32,
+    pub tile_offsets: Vec<u32>,
+    pub tile_byte_counts: Vec<u32>,
+    pub active_area: Option<[u32; 4]>,
+    pub default_crop_origin: Option<[f64; 2]>,
+    pub default_crop_size: Option<[f64; 2]>,
+}
+
+/// Decoded linear `f64` image extracted from a DNG file (with GainMap + Vignette applied).
+#[derive(Debug, Clone)]
+pub struct DecodedDngImage {
+    pub meta: DngMetadata,
+    pub width: usize,
+    pub height: usize,
+    /// Linear RGB pixels `[R, G, B]` in `[0.0, 1.0+]` (demosaiced via Malvar-He-Cutler if CFA).
+    pub rgb: Vec<[f64; 3]>,
+    /// Linear luminance `0.2126 R + 0.7152 G + 0.0722 B` for geometric feature/card detection.
+    pub luma: Vec<f64>,
 }
 
 // ============================================================================
@@ -476,7 +591,11 @@ fn read_be_f64(buf: &[u8], off: usize) -> Result<f64> {
     ]))
 }
 
-fn parse_ifd(buf: &[u8], offset: usize, le: bool) -> Result<Vec<TiffEntry>> {
+fn read_i32(buf: &[u8], off: usize, le: bool) -> Result<i32> {
+    Ok(read_u32(buf, off, le)? as i32)
+}
+
+fn parse_ifd_with_next(buf: &[u8], offset: usize, le: bool) -> Result<(Vec<TiffEntry>, usize)> {
     let n = read_u16(buf, offset, le)? as usize;
     let mut entries = Vec::with_capacity(n);
     for i in 0..n {
@@ -497,43 +616,16 @@ fn parse_ifd(buf: &[u8], offset: usize, le: bool) -> Result<Vec<TiffEntry>> {
             raw_value_bytes,
         });
     }
-    Ok(entries)
+    let next_off_pos = offset + 2 + n * 12;
+    let next_ifd = if next_off_pos + 4 <= buf.len() {
+        read_u32(buf, next_off_pos, le)? as usize
+    } else {
+        0
+    };
+    Ok((entries, next_ifd))
 }
 
-fn entry_scalar_u32(buf: &[u8], e: &TiffEntry, le: bool) -> Result<u32> {
-    match e.typ {
-        3 => {
-            // SHORT
-            if e.count <= 2 {
-                Ok(if le {
-                    u16::from_le_bytes([e.raw_value_bytes[0], e.raw_value_bytes[1]]) as u32
-                } else {
-                    u16::from_be_bytes([e.raw_value_bytes[0], e.raw_value_bytes[1]]) as u32
-                })
-            } else {
-                Ok(read_u16(buf, e.value_offset as usize, le)? as u32)
-            }
-        }
-        4 => {
-            // LONG
-            if e.count <= 1 {
-                Ok(e.value_offset)
-            } else {
-                read_u32(buf, e.value_offset as usize, le)
-            }
-        }
-        5 => {
-            // RATIONAL
-            let off = e.value_offset as usize;
-            let num = read_u32(buf, off, le)?;
-            let den = read_u32(buf, off + 4, le)?.max(1);
-            Ok(num / den)
-        }
-        _ => Ok(e.value_offset),
-    }
-}
-
-fn entry_bytes<'a>(buf: &'a [u8], e: &TiffEntry) -> Result<&'a [u8]> {
+fn entry_bytes<'a>(buf: &'a [u8], e: &'a TiffEntry) -> Result<&'a [u8]> {
     let type_size: usize = match e.typ {
         1 | 2 | 6 | 7 => 1,
         3 | 8 => 2,
@@ -542,8 +634,11 @@ fn entry_bytes<'a>(buf: &'a [u8], e: &TiffEntry) -> Result<&'a [u8]> {
         _ => 1,
     };
     let total = (e.count as usize).saturating_mul(type_size);
+    if total <= 4 {
+        return Ok(&e.raw_value_bytes[..total]);
+    }
     let off = e.value_offset as usize;
-    if off + total > buf.len() {
+    if off.saturating_add(total) > buf.len() {
         return Err(Error::msg(format!(
             "TIFF tag {} payload ({} bytes at {}) exceeds file size {}",
             e.tag,
@@ -553,6 +648,116 @@ fn entry_bytes<'a>(buf: &'a [u8], e: &TiffEntry) -> Result<&'a [u8]> {
         )));
     }
     Ok(&buf[off..(off + total)])
+}
+
+fn entry_u32_vec(buf: &[u8], e: &TiffEntry, le: bool) -> Result<Vec<u32>> {
+    let raw = entry_bytes(buf, e)?;
+    let n = e.count as usize;
+    let mut out = Vec::with_capacity(n);
+    match e.typ {
+        1 | 6 | 7 => {
+            for &b in raw.iter().take(n) {
+                out.push(b as u32);
+            }
+        }
+        3 | 8 => {
+            for i in 0..n {
+                out.push(read_u16(raw, i * 2, le)? as u32);
+            }
+        }
+        4 | 9 => {
+            for i in 0..n {
+                out.push(read_u32(raw, i * 4, le)?);
+            }
+        }
+        5 => {
+            for i in 0..n {
+                let num = read_u32(raw, i * 8, le)? as f64;
+                let den = (read_u32(raw, i * 8 + 4, le)?).max(1) as f64;
+                out.push((num / den).round().max(0.0) as u32);
+            }
+        }
+        _ => out.push(e.value_offset),
+    }
+    Ok(out)
+}
+
+fn entry_f64_vec(buf: &[u8], e: &TiffEntry, le: bool) -> Result<Vec<f64>> {
+    let raw = entry_bytes(buf, e)?;
+    let n = e.count as usize;
+    let mut out = Vec::with_capacity(n);
+    match e.typ {
+        1 | 7 => {
+            for &b in raw.iter().take(n) {
+                out.push(b as f64);
+            }
+        }
+        3 => {
+            for i in 0..n {
+                out.push(read_u16(raw, i * 2, le)? as f64);
+            }
+        }
+        4 => {
+            for i in 0..n {
+                out.push(read_u32(raw, i * 4, le)? as f64);
+            }
+        }
+        5 => {
+            for i in 0..n {
+                let num = read_u32(raw, i * 8, le)? as f64;
+                let den = (read_u32(raw, i * 8 + 4, le)?).max(1) as f64;
+                out.push(num / den);
+            }
+        }
+        8 => {
+            for i in 0..n {
+                out.push((read_u16(raw, i * 2, le)? as i16) as f64);
+            }
+        }
+        9 => {
+            for i in 0..n {
+                out.push(read_i32(raw, i * 4, le)? as f64);
+            }
+        }
+        10 => {
+            for i in 0..n {
+                let num = read_i32(raw, i * 8, le)? as f64;
+                let den = read_i32(raw, i * 8 + 4, le)?;
+                let den = if den == 0 { 1.0 } else { den as f64 };
+                out.push(num / den);
+            }
+        }
+        11 => {
+            for i in 0..n {
+                let b = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]];
+                let v = if le {
+                    f32::from_le_bytes(b)
+                } else {
+                    f32::from_be_bytes(b)
+                };
+                out.push(v as f64);
+            }
+        }
+        12 => {
+            for i in 0..n {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&raw[i * 8..i * 8 + 8]);
+                let v = if le {
+                    f64::from_le_bytes(b)
+                } else {
+                    f64::from_be_bytes(b)
+                };
+                out.push(v);
+            }
+        }
+        _ => out.push(e.value_offset as f64),
+    }
+    Ok(out)
+}
+
+fn entry_scalar_u32(buf: &[u8], e: &TiffEntry, le: bool) -> Result<u32> {
+    let v = entry_u32_vec(buf, e, le)?;
+    Ok(v.first().copied().unwrap_or(0))
 }
 
 /// Parse a DNG `OpcodeList` binary blob (big-endian per DNG 1.7 specification).
@@ -676,9 +881,10 @@ fn parse_opcode_list(
     Ok(())
 }
 
-/// Parse a binary TIFF/DNG 1.7 file buffer, bypassing the IFD0 preview thumbnail trap to
-/// select the high-resolution `SubIFD` payload and extracting all `OpcodeList2/3` polynomials.
-pub fn parse_dng_bytes(buf: &[u8]) -> Result<DngMetadata> {
+/// Parse a binary TIFF/DNG 1.7 file buffer, returning both optical calibration metadata and
+/// physical strip/tile pixel layout. Walks chained IFDs and `SubIFD`s (Tag 330) to bypass
+/// low-resolution `IFD0` thumbnails.
+pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)> {
     if buf.len() < 8 {
         return Err(Error::msg("DNG buffer too short (< 8 bytes)"));
     }
@@ -694,53 +900,107 @@ pub fn parse_dng_bytes(buf: &[u8]) -> Result<DngMetadata> {
         )));
     }
     let ifd0_off = read_u32(buf, 4, le)? as usize;
-    let ifd0 = parse_ifd(buf, ifd0_off, le)?;
+    let (ifd0, mut next_ifd) = parse_ifd_with_next(buf, ifd0_off, le)?;
 
-    let mut dng_version = [1, 7, 0, 0];
+    let mut dng_version = [0, 0, 0, 0];
     let mut preview_w = 0u32;
     let mut preview_h = 0u32;
-    let mut subifd_offsets = Vec::new();
+    let mut candidate_ifds: Vec<(Vec<TiffEntry>, bool)> = Vec::new();
+    let mut visited_offsets = vec![ifd0_off];
+
+    let collect_subifds = |entries: &[TiffEntry], out_offsets: &mut Vec<usize>| {
+        for e in entries {
+            if e.tag == TAG_SUB_IFDS {
+                if let Ok(offs) = entry_u32_vec(buf, e, le) {
+                    for o in offs {
+                        let ou = o as usize;
+                        if ou > 0 && ou < buf.len() && !out_offsets.contains(&ou) {
+                            out_offsets.push(ou);
+                        }
+                    }
+                }
+            }
+        }
+    };
 
     for e in &ifd0 {
         match e.tag {
             TAG_DNG_VERSION => dng_version = e.raw_value_bytes,
             TAG_IMAGE_WIDTH => preview_w = entry_scalar_u32(buf, e, le)?,
             TAG_IMAGE_LENGTH => preview_h = entry_scalar_u32(buf, e, le)?,
-            TAG_SUB_IFDS => {
-                if e.count <= 1 {
-                    subifd_offsets.push(e.value_offset as usize);
-                } else {
-                    for i in 0..(e.count as usize) {
-                        subifd_offsets
-                            .push(read_u32(buf, e.value_offset as usize + i * 4, le)? as usize);
-                    }
-                }
-            }
             _ => {}
         }
     }
 
-    // Choose the largest-resolution SubIFD (bypassing IFD0 preview trap!).
+    let mut subifd_offsets = Vec::new();
+    collect_subifds(&ifd0, &mut subifd_offsets);
+
+    // Walk chained top-level IFDs (some real cameras store full RAW in IFD1 rather than SubIFD).
+    let mut chain_steps = 0usize;
+    while next_ifd != 0 && next_ifd < buf.len() && chain_steps < 16 {
+        chain_steps += 1;
+        if visited_offsets.contains(&next_ifd) {
+            break;
+        }
+        visited_offsets.push(next_ifd);
+        match parse_ifd_with_next(buf, next_ifd, le) {
+            Ok((chained, nxt)) => {
+                collect_subifds(&chained, &mut subifd_offsets);
+                candidate_ifds.push((chained, true));
+                next_ifd = nxt;
+            }
+            Err(_) => break,
+        }
+    }
+
+    for off in subifd_offsets {
+        if visited_offsets.contains(&off) {
+            continue;
+        }
+        visited_offsets.push(off);
+        if let Ok((sub, _)) = parse_ifd_with_next(buf, off, le) {
+            candidate_ifds.push((sub, true));
+        }
+    }
+
+    // Select the highest-resolution full RAW IFD (preferring full-res CFA/LinearRaw over preview).
+    let score_ifd = |entries: &[TiffEntry]| -> (u8, u64) {
+        let mut w = 0u32;
+        let mut h = 0u32;
+        let mut phot = 0u16;
+        let mut subfile = 0u32;
+        for e in entries {
+            match e.tag {
+                TAG_IMAGE_WIDTH => w = entry_scalar_u32(buf, e, le).unwrap_or(0),
+                TAG_IMAGE_LENGTH => h = entry_scalar_u32(buf, e, le).unwrap_or(0),
+                TAG_PHOTOMETRIC => phot = entry_scalar_u32(buf, e, le).unwrap_or(0) as u16,
+                TAG_NEW_SUBFILE_TYPE => subfile = entry_scalar_u32(buf, e, le).unwrap_or(0),
+                _ => {}
+            }
+        }
+        let is_raw = matches!(phot, PHOTOMETRIC_CFA | PHOTOMETRIC_LINEAR_RAW);
+        let is_thumb = (subfile & 1) != 0;
+        let prio = if is_raw && !is_thumb {
+            3
+        } else if !is_thumb {
+            2
+        } else if is_raw {
+            1
+        } else {
+            0
+        };
+        (prio, (w as u64) * (h as u64))
+    };
+
     let mut chosen = ifd0.clone();
     let mut subifd_routed = false;
-    let mut best_pixels = 0u64;
-    for off in subifd_offsets {
-        if let Ok(sub) = parse_ifd(buf, off, le) {
-            let mut w = 0u32;
-            let mut h = 0u32;
-            for e in &sub {
-                if e.tag == TAG_IMAGE_WIDTH {
-                    w = entry_scalar_u32(buf, e, le).unwrap_or(0);
-                } else if e.tag == TAG_IMAGE_LENGTH {
-                    h = entry_scalar_u32(buf, e, le).unwrap_or(0);
-                }
-            }
-            let px = (w as u64) * (h as u64);
-            if px > best_pixels {
-                best_pixels = px;
-                chosen = sub;
-                subifd_routed = true;
-            }
+    let mut best_score = score_ifd(&ifd0);
+    for (cand, is_sub) in candidate_ifds {
+        let sc = score_ifd(&cand);
+        if sc.1 > 0 && (sc.0 > best_score.0 || (sc.0 == best_score.0 && sc.1 > best_score.1)) {
+            best_score = sc;
+            chosen = cand;
+            subifd_routed = is_sub;
         }
     }
 
@@ -763,10 +1023,33 @@ pub fn parse_dng_bytes(buf: &[u8]) -> Result<DngMetadata> {
         warp_rectilinear: None,
     };
 
-    // Inspect both chosen SubIFD and IFD0 (some cameras place OpcodeList on SubIFD, some on IFD0).
-    for e in ifd0.iter().chain(chosen.iter()) {
+    let mut layout = DngPixelLayout {
+        little_endian: le,
+        samples_per_pixel: 1,
+        bits_per_sample_per_ch: vec![16],
+        black_levels: vec![0.0],
+        white_levels: vec![65535.0],
+        rows_per_strip: 0,
+        strip_offsets: Vec::new(),
+        strip_byte_counts: Vec::new(),
+        tile_width: 0,
+        tile_length: 0,
+        tile_offsets: Vec::new(),
+        tile_byte_counts: Vec::new(),
+        active_area: None,
+        default_crop_origin: None,
+        default_crop_size: None,
+    };
+
+    // Inspect both IFD0 and chosen SubIFD for OpcodeList1/2/3 (avoid duplicate parsing if same).
+    let op_entries: Vec<&TiffEntry> = if subifd_routed {
+        ifd0.iter().chain(chosen.iter()).collect()
+    } else {
+        chosen.iter().collect()
+    };
+    for e in op_entries {
         match e.tag {
-            TAG_OPCODE_LIST_2 | TAG_OPCODE_LIST_3 => {
+            TAG_OPCODE_LIST_1 | TAG_OPCODE_LIST_2 | TAG_OPCODE_LIST_3 => {
                 if let Ok(blob) = entry_bytes(buf, e) {
                     parse_opcode_list(
                         blob,
@@ -779,24 +1062,86 @@ pub fn parse_dng_bytes(buf: &[u8]) -> Result<DngMetadata> {
             _ => {}
         }
     }
+
     for e in &chosen {
         match e.tag {
             TAG_NEW_SUBFILE_TYPE => meta.new_subfile_type = entry_scalar_u32(buf, e, le)?,
             TAG_IMAGE_WIDTH => meta.main_width = entry_scalar_u32(buf, e, le)?,
             TAG_IMAGE_LENGTH => meta.main_height = entry_scalar_u32(buf, e, le)?,
-            TAG_BITS_PER_SAMPLE => meta.bits_per_sample = entry_scalar_u32(buf, e, le)? as u16,
+            TAG_BITS_PER_SAMPLE => {
+                let vals = entry_u32_vec(buf, e, le)?;
+                if let Some(&first) = vals.first() {
+                    meta.bits_per_sample = first as u16;
+                }
+                if !vals.is_empty() {
+                    layout.bits_per_sample_per_ch = vals.into_iter().map(|v| v as u16).collect();
+                }
+            }
+            TAG_SAMPLES_PER_PIXEL => {
+                layout.samples_per_pixel = entry_scalar_u32(buf, e, le)?.max(1) as u16;
+            }
             TAG_COMPRESSION => meta.compression = entry_scalar_u32(buf, e, le)? as u16,
             TAG_PHOTOMETRIC => meta.photometric = entry_scalar_u32(buf, e, le)? as u16,
-            TAG_BLACK_LEVEL => meta.black_level = entry_scalar_u32(buf, e, le)? as f64,
-            TAG_WHITE_LEVEL => meta.white_level = entry_scalar_u32(buf, e, le)? as f64,
+            TAG_BLACK_LEVEL => {
+                let vals = entry_f64_vec(buf, e, le)?;
+                if !vals.is_empty() {
+                    meta.black_level = vals.iter().sum::<f64>() / (vals.len() as f64);
+                    layout.black_levels = vals;
+                }
+            }
+            TAG_WHITE_LEVEL => {
+                let vals = entry_f64_vec(buf, e, le)?;
+                if !vals.is_empty() {
+                    meta.white_level = vals.iter().sum::<f64>() / (vals.len() as f64);
+                    layout.white_levels = vals;
+                }
+            }
             TAG_CFA_PATTERN => {
-                meta.cfa_pattern = Some(CfaPattern::from_bytes(e.raw_value_bytes));
+                let b = entry_bytes(buf, e)?;
+                if b.len() >= 4 {
+                    meta.cfa_pattern = Some(CfaPattern::from_bytes([b[0], b[1], b[2], b[3]]));
+                }
+            }
+            TAG_STRIP_OFFSETS => layout.strip_offsets = entry_u32_vec(buf, e, le)?,
+            TAG_ROWS_PER_STRIP => layout.rows_per_strip = entry_scalar_u32(buf, e, le)?,
+            TAG_STRIP_BYTE_COUNTS => layout.strip_byte_counts = entry_u32_vec(buf, e, le)?,
+            TAG_TILE_WIDTH => layout.tile_width = entry_scalar_u32(buf, e, le)?,
+            TAG_TILE_LENGTH => layout.tile_length = entry_scalar_u32(buf, e, le)?,
+            TAG_TILE_OFFSETS => layout.tile_offsets = entry_u32_vec(buf, e, le)?,
+            TAG_TILE_BYTE_COUNTS => layout.tile_byte_counts = entry_u32_vec(buf, e, le)?,
+            TAG_ACTIVE_AREA => {
+                let vals = entry_u32_vec(buf, e, le)?;
+                if vals.len() >= 4 {
+                    layout.active_area = Some([vals[0], vals[1], vals[2], vals[3]]);
+                }
+            }
+            TAG_DEFAULT_CROP_ORIGIN => {
+                let vals = entry_f64_vec(buf, e, le)?;
+                if vals.len() >= 2 {
+                    layout.default_crop_origin = Some([vals[0], vals[1]]);
+                }
+            }
+            TAG_DEFAULT_CROP_SIZE => {
+                let vals = entry_f64_vec(buf, e, le)?;
+                if vals.len() >= 2 {
+                    layout.default_crop_size = Some([vals[0], vals[1]]);
+                }
             }
             _ => {}
         }
     }
 
-    Ok(meta)
+    if layout.rows_per_strip == 0 {
+        layout.rows_per_strip = meta.main_height;
+    }
+
+    Ok((meta, layout))
+}
+
+/// Parse a binary TIFF/DNG 1.7 file buffer, bypassing the IFD0 preview thumbnail trap to
+/// select the high-resolution `SubIFD` payload and extracting all `OpcodeList2/3` polynomials.
+pub fn parse_dng_bytes(buf: &[u8]) -> Result<DngMetadata> {
+    parse_dng_with_layout(buf).map(|(m, _)| m)
 }
 
 /// Parse a DNG 1.7 file from disk (including stealing `OpcodeList3` from `reference_lens56_opcodes.dng`).
@@ -804,6 +1149,1037 @@ pub fn parse_dng_file(path: &Path) -> Result<DngMetadata> {
     let bytes = fs::read(path)
         .map_err(|e| Error::msg(format!("cannot read DNG `{}`: {e}", path.display())))?;
     parse_dng_bytes(&bytes)
+}
+
+// ============================================================================
+// 2b. Native DNG Pixel Decoding (Uncompressed Strips/Tiles & ITU-T T.81 SOF3 Lossless JPEG)
+// ============================================================================
+
+#[derive(Default, Clone)]
+struct LjpegHuffTable {
+    /// For each bit-length `1..=16`, `(max_code_exclusive, val_offset)` in `values`.
+    min_code: [i32; 17],
+    max_code: [i32; 17],
+    val_ptr: [usize; 17],
+    values: Vec<u8>,
+    valid: bool,
+}
+
+impl LjpegHuffTable {
+    fn from_counts(counts: &[u8; 16], values: Vec<u8>) -> Self {
+        let mut t = Self {
+            min_code: [0; 17],
+            max_code: [-1; 17],
+            val_ptr: [0; 17],
+            values,
+            valid: true,
+        };
+        let mut code = 0i32;
+        let mut idx = 0usize;
+        for bits in 1..=16 {
+            let n = counts[bits - 1] as usize;
+            if n > 0 {
+                t.val_ptr[bits] = idx;
+                t.min_code[bits] = code;
+                t.max_code[bits] = code + (n as i32) - 1;
+                code += n as i32;
+                idx += n;
+            }
+            code <<= 1;
+        }
+        t
+    }
+}
+
+struct JpegBitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bit_buf: u64,
+    bit_cnt: u32,
+}
+
+impl<'a> JpegBitReader<'a> {
+    fn new(data: &'a [u8], pos: usize) -> Self {
+        Self {
+            data,
+            pos,
+            bit_buf: 0,
+            bit_cnt: 0,
+        }
+    }
+
+    fn refill(&mut self, need: u32) -> Result<()> {
+        while self.bit_cnt < need {
+            if self.pos >= self.data.len() {
+                // Pad trailing bits with zeros at end of scan per JPEG spec.
+                self.bit_buf <<= 8;
+                self.bit_cnt += 8;
+                continue;
+            }
+            let b = self.data[self.pos];
+            self.pos += 1;
+            if b == 0xFF && self.pos < self.data.len() {
+                let next = self.data[self.pos];
+                if next == 0x00 {
+                    // Stuffed literal 0xFF byte.
+                    self.pos += 1;
+                } else if (0xD0..=0xD7).contains(&next) {
+                    // Restart marker encountered inside scan: skip it cleanly.
+                    self.pos += 1;
+                    continue;
+                } else {
+                    // Other marker (e.g. EOI): rewind so marker parser sees it, pad 0.
+                    self.pos -= 1;
+                    self.bit_buf <<= 8;
+                    self.bit_cnt += 8;
+                    continue;
+                }
+            }
+            self.bit_buf = (self.bit_buf << 8) | (b as u64);
+            self.bit_cnt += 8;
+        }
+        Ok(())
+    }
+
+    fn read_bits(&mut self, n: u32) -> Result<u32> {
+        if n == 0 {
+            return Ok(0);
+        }
+        self.refill(n)?;
+        self.bit_cnt -= n;
+        let mask = (1u64 << n) - 1;
+        Ok(((self.bit_buf >> self.bit_cnt) & mask) as u32)
+    }
+
+    fn decode_huff(&mut self, table: &LjpegHuffTable) -> Result<u8> {
+        if !table.valid {
+            return Err(Error::msg(
+                "Lossless JPEG referenced undefined Huffman table",
+            ));
+        }
+        let mut code = 0i32;
+        for bits in 1..=16 {
+            code = (code << 1) | (self.read_bits(1)? as i32);
+            if table.max_code[bits] >= 0 && code <= table.max_code[bits] {
+                let idx = table.val_ptr[bits] + (code - table.min_code[bits]) as usize;
+                return table
+                    .values
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| Error::msg("Lossless JPEG Huffman index out of range"));
+            }
+        }
+        Err(Error::msg("Lossless JPEG invalid Huffman codeword"))
+    }
+
+    fn decode_diff(&mut self, table: &LjpegHuffTable) -> Result<i32> {
+        let ssss = self.decode_huff(table)? as u32;
+        if ssss == 0 {
+            return Ok(0);
+        }
+        if ssss == 16 {
+            return Ok(-32768);
+        }
+        if ssss > 16 {
+            return Err(Error::msg(format!(
+                "Lossless JPEG invalid category ssss={ssss}"
+            )));
+        }
+        let bits = self.read_bits(ssss)? as i32;
+        let half = 1i32 << (ssss - 1);
+        if bits < half {
+            Ok(bits - ((1i32 << ssss) - 1))
+        } else {
+            Ok(bits)
+        }
+    }
+
+    fn align_and_skip_rst(&mut self) {
+        self.bit_cnt = 0;
+        self.bit_buf = 0;
+        while self.pos + 1 < self.data.len() && self.data[self.pos] == 0xFF {
+            let m = self.data[self.pos + 1];
+            if m == 0xFF {
+                self.pos += 1;
+            } else if (0xD0..=0xD7).contains(&m) {
+                self.pos += 2;
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Decode an ITU-T T.81 SOF3 Lossless JPEG stream (used by Android/Samsung/Adobe DNG
+/// `Compression = 7` strips & tiles) into `(width, height, num_components, interleaved_u16)`.
+pub fn decode_lossless_jpeg_sof3(stream: &[u8]) -> Result<(usize, usize, usize, Vec<u16>)> {
+    if stream.len() < 4 || stream[0] != 0xFF || stream[1] != 0xD8 {
+        return Err(Error::msg("Lossless JPEG missing SOI (0xFFD8) marker"));
+    }
+    let mut pos = 2usize;
+    let mut tables = vec![LjpegHuffTable::default(); 4];
+    let mut precision = 0u8;
+    let mut width = 0usize;
+    let mut height = 0usize;
+    let mut n_comp = 0usize;
+    let mut comp_ids = Vec::new();
+    let mut restart_interval = 0usize;
+
+    while pos + 1 < stream.len() {
+        while pos < stream.len() && stream[pos] != 0xFF {
+            pos += 1;
+        }
+        while pos < stream.len() && stream[pos] == 0xFF {
+            pos += 1;
+        }
+        if pos >= stream.len() {
+            break;
+        }
+        let marker = stream[pos];
+        pos += 1;
+        if marker == 0xD9 {
+            break;
+        }
+        if marker == 0x01 || (0xD0..=0xD8).contains(&marker) {
+            continue;
+        }
+        if pos + 2 > stream.len() {
+            return Err(Error::msg("truncated Lossless JPEG marker length"));
+        }
+        let seg_len = u16::from_be_bytes([stream[pos], stream[pos + 1]]) as usize;
+        if seg_len < 2 || pos + seg_len > stream.len() {
+            return Err(Error::msg("invalid Lossless JPEG segment length"));
+        }
+        let seg = &stream[(pos + 2)..(pos + seg_len)];
+        pos += seg_len;
+
+        match marker {
+            0xC4 => {
+                // DHT (Define Huffman Table)
+                let mut sp = 0usize;
+                while sp < seg.len() {
+                    if sp + 17 > seg.len() {
+                        return Err(Error::msg("truncated Lossless JPEG DHT segment"));
+                    }
+                    let tc_th = seg[sp];
+                    let th = (tc_th & 0x0F) as usize;
+                    sp += 1;
+                    let mut counts = [0u8; 16];
+                    counts.copy_from_slice(&seg[sp..sp + 16]);
+                    sp += 16;
+                    let total: usize = counts.iter().map(|&c| c as usize).sum();
+                    if sp + total > seg.len() {
+                        return Err(Error::msg("truncated Lossless JPEG DHT symbols"));
+                    }
+                    let vals = seg[sp..sp + total].to_vec();
+                    sp += total;
+                    if th < 4 {
+                        tables[th] = LjpegHuffTable::from_counts(&counts, vals);
+                    }
+                }
+            }
+            0xC3 => {
+                // SOF3 (Lossless Huffman)
+                if seg.len() < 6 {
+                    return Err(Error::msg("truncated SOF3 header"));
+                }
+                precision = seg[0];
+                height = u16::from_be_bytes([seg[1], seg[2]]) as usize;
+                width = u16::from_be_bytes([seg[3], seg[4]]) as usize;
+                n_comp = seg[5] as usize;
+                if !(2..=16).contains(&precision) || n_comp == 0 || n_comp > 4 {
+                    return Err(Error::msg(format!(
+                        "unsupported SOF3 precision={precision} comps={n_comp}"
+                    )));
+                }
+                if seg.len() < 6 + n_comp * 3 {
+                    return Err(Error::msg("truncated SOF3 component spec"));
+                }
+                comp_ids.clear();
+                for c in 0..n_comp {
+                    comp_ids.push(seg[6 + c * 3]);
+                }
+            }
+            0xDD => {
+                // DRI (Define Restart Interval)
+                if seg.len() >= 2 {
+                    restart_interval = u16::from_be_bytes([seg[0], seg[1]]) as usize;
+                }
+            }
+            0xDA => {
+                // SOS (Start of Scan)
+                if width == 0 || height == 0 || n_comp == 0 {
+                    return Err(Error::msg("Lossless JPEG SOS encountered before SOF3"));
+                }
+                if seg.len() < 1 + n_comp * 2 + 3 {
+                    return Err(Error::msg("truncated Lossless JPEG SOS header"));
+                }
+                let ns = seg[0] as usize;
+                if ns != n_comp {
+                    return Err(Error::msg("Lossless JPEG non-interleaved scan unsupported"));
+                }
+                let mut td = vec![0usize; ns];
+                for c in 0..ns {
+                    td[c] = ((seg[1 + c * 2 + 1] >> 4) & 0x0F) as usize;
+                    if td[c] >= 4 {
+                        return Err(Error::msg("Lossless JPEG table index out of range"));
+                    }
+                }
+                let predictor = seg[1 + ns * 2];
+                let al = (seg[1 + ns * 2 + 2] & 0x0F) as u32;
+                let init_pred = 1i32 << ((precision as u32).saturating_sub(al).saturating_sub(1));
+
+                let mut out = vec![0u16; width * height * n_comp];
+                let mut reader = JpegBitReader::new(stream, pos);
+                let mut mcu_in_interval = 0usize;
+                let mut interval_row_start = 0usize;
+
+                for y in 0..height {
+                    for x in 0..width {
+                        if restart_interval > 0 && mcu_in_interval == restart_interval {
+                            reader.align_and_skip_rst();
+                            mcu_in_interval = 0;
+                            interval_row_start = y;
+                        }
+                        let is_first_in_interval =
+                            restart_interval > 0 && mcu_in_interval == 0 && y == interval_row_start;
+                        for c in 0..n_comp {
+                            let pred = if (x == 0 && y == 0) || is_first_in_interval {
+                                init_pred
+                            } else if y == 0
+                                || (restart_interval > 0
+                                    && y == interval_row_start
+                                    && x > 0
+                                    && mcu_in_interval < width)
+                            {
+                                out[(y * width + (x - 1)) * n_comp + c] as i32
+                            } else if x == 0 {
+                                out[((y - 1) * width) * n_comp + c] as i32
+                            } else {
+                                let ra = out[(y * width + (x - 1)) * n_comp + c] as i32;
+                                let rb = out[((y - 1) * width + x) * n_comp + c] as i32;
+                                let rc = out[((y - 1) * width + (x - 1)) * n_comp + c] as i32;
+                                match predictor {
+                                    1 => ra,
+                                    2 => rb,
+                                    3 => rc,
+                                    4 => ra + rb - rc,
+                                    5 => ra + ((rb - rc) >> 1),
+                                    6 => rb + ((ra - rc) >> 1),
+                                    7 => (ra + rb) >> 1,
+                                    _ => ra,
+                                }
+                            };
+                            let diff = reader.decode_diff(&tables[td[c]])?;
+                            let val = (pred.wrapping_add(diff) & 0xFFFF) as u16;
+                            out[(y * width + x) * n_comp + c] = val;
+                        }
+                        mcu_in_interval += 1;
+                    }
+                }
+                if al > 0 {
+                    for v in &mut out {
+                        *v = v.wrapping_shl(al);
+                    }
+                }
+                return Ok((width, height, n_comp, out));
+            }
+            _ => {}
+        }
+    }
+    Err(Error::msg("Lossless JPEG stream missing SOS scan data"))
+}
+
+/// Encode an interleaved `u16` pixel block into ITU-T T.81 SOF3 Lossless JPEG (predictor 1,
+/// standard DC Huffman table) for generating realistic Lossless-JPEG DNG test fixtures.
+pub fn encode_lossless_jpeg_sof3(
+    samples: &[u16],
+    width: usize,
+    height: usize,
+    n_comp: usize,
+    precision: u8,
+) -> Vec<u8> {
+    assert_eq!(samples.len(), width * height * n_comp);
+    assert!((8..=16).contains(&precision));
+    assert!((1..=4).contains(&n_comp));
+
+    // Simple complete prefix-free Huffman table covering categories ssss = 0..=16:
+    // 1 code of len 2 (00 -> ssss=0), 15 codes of len 5 (01000..10110 -> ssss=1..15),
+    // 1 code of len 6 (101110 -> ssss=16).
+    let mut counts = [0u8; 16];
+    counts[1] = 1; // len 2 -> 1 symbol (0)
+    counts[4] = 15; // len 5 -> 15 symbols (1..=15)
+    counts[5] = 1; // len 6 -> 1 symbol (16)
+    let values: Vec<u8> = (0u8..=16).collect();
+    // Build canonical codes from (counts, values)
+    let mut sym_code = [(0u32, 0u32); 17]; // (code, len)
+    let mut code = 0u32;
+    let mut idx = 0usize;
+    for bits in 1..=16u32 {
+        let n = counts[(bits - 1) as usize] as usize;
+        for _ in 0..n {
+            let s = values[idx] as usize;
+            sym_code[s] = (code, bits);
+            code += 1;
+            idx += 1;
+        }
+        code <<= 1;
+    }
+
+    let mut out = Vec::new();
+    // SOI
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    // DHT (table 0)
+    out.extend_from_slice(&[0xFF, 0xC4]);
+    let dht_len = (2 + 1 + 16 + values.len()) as u16;
+    out.extend_from_slice(&dht_len.to_be_bytes());
+    out.push(0x00);
+    out.extend_from_slice(&counts);
+    out.extend_from_slice(&values);
+    // SOF3
+    out.extend_from_slice(&[0xFF, 0xC3]);
+    let sof_len = (8 + 3 * n_comp) as u16;
+    out.extend_from_slice(&sof_len.to_be_bytes());
+    out.push(precision);
+    out.extend_from_slice(&(height as u16).to_be_bytes());
+    out.extend_from_slice(&(width as u16).to_be_bytes());
+    out.push(n_comp as u8);
+    for c in 0..n_comp {
+        out.push((c + 1) as u8);
+        out.push(0x11);
+        out.push(0);
+    }
+    // SOS (predictor = 1, Al = 0)
+    out.extend_from_slice(&[0xFF, 0xDA]);
+    let sos_len = (6 + 2 * n_comp) as u16;
+    out.extend_from_slice(&sos_len.to_be_bytes());
+    out.push(n_comp as u8);
+    for c in 0..n_comp {
+        out.push((c + 1) as u8);
+        out.push(0x00); // table 0
+    }
+    out.push(1); // Ss = predictor 1
+    out.push(0); // Se = 0
+    out.push(0); // Ah/Al = 0
+
+    let mut bit_buf = 0u64;
+    let mut bit_cnt = 0u32;
+    fn emit_bits(val: u32, n: u32, dst: &mut Vec<u8>, bit_buf: &mut u64, bit_cnt: &mut u32) {
+        if n == 0 {
+            return;
+        }
+        *bit_buf = (*bit_buf << n) | ((val as u64) & ((1u64 << n) - 1));
+        *bit_cnt += n;
+        while *bit_cnt >= 8 {
+            *bit_cnt -= 8;
+            let byte = ((*bit_buf >> *bit_cnt) & 0xFF) as u8;
+            dst.push(byte);
+            if byte == 0xFF {
+                dst.push(0x00);
+            }
+        }
+    }
+
+    let init_pred = 1i32 << ((precision as u32) - 1);
+    for y in 0..height {
+        for x in 0..width {
+            for c in 0..n_comp {
+                let cur = samples[(y * width + x) * n_comp + c] as i32;
+                let pred = if x == 0 && y == 0 {
+                    init_pred
+                } else if x == 0 {
+                    samples[((y - 1) * width) * n_comp + c] as i32
+                } else {
+                    samples[(y * width + (x - 1)) * n_comp + c] as i32
+                };
+                let mut diff = (cur - pred) & 0xFFFF;
+                if diff >= 32768 {
+                    diff -= 65536;
+                }
+                if diff == 0 {
+                    let (hc, hl) = sym_code[0];
+                    emit_bits(hc, hl, &mut out, &mut bit_buf, &mut bit_cnt);
+                } else if diff == -32768 {
+                    let (hc, hl) = sym_code[16];
+                    emit_bits(hc, hl, &mut out, &mut bit_buf, &mut bit_cnt);
+                } else {
+                    let abs_d = diff.unsigned_abs();
+                    let ssss = 32 - abs_d.leading_zeros();
+                    let (hc, hl) = sym_code[ssss as usize];
+                    emit_bits(hc, hl, &mut out, &mut bit_buf, &mut bit_cnt);
+                    let extra = if diff > 0 {
+                        diff as u32
+                    } else {
+                        (diff + ((1i32 << ssss) - 1)) as u32
+                    };
+                    emit_bits(extra, ssss, &mut out, &mut bit_buf, &mut bit_cnt);
+                }
+            }
+        }
+    }
+    if bit_cnt > 0 {
+        let pad = 8 - bit_cnt;
+        emit_bits((1u32 << pad) - 1, pad, &mut out, &mut bit_buf, &mut bit_cnt);
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+fn unpack_uncompressed_block(raw: &[u8], count: usize, bps: u16, le: bool) -> Result<Vec<u16>> {
+    let mut out = vec![0u16; count];
+    match bps {
+        8 => {
+            if raw.len() < count {
+                return Err(Error::msg("truncated 8-bit uncompressed DNG block"));
+            }
+            for i in 0..count {
+                out[i] = raw[i] as u16;
+            }
+        }
+        16 => {
+            if raw.len() < count * 2 {
+                return Err(Error::msg("truncated 16-bit uncompressed DNG block"));
+            }
+            for i in 0..count {
+                let b = [raw[i * 2], raw[i * 2 + 1]];
+                out[i] = if le {
+                    u16::from_le_bytes(b)
+                } else {
+                    u16::from_be_bytes(b)
+                };
+            }
+        }
+        10 | 12 | 14 => {
+            // Packed MSB-first bitstream (standard TIFF/DNG packed raw).
+            let bpp = bps as usize;
+            let mask = (1u32 << bpp) - 1;
+            let mut bit_buf = 0u64;
+            let mut bit_cnt = 0usize;
+            let mut pos = 0usize;
+            for dst in &mut out {
+                while bit_cnt < bpp {
+                    if pos >= raw.len() {
+                        return Err(Error::msg(format!(
+                            "truncated {bps}-bit packed uncompressed DNG block"
+                        )));
+                    }
+                    bit_buf = (bit_buf << 8) | (raw[pos] as u64);
+                    bit_cnt += 8;
+                    pos += 1;
+                }
+                bit_cnt -= bpp;
+                *dst = ((bit_buf >> bit_cnt) as u32 & mask) as u16;
+            }
+        }
+        _ => {
+            return Err(Error::msg(format!(
+                "unsupported uncompressed DNG BitsPerSample={bps}"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// Decode full linear RGB + luminance pixels directly from a binary DNG file buffer,
+/// applying parsed `OpcodeList2` (`GainMap`) and `OpcodeList3` (`FixVignetteRadial`)
+/// radiometrically while keeping `WarpRectilinear` strictly analytical (zero pixel warping!).
+///
+/// Supports:
+/// - `Compression = 1` (Uncompressed 8/10/12/14/16-bit, strips or tiles)
+/// - `Compression = 7` (Lossless JPEG SOF3 ITU-T T.81, strips or tiles)
+/// - `Photometric = 32803` (CFA Bayer, demosaiced via Malvar–He–Cutler `f64`) and
+///   `Photometric = 34892` (LinearRaw 1-ch gray or 3-ch RGB)
+///
+/// Explicitly returns an informative error for `Compression = 52546` (JPEG-XL).
+pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
+    let (meta, layout) = parse_dng_with_layout(buf)?;
+    if meta.main_width == 0 || meta.main_height == 0 {
+        return Err(Error::msg("DNG has zero image dimensions"));
+    }
+    if meta.compression == COMPRESSION_JPEG_XL {
+        return Err(Error::msg(
+            "DNG uses JPEG-XL pixel tiles (Compression=52546): headers and OpcodeList2/3 were parsed, \
+             but zero-dependency built-in pixel decoding supports Uncompressed (1) and Lossless JPEG SOF3 (7) DNGs \
+             (or v7.0 MIPI RAW10 bursts). Convert JXL DNGs with Adobe DNG Converter (Lossless JPEG) or capture RAW10.",
+        ));
+    }
+    if meta.compression != COMPRESSION_UNCOMPRESSED && meta.compression != COMPRESSION_LOSSLESS_JPEG
+    {
+        return Err(Error::msg(format!(
+            "unsupported DNG compression={} (supported: 1=Uncompressed, 7=Lossless JPEG SOF3)",
+            meta.compression
+        )));
+    }
+
+    let w = meta.main_width as usize;
+    let h = meta.main_height as usize;
+    let spp = layout.samples_per_pixel.max(1) as usize;
+    let mut raw_u16 = vec![0u16; w * h * spp];
+
+    let decode_block_to_u16 = |slice: &[u8], bw: usize, bh: usize| -> Result<Vec<u16>> {
+        if meta.compression == COMPRESSION_UNCOMPRESSED {
+            unpack_uncompressed_block(
+                slice,
+                bw * bh * spp,
+                meta.bits_per_sample,
+                layout.little_endian,
+            )
+        } else {
+            let (jw, jh, jc, jdata) = decode_lossless_jpeg_sof3(slice)?;
+            let expected = bw * bh * spp;
+            if jdata.len() == expected {
+                Ok(jdata)
+            } else if jw * jc == bw * spp && jh >= bh {
+                Ok(jdata[..expected].to_vec())
+            } else {
+                Err(Error::msg(format!(
+                    "Lossless JPEG block size mismatch: decoded {jw}x{jh}x{jc}, expected {bw}x{bh}x{spp}"
+                )))
+            }
+        }
+    };
+
+    if !layout.tile_offsets.is_empty() && layout.tile_width > 0 && layout.tile_length > 0 {
+        let tw = layout.tile_width as usize;
+        let th = layout.tile_length as usize;
+        let tiles_x = w.div_ceil(tw);
+        let tiles_y = h.div_ceil(th);
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let tid = ty * tiles_x + tx;
+                if tid >= layout.tile_offsets.len() || tid >= layout.tile_byte_counts.len() {
+                    return Err(Error::msg("DNG tile table truncated"));
+                }
+                let off = layout.tile_offsets[tid] as usize;
+                let len = layout.tile_byte_counts[tid] as usize;
+                if off.saturating_add(len) > buf.len() {
+                    return Err(Error::msg("DNG tile offset/length exceeds file size"));
+                }
+                let tile_vals = decode_block_to_u16(&buf[off..off + len], tw, th)?;
+                let copy_h = th.min(h.saturating_sub(ty * th));
+                let copy_w = tw.min(w.saturating_sub(tx * tw));
+                for ry in 0..copy_h {
+                    let dst_y = ty * th + ry;
+                    let src_row = ry * tw * spp;
+                    let dst_row = (dst_y * w + tx * tw) * spp;
+                    raw_u16[dst_row..dst_row + copy_w * spp]
+                        .copy_from_slice(&tile_vals[src_row..src_row + copy_w * spp]);
+                }
+            }
+        }
+    } else if !layout.strip_offsets.is_empty() {
+        let rps = (layout.rows_per_strip as usize).max(1);
+        for (si, &off_u32) in layout.strip_offsets.iter().enumerate() {
+            let y0 = si * rps;
+            if y0 >= h {
+                break;
+            }
+            let bh = rps.min(h - y0);
+            let off = off_u32 as usize;
+            let len = layout
+                .strip_byte_counts
+                .get(si)
+                .copied()
+                .map(|v| v as usize)
+                .unwrap_or_else(|| buf.len().saturating_sub(off));
+            if off.saturating_add(len) > buf.len() {
+                return Err(Error::msg("DNG strip offset/length exceeds file size"));
+            }
+            let strip_vals = decode_block_to_u16(&buf[off..off + len], w, bh)?;
+            let dst_off = y0 * w * spp;
+            raw_u16[dst_off..dst_off + w * bh * spp].copy_from_slice(&strip_vals);
+        }
+    } else {
+        return Err(Error::msg(
+            "DNG contains neither StripOffsets (273) nor TileOffsets (324) — header-only file has no pixel payload",
+        ));
+    }
+
+    // Normalize with per-channel BlackLevel/WhiteLevel + radiometric GainMap & FixVignetteRadial.
+    let mut rgb = if meta.photometric == PHOTOMETRIC_CFA && spp == 1 {
+        let pat = meta.cfa_pattern.unwrap_or(CfaPattern::Gbrg);
+        let mut cfa = vec![0.0_f64; w * h];
+        for y in 0..h {
+            let v_norm = (y as f64 + 0.5) / (h as f64);
+            for x in 0..w {
+                let u_norm = (x as f64 + 0.5) / (w as f64);
+                let bayer_idx = ((y & 1) << 1) | (x & 1);
+                let bl = layout
+                    .black_levels
+                    .get(bayer_idx)
+                    .or_else(|| layout.black_levels.first())
+                    .copied()
+                    .unwrap_or(meta.black_level);
+                let wl = layout
+                    .white_levels
+                    .first()
+                    .copied()
+                    .unwrap_or(meta.white_level);
+                let mut val = (((raw_u16[y * w + x] as f64) - bl) / (wl - bl).max(1.0)).max(0.0);
+                for gm in &meta.gain_maps {
+                    val *= gm.eval(u_norm, v_norm, bayer_idx);
+                }
+                if let Some(vig) = &meta.vignette {
+                    val *= vig.eval_gain(x as f64, y as f64, w as f64, h as f64);
+                }
+                cfa[y * w + x] = val;
+            }
+        }
+        demosaic_malvar_he_cutler(&cfa, w, h, pat)
+    } else {
+        let mut out_rgb = vec![[0.0_f64; 3]; w * h];
+        for y in 0..h {
+            let v_norm = (y as f64 + 0.5) / (h as f64);
+            for x in 0..w {
+                let u_norm = (x as f64 + 0.5) / (w as f64);
+                let vig_g = meta
+                    .vignette
+                    .as_ref()
+                    .map(|v| v.eval_gain(x as f64, y as f64, w as f64, h as f64))
+                    .unwrap_or(1.0);
+                let mut px = [0.0_f64; 3];
+                for (c, dst) in px.iter_mut().enumerate() {
+                    let sc = c.min(spp - 1);
+                    let bl = layout
+                        .black_levels
+                        .get(sc)
+                        .or_else(|| layout.black_levels.first())
+                        .copied()
+                        .unwrap_or(meta.black_level);
+                    let wl = layout
+                        .white_levels
+                        .get(sc)
+                        .or_else(|| layout.white_levels.first())
+                        .copied()
+                        .unwrap_or(meta.white_level);
+                    let mut val = (((raw_u16[(y * w + x) * spp + sc] as f64) - bl)
+                        / (wl - bl).max(1.0))
+                    .max(0.0);
+                    for gm in &meta.gain_maps {
+                        val *= gm.eval(u_norm, v_norm, sc);
+                    }
+                    *dst = val * vig_g;
+                }
+                out_rgb[y * w + x] = px;
+            }
+        }
+        out_rgb
+    };
+
+    // Respect ActiveArea crop if strictly inside image bounds.
+    let (out_w, out_h) = if let Some([top, left, bottom, right]) = layout.active_area {
+        let (t, l, b, r) = (top as usize, left as usize, bottom as usize, right as usize);
+        if b > t && r > l && b <= h && r <= w && (t > 0 || l > 0 || b < h || r < w) {
+            let cw = r - l;
+            let ch = b - t;
+            let mut cropped = Vec::with_capacity(cw * ch);
+            for y in t..b {
+                cropped.extend_from_slice(&rgb[(y * w + l)..(y * w + r)]);
+            }
+            rgb = cropped;
+            (cw, ch)
+        } else {
+            (w, h)
+        }
+    } else {
+        (w, h)
+    };
+
+    let luma: Vec<f64> = rgb
+        .iter()
+        .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
+        .collect();
+
+    Ok(DecodedDngImage {
+        meta,
+        width: out_w,
+        height: out_h,
+        rgb,
+        luma,
+    })
+}
+
+/// Read and decode a DNG file from disk into linear `f64` RGB + luminance buffers.
+pub fn decode_dng_file(path: &Path) -> Result<DecodedDngImage> {
+    let bytes = fs::read(path)
+        .map_err(|e| Error::msg(format!("cannot read DNG `{}`: {e}", path.display())))?;
+    decode_dng_bytes(&bytes)
+}
+
+/// Build a valid binary DNG 1.7 file WITH real pixel data (either `COMPRESSION_UNCOMPRESSED`
+/// 16-bit strip or `COMPRESSION_LOSSLESS_JPEG` SOF3 strip) + SubIFD + `OpcodeList2/3`.
+pub fn build_synthetic_dng_with_pixels(
+    meta: &DngMetadata,
+    samples_u16: &[u16],
+    samples_per_pixel: u16,
+    use_lossless_jpeg: bool,
+) -> Vec<u8> {
+    let w = meta.main_width as usize;
+    let h = meta.main_height as usize;
+    let spp = samples_per_pixel.max(1) as usize;
+    assert_eq!(samples_u16.len(), w * h * spp);
+
+    let pixel_blob: Vec<u8> = if use_lossless_jpeg {
+        encode_lossless_jpeg_sof3(
+            samples_u16,
+            w,
+            h,
+            spp,
+            meta.bits_per_sample.clamp(8, 16) as u8,
+        )
+    } else {
+        // DNG/TIFF: 8- and 16-bit samples are stored as whole bytes/words; every other
+        // depth is packed continuously MSB-first (FillOrder 1) regardless of file endianness.
+        let bps = meta.bits_per_sample;
+        let mut b = Vec::with_capacity(samples_u16.len() * 2);
+        match bps {
+            8 => b.extend(samples_u16.iter().map(|&v| v as u8)),
+            16 => {
+                for &v in samples_u16 {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            _ => {
+                assert!(
+                    bps <= 16,
+                    "synthetic builder supports at most 16-bit samples"
+                );
+                let mask = (1u64 << bps) - 1;
+                let mut bit_buf = 0u64;
+                let mut bit_cnt = 0u32;
+                for &v in samples_u16 {
+                    bit_buf = (bit_buf << bps) | ((v as u64) & mask);
+                    bit_cnt += bps as u32;
+                    while bit_cnt >= 8 {
+                        bit_cnt -= 8;
+                        b.push(((bit_buf >> bit_cnt) & 0xFF) as u8);
+                    }
+                }
+                if bit_cnt > 0 {
+                    b.push(((bit_buf << (8 - bit_cnt)) & 0xFF) as u8);
+                }
+            }
+        }
+        b
+    };
+
+    // Encode OpcodeList2 & OpcodeList3 using the same serializer logic.
+    let mut op2 = Vec::new();
+    op2.extend_from_slice(&(meta.gain_maps.len() as u32).to_be_bytes());
+    for gm in &meta.gain_maps {
+        let mut p = Vec::new();
+        for &v in &[
+            gm.top,
+            gm.left,
+            gm.bottom,
+            gm.right,
+            gm.plane,
+            gm.planes,
+            gm.row_pitch,
+            gm.col_pitch,
+            gm.map_points_v,
+            gm.map_points_h,
+        ] {
+            p.extend_from_slice(&v.to_be_bytes());
+        }
+        p.extend_from_slice(&gm.map_spacing_v.to_be_bytes());
+        p.extend_from_slice(&gm.map_spacing_h.to_be_bytes());
+        p.extend_from_slice(&gm.map_origin_v.to_be_bytes());
+        p.extend_from_slice(&gm.map_origin_h.to_be_bytes());
+        p.extend_from_slice(&gm.map_planes.to_be_bytes());
+        for &g in &gm.gains {
+            p.extend_from_slice(&g.to_be_bytes());
+        }
+        op2.extend_from_slice(&OPCODE_GAIN_MAP.to_be_bytes());
+        op2.extend_from_slice(&0x0103_0000u32.to_be_bytes());
+        op2.extend_from_slice(&0u32.to_be_bytes());
+        op2.extend_from_slice(&(p.len() as u32).to_be_bytes());
+        op2.extend_from_slice(&p);
+    }
+
+    let mut op3_count = 0u32;
+    let mut op3_body = Vec::new();
+    if let Some(v) = &meta.vignette {
+        op3_count += 1;
+        let mut p = Vec::with_capacity(56);
+        for &k in &v.k {
+            p.extend_from_slice(&k.to_be_bytes());
+        }
+        p.extend_from_slice(&v.cx_hat.to_be_bytes());
+        p.extend_from_slice(&v.cy_hat.to_be_bytes());
+        op3_body.extend_from_slice(&OPCODE_FIX_VIGNETTE_RADIAL.to_be_bytes());
+        op3_body.extend_from_slice(&0x0103_0000u32.to_be_bytes());
+        op3_body.extend_from_slice(&0u32.to_be_bytes());
+        op3_body.extend_from_slice(&(p.len() as u32).to_be_bytes());
+        op3_body.extend_from_slice(&p);
+    }
+    if let Some(wr) = &meta.warp_rectilinear {
+        op3_count += 1;
+        let mut p = Vec::new();
+        p.extend_from_slice(&(wr.planes.len() as u32).to_be_bytes());
+        for pl in &wr.planes {
+            for &k in &pl.k {
+                p.extend_from_slice(&k.to_be_bytes());
+            }
+            for &m in &pl.m {
+                p.extend_from_slice(&m.to_be_bytes());
+            }
+        }
+        p.extend_from_slice(&wr.cx_hat.to_be_bytes());
+        p.extend_from_slice(&wr.cy_hat.to_be_bytes());
+        op3_body.extend_from_slice(&OPCODE_WARP_RECTILINEAR.to_be_bytes());
+        op3_body.extend_from_slice(&0x0103_0000u32.to_be_bytes());
+        op3_body.extend_from_slice(&0u32.to_be_bytes());
+        op3_body.extend_from_slice(&(p.len() as u32).to_be_bytes());
+        op3_body.extend_from_slice(&p);
+    }
+    let mut op3 = Vec::new();
+    op3.extend_from_slice(&op3_count.to_be_bytes());
+    op3.extend_from_slice(&op3_body);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"II");
+    out.extend_from_slice(&42u16.to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
+
+    let subifd_off = 64u32;
+    let write_entry = |dst: &mut Vec<u8>, tag: u16, typ: u16, count: u32, val: [u8; 4]| {
+        dst.extend_from_slice(&tag.to_le_bytes());
+        dst.extend_from_slice(&typ.to_le_bytes());
+        dst.extend_from_slice(&count.to_le_bytes());
+        dst.extend_from_slice(&val);
+    };
+
+    out.extend_from_slice(&4u16.to_le_bytes());
+    write_entry(
+        &mut out,
+        TAG_IMAGE_WIDTH,
+        4,
+        1,
+        meta.preview_width.to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_IMAGE_LENGTH,
+        4,
+        1,
+        meta.preview_height.to_le_bytes(),
+    );
+    write_entry(&mut out, TAG_SUB_IFDS, 4, 1, subifd_off.to_le_bytes());
+    write_entry(&mut out, TAG_DNG_VERSION, 1, 4, meta.dng_version);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    while out.len() < subifd_off as usize {
+        out.push(0);
+    }
+
+    // SubIFD has 15 entries -> 2 + 15*12 + 4 = 186 bytes -> payloads start at offset 256.
+    let op2_off = 256u32;
+    let op3_off = op2_off + (op2.len() as u32);
+    let pix_off = op3_off + (op3.len() as u32);
+    let comp = if use_lossless_jpeg {
+        COMPRESSION_LOSSLESS_JPEG
+    } else {
+        COMPRESSION_UNCOMPRESSED
+    };
+    let cfa_bytes = meta.cfa_pattern.unwrap_or(CfaPattern::Gbrg).to_bytes();
+
+    out.extend_from_slice(&15u16.to_le_bytes());
+    write_entry(
+        &mut out,
+        TAG_NEW_SUBFILE_TYPE,
+        4,
+        1,
+        meta.new_subfile_type.to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_IMAGE_WIDTH,
+        4,
+        1,
+        meta.main_width.to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_IMAGE_LENGTH,
+        4,
+        1,
+        meta.main_height.to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_BITS_PER_SAMPLE,
+        3,
+        1,
+        (meta.bits_per_sample as u32).to_le_bytes(),
+    );
+    write_entry(&mut out, TAG_COMPRESSION, 3, 1, (comp as u32).to_le_bytes());
+    write_entry(
+        &mut out,
+        TAG_PHOTOMETRIC,
+        3,
+        1,
+        (meta.photometric as u32).to_le_bytes(),
+    );
+    write_entry(&mut out, TAG_STRIP_OFFSETS, 4, 1, pix_off.to_le_bytes());
+    write_entry(
+        &mut out,
+        TAG_SAMPLES_PER_PIXEL,
+        3,
+        1,
+        (spp as u32).to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_ROWS_PER_STRIP,
+        4,
+        1,
+        meta.main_height.to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_STRIP_BYTE_COUNTS,
+        4,
+        1,
+        (pixel_blob.len() as u32).to_le_bytes(),
+    );
+    write_entry(&mut out, TAG_CFA_PATTERN, 1, 4, cfa_bytes);
+    write_entry(
+        &mut out,
+        TAG_BLACK_LEVEL,
+        4,
+        1,
+        (meta.black_level.round() as u32).to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_WHITE_LEVEL,
+        4,
+        1,
+        (meta.white_level.round() as u32).to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_OPCODE_LIST_2,
+        7,
+        op2.len() as u32,
+        op2_off.to_le_bytes(),
+    );
+    write_entry(
+        &mut out,
+        TAG_OPCODE_LIST_3,
+        7,
+        op3.len() as u32,
+        op3_off.to_le_bytes(),
+    );
+    out.extend_from_slice(&0u32.to_le_bytes());
+    while out.len() < op2_off as usize {
+        out.push(0);
+    }
+    out.extend_from_slice(&op2);
+    out.extend_from_slice(&op3);
+    out.extend_from_slice(&pixel_blob);
+    out
 }
 
 /// Build a valid binary DNG 1.7 file with an IFD0 preview thumbnail + high-res SubIFD +
@@ -1531,8 +2907,8 @@ mod tests {
 
         let meta = BurstMetaSidecar {
             cfa: "GBRG".into(),
-            black_level: 256.0,
-            white_level: 4095.0,
+            black_level: 64.0,
+            white_level: 1023.0,
             sensor_info_timestamp_source: 1,
             lens_intrinsic_calibration: [6000.0, 6000.0, 4080.0, 3060.0, 0.0],
             frames,
@@ -1580,5 +2956,131 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn real_pixel_decode_uncompressed_and_lossless_jpeg_sof3_and_jxl_honesty() {
+        let w = 32usize;
+        let h = 24usize;
+        let pat = CfaPattern::Rggb;
+        let mut cfa_u16 = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let ch = pat.color_at(x, y);
+                let base = match ch {
+                    0 => 2200u16,
+                    1 => 1800u16,
+                    _ => 1200u16,
+                };
+                cfa_u16[y * w + x] = base + ((x * 13 + y * 19) % 400) as u16;
+            }
+        }
+        let base_meta = DngMetadata {
+            dng_version: [1, 7, 0, 0],
+            preview_width: 8,
+            preview_height: 6,
+            main_width: w as u32,
+            main_height: h as u32,
+            bits_per_sample: 14,
+            compression: COMPRESSION_LOSSLESS_JPEG,
+            photometric: PHOTOMETRIC_CFA,
+            new_subfile_type: 0,
+            subifd_routed: true,
+            cfa_pattern: Some(pat),
+            black_level: 256.0,
+            white_level: 16383.0,
+            gain_maps: Vec::new(),
+            vignette: None,
+            warp_rectilinear: None,
+        };
+
+        // 1. Uncompressed 16-bit strip DNG decode
+        let raw_dng = build_synthetic_dng_with_pixels(&base_meta, &cfa_u16, 1, false);
+        let dec_raw = decode_dng_bytes(&raw_dng).expect("decode uncompressed DNG");
+        assert_eq!(dec_raw.width, w);
+        assert_eq!(dec_raw.height, h);
+
+        // 2. Lossless JPEG SOF3 strip DNG decode must match Uncompressed bit-for-bit!
+        let ljpeg_dng = build_synthetic_dng_with_pixels(&base_meta, &cfa_u16, 1, true);
+        let dec_ljpeg = decode_dng_bytes(&ljpeg_dng).expect("decode Lossless JPEG SOF3 DNG");
+        assert_eq!(dec_ljpeg.rgb.len(), dec_raw.rgb.len());
+        for (a, b) in dec_raw.rgb.iter().zip(dec_ljpeg.rgb.iter()) {
+            for c in 0..3 {
+                assert!(
+                    (a[c] - b[c]).abs() < 1e-12,
+                    "LJPEG SOF3 decode diverged from uncompressed: {} vs {}",
+                    a[c],
+                    b[c]
+                );
+            }
+        }
+
+        // 3. JPEG-XL (52546) must parse metadata cleanly and fail pixel decode honestly (never fake pixels!)
+        let mut jxl_meta = base_meta.clone();
+        jxl_meta.compression = COMPRESSION_JPEG_XL;
+        let jxl_bytes = build_synthetic_dng_17(&jxl_meta);
+        let err = decode_dng_bytes(&jxl_bytes)
+            .expect_err("JXL 52546 pixel decode must fail honestly without synthetic fallback");
+        assert!(err.to_string().contains("52546"));
+    }
+
+    #[test]
+    fn tiff_rational_array_black_level_and_inline_cfa_and_chained_ifd_survive_real_camera_quirks() {
+        // Construct a Samsung-like TIFF with:
+        // - IFD0 preview (320x240) + chained IFD1 (full 16x12 LinearRaw)
+        // - 4-element RATIONAL BlackLevel [64.5, 64.25, 64.75, 64.5]
+        // - Inline 4-byte CFA pattern (no offset indirection)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at 8
+
+        let ifd1_off = 64u32;
+        let write_e = |dst: &mut Vec<u8>, tag: u16, typ: u16, cnt: u32, val: [u8; 4]| {
+            dst.extend_from_slice(&tag.to_le_bytes());
+            dst.extend_from_slice(&typ.to_le_bytes());
+            dst.extend_from_slice(&cnt.to_le_bytes());
+            dst.extend_from_slice(&val);
+        };
+        buf.extend_from_slice(&3u16.to_le_bytes());
+        write_e(&mut buf, TAG_IMAGE_WIDTH, 4, 1, 320u32.to_le_bytes());
+        write_e(&mut buf, TAG_IMAGE_LENGTH, 4, 1, 240u32.to_le_bytes());
+        write_e(&mut buf, TAG_DNG_VERSION, 1, 4, [1, 7, 0, 0]);
+        buf.extend_from_slice(&ifd1_off.to_le_bytes()); // chained IFD1!
+        while buf.len() < ifd1_off as usize {
+            buf.push(0);
+        }
+
+        let bl_off = 200u32;
+        buf.extend_from_slice(&6u16.to_le_bytes());
+        write_e(&mut buf, TAG_IMAGE_WIDTH, 4, 1, 16u32.to_le_bytes());
+        write_e(&mut buf, TAG_IMAGE_LENGTH, 4, 1, 12u32.to_le_bytes());
+        write_e(
+            &mut buf,
+            TAG_PHOTOMETRIC,
+            3,
+            1,
+            (PHOTOMETRIC_CFA as u32).to_le_bytes(),
+        );
+        write_e(&mut buf, TAG_CFA_PATTERN, 1, 4, [1, 2, 0, 1]);
+        write_e(&mut buf, TAG_BLACK_LEVEL, 5, 4, bl_off.to_le_bytes()); // 4x RATIONAL
+        write_e(&mut buf, TAG_WHITE_LEVEL, 4, 1, 4095u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        while buf.len() < bl_off as usize {
+            buf.push(0);
+        }
+        for &(num, den) in &[(258u32, 4u32), (257, 4), (259, 4), (258, 4)] {
+            buf.extend_from_slice(&num.to_le_bytes());
+            buf.extend_from_slice(&den.to_le_bytes());
+        }
+
+        let (meta, layout) = parse_dng_with_layout(&buf).expect("parse Samsung-style chained IFD");
+        assert!(meta.subifd_routed);
+        assert_eq!(meta.main_width, 16);
+        assert_eq!(meta.main_height, 12);
+        assert_eq!(layout.black_levels.len(), 4);
+        assert!((layout.black_levels[1] - 64.25).abs() < 1e-12);
+        assert!((meta.black_level - 64.5).abs() < 1e-12);
+        assert_eq!(meta.cfa_pattern, Some(CfaPattern::Gbrg));
     }
 }

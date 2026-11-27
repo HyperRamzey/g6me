@@ -25,6 +25,8 @@ pub enum PickTarget {
     Queue,
     OutDir,
     Ir,
+    RoomJson,
+    HeadMesh,
 }
 
 /// Severity, so the log can colour and count problems.

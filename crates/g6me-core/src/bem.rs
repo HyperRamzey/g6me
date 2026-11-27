@@ -315,7 +315,12 @@ impl TriangleMesh {
                 0.0
             },
             boundary_edges,
-            is_watertight: boundary_edges == 0 && center_winding.abs() > 0.5,
+            // Watertight means a closed 2-manifold: every edge is shared by exactly two
+            // faces. `center_winding` is a separate solidity/orientation diagnostic and is
+            // legitimately 0 whenever the bounding-box centre lies outside the surface
+            // (torus, multi-shell or off-centre reconstruction), so it cannot be part of
+            // this predicate.
+            is_watertight: boundary_edges == 0,
             center_winding,
             max_valid_freq_hz,
         }
@@ -1692,6 +1697,37 @@ mod tests {
             (st.center_winding - 1.0).abs() < 1e-6,
             "closed watertight solid must have exact winding 1.0 at center, got {}",
             st.center_winding
+        );
+    }
+
+    #[test]
+    fn watertight_means_closed_even_when_the_bbox_centre_is_outside() {
+        // Two disjoint closed spheres: every edge is shared by exactly two faces, but the
+        // bounding-box centre lies in the gap between them, so its winding number is 0.
+        let mut mesh = TriangleMesh::sphere(0.05, 1);
+        let mut second = TriangleMesh::sphere(0.05, 1);
+        for v in &mut second.vertices {
+            v[0] += 0.30;
+        }
+        let offset = mesh.vertices.len();
+        mesh.vertices.extend_from_slice(&second.vertices);
+        mesh.faces.extend(
+            second
+                .faces
+                .iter()
+                .map(|&[a, b, c]| [a + offset, b + offset, c + offset]),
+        );
+
+        let st = mesh.stats(344.8);
+        assert_eq!(st.boundary_edges, 0);
+        assert!(
+            st.center_winding.abs() < 1e-6,
+            "bbox centre must be outside both spheres, got winding {}",
+            st.center_winding
+        );
+        assert!(
+            st.is_watertight,
+            "a closed multi-shell mesh is watertight even when its bbox centre is outside"
         );
     }
 

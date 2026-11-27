@@ -59,7 +59,8 @@ use crate::fft::{
 };
 use crate::hoa::{kermit_canfield_warped_allpass, MagLsDecoder};
 use crate::ntt::{
-    field_to_i128, i64_to_field, mod_add, mod_mul, NttPlan, NTT_KERNEL_SCALE, NTT_PCM_SCALE,
+    field_to_i128, i64_to_field, mod_add, mod_mul, NttPlan, GOLDILOCKS_P, NTT_KERNEL_SCALE,
+    NTT_PCM_SCALE,
 };
 use crate::room::{synthesize_hybrid_room_reflections, FdtdSolver3d, RoomGeometry, RoomPreset};
 use crate::scattering::{
@@ -70,9 +71,11 @@ use crate::scattering::{
 /// Synthesis FFT size (`341.3 ms` at 48 kHz) — long enough that the causal LR4
 /// bass-mono crossover impulse decays `< -140 dB` with zero circular wrap.
 pub const N_SYNTH: usize = 16_384;
-/// Final windowed FIR kernel length (`42.67 ms` at 48 kHz).
+/// Final windowed anechoic FIR kernel length (`42.67 ms` at 48 kHz).
 pub const N_IR: usize = 2_048;
-/// Streaming overlap-add FFT size (`HOP + N_IR - 1 = 8191 < 8192`).
+/// Final windowed 3D Hybrid Room BRIR kernel length (`170.67 ms` at 48 kHz).
+pub const N_IR_ROOM: usize = 8_192;
+/// Streaming overlap-add FFT size for anechoic kernels (`HOP + N_IR - 1 = 8191 < 8192`).
 pub const N_FFT: usize = 8_192;
 /// Maximum input chunk per single OLA transform (`8192 - 2048 = 6144`).
 pub const OLA_HOP: usize = 6_144;
@@ -669,8 +672,17 @@ impl KernelBank {
         let fs = (sample_rate.max(8_000)) as f64;
         let scale = sr_scale(sample_rate);
         let n_synth = N_SYNTH * scale;
-        let n_ir = N_IR * scale;
-        let kaiser_tail = KAISER_TAIL * scale;
+        let has_room = custom_room.is_some() || cfg.room_preset != RoomPreset::Anechoic;
+        let n_ir = if has_room {
+            N_IR_ROOM * scale
+        } else {
+            N_IR * scale
+        };
+        let kaiser_tail = if has_room {
+            (KAISER_TAIL * 2) * scale
+        } else {
+            KAISER_TAIL * scale
+        };
         let nb = n_synth / 2 + 1;
         let plan = FftPlan::new(n_synth);
         let freqs: Vec<f64> = (0..nb)
@@ -878,7 +890,8 @@ impl KernelBank {
             }
 
             // Acoustic Reciprocity shortcut: only 2 3D FDTD runs (L ear + R ear) record all 12 speakers!
-            let fdtd = FdtdSolver3d::new(room_geom, c_air, 0.28);
+            // Targets 500 Hz @ 6 PPW (`dx = 0.114 m` on ControlRoom) within a 65k-voxel budget.
+            let fdtd = FdtdSolver3d::for_room_budget(room_geom, c_air, 500.0, 65_000);
             let ear_l_v = fdtd.coord_to_voxel([
                 room_geom.listener_m[0],
                 room_geom.listener_m[1] + cfg.head_radius_m,
@@ -891,7 +904,7 @@ impl KernelBank {
             ]);
             let spk_voxels: Vec<(usize, usize, usize)> =
                 spk_coords.iter().map(|&p| fdtd.coord_to_voxel(p)).collect();
-            let fdtd_steps = ((0.10 / fdtd.dt_s).ceil() as usize).clamp(40, 260);
+            let fdtd_steps = ((0.165 / fdtd.dt_s).ceil() as usize).clamp(120, 1_100);
             let fdtd_l_all = fdtd.simulate(ear_l_v, &spk_voxels, fdtd_steps);
             let fdtd_r_all = fdtd.simulate(ear_r_v, &spk_voxels, fdtd_steps);
 
@@ -1959,6 +1972,7 @@ pub struct BinauralPlus {
     ntt_x: Vec<u64>,
     ntt_acc_l: Vec<u64>,
     ntt_acc_r: Vec<u64>,
+    ntt_kernel_scale: f64,
     finite: bool,
 }
 
@@ -1986,8 +2000,12 @@ impl BinauralPlus {
         let bank =
             KernelBank::synthesize_with_assets(cfg, sample_rate, custom_room, custom_head_mesh);
         let scale = sr_scale(sample_rate);
-        let n_ir = N_IR * scale;
-        let n_fft = N_FFT * scale;
+        let n_ir = bank.ir_l[0].len();
+        let n_fft = if n_ir <= N_IR * scale {
+            N_FFT * scale
+        } else {
+            (n_ir * 2).next_power_of_two()
+        };
         let ola_hop = n_fft - n_ir;
         let plan = FftPlan::new(n_fft);
         let nb = n_fft / 2 + 1;
@@ -2006,6 +2024,25 @@ impl BinauralPlus {
             plan.rfft(&pad, &mut scratch, &mut kern_r[ch]);
         }
 
+        // Choose exact power-of-two NTT kernel quantization scale with guaranteed >= 4x headroom
+        // below `GOLDILOCKS_P / 2` across all active channels and full-scale 24-bit PCM.
+        let mut ntt_kernel_scale = NTT_KERNEL_SCALE;
+        if cfg.exact_ntt {
+            let total_l1: f64 = (0..SLOTS)
+                .map(|ch| {
+                    let l1_l: f64 = bank.ir_l[ch].iter().map(|v| v.abs()).sum();
+                    let l1_r: f64 = bank.ir_r[ch].iter().map(|v| v.abs()).sum();
+                    l1_l.max(l1_r)
+                })
+                .sum();
+            let max_safe = 0.25 * (GOLDILOCKS_P as f64);
+            while ntt_kernel_scale > 65_536.0
+                && total_l1 * NTT_PCM_SCALE * ntt_kernel_scale > max_safe
+            {
+                ntt_kernel_scale *= 0.5;
+            }
+        }
+
         let (ntt_plan, ntt_kern_l, ntt_kern_r, ntt_ov_l, ntt_ov_r, ntt_x, ntt_acc_l, ntt_acc_r) =
             if cfg.exact_ntt {
                 let np = NttPlan::new(n_fft);
@@ -2013,8 +2050,8 @@ impl BinauralPlus {
                 let mut nkr = vec![vec![0u64; n_fft]; SLOTS];
                 for ch in 0..SLOTS {
                     for i in 0..n_ir {
-                        let ql = (bank.ir_l[ch][i] * NTT_KERNEL_SCALE).round() as i64;
-                        let qr = (bank.ir_r[ch][i] * NTT_KERNEL_SCALE).round() as i64;
+                        let ql = (bank.ir_l[ch][i] * ntt_kernel_scale).round() as i64;
+                        let qr = (bank.ir_r[ch][i] * ntt_kernel_scale).round() as i64;
                         nkl[ch][i] = i64_to_field(ql);
                         nkr[ch][i] = i64_to_field(qr);
                     }
@@ -2071,6 +2108,7 @@ impl BinauralPlus {
             ntt_x,
             ntt_acc_l,
             ntt_acc_r,
+            ntt_kernel_scale,
             finite: true,
         }
     }
@@ -2185,7 +2223,7 @@ impl BinauralPlus {
             np.inverse(&mut self.ntt_acc_l);
             np.inverse(&mut self.ntt_acc_r);
 
-            let inv_scale = 1.0 / (NTT_PCM_SCALE * NTT_KERNEL_SCALE);
+            let inv_scale = 1.0 / (NTT_PCM_SCALE * self.ntt_kernel_scale);
             let ov_len = self.n_ir - 1;
             for i in 0..m {
                 let ol = if i < ov_len { self.ntt_ov_l[i] } else { 0 };
@@ -2272,7 +2310,7 @@ impl BinauralPlus {
             return (Vec::new(), Vec::new());
         }
         if self.ntt_plan.is_some() {
-            let inv_scale = 1.0 / (NTT_PCM_SCALE * NTT_KERNEL_SCALE);
+            let inv_scale = 1.0 / (NTT_PCM_SCALE * self.ntt_kernel_scale);
             let tl: Vec<f64> = self
                 .ntt_ov_l
                 .iter()
@@ -3141,6 +3179,60 @@ mod tests {
         assert!(
             rms_l > rms_r * 1.1,
             "FMM-BEM head-mesh FL source should yield ipsilateral > contralateral energy (L={rms_l:.4}, R={rms_r:.4})"
+        );
+    }
+
+    #[test]
+    fn control_room_long_brir_and_exact_ntt_match_fft_without_wrap() {
+        let mut cfg = PlusCfg::from_profile(PlusProfile::Studio);
+        cfg.room_preset = RoomPreset::ControlRoom;
+        cfg.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+
+        let bank = KernelBank::synthesize(cfg, 48_000);
+        assert_eq!(
+            bank.ir_l[SLOT_FL].len(),
+            N_IR_ROOM,
+            "3D Hybrid ControlRoom must synthesize full 8192-tap (170.7 ms) BRIR"
+        );
+
+        let mut cfg_ntt = cfg;
+        cfg_ntt.exact_ntt = true;
+        let mut eng_fft = BinauralPlus::new(crate::dsp::MASK_5_1, cfg, 48_000);
+        let mut eng_ntt = BinauralPlus::new(crate::dsp::MASK_5_1, cfg_ntt, 48_000);
+
+        let n = 4096usize;
+        let fl: Vec<f64> = (0..n)
+            .map(|i| 0.45 * (2.0 * PI * 320.0 * i as f64 / 48_000.0).sin())
+            .collect();
+        let fr: Vec<f64> = (0..n)
+            .map(|i| 0.35 * (2.0 * PI * 640.0 * i as f64 / 48_000.0).cos())
+            .collect();
+        let mut refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        refs[SLOT_FL] = Some(&fl);
+        refs[SLOT_FR] = Some(&fr);
+
+        let mut l_fft = vec![0.0_f64; n];
+        let mut r_fft = vec![0.0_f64; n];
+        let mut l_ntt = vec![0.0_f64; n];
+        let mut r_ntt = vec![0.0_f64; n];
+        eng_fft.process(&refs, &mut l_fft, &mut r_fft, n);
+        eng_ntt.process(&refs, &mut l_ntt, &mut r_ntt, n);
+        let (tl_fft, tr_fft) = eng_fft.flush();
+        let (tl_ntt, tr_ntt) = eng_ntt.flush();
+        l_fft.extend_from_slice(&tl_fft);
+        r_fft.extend_from_slice(&tr_fft);
+        l_ntt.extend_from_slice(&tl_ntt);
+        r_ntt.extend_from_slice(&tr_ntt);
+
+        let max_diff = l_fft
+            .iter()
+            .zip(&l_ntt)
+            .chain(r_fft.iter().zip(&r_ntt))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 2e-6,
+            "ControlRoom 8192-tap --exact-ntt diverged from f64 FFT: max_diff={max_diff:e}"
         );
     }
 }
