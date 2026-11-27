@@ -790,8 +790,11 @@ impl FdtdSolver3d {
         self.simulate(src_voxel, receivers, steps)
     }
 
+    /// Run the FDTD loop on a live GPU with no CPU fallback. `simulate_with_cuda` silently
+    /// falls back when the runtime or a launch fails; this entry point returns the error so
+    /// callers (the verifier's live parity check) can prove the kernel actually executed.
     #[cfg(feature = "cuda")]
-    fn simulate_on_cuda(
+    pub fn simulate_on_cuda(
         &self,
         rt: &g6me_cuda::G6meCudaRuntime,
         src_voxel: (usize, usize, usize),
@@ -799,7 +802,7 @@ impl FdtdSolver3d {
         steps: usize,
     ) -> std::result::Result<Vec<Vec<f64>>, String> {
         let total = self.nx * self.ny * self.nz;
-        let mut p_prev = vec![0.0_f64; total];
+        let p_prev = vec![0.0_f64; total];
         let mut p_curr = vec![0.0_f64; total];
         let lam2 = self.lambda * self.lambda;
         let half_lam_beta = 0.5 * self.lambda * self.beta_wall;
@@ -808,32 +811,25 @@ impl FdtdSolver3d {
             *slot = 1.0 / (1.0 + half_lam_beta * (kb as f64));
         }
         let src_id = self.idx(src_voxel.0, src_voxel.1, src_voxel.2);
+        // Step 0 records p_curr after the impulse injection and before the first update;
+        // both happen on the host so the GPU loop sees exactly the CPU solver's state.
+        p_curr[src_id] += 1.0;
         let rec_ids: Vec<usize> = receivers
             .iter()
             .map(|&(i, j, k)| self.idx(i, j, k))
             .collect();
-        let mut out: Vec<Vec<f64>> = vec![vec![0.0_f64; steps]; receivers.len()];
-        for step in 0..steps {
-            if step == 0 {
-                p_curr[src_id] += 1.0;
-            }
-            for (row, &rid) in out.iter_mut().zip(rec_ids.iter()) {
-                row[step] = p_curr[rid];
-            }
-            let p_next = rt.run_fdtd_3d_step(
-                &p_prev,
-                &p_curr,
-                &inv_den,
-                self.nx,
-                self.ny,
-                self.nz,
-                lam2,
-                half_lam_beta,
-            )?;
-            p_prev = p_curr;
-            p_curr = p_next;
-        }
-        Ok(out)
+        rt.run_fdtd_3d_simulation(
+            &p_prev,
+            &p_curr,
+            &inv_den,
+            self.nx,
+            self.ny,
+            self.nz,
+            lam2,
+            half_lam_beta,
+            &rec_ids,
+            steps,
+        )
     }
 
     pub fn simulate(

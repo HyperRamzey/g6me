@@ -97,7 +97,7 @@ Based on **He, Tan & Gan (IEEE/ACM TASLP 2014/2015)**, **Song et al. (IEEE TCE J
 - `--dither wannamaker` runs an in-app 9-tap error-feedback psychoacoustic quantizer (`PcmQuantizer` / `Grid24`) with TPDF dither at 16-bit and 24-bit output depths (Wannamaker F-weighted taps at 44.1/48 kHz; Levinson–Durbin ISO-226 minimum-phase taps at 88.2–384 kHz), lowering the 1–5 kHz noise floor by $> 15\text{–}20\text{ dB}$ vs. flat TPDF.
 
 ### 3.7 Non-Intrusive Klippel (2006) & King–Agerkvist (JAES 2018) Transducer Assessment (`crates/g6me-core/src/transducer.rs`)
-- `--assess studio-5|studio-8|sub-12|headphone|iem` feeds the post-limiter output stream through a 4×-substepped electro-mechanical-thermal ODE ($Bl(x)$, $K_{ms}(x)$, $L_e(x)$ reluctance, 5-pole viscoelastic creep, and voice-coil $\Delta T$) and reports excursion (% $X_{\max}$), thermal rise, $Bl$ compression, and estimated nonlinear THD% without modifying a single output sample.
+- `--assess none|headphone-dynamic|headphone-planar|studio-monitor` feeds the post-limiter output stream through a 4×-substepped electro-mechanical-thermal ODE ($Bl(x)$, $K_{ms}(x)$, $L_e(x)$ reluctance, 5-pole viscoelastic creep, and voice-coil $\Delta T$) and reports excursion (% $X_{\max}$), thermal rise, $Bl$ compression, and estimated nonlinear THD% without modifying a single output sample.
 
 ---
 
@@ -128,7 +128,7 @@ g6me input_stereo.flac \
   --detail --detail-intensity 0.35 --detail-tilt 2.0 \
   --unmask --unmask-recover 0.35 --unmask-tame 0.35 --unmask-max-db 4.5 \
   --limit-style punchy --limit-clip-db 2.0 --ceiling -1.0 \
-  --depth s16 --dither wannamaker --assess studio-5
+  --depth s16 --dither wannamaker --assess studio-monitor
 
 # Verify bit-exact default path (all new stages off, Transparent limiter):
 g6me input_7_1.flac --dry-run

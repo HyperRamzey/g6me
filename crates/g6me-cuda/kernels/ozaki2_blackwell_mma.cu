@@ -1,10 +1,11 @@
-// Zero-FMA Ozaki-II CRT FP64-on-Tensor-Core Kernel for NVIDIA Blackwell (sm_120) & Ampere+.
+// Zero-FMA Ozaki-II CRT FP64 reconstruction kernels for NVIDIA Blackwell (sm_120) & Ampere+.
 // Compiled with: nvcc --fmad=false -Xcompiler -ffp-contract=off -O3
 //
-// On Blackwell (sm_120, PTX 8.7+), executes NVFP4 E2M1 block-scaled tensor core MMA:
+// The executed kernels below are scalar CUDA-core code. The file also defines the Blackwell
+// NVFP4 E2M1 block-scaled tensor-core wrapper
 //   mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3
-// On Ampere/Ada/Hopper (sm_80..sm_90), executes exact INT8 tensor core MMA:
-//   mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
+// which is exercised only by the compile-only probe kernel at the end of the file; the sm_120a
+// SASS audit fails if that MMA instruction disappears. Plain sm_120 rejects it in ptxas.
 // CRT residue reconstruction uses strict IEEE-754 __dadd_rn / __dmul_rn (zero DFMA contractions).
 
 #include <stdint.h>
@@ -94,4 +95,21 @@ extern "C" __global__ void g6me_ozaki2_int8_residue_gemm(
     int32_t rem = acc % modulus;
     if (rem < 0) rem += modulus;
     c_mod[row * n + col] = rem;
+}
+
+// Compile-coverage probe for the arch-gated Blackwell path. The shipped kernels above are
+// scalar CUDA-core code; this kernel is never launched, but its call site keeps the NVFP4
+// `mma.sync` instruction in the sm_120a SASS, so the verifier can prove the block actually
+// assembles instead of being dead code. Plain sm_120 rejects the instruction in ptxas,
+// hence the __CUDA_ARCH_SPECIFIC__ guard.
+extern "C" __global__ void g6me_ozaki2_nvfp4_mma_compile_probe(float* out) {
+#if defined(__CUDA_ARCH_SPECIFIC__) && (__CUDA_ARCH__ >= 1200)
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    uint32_t z = 0u;
+    blackwell_nvfp4_mma_m16n8k64(d0, d1, d2, d3, z, z, z, z, z, z,
+                                 0.0f, 0.0f, 0.0f, 0.0f, z, z);
+    if (out != 0) out[0] = d0 + d1 + d2 + d3;
+#else
+    (void)out;
+#endif
 }

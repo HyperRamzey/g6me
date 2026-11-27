@@ -3224,11 +3224,15 @@ pub fn cuda() -> Vec<Check> {
     let mut out = Vec::new();
     #[cfg(feature = "cuda")]
     {
-        let arch = "sm_75";
-        match g6me_cuda::audit_all_cuda_kernels_sass(Some(arch)) {
+        // Let the toolchain pick the newest target it supports (sm_120a on CUDA 12.8+),
+        // so the Blackwell-only `__CUDA_ARCH__ >= 1200` NVFP4 MMA path is actually audited.
+        match g6me_cuda::audit_all_cuda_kernels_sass(None) {
             Ok(reports) => {
                 let total_instrs: usize = reports.iter().map(|r| r.sass_instructions).sum();
-                let used_arch = reports.first().map(|r| r.arch.as_str()).unwrap_or(arch);
+                let used_arch = reports
+                    .first()
+                    .map(|r| r.arch.as_str())
+                    .unwrap_or("unknown");
                 out.push(with_metric(
                     if reports.len() == 6 && total_instrs > 0 {
                         pass(
@@ -3256,7 +3260,7 @@ pub fn cuda() -> Vec<Check> {
                         "fma_hits": 0,
                     }),
                 ));
-                match g6me_cuda::verify_sass_auditor_catches_fmad_sabotage(Some(arch)) {
+                match g6me_cuda::verify_sass_auditor_catches_fmad_sabotage(None) {
                     Ok(hits) => out.push(with_metric(
                         pass(
                             "cuda",
@@ -3291,6 +3295,86 @@ pub fn cuda() -> Vec<Check> {
                         "6 CUDA kernels nvcc --fmad=false SASS audit",
                         e,
                     ));
+                }
+            }
+        }
+        // Live numerical parity: run one real FDTD problem through the CPU solver and the
+        // GPU kernel, automatically, whenever a device is visible and the toolchain can
+        // build/load the module. Absent hardware/toolkit is informational; a detected GPU
+        // whose kernel cannot initialize or launch is a failure.
+        let hw_summary = g6me_core::blackwell::cuda_hardware_summary();
+        match hw_summary {
+            None => out.push(info(
+                "cuda",
+                "live FDTD CPU/GPU parity",
+                "no CUDA GPU detected; live parity not run (CPU fallback active)".to_string(),
+            )),
+            Some(ref hw) if !g6me_cuda::nvcc_toolchain_available() => out.push(info(
+                "cuda",
+                "live FDTD CPU/GPU parity",
+                format!("{hw}: CUDA toolkit unavailable, live parity not run"),
+            )),
+            Some(hw) => {
+                use g6me_core::atmosphere::AtmosphereCfg;
+                use g6me_core::room::{FdtdSolver3d, RoomGeometry, RoomPreset};
+                use std::time::Instant;
+                let c_air = AtmosphereCfg::default().speed_of_sound_m_s();
+                match g6me_cuda::G6meCudaRuntime::init() {
+                    Ok(rt) => {
+                        let room = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+                        let fdtd = FdtdSolver3d::new(&room, c_air, 0.35);
+                        let va = fdtd.coord_to_voxel([1.5, 1.4, 1.2]);
+                        let vb = fdtd.coord_to_voxel([3.9, 3.2, 1.5]);
+                        let steps = 90;
+                        let t_cpu = Instant::now();
+                        let cpu = fdtd.simulate(va, &[vb], steps);
+                        let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+                        let t_gpu = Instant::now();
+                        match fdtd.simulate_on_cuda(&rt, va, &[vb], steps) {
+                            Ok(gpu) => {
+                                let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1e3;
+                                let peak = cpu[0].iter().map(|v| v.abs()).fold(0.0, f64::max);
+                                let max_abs = cpu[0]
+                                    .iter()
+                                    .zip(gpu[0].iter())
+                                    .map(|(a, b)| (a - b).abs())
+                                    .fold(0.0, f64::max);
+                                let rel = max_abs / peak.max(1e-300);
+                                let ok = peak > 1e-5 && max_abs < 1e-12;
+                                let detail = format!(
+                                    "CPU vs live GPU over {steps} steps: max |d| = {max_abs:.3e} \
+                                     ({rel:.1e} of peak {peak:.3e}); CPU {cpu_ms:.1} ms vs GPU \
+                                     {gpu_ms:.2} ms on {hw}"
+                                );
+                                out.push(with_metric(
+                                    if ok {
+                                        pass("cuda", "live FDTD CPU/GPU numerical parity", detail)
+                                    } else {
+                                        fail("cuda", "live FDTD CPU/GPU numerical parity", detail)
+                                    },
+                                    json!({
+                                        "max_abs_err": max_abs,
+                                        "rel_err": rel,
+                                        "peak": peak,
+                                        "steps": steps,
+                                        "cpu_ms": cpu_ms,
+                                        "gpu_ms": gpu_ms,
+                                        "device": hw,
+                                    }),
+                                ));
+                            }
+                            Err(e) => out.push(fail(
+                                "cuda",
+                                "live FDTD CPU/GPU numerical parity",
+                                format!("{hw}: GPU FDTD failed: {e}"),
+                            )),
+                        }
+                    }
+                    Err(e) => out.push(fail(
+                        "cuda",
+                        "live FDTD CPU/GPU numerical parity",
+                        format!("{hw}: CUDA runtime init failed: {e}"),
+                    )),
                 }
             }
         }

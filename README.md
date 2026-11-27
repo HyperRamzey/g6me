@@ -304,8 +304,15 @@ standalone `.cu` kernels (`fdtd_3d.cu`, `raytrace_hoa.cu`, `stockham_fft_f64.cu`
 `goldilocks_ntt.cu`, `bem_matvec.cu`, `ozaki2_blackwell_mma.cu`) compiled with
 `nvcc --fmad=false` and audited for 0 contracted `fma.rn` in the PTX and 0 fused
 FMA in the `cuobjdump --dump-sass` hardware SASS (with a `--fmad=true` sabotage
-negative control) in `g6me-verify --group cuda`, plus dynamic `cudarc`
-GPU offload for 3D FDTD (`--cuda`) with deterministic pure-Rust CPU fallback.
+negative control) in `g6me-verify --group cuda`. The audit targets the newest arch
+the toolkit supports (`sm_120a` on CUDA 12.8+, so the Blackwell NVFP4 MMA path is
+compiled rather than skipped) and requires the `OMMA` instruction to be present in
+that SASS — an unused wrapper cannot leave the arch-gated path silently dead. The same group automatically runs one real 3D FDTD
+problem through both the CPU solver and the GPU kernel whenever a device and `nvcc`
+are present, requiring `max |d| < 1e-12` over 90 steps (observed 9.3e-16, 2.8e-14 of
+peak) and reporting both timings; on a host with no GPU it reports that instead of
+failing. 3D FDTD GPU offload (`--cuda`) keeps the grids resident in VRAM for the whole
+run — one upload, one download — with a deterministic pure-Rust CPU fallback.
 
 Design notes: `docs/G6ME_SCAN_FMM_BEM_NTT.md` (scan, FMM-BEM, NTT),
 `docs/ACADEMIC_NUKE_ACOUSTICS.md` (room, CUDA, noise shaping, transducer, and perceptual models), and

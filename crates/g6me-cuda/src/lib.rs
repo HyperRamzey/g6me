@@ -160,9 +160,14 @@ impl G6meCudaRuntime {
         })
     }
 
-    /// Execute one zero-FMA 3D SRL FDTD acoustic wave step on the GPU.
+    /// Execute the whole 3D SRL FDTD simulation on the GPU. The two pressure grids, the
+    /// boundary denominators and the receiver gather stay in VRAM for the entire run: one
+    /// htod at the start and one dtoh at the end, with only the per-step kernel launch
+    /// crossing the host. This is what keeps a 3,200-step production simulation off the
+    /// PCIe bus (the previous per-step API moved ~20 GB for a 260k-voxel grid).
+    /// Returns `out[receiver][step]`.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_fdtd_3d_step(
+    pub fn run_fdtd_3d_simulation(
         &self,
         p_prev: &[f64],
         p_curr: &[f64],
@@ -172,16 +177,26 @@ impl G6meCudaRuntime {
         nz: usize,
         lam2: f64,
         half_lam_beta: f64,
-    ) -> Result<Vec<f64>, String> {
+        rec_ids: &[usize],
+        steps: usize,
+    ) -> Result<Vec<Vec<f64>>, String> {
         let n = nx * ny * nz;
         if p_prev.len() != n || p_curr.len() != n {
             return Err("FDTD buffer size mismatch".into());
         }
-        let d_prev = self
+        for &rid in rec_ids {
+            if rid >= n {
+                return Err(format!("receiver id {rid} is outside the {n}-voxel grid"));
+            }
+        }
+        let n_rec = rec_ids.len();
+        let ids_i32: Vec<i32> = rec_ids.iter().map(|&r| r as i32).collect();
+
+        let mut d_prev = self
             .stream
             .clone_htod(p_prev)
             .map_err(|e| format!("htod p_prev: {e}"))?;
-        let d_curr = self
+        let mut d_curr = self
             .stream
             .clone_htod(p_curr)
             .map_err(|e| format!("htod p_curr: {e}"))?;
@@ -193,6 +208,19 @@ impl G6meCudaRuntime {
             .stream
             .clone_htod(inv_den.as_slice())
             .map_err(|e| format!("htod inv_den: {e}"))?;
+        let d_rec = if n_rec == 0 {
+            self.stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| format!("alloc rec_ids: {e}"))?
+        } else {
+            self.stream
+                .clone_htod(&ids_i32)
+                .map_err(|e| format!("htod rec_ids: {e}"))?
+        };
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f64>((steps * n_rec).max(1))
+            .map_err(|e| format!("alloc rec_out: {e}"))?;
 
         let func: CudaFunction = self
             .fdtd_mod
@@ -208,22 +236,45 @@ impl G6meCudaRuntime {
             shared_mem_bytes: 0,
         };
         let (nx_i, ny_i, nz_i) = (nx as i32, ny as i32, nz as i32);
-        let mut builder = self.stream.launch_builder(&func);
-        builder
-            .arg(&d_prev)
-            .arg(&d_curr)
-            .arg(&mut d_next)
-            .arg(&d_inv)
-            .arg(&nx_i)
-            .arg(&ny_i)
-            .arg(&nz_i)
-            .arg(&lam2)
-            .arg(&half_lam_beta);
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch fdtd_3d: {e}"))?;
+        let n_rec_i = n_rec as i32;
+        for step in 0..steps {
+            let step_i = step as i32;
+            let mut builder = self.stream.launch_builder(&func);
+            builder
+                .arg(&d_prev)
+                .arg(&d_curr)
+                .arg(&mut d_next)
+                .arg(&d_inv)
+                .arg(&nx_i)
+                .arg(&ny_i)
+                .arg(&nz_i)
+                .arg(&lam2)
+                .arg(&half_lam_beta)
+                .arg(&d_rec)
+                .arg(&n_rec_i)
+                .arg(&mut d_out)
+                .arg(&step_i);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| format!("launch fdtd_3d step {step}: {e}"))?;
+            // p_{s-1} <- p_s <- p_{s+1}; the old p_{s-1} buffer becomes the next scratch.
+            std::mem::swap(&mut d_prev, &mut d_curr);
+            std::mem::swap(&mut d_curr, &mut d_next);
+        }
 
-        self.stream
-            .clone_dtoh(&d_next)
-            .map_err(|e| format!("dtoh p_next: {e}"))
+        if n_rec == 0 || steps == 0 {
+            return Ok(vec![vec![0.0; steps]; n_rec]);
+        }
+        let host = self
+            .stream
+            .clone_dtoh(&d_out)
+            .map_err(|e| format!("dtoh rec_out: {e}"))?;
+        let mut out = vec![vec![0.0_f64; steps]; n_rec];
+        for step in 0..steps {
+            for (r, row) in out.iter_mut().enumerate() {
+                row[step] = host[step * n_rec + r];
+            }
+        }
+        Ok(out)
     }
 
     /// Execute a zero-FMA complex Helmholtz BEM matrix-vector product `y = A * x` on the GPU.
@@ -459,7 +510,11 @@ pub fn pick_supported_nvcc_arch(preferred: Option<&str>) -> Result<String, Strin
     if let Some(p) = preferred {
         candidates.push(p.to_string());
     }
-    for arch in ["sm_120", "sm_90", "sm_89", "sm_86", "sm_80", "sm_75"] {
+    // sm_120a is the arch-specific target the Blackwell NVFP4 `mxf4nvf4` MMA requires;
+    // plain sm_120 is the portable fallback for toolkits/drivers without the `a` suffix.
+    for arch in [
+        "sm_120a", "sm_120", "sm_90", "sm_89", "sm_86", "sm_80", "sm_75",
+    ] {
         if !candidates.iter().any(|c| c == arch) {
             candidates.push(arch.to_string());
         }
@@ -636,6 +691,23 @@ pub fn audit_all_cuda_kernels_sass(
             })?;
         if count == 0 {
             return Err(format!("CUDA kernel `{name}` produced 0 SASS instructions"));
+        }
+        // On an arch-specific Blackwell target the NVFP4 MMA must actually be present;
+        // an unused wrapper would otherwise leave the arch-gated path silently dead.
+        let arch_num: u32 = arch
+            .trim_start_matches("sm_")
+            .trim_end_matches('a')
+            .parse()
+            .unwrap_or(0);
+        if name == "ozaki2_blackwell_mma"
+            && arch.ends_with('a')
+            && arch_num >= 120
+            && !sass.lines().any(|line| line.contains("MMA"))
+        {
+            return Err(format!(
+                "CUDA kernel `{name}` ({arch}) contains no MMA instruction in SASS: \
+                 the Blackwell NVFP4 path is dead code"
+            ));
         }
         results.push(KernelSassAudit {
             name: name.to_string(),
