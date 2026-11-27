@@ -191,7 +191,7 @@ cargo run -p g6me-cli -- --caps
 
 ```sh
 cargo build --release            # g6me, g6me-scan and g6me-gui in target/release/
-cargo test --workspace           # 362 tests (282 core, 24 CLI, 43 GUI, 13 harness)
+cargo test --workspace           # 363 tests (283 core, 24 CLI, 43 GUI, 13 harness)
 cargo run -p g6me-verify         # the bit-exactness evidence (122 checks)
 scripts/build-install.sh         # optimized x86-64-v3 build, verified, installed
 ```
@@ -603,8 +603,8 @@ than a stale binary in `target/` — an out-of-date verifier is worse than none.
 check also runs per-group (`--group bitexact` …), so a failure can be reproduced
 without waiting for the whole suite.
 
-The workspace test suite covers what the verifier does not: 362 tests across the
-core (282), CLI (24), GUI (43) and harness (13). The G6+ invariants live there —
+The workspace test suite covers what the verifier does not: 363 tests across the
+core (283), CLI (24), GUI (43) and harness (13). The G6+ invariants live there —
 a flat 1-ERB diffuse field across all three profiles, measured ITD against
 Woodworth, sub-bass coherence, exact L/R mirror symmetry, a clean kernel tail with
 no pre-ringing, chunk-size-invariant overlap-add streaming, stereo bypass, LFE gain
