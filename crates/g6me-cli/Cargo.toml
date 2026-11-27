@@ -11,6 +11,10 @@ repository.workspace = true
 name = "g6me"
 path = "src/main.rs"
 
+[[bin]]
+name = "g6me-scan"
+path = "src/scan_main.rs"
+
 [dependencies]
 g6me-core = { workspace = true }
 clap = { workspace = true }

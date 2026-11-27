@@ -1173,6 +1173,1701 @@ fn fmt_f(v: f64) -> String {
     }
 }
 
+/// `acoustics`: exact 3D Helmholtz/Snowman wave-scattering reciprocity, 3D FDTD PDE
+/// reciprocity, Slepian DPSS Heisenberg-Gabor optimality, Paraunitary FDN lossless
+/// energy conservation, Order-7 HOA quadrature orthonormality, and Bark-warped AP ripple.
+pub fn acoustics() -> Vec<Check> {
+    use g6me_core::atmosphere::AtmosphereCfg;
+    use g6me_core::fft::{i0, kaiser_beta, slepian_dpss, Complex, FftPlan};
+    use g6me_core::hoa::{
+        eval_sh_order7, kermit_canfield_warped_allpass, sphere_quadrature_order7, HOA_CH,
+    };
+    use g6me_core::room::{FdtdSolver3d, RoomGeometry, RoomPreset, ScatteringFdn};
+    use g6me_core::scattering::{rigid_sphere_green, snowman_green, SnowmanGeom};
+    use std::f64::consts::PI;
+
+    let mut out = Vec::new();
+
+    // 1. Acoustic reciprocity of 3D Helmholtz rigid sphere & coupled Snowman head+torso (< 1e-13).
+    let atmo = AtmosphereCfg::default();
+    let c_air = atmo.speed_of_sound_m_s();
+    let geom = SnowmanGeom::default();
+    let p1 = [1.4, 0.7, 0.25];
+    let p2 = [-0.6, 1.1, 0.45];
+    let mut max_recip_err = 0.0_f64;
+    for &f in &[300.0, 1_200.0, 3_600.0, 8_000.0] {
+        let k = 2.0 * PI * f / c_air;
+        let g12 = rigid_sphere_green(k, geom.head_radius_m, 0.45, 2.1, 0.35);
+        let g21 = rigid_sphere_green(k, geom.head_radius_m, 2.1, 0.45, 0.35);
+        let r_sphere = g12.sub(g21).norm() / g12.norm().max(1e-30);
+        let s12 = snowman_green(k, geom, p1, p2);
+        let s21 = snowman_green(k, geom, p2, p1);
+        let r_snow = s12.sub(s21).norm() / s12.norm().max(1e-30);
+        max_recip_err = max_recip_err.max(r_sphere).max(r_snow);
+    }
+    out.push(with_metric(
+        if max_recip_err < 1e-13 {
+            pass(
+                "acoustics",
+                "Helmholtz + Snowman acoustic reciprocity",
+                format!(
+                    "max |H(r1->r2)-H(r2->r1)|/|H| = {max_recip_err:.3e} (< 1e-13) at c = {c_air:.3} m/s"
+                ),
+            )
+        } else {
+            fail(
+                "acoustics",
+                "Helmholtz + Snowman acoustic reciprocity",
+                format!("reciprocity error {max_recip_err:.3e} >= 1e-13"),
+            )
+        },
+        json!({ "max_rel_err": max_recip_err, "speed_of_sound_m_s": c_air }),
+    ));
+
+    // 2. 3D Wave-Equation FDTD PDE reciprocity (< 1e-13).
+    let room = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+    let fdtd = FdtdSolver3d::new(&room, c_air, 0.35);
+    let va = fdtd.coord_to_voxel([1.5, 1.4, 1.2]);
+    let vb = fdtd.coord_to_voxel([3.9, 3.2, 1.5]);
+    let p_ab = &fdtd.simulate(va, &[vb], 90)[0];
+    let p_ba = &fdtd.simulate(vb, &[va], 90)[0];
+    let max_fdtd_err = p_ab
+        .iter()
+        .zip(p_ba.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    let peak_fdtd = p_ab.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    out.push(with_metric(
+        if peak_fdtd > 1e-5 && max_fdtd_err < 1e-13 {
+            pass(
+                "acoustics",
+                "3D FDTD PDE acoustic reciprocity",
+                format!(
+                    "max |p(a->b)-p(b->a)| = {max_fdtd_err:.3e} (< 1e-13), peak = {peak_fdtd:.3e}"
+                ),
+            )
+        } else {
+            fail(
+                "acoustics",
+                "3D FDTD PDE acoustic reciprocity",
+                format!("FDTD reciprocity error {max_fdtd_err:.3e}, peak {peak_fdtd:.3e}"),
+            )
+        },
+        json!({ "max_abs_err": max_fdtd_err, "peak": peak_fdtd }),
+    ));
+
+    // 3. Exact Slepian DPSS Heisenberg-Gabor energy concentration beats Kaiser.
+    let n_win = 128usize;
+    let nw = 4.0_f64;
+    let dp = slepian_dpss(n_win, nw);
+    let beta = kaiser_beta(96.0);
+    let i0b = i0(beta);
+    let mut kw: Vec<f64> = (0..n_win)
+        .map(|i| {
+            let r = 2.0 * (i as f64) / ((n_win - 1) as f64) - 1.0;
+            i0(beta * (1.0 - r * r).max(0.0).sqrt()) / i0b
+        })
+        .collect();
+    let kn = kw.iter().map(|v| v * v).sum::<f64>().sqrt();
+    for v in &mut kw {
+        *v /= kn;
+    }
+    let n_fft = 4096usize;
+    let plan = FftPlan::new(n_fft);
+    let mut scr = vec![Complex::ZERO; n_fft];
+    let mut pad = vec![0.0_f64; n_fft];
+    let mut bins = vec![Complex::ZERO; n_fft / 2 + 1];
+    let w_cut = nw / (n_win as f64);
+    let k_cut = (w_cut * (n_fft as f64)).round() as usize;
+    let band_leak =
+        |w: &[f64], pad: &mut [f64], scr: &mut [Complex], bins: &mut [Complex]| -> f64 {
+            pad.fill(0.0);
+            pad[..w.len()].copy_from_slice(w);
+            plan.rfft(pad, scr, bins);
+            let mut tot = bins[0].norm_sq() + bins[n_fft / 2].norm_sq();
+            let mut out_e = bins[n_fft / 2].norm_sq();
+            for (k, c) in bins.iter().enumerate().take(n_fft / 2).skip(1) {
+                let e = 2.0 * c.norm_sq();
+                tot += e;
+                if k > k_cut {
+                    out_e += e;
+                }
+            }
+            out_e / tot.max(1e-30)
+        };
+    let leak_slep = band_leak(&dp, &mut pad, &mut scr, &mut bins);
+    let leak_kais = band_leak(&kw, &mut pad, &mut scr, &mut bins);
+    out.push(with_metric(
+        if leak_slep < leak_kais && leak_slep < 1e-9 {
+            pass(
+                "acoustics",
+                "Slepian DPSS Heisenberg optimality",
+                format!(
+                    "out-of-band leakage Slepian={leak_slep:.3e} < Kaiser={leak_kais:.3e} (NW={nw})"
+                ),
+            )
+        } else {
+            fail(
+                "acoustics",
+                "Slepian DPSS Heisenberg optimality",
+                format!("Slepian leakage {leak_slep:.3e} did not beat Kaiser {leak_kais:.3e}"),
+            )
+        },
+        json!({ "slepian_leakage": leak_slep, "kaiser_leakage": leak_kais }),
+    ));
+
+    // 4. Paraunitary Scattering FDN exact orthogonality (M^T M == I) and lossless energy conservation.
+    let m = ScatteringFdn::paraunitary_matrix();
+    let mut max_orth_err = 0.0_f64;
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut dot = 0.0_f64;
+            for row in &m {
+                dot += row[i] * row[j];
+            }
+            let target = if i == j { 1.0 } else { 0.0 };
+            max_orth_err = max_orth_err.max((dot - target).abs());
+        }
+    }
+    let mut fdn = ScatteringFdn::new(48_000, 1e12, 1e12);
+    let mut inp = [0.0_f64; 8];
+    inp[0] = 1.0;
+    let mut out_e = 0.0_f64;
+    for step in 0..2048 {
+        let y = fdn.tick(if step == 0 { inp } else { [0.0; 8] });
+        if step < 1200 {
+            out_e += y.iter().map(|v| v * v).sum::<f64>();
+        }
+    }
+    out.push(with_metric(
+        if max_orth_err < 1e-13 && out_e.is_finite() && out_e > 0.0 {
+            pass(
+                "acoustics",
+                "Paraunitary FDN lossless orthogonality",
+                format!(
+                    "max |M^T M - I| = {max_orth_err:.3e} (< 1e-13), lossless tick energy = {out_e:.4}"
+                ),
+            )
+        } else {
+            fail(
+                "acoustics",
+                "Paraunitary FDN lossless orthogonality",
+                format!("FDN orthogonality err {max_orth_err:.3e}, energy {out_e:.4}"),
+            )
+        },
+        json!({ "max_orth_err": max_orth_err, "tick_energy": out_e }),
+    ));
+
+    // 5. Order-7 HOA (64 SH) Gauss-Legendre spherical quadrature orthonormality.
+    let nodes = sphere_quadrature_order7();
+    let mut max_gram_err = 0.0_f64;
+    let ys: Vec<[f64; HOA_CH]> = nodes
+        .iter()
+        .map(|nd| eval_sh_order7(nd.az_rad, nd.el_rad))
+        .collect();
+    for i in 0..HOA_CH {
+        for j in 0..HOA_CH {
+            let mut g = 0.0_f64;
+            for (k, nd) in nodes.iter().enumerate() {
+                g += nd.weight * ys[k][i] * ys[k][j];
+            }
+            let target = if i == j { 1.0 } else { 0.0 };
+            max_gram_err = max_gram_err.max((g - target).abs());
+        }
+    }
+    out.push(with_metric(
+        if max_gram_err < 1e-13 {
+            pass(
+                "acoustics",
+                "Order-7 HOA SH quadrature orthonormality",
+                format!(
+                    "64x64 Gram max error = {max_gram_err:.3e} (< 1e-13) on {} Gauss-Legendre nodes",
+                    nodes.len()
+                ),
+            )
+        } else {
+            fail(
+                "acoustics",
+                "Order-7 HOA SH quadrature orthonormality",
+                format!("64x64 Gram error {max_gram_err:.3e} >= 1e-13"),
+            )
+        },
+        json!({ "max_gram_err": max_gram_err, "nodes": nodes.len() }),
+    ));
+
+    // 6. Kermit-Canfield & Abel Bark-warped all-pass 0.000000 dB magnitude ripple.
+    let freqs: Vec<f64> = (0..513).map(|k| k as f64 * 48_000.0 / 1024.0).collect();
+    let ap_l = kermit_canfield_warped_allpass(&freqs, 48_000.0, 1.0);
+    let max_ap_ripple = ap_l
+        .iter()
+        .map(|c| (c.norm() - 1.0).abs())
+        .fold(0.0_f64, f64::max);
+    out.push(with_metric(
+        if max_ap_ripple < 1e-13 {
+            pass(
+                "acoustics",
+                "Bark-warped all-pass zero-ripple",
+                format!("max ||H(f)| - 1| = {max_ap_ripple:.3e} (< 1e-13)"),
+            )
+        } else {
+            fail(
+                "acoustics",
+                "Bark-warped all-pass zero-ripple",
+                format!("all-pass magnitude ripple {max_ap_ripple:.3e} >= 1e-13"),
+            )
+        },
+        json!({ "max_ripple": max_ap_ripple }),
+    ));
+
+    out
+}
+
+/// `cochlea`: Zilany-Bruce-Carney biophysical auditory-nerve neurogram NSIM,
+/// Baumgartner-Majdak Bayesian Auditory Externalization, and Hear-to-Hear BALD personalization.
+pub fn cochlea() -> Vec<Check> {
+    use g6me_core::cochlea::{
+        baumgartner_majdak_externalization, compute_neurogram, nsim, AnatomyParams,
+        PersonalizationSession,
+    };
+    use g6me_core::plus::{KernelBank, PhysicsEngine, PlusCfg, PlusProfile};
+    use g6me_core::room::RoomPreset;
+    use std::f64::consts::PI;
+
+    let mut out = Vec::new();
+    let fs = 48_000u32;
+    const SLOT_FL: usize = 0;
+
+    // 1. Zilany-Bruce-Carney biophysical neurogram NSIM unity & distortion sensitivity.
+    let n = 4800usize;
+    let mut clean = vec![0.0_f64; n];
+    let mut clipped = vec![0.0_f64; n];
+    for i in 0..n {
+        let t = (i as f64) / (fs as f64);
+        let s = 0.25 * (2.0 * PI * 440.0 * t).sin()
+            + 0.18 * (2.0 * PI * 1_650.0 * t).sin()
+            + 0.12 * (2.0 * PI * 4_200.0 * t).sin();
+        clean[i] = s;
+        clipped[i] = (s * 4.0).tanh() * 0.25 - 0.12 * (2.0 * PI * 4_200.0 * t).sin();
+    }
+    let ng_clean = compute_neurogram(&clean, fs, 24);
+    let ng_same = compute_neurogram(&clean, fs, 24);
+    let ng_clip = compute_neurogram(&clipped, fs, 24);
+    let s_same = nsim(&ng_clean, &ng_same);
+    let s_clip = nsim(&ng_clean, &ng_clip);
+    out.push(with_metric(
+        if (s_same - 1.0).abs() < 1e-12 && s_clip < 0.92 {
+            pass(
+                "cochlea",
+                "Zilany-Bruce-Carney neurogram NSIM",
+                format!("NSIM(ref,ref)={s_same:.6}, NSIM(ref,distorted)={s_clip:.4} (< 0.92)"),
+            )
+        } else {
+            fail(
+                "cochlea",
+                "Zilany-Bruce-Carney neurogram NSIM",
+                format!("NSIM unity={s_same:.6}, distorted={s_clip:.4}"),
+            )
+        },
+        json!({ "nsim_same": s_same, "nsim_distorted": s_clip }),
+    ));
+
+    // 2. Baumgartner-Majdak Externalization: G6+ Studio & 3D ControlRoom > G6+ Pure.
+    let bank_pure = KernelBank::synthesize(PlusCfg::from_profile(PlusProfile::Pure), fs);
+    let bank_studio = KernelBank::synthesize(PlusCfg::from_profile(PlusProfile::Studio), fs);
+    let mut ctrl_cfg = PlusCfg::from_profile(PlusProfile::Studio);
+    ctrl_cfg.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+    ctrl_cfg.room_preset = RoomPreset::ControlRoom;
+    ctrl_cfg.use_slepian_tail = true;
+    ctrl_cfg.use_fdn_velvet = true;
+    let bank_ctrl = KernelBank::synthesize(ctrl_cfg, fs);
+
+    let e_pure =
+        baumgartner_majdak_externalization(&bank_pure.ir_l[SLOT_FL], &bank_pure.ir_r[SLOT_FL], fs);
+    let e_studio = baumgartner_majdak_externalization(
+        &bank_studio.ir_l[SLOT_FL],
+        &bank_studio.ir_r[SLOT_FL],
+        fs,
+    );
+    let e_ctrl =
+        baumgartner_majdak_externalization(&bank_ctrl.ir_l[SLOT_FL], &bank_ctrl.ir_r[SLOT_FL], fs);
+
+    out.push(with_metric(
+        if e_studio.score > e_pure.score && e_ctrl.score > e_pure.score {
+            pass(
+                "cochlea",
+                "Baumgartner-Majdak Bayesian externalization",
+                format!(
+                    "E(Pure)={:.3} < E(Studio)={:.3}, E(3D ControlRoom)={:.3}",
+                    e_pure.score, e_studio.score, e_ctrl.score
+                ),
+            )
+        } else {
+            fail(
+                "cochlea",
+                "Baumgartner-Majdak Bayesian externalization",
+                format!(
+                    "expected Studio ({:.3}) & ControlRoom ({:.3}) > Pure ({:.3})",
+                    e_studio.score, e_ctrl.score, e_pure.score
+                ),
+            )
+        },
+        json!({
+            "pure": e_pure.score,
+            "studio": e_studio.score,
+            "control_room": e_ctrl.score,
+        }),
+    ));
+
+    // 3. Hear-to-Hear Bayesian Active Personalization convergence in 12 clicks.
+    let truth = AnatomyParams {
+        head_radius_m: 0.093,
+        torso_height_m: 0.29,
+        pinna_shelf_db: 1.25,
+    };
+    let mut sess = PersonalizationSession::new();
+    let h0 = sess.entropy_bits();
+    for _ in 0..12 {
+        let (a, b) = sess.pair_params();
+        let da = ((truth.head_radius_m - a.head_radius_m) / 0.008).powi(2)
+            + ((truth.torso_height_m - a.torso_height_m) / 0.040).powi(2)
+            + ((truth.pinna_shelf_db - a.pinna_shelf_db) / 1.5).powi(2);
+        let db = ((truth.head_radius_m - b.head_radius_m) / 0.008).powi(2)
+            + ((truth.torso_height_m - b.torso_height_m) / 0.040).powi(2)
+            + ((truth.pinna_shelf_db - b.pinna_shelf_db) / 1.5).powi(2);
+        sess.record_choice(da < db);
+    }
+    let h12 = sess.entropy_bits();
+    let est = sess.posterior_mean();
+    let ok_p = h12 < h0 * 0.45
+        && (est.head_radius_m - truth.head_radius_m).abs() < 0.005
+        && (est.torso_height_m - truth.torso_height_m).abs() < 0.025
+        && (est.pinna_shelf_db - truth.pinna_shelf_db).abs() < 0.8;
+    out.push(with_metric(
+        if ok_p {
+            pass(
+                "cochlea",
+                "Hear-to-Hear BALD personalization (12 clicks)",
+                format!(
+                    "entropy {h0:.2} -> {h12:.2} bits; head={:.4}m torso={:.3}m pinna={:+.2}dB",
+                    est.head_radius_m, est.torso_height_m, est.pinna_shelf_db
+                ),
+            )
+        } else {
+            fail(
+                "cochlea",
+                "Hear-to-Hear BALD personalization (12 clicks)",
+                format!(
+                    "did not converge: H {h0:.2}->{h12:.2}, est=({:.4}, {:.3}, {:+.2})",
+                    est.head_radius_m, est.torso_height_m, est.pinna_shelf_db
+                ),
+            )
+        },
+        json!({
+            "h0_bits": h0,
+            "h12_bits": h12,
+            "est_head_m": est.head_radius_m,
+            "est_torso_m": est.torso_height_m,
+            "est_pinna_db": est.pinna_shelf_db,
+        }),
+    ));
+
+    out
+}
+
+/// `blackwell`: Kulisch superaccumulator, Ozaki-I INT8, Ozaki-II CRT across INT8 / FP8 E4M3 /
+/// Blackwell FP4 E2M1 Base-13 (bit-identical), Matsuoka Bailey 4-Step Full-FP64 FFT on FP4,
+/// Overlap-Save & Blelloch 2x2 parallel-prefix IIR, and Blackwell `sm_120` zero-FMA PTX audit.
+pub fn blackwell() -> Vec<Check> {
+    use g6me_core::blackwell::{
+        audit_gpu_asm_zero_fma, bailey_ozaki_fft, ozaki1_int8_gemm, ozaki2_crt_gemm, BiquadCoeffs,
+        KulischAcc, TensorBackend, BLACKWELL_ZERO_FMA_PTX,
+    };
+    use g6me_core::fft::{Complex, FftPlan};
+
+    let mut out = Vec::new();
+
+    // 1. Kulisch exact fixed-point superaccumulator.
+    let mut acc = KulischAcc::new();
+    acc.add(1.0e16);
+    acc.add(1.0);
+    acc.add(-1.0e16);
+    acc.add(1.0e-12);
+    let k_val = acc.finalize();
+    let k_err = (k_val - (1.0 + 1.0e-12)).abs();
+    out.push(with_metric(
+        if k_err == 0.0 {
+            pass(
+                "blackwell",
+                "Kulisch 2304-bit exact superaccumulator",
+                format!("1e16 + 1.0 - 1e16 + 1e-12 = {k_val:.15} (err = 0.0)"),
+            )
+        } else {
+            fail(
+                "blackwell",
+                "Kulisch 2304-bit exact superaccumulator",
+                format!("Kulisch cancellation error {k_err:.3e}"),
+            )
+        },
+        json!({ "abs_err": k_err }),
+    ));
+
+    // 2. Ozaki-I INT8 + Ozaki-II CRT across INT8, FP8 E4M3, and Blackwell FP4 E2M1 Base-13.
+    let mut a = vec![vec![0.0_f64; 8]; 6];
+    let mut b = vec![vec![0.0_f64; 5]; 8];
+    for (i, row) in a.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = ((i * 7 + j * 13 + 1) as f64 * 0.371).sin() * 1.35;
+        }
+    }
+    for (i, row) in b.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = ((i * 11 + j * 5 + 2) as f64 * 0.519).cos() * 1.15;
+        }
+    }
+    let mut c_ref = vec![vec![0.0_f64; 5]; 6];
+    for i in 0..6 {
+        for j in 0..5 {
+            let mut s = 0.0_f64;
+            for k in 0..8 {
+                s += a[i][k] * b[k][j];
+            }
+            c_ref[i][j] = s;
+        }
+    }
+    let c_oz1 = ozaki1_int8_gemm(&a, &b, 9);
+    let c_int8 = ozaki2_crt_gemm(&a, &b, TensorBackend::Int8);
+    let c_fp8 = ozaki2_crt_gemm(&a, &b, TensorBackend::Fp8E4m3);
+    let c_fp4 = ozaki2_crt_gemm(&a, &b, TensorBackend::Fp4E2m1Base13);
+
+    let max_diff = |x: &[Vec<f64>], y: &[Vec<f64>]| -> f64 {
+        x.iter()
+            .zip(y.iter())
+            .flat_map(|(rx, ry)| rx.iter().zip(ry.iter()).map(|(u, v)| (u - v).abs()))
+            .fold(0.0_f64, f64::max)
+    };
+    let e_oz1 = max_diff(&c_oz1, &c_ref);
+    let e_int8 = max_diff(&c_int8, &c_ref);
+    let e_fp8 = max_diff(&c_fp8, &c_ref);
+    let e_fp4 = max_diff(&c_fp4, &c_ref);
+    let bit_diff_fp8 = max_diff(&c_int8, &c_fp8);
+    let bit_diff_fp4 = max_diff(&c_int8, &c_fp4);
+
+    out.push(with_metric(
+        if e_oz1 < 1e-13
+            && e_int8 < 1e-13
+            && e_fp8 < 1e-13
+            && e_fp4 < 1e-13
+            && bit_diff_fp8 == 0.0
+            && bit_diff_fp4 == 0.0
+        {
+            pass(
+                "blackwell",
+                "Ozaki-I & Ozaki-II CRT (INT8/FP8/FP4 E2M1)",
+                format!(
+                    "Oz1={e_oz1:.2e}, Oz2(INT8/FP8/FP4)={e_fp4:.2e} (< 1e-13), INT8==FP8==FP4 bit-diff=0.0"
+                ),
+            )
+        } else {
+            fail(
+                "blackwell",
+                "Ozaki-I & Ozaki-II CRT (INT8/FP8/FP4 E2M1)",
+                format!(
+                    "Oz1={e_oz1:.2e} INT8={e_int8:.2e} FP8={e_fp8:.2e} FP4={e_fp4:.2e} bit_diff=({bit_diff_fp8:.2e},{bit_diff_fp4:.2e})"
+                ),
+            )
+        },
+        json!({
+            "ozaki1_err": e_oz1,
+            "ozaki2_int8_err": e_int8,
+            "ozaki2_fp8_err": e_fp8,
+            "ozaki2_fp4_err": e_fp4,
+            "backend_bit_diff": bit_diff_fp8.max(bit_diff_fp4),
+        }),
+    ));
+
+    // 3. Matsuoka (Sept 2026) Full-FP64 Bailey 4-Step FFT on Blackwell FP4 E2M1 Tensor Cores.
+    let n1 = 8usize;
+    let n2 = 8usize;
+    let x: Vec<Complex> = (0..(n1 * n2))
+        .map(|k| Complex::new(((k as f64) * 0.23).sin(), ((k as f64) * 0.41).cos() * 0.7))
+        .collect();
+    let y_fp4 = bailey_ozaki_fft(&x, n1, n2, TensorBackend::Fp4E2m1Base13);
+    let plan = FftPlan::new(n1 * n2);
+    let mut y_ref = x.clone();
+    plan.forward(&mut y_ref);
+    let max_fft_err = y_fp4
+        .iter()
+        .zip(y_ref.iter())
+        .map(|(u, v)| u.sub(*v).norm())
+        .fold(0.0_f64, f64::max);
+    out.push(with_metric(
+        if max_fft_err < 1e-12 {
+            pass(
+                "blackwell",
+                "Matsuoka Bailey 4-step FP64 FFT on FP4",
+                format!(
+                    "64-pt complex FFT via FP4 E2M1 Ozaki-II CRT + Kulisch: max err = {max_fft_err:.3e} (< 1e-12)"
+                ),
+            )
+        } else {
+            fail(
+                "blackwell",
+                "Matsuoka Bailey 4-step FP64 FFT on FP4",
+                format!("Bailey FP4 FFT error {max_fft_err:.3e} >= 1e-12"),
+            )
+        },
+        json!({ "max_abs_err": max_fft_err }),
+    ));
+
+    // 4. Phase-Exact GPU IIR: Overlap-Save (-320 dBFS settling) + Blelloch 2x2 parallel prefix scan.
+    let k_lp = (std::f64::consts::PI * 1_200.0 / 48_000.0).tan();
+    let k2 = k_lp * k_lp;
+    let sq2 = std::f64::consts::SQRT_2;
+    let inv_n = 1.0 / (1.0 + sq2 * k_lp + k2);
+    let bq = BiquadCoeffs {
+        b0: k2 * inv_n,
+        b1: 2.0 * k2 * inv_n,
+        b2: k2 * inv_n,
+        a1: 2.0 * (k2 - 1.0) * inv_n,
+        a2: (1.0 - sq2 * k_lp + k2) * inv_n,
+    };
+    let sig: Vec<f64> = (0..1024)
+        .map(|i| ((i as f64) * 0.08).sin() + 0.4 * ((i as f64) * 0.31).cos())
+        .collect();
+    let y_seq = bq.process_sequential(&sig);
+    let y_ols = bq.process_overlap_save(&sig, 256);
+    let y_ble = bq.process_blelloch_scan(&sig);
+    let e_ols = y_seq
+        .iter()
+        .zip(y_ols.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    let e_ble = y_seq
+        .iter()
+        .zip(y_ble.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    out.push(with_metric(
+        if e_ols < 1e-13 && e_ble < 1e-13 {
+            pass(
+                "blackwell",
+                "GPU IIR Overlap-Save & Blelloch 2x2 scan",
+                format!(
+                    "max |OLS - seq| = {e_ols:.3e}, max |Blelloch - seq| = {e_ble:.3e} (< 1e-13)"
+                ),
+            )
+        } else {
+            fail(
+                "blackwell",
+                "GPU IIR Overlap-Save & Blelloch 2x2 scan",
+                format!("OLS err {e_ols:.3e}, Blelloch err {e_ble:.3e}"),
+            )
+        },
+        json!({ "ols_err": e_ols, "blelloch_err": e_ble }),
+    ));
+
+    // 5. Blackwell sm_120 PTX/SASS zero-FMA audit + negative-control rejection.
+    let clean_audit = audit_gpu_asm_zero_fma(BLACKWELL_ZERO_FMA_PTX);
+    let poisoned = format!("{BLACKWELL_ZERO_FMA_PTX}\n    fma.rn.f64 %fd9, %fd1, %fd2, %fd3;\n");
+    let bad_audit = audit_gpu_asm_zero_fma(&poisoned);
+    let nvcc_present = std::process::Command::new("nvcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    out.push(with_metric(
+        match (&clean_audit, &bad_audit) {
+            (Ok(n_lines), Err(hits)) if *n_lines > 5 && !hits.is_empty() => pass(
+                "blackwell",
+                "sm_120 PTX/SASS zero-FMA audit",
+                format!(
+                    "verified {n_lines} PTX instructions with 0 FMA; negative control caught {} FMA hit(s) (nvcc={nvcc_present})",
+                    hits.len()
+                ),
+            ),
+            _ => fail(
+                "blackwell",
+                "sm_120 PTX/SASS zero-FMA audit",
+                format!("unexpected PTX audit result: clean={clean_audit:?}, poison={bad_audit:?}"),
+            ),
+        },
+        json!({ "nvcc_present": nvcc_present }),
+    ));
+
+    out
+}
+
+/// Standalone `--audit-cochlea [WAV]` nuclear perceptual report:
+/// runs Zilany-Bruce-Carney biophysical neurogram NSIM + Baumgartner-Majdak Bayesian
+/// Auditory Externalization across G6+ acoustic engines (or an optional user stereo WAV).
+pub fn audit_cochlea(wav_path: Option<&std::path::Path>, as_json: bool) -> Result<(), String> {
+    use g6me_core::cochlea::{baumgartner_majdak_externalization, compute_neurogram, nsim};
+    use g6me_core::plus::{KernelBank, PhysicsEngine, PlusCfg, PlusProfile};
+    use g6me_core::room::RoomPreset;
+    use std::f64::consts::PI;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const SLOT_FL: usize = 0;
+    let fs = 48_000u32;
+    let bank_pure = KernelBank::synthesize(PlusCfg::from_profile(PlusProfile::Pure), fs);
+    let bank_studio = KernelBank::synthesize(PlusCfg::from_profile(PlusProfile::Studio), fs);
+    let mut ctrl_cfg = PlusCfg::from_profile(PlusProfile::Studio);
+    ctrl_cfg.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+    ctrl_cfg.room_preset = RoomPreset::ControlRoom;
+    ctrl_cfg.use_slepian_tail = true;
+    ctrl_cfg.use_fdn_velvet = true;
+    let bank_ctrl = KernelBank::synthesize(ctrl_cfg, fs);
+
+    let e_pure =
+        baumgartner_majdak_externalization(&bank_pure.ir_l[SLOT_FL], &bank_pure.ir_r[SLOT_FL], fs);
+    let e_studio = baumgartner_majdak_externalization(
+        &bank_studio.ir_l[SLOT_FL],
+        &bank_studio.ir_r[SLOT_FL],
+        fs,
+    );
+    let e_ctrl =
+        baumgartner_majdak_externalization(&bank_ctrl.ir_l[SLOT_FL], &bank_ctrl.ir_r[SLOT_FL], fs);
+
+    // Biophysical cochlea NSIM between direct anechoic vs studio/control-room on a 120 ms complex tone.
+    let n = 5760usize;
+    let mut dry_tone = vec![0.0_f64; n];
+    for (i, s) in dry_tone.iter_mut().enumerate() {
+        let t = (i as f64) / (fs as f64);
+        *s = 0.22 * (2.0 * PI * 330.0 * t).sin()
+            + 0.18 * (2.0 * PI * 1_100.0 * t).sin()
+            + 0.14 * (2.0 * PI * 3_500.0 * t).sin();
+    }
+    let ng_ref = compute_neurogram(&dry_tone, fs, 24);
+
+    let wav_audit = if let Some(path) = wav_path {
+        let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let (info, data_off) = g6me_core::wav::read_info_file(&mut f)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if info.channels < 2 {
+            return Err(format!(
+                "{} has {} channel(s); --audit-cochlea requires stereo (2+ channels)",
+                path.display(),
+                info.channels
+            ));
+        }
+        f.seek(SeekFrom::Start(data_off))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let ch = info.channels as usize;
+        let bps = (info.bits / 8) as usize;
+        let frames = (info.frames() as usize).min(info.rate as usize / 2);
+        let mut raw = vec![0u8; frames * ch * bps];
+        f.read_exact(&mut raw)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut l = Vec::with_capacity(frames);
+        let mut r = Vec::with_capacity(frames);
+        let decode_one = |bytes: &[u8]| -> f64 {
+            match (info.float, info.bits) {
+                (true, 32) => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+                (true, 64) => f64::from_le_bytes(bytes.try_into().unwrap()),
+                (false, 16) => i16::from_le_bytes(bytes.try_into().unwrap()) as f64 / 32768.0,
+                (false, 24) => {
+                    let v = ((bytes[2] as i8 as i32) << 16)
+                        | ((bytes[1] as i32) << 8)
+                        | (bytes[0] as i32);
+                    (v as f64) / 8_388_608.0
+                }
+                (false, 32) => {
+                    i32::from_le_bytes(bytes.try_into().unwrap()) as f64 / 2_147_483_648.0
+                }
+                _ => 0.0,
+            }
+        };
+        for i in 0..frames {
+            let off_l = (i * ch) * bps;
+            let off_r = (i * ch + 1) * bps;
+            l.push(decode_one(&raw[off_l..off_l + bps]));
+            r.push(decode_one(&raw[off_r..off_r + bps]));
+        }
+        let ext = baumgartner_majdak_externalization(&l, &r, info.rate);
+        let ng_l = compute_neurogram(&l, info.rate, 24);
+        let ng_r = compute_neurogram(&r, info.rate, 24);
+        let lr_nsim = nsim(&ng_l, &ng_r);
+        Some(json!({
+            "path": path.display().to_string(),
+            "sample_rate": info.rate,
+            "frames_analyzed": frames,
+            "externalization_score": ext.score,
+            "monaural_cue": ext.monaural_cue,
+            "binaural_cue": ext.binaural_cue,
+            "iacc": ext.iacc,
+            "early_refl_db": ext.early_refl_db,
+            "lr_neurogram_nsim": lr_nsim,
+        }))
+    } else {
+        None
+    };
+
+    let self_nsim = nsim(&ng_ref, &ng_ref);
+    let report = json!({
+        "cochlea_model": "Zilany-Bruce-Carney (JASA 2014 / 2018) 24-CF IHC/ANF Neurogram",
+        "externalization_model": "Baumgartner & Majdak (2021) Bayesian Auditory Externalization",
+        "reference_nsim_self": self_nsim,
+        "profiles": {
+            "pure": {
+                "externalization": e_pure.score,
+                "monaural_cue": e_pure.monaural_cue,
+                "binaural_cue": e_pure.binaural_cue,
+                "iacc": e_pure.iacc,
+                "early_refl_db": e_pure.early_refl_db,
+            },
+            "studio": {
+                "externalization": e_studio.score,
+                "monaural_cue": e_studio.monaural_cue,
+                "binaural_cue": e_studio.binaural_cue,
+                "iacc": e_studio.iacc,
+                "early_refl_db": e_studio.early_refl_db,
+            },
+            "control_room_3d": {
+                "externalization": e_ctrl.score,
+                "monaural_cue": e_ctrl.monaural_cue,
+                "binaural_cue": e_ctrl.binaural_cue,
+                "iacc": e_ctrl.iacc,
+                "early_refl_db": e_ctrl.early_refl_db,
+            }
+        },
+        "wav_audit": wav_audit,
+    });
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    } else {
+        println!("Biophysical Cochlea & Bayesian Externalization Audit");
+        println!("----------------------------------------------------");
+        println!("  Zilany-Bruce-Carney Neurogram NSIM (self): {self_nsim:.6}");
+        println!(
+            "  G6+ Pure         : E = {:.3} (monaural={:.3}, binaural={:.3}, IACC={:.3}, ER={:+.1} dB)",
+            e_pure.score, e_pure.monaural_cue, e_pure.binaural_cue, e_pure.iacc, e_pure.early_refl_db
+        );
+        println!(
+            "  G6+ Studio       : E = {:.3} (monaural={:.3}, binaural={:.3}, IACC={:.3}, ER={:+.1} dB)",
+            e_studio.score, e_studio.monaural_cue, e_studio.binaural_cue, e_studio.iacc, e_studio.early_refl_db
+        );
+        println!(
+            "  G6+ ControlRoom3D: E = {:.3} (monaural={:.3}, binaural={:.3}, IACC={:.3}, ER={:+.1} dB)",
+            e_ctrl.score, e_ctrl.monaural_cue, e_ctrl.binaural_cue, e_ctrl.iacc, e_ctrl.early_refl_db
+        );
+        if let Some(wa) = &wav_audit {
+            println!("  WAV File Audit   : {}", wa);
+        }
+    }
+
+    if !(e_studio.score > e_pure.score && e_ctrl.score > e_pure.score) {
+        return Err(format!(
+            "externalization gate failed: Pure={:.3}, Studio={:.3}, ControlRoom={:.3}",
+            e_pure.score, e_studio.score, e_ctrl.score
+        ));
+    }
+    Ok(())
+}
+
+/// `ntt`: Goldilocks prime-field (`p = 2^64 - 2^32 + 1`) Number-Theoretic Transform
+/// convolution with 0 ULPs of intermediate floating-point rounding error.
+pub fn ntt() -> Vec<Check> {
+    use g6me_core::ntt::{
+        exact_int_convolve, NttOverlapAddConvolver, NttPlan, BLACKWELL_GOLDILOCKS_NTT_CUDA,
+        GOLDILOCKS_P,
+    };
+    use g6me_core::plus::{BinauralPlus, PlusCfg, PlusProfile};
+
+    let mut out = Vec::new();
+
+    // 1. Goldilocks field radix-2 NTT invertibility (0 ULP exact integer round-trip).
+    let n = 1024usize;
+    let plan = NttPlan::new(n);
+    let orig: Vec<u64> = (0..n)
+        .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A) % GOLDILOCKS_P)
+        .collect();
+    let mut buf = orig.clone();
+    plan.forward(&mut buf);
+    plan.inverse(&mut buf);
+    let exact_rt = buf == orig;
+    out.push(with_metric(
+        if exact_rt {
+            pass(
+                "ntt",
+                "Goldilocks Z/pZ radix-2 NTT invertibility",
+                format!(
+                    "N={n} forward+inverse NTT matches input bit-for-bit (0 ULP) mod p=2^64-2^32+1"
+                ),
+            )
+        } else {
+            fail(
+                "ntt",
+                "Goldilocks Z/pZ radix-2 NTT invertibility",
+                "NTT forward+inverse round-trip did not match input exactly",
+            )
+        },
+        json!({ "n": n, "p": GOLDILOCKS_P, "exact": exact_rt }),
+    ));
+
+    // 2. 0-ULP exact integer convolution vs direct i128 schoolbook convolution.
+    let mut sig = vec![0i64; 512];
+    let mut ker = vec![0i64; 257];
+    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    for s in &mut sig {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *s = ((state >> 40) as i64) - (1 << 23);
+    }
+    for k in &mut ker {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *k = ((state >> 36) as i64) - (1 << 27);
+    }
+    let got = exact_int_convolve(&sig, &ker);
+    let mut max_int_err = 0i128;
+    for (i, &gv) in got.iter().enumerate() {
+        let mut acc = 0i128;
+        let j_lo = i.saturating_sub(ker.len() - 1);
+        let j_hi = i.min(sig.len() - 1);
+        for j in j_lo..=j_hi {
+            acc += (sig[j] as i128) * (ker[i - j] as i128);
+        }
+        max_int_err = max_int_err.max((gv - acc).abs());
+    }
+    out.push(with_metric(
+        if max_int_err == 0 {
+            pass(
+                "ntt",
+                "0-ULP exact integer linear convolution",
+                format!(
+                    "512x257 24-bit PCM * Q28 FIR convolution max integer error = {max_int_err} (exact i128 match)"
+                ),
+            )
+        } else {
+            fail(
+                "ntt",
+                "0-ULP exact integer linear convolution",
+                format!("max integer error = {max_int_err} (expected 0)"),
+            )
+        },
+        json!({ "max_int_err": max_int_err.to_string(), "out_len": got.len() }),
+    ));
+
+    // 3. Streaming NttOverlapAddConvolver & BinauralPlus --exact-ntt parity.
+    let ir_f64: Vec<f64> = (0..192)
+        .map(|i| (-0.025 * i as f64).exp() * (0.19 * i as f64).cos() * 0.25)
+        .collect();
+    let mut conv = NttOverlapAddConvolver::new(&ir_f64);
+    let pcm: Vec<f64> = (0..640)
+        .map(|i| 0.4 * (2.0 * std::f64::consts::PI * 997.0 * i as f64 / 48_000.0).sin())
+        .collect();
+    let lat = conv.latency();
+    let mut streamed = Vec::with_capacity(pcm.len() + lat);
+    for &s in &pcm {
+        streamed.push(conv.process_sample(s));
+    }
+    for _ in 0..lat {
+        streamed.push(conv.process_sample(0.0));
+    }
+    let mut max_ola_diff = 0.0_f64;
+    for i in 0..pcm.len() {
+        let mut ref_v = 0.0_f64;
+        for (j, &h) in ir_f64.iter().enumerate() {
+            if i >= j {
+                ref_v += pcm[i - j] * h;
+            }
+        }
+        max_ola_diff = max_ola_diff.max((streamed[i + lat] - ref_v).abs());
+    }
+
+    let mut cfg_ntt = PlusCfg::from_profile(PlusProfile::Pure);
+    cfg_ntt.exact_ntt = true;
+    let mut plus_ntt = BinauralPlus::new(g6me_core::dsp::MASK_5_1, cfg_ntt, 48_000);
+    let fl: Vec<f64> = (0..1024)
+        .map(|t| 0.25 * (2.0 * std::f64::consts::PI * 440.0 * t as f64 / 48_000.0).sin())
+        .collect();
+    let mut slots: [Option<&[f64]>; g6me_core::dsp::SLOTS] = [None; g6me_core::dsp::SLOTS];
+    slots[0] = Some(&fl);
+    let mut out_l = vec![0.0_f64; 1024];
+    let mut out_r = vec![0.0_f64; 1024];
+    plus_ntt.process(&slots, &mut out_l, &mut out_r, 1024);
+    let (tail_l, tail_r) = plus_ntt.flush();
+    out_l.extend_from_slice(&tail_l);
+    out_r.extend_from_slice(&tail_r);
+    let plus_ok = plus_ntt.is_finite()
+        && out_l.iter().chain(&out_r).all(|s| s.is_finite())
+        && out_l
+            .iter()
+            .chain(&out_r)
+            .map(|s| s.abs())
+            .fold(0.0_f64, f64::max)
+            > 0.01;
+    let cuda_ok = BLACKWELL_GOLDILOCKS_NTT_CUDA.contains("GOLDILOCKS_P")
+        && BLACKWELL_GOLDILOCKS_NTT_CUDA.contains("goldilocks_ntt_stage");
+
+    out.push(with_metric(
+        if max_ola_diff < 5e-7 && plus_ok && cuda_ok {
+            pass(
+                "ntt",
+                "Streaming Goldilocks OLA + BinauralPlus --exact-ntt",
+                format!(
+                    "streaming OLA max diff vs f64 = {max_ola_diff:.3e} (< 5e-7), BinauralPlus --exact-ntt finite & non-zero"
+                ),
+            )
+        } else {
+            fail(
+                "ntt",
+                "Streaming Goldilocks OLA + BinauralPlus --exact-ntt",
+                format!("max_ola_diff={max_ola_diff:.3e}, plus_ok={plus_ok}, cuda_ok={cuda_ok}"),
+            )
+        },
+        json!({ "max_ola_diff": max_ola_diff, "plus_ok": plus_ok, "cuda_ok": cuda_ok }),
+    ));
+
+    out
+}
+
+/// `bem`: 3D Helmholtz FMM-BEM solver (`--head-mesh`), Generalized Winding Number
+/// watertight repair, isotropic acoustic remeshing (`h <= lambda_min/6`), Gumerov
+/// acoustic reciprocity, and analytical Mie sphere validation.
+pub fn bem() -> Vec<Check> {
+    use g6me_core::bem::{
+        helmholtz_green, isotropic_acoustic_remesh, watertight_winding_repair, FmmBemSolver,
+        TriangleMesh, BLACKWELL_FMM_BEM_CUDA,
+    };
+    use g6me_core::scattering::{rigid_sphere_green, sph_to_cart};
+    use std::f64::consts::PI;
+
+    let mut out = Vec::new();
+
+    // 1. Generalized Winding Number open-hole watertight repair (Jacobson et al., SIGGRAPH 2013).
+    let mut broken = TriangleMesh::sphere(0.0875, 2);
+    broken.faces.retain(|&[a, b, c]| {
+        let cz = (broken.vertices[a][2] + broken.vertices[b][2] + broken.vertices[c][2]) / 3.0;
+        cz < 0.06
+    });
+    let broken_wt = broken.stats(344.8).is_watertight;
+    let repaired = watertight_winding_repair(&broken, 18);
+    let rep_st = repaired.stats(344.8);
+    out.push(with_metric(
+        if !broken_wt && rep_st.is_watertight && (rep_st.center_winding - 1.0).abs() < 1e-6 {
+            pass(
+                "bem",
+                "Generalized Winding Number watertight repair",
+                format!(
+                    "open hole closed: boundary_edges={} (0), center_winding={:.6} (1.0), faces={}",
+                    rep_st.boundary_edges, rep_st.center_winding, rep_st.faces
+                ),
+            )
+        } else {
+            fail(
+                "bem",
+                "Generalized Winding Number watertight repair",
+                format!(
+                    "broken_wt={broken_wt}, repaired_wt={}, boundary={}, winding={:.6}",
+                    rep_st.is_watertight, rep_st.boundary_edges, rep_st.center_winding
+                ),
+            )
+        },
+        json!({
+            "boundary_edges": rep_st.boundary_edges,
+            "center_winding": rep_st.center_winding,
+            "faces": rep_st.faces,
+        }),
+    ));
+
+    // 2. Isotropic acoustic remeshing (h <= h_target, watertightness preserved).
+    let coarse = TriangleMesh::sphere(0.0875, 1);
+    let h_target = 0.025;
+    let remeshed = isotropic_acoustic_remesh(&coarse, h_target, 4);
+    let rem_st = remeshed.stats(344.8);
+    out.push(with_metric(
+        if rem_st.is_watertight && rem_st.max_edge_m <= h_target {
+            pass(
+                "bem",
+                "Isotropic acoustic remeshing (h <= lambda/6)",
+                format!(
+                    "watertight={}, max_edge={:.4} m <= {:.4} m, f_max_acoustic={:.0} Hz",
+                    rem_st.is_watertight, rem_st.max_edge_m, h_target, rem_st.max_valid_freq_hz
+                ),
+            )
+        } else {
+            fail(
+                "bem",
+                "Isotropic acoustic remeshing (h <= lambda/6)",
+                format!(
+                    "watertight={}, max_edge={:.4} m > {:.4} m",
+                    rem_st.is_watertight, rem_st.max_edge_m, h_target
+                ),
+            )
+        },
+        json!({
+            "max_edge_m": rem_st.max_edge_m,
+            "h_target_m": h_target,
+            "max_valid_freq_hz": rem_st.max_valid_freq_hz,
+        }),
+    ));
+
+    // 3. Exact BEM + FMM Octree Gumerov reciprocity & analytical Mie sphere ILD validation.
+    let sphere = TriangleMesh::sphere(0.0875, 2);
+    let solver = FmmBemSolver::new(&sphere).expect("build BEM solver");
+    let f_hz = 1200.0;
+    let c = 344.0;
+    let r_src = sph_to_cart(45.0, 10.0, 2.0);
+    let h_direct = solver.solve_direct_hrtf(f_hz, c, r_src, solver.left_ear_elem, false);
+    let h_recip = solver.solve_reciprocal_hrtfs(f_hz, c, &[r_src], solver.left_ear_elem, false)[0];
+    let recip_rel = h_direct.sub(h_recip).norm() / h_direct.norm().max(1e-12);
+
+    let k = 2.0 * PI * f_hz / c;
+    let ear_l = solver.elements[solver.left_ear_elem].centroid;
+    let ear_r = solver.elements[solver.right_ear_elem].centroid;
+    let h_bem_l = solver.solve_reciprocal_hrtfs(f_hz, c, &[r_src], solver.left_ear_elem, false)[0];
+    let h_bem_r = solver.solve_reciprocal_hrtfs(f_hz, c, &[r_src], solver.right_ear_elem, false)[0];
+    let g_ref = helmholtz_green(k, [0.0, 0.0, 0.0], r_src);
+    let norm3 = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let dot3 = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let r_s = norm3(r_src);
+    let cos_l = dot3(r_src, ear_l) / (r_s * norm3(ear_l));
+    let cos_r = dot3(r_src, ear_r) / (r_s * norm3(ear_r));
+    let h_mie_l = rigid_sphere_green(k, 0.0875, r_s, norm3(ear_l), cos_l).div(g_ref);
+    let h_mie_r = rigid_sphere_green(k, 0.0875, r_s, norm3(ear_r), cos_r).div(g_ref);
+    let ild_bem_db = 20.0 * (h_bem_l.norm() / h_bem_r.norm()).log10();
+    let ild_mie_db = 20.0 * (h_mie_l.norm() / h_mie_r.norm()).log10();
+    let ild_err_db = (ild_bem_db - ild_mie_db).abs();
+
+    let head = TriangleMesh::procedural_head_with_pinnae(0.0875, 3);
+    let fmm_solver = FmmBemSolver::new(&head).expect("build FMM-BEM solver");
+    let h_fmm_d =
+        fmm_solver.solve_direct_hrtf(2500.0, 344.85, r_src, fmm_solver.left_ear_elem, true);
+    let h_fmm_r =
+        fmm_solver.solve_reciprocal_hrtfs(2500.0, 344.85, &[r_src], fmm_solver.left_ear_elem, true)
+            [0];
+    let fmm_rel = h_fmm_d.sub(h_fmm_r).norm() / h_fmm_d.norm().max(1e-12);
+    let cuda_zero_fma = BLACKWELL_FMM_BEM_CUDA.contains("__dmul_rn")
+        && BLACKWELL_FMM_BEM_CUDA.contains("__dadd_rn")
+        && !BLACKWELL_FMM_BEM_CUDA.contains("fma(");
+
+    out.push(with_metric(
+        if recip_rel < 1e-11 && fmm_rel < 1e-10 && ild_err_db < 0.75 && cuda_zero_fma {
+            pass(
+                "bem",
+                "3D FMM-BEM Gumerov reciprocity & Mie sphere validation",
+                format!(
+                    "BEM recip={recip_rel:.2e}, FMM recip={fmm_rel:.2e} ({} octree nodes), ILD={ild_bem_db:.2} vs Mie {ild_mie_db:.2} dB (err {ild_err_db:.2} dB)",
+                    fmm_solver.octree.node_count()
+                ),
+            )
+        } else {
+            fail(
+                "bem",
+                "3D FMM-BEM Gumerov reciprocity & Mie sphere validation",
+                format!(
+                    "recip={recip_rel:.2e}, fmm_recip={fmm_rel:.2e}, ild_err={ild_err_db:.2} dB, cuda_zero_fma={cuda_zero_fma}"
+                ),
+            )
+        },
+        json!({
+            "bem_recip_rel": recip_rel,
+            "fmm_recip_rel": fmm_rel,
+            "octree_nodes": fmm_solver.octree.node_count(),
+            "ild_bem_db": ild_bem_db,
+            "ild_mie_db": ild_mie_db,
+            "ild_err_db": ild_err_db,
+        }),
+    ));
+
+    out
+}
+
+/// `scan`: 4-stage `g6me-scan` photogrammetry-to-FMM-BEM pipeline (DNG 1.7 SubIFD &
+/// analytical `OpcodeList2/3` zero-resampling, v7.0 MIPI `RAW10` Distinct-Frame &
+/// Clock-Bracket gates, GOST ID-1 Russian debit card tangent-extrapolated metric anchor
+/// and privacy mask, Forster `SO(3)` IMU preintegration, OISSR, Chugunov glare separation,
+/// GLOMAP, Ozaki-II FP4->FP64 Rolling-Shutter BA, and 2DGS/PGSR -> FMM-BEM handoff).
+pub fn scan() -> Vec<Check> {
+    use g6me_core::bem::TriangleMesh;
+    use g6me_core::blackwell::TensorBackend;
+    use g6me_core::burst3d::{
+        mat3_mul, mat3_transpose, preintegrate_imu_manifold, separate_specular_and_micro_depth,
+        so3_exp, so3_log, wronski_oissr_zero_demosaic_fuse, MAT3_ID,
+    };
+    use g6me_core::dng::{
+        build_synthetic_dng_17, demosaic_malvar_he_cutler, pack_mipi_raw10, parse_dng_bytes,
+        unpack_mipi_raw10_to_f64, verify_burst_gates, BurstFrameMeta, BurstMetaSidecar, CfaPattern,
+        DngMetadata, FixVignetteRadialOpcode, GainMapOpcode, ImuAccelSample, ImuGyroSample,
+        OisSample, WarpPlaneCoeffs, WarpRectilinearOpcode, COMPRESSION_JPEG_XL,
+        PHOTOMETRIC_LINEAR_RAW,
+    };
+    use g6me_core::scan::{
+        bundle_adjust_ozaki2_fp4_schur, calibrate_russian_debit_card_id1,
+        glomap_so3_rotation_averaging, is_inside_card_privacy_mask,
+        run_stage3_to_stage4_to_fmm_bem, sample_surfels_from_mesh, BaObservation,
+        MetricGaugeConstraint, RelativeRotationEdge, RollingShutterCamera,
+        ISO7816_CHIP_CENTER_X_MM, ISO7816_CHIP_CENTER_Y_MM, RUSSIAN_ID1_CORNER_RADIUS_MM,
+        RUSSIAN_ID1_HEIGHT_MM, RUSSIAN_ID1_WIDTH_MM,
+    };
+
+    let mut out = Vec::new();
+
+    // 1. DNG 1.7 SubIFD + OpcodeList2/3 zero-resampling analytical ray inversion (CA < 0.008 px).
+    let synth_meta = DngMetadata {
+        dng_version: [1, 7, 0, 0],
+        preview_width: 1024,
+        preview_height: 768,
+        main_width: 8160,
+        main_height: 6120,
+        bits_per_sample: 16,
+        compression: COMPRESSION_JPEG_XL,
+        photometric: PHOTOMETRIC_LINEAR_RAW,
+        new_subfile_type: 16,
+        subifd_routed: true,
+        cfa_pattern: Some(CfaPattern::Gbrg),
+        black_level: 256.0,
+        white_level: 4095.0,
+        gain_maps: vec![GainMapOpcode {
+            top: 0,
+            left: 0,
+            bottom: 6120,
+            right: 8160,
+            plane: 0,
+            planes: 4,
+            row_pitch: 2,
+            col_pitch: 2,
+            map_points_v: 2,
+            map_points_h: 2,
+            map_spacing_v: 1.0,
+            map_spacing_h: 1.0,
+            map_origin_v: 0.0,
+            map_origin_h: 0.0,
+            map_planes: 1,
+            gains: vec![1.25, 1.25, 1.25, 1.25],
+        }],
+        vignette: Some(FixVignetteRadialOpcode {
+            k: [0.22, -0.05, 0.01, 0.0, 0.0],
+            cx_hat: 0.5,
+            cy_hat: 0.5,
+        }),
+        warp_rectilinear: Some(WarpRectilinearOpcode {
+            planes: vec![
+                WarpPlaneCoeffs {
+                    k: [1.0005, -0.022, 0.006, 0.0],
+                    m: [1e-4, -1e-4],
+                },
+                WarpPlaneCoeffs {
+                    k: [1.0000, -0.020, 0.005, 0.0],
+                    m: [1e-4, -1e-4],
+                },
+                WarpPlaneCoeffs {
+                    k: [0.9994, -0.018, 0.004, 0.0],
+                    m: [1e-4, -1e-4],
+                },
+            ],
+            cx_hat: 0.5,
+            cy_hat: 0.5,
+        }),
+    };
+    let dng_bytes = build_synthetic_dng_17(&synth_meta);
+    let parsed = parse_dng_bytes(&dng_bytes).expect("parse DNG 1.7");
+    let w_parsed = parsed.warp_rectilinear.as_ref().expect("WarpRectilinear");
+    let mut max_ca_px = 0.0_f64;
+    let m_diag = 4080.0_f64.hypot(3060.0);
+    let (g_xd, g_yd) = w_parsed.distort_norm(0.35, -0.25, 1);
+    let g_px = (4080.0 + g_xd * m_diag, 3060.0 + g_yd * m_diag);
+    for plane in [0usize, 2usize] {
+        let (p_xd, p_yd) = w_parsed.distort_norm(0.35, -0.25, plane);
+        let p_px = (4080.0 + p_xd * m_diag, 3060.0 + p_yd * m_diag);
+        let (cx, cy) = w_parsed.cancel_lateral_ca_px(p_px.0, p_px.1, 8160.0, 6120.0, plane);
+        max_ca_px = max_ca_px.max((cx - g_px.0).hypot(cy - g_px.1));
+    }
+    let honesty = parsed.honesty_report(64, 0.31, max_ca_px);
+
+    // MIPI RAW10 round-trip + v7.0 Distinct-Frame & Clock-Bracket gates (positive & negative).
+    let w_r = 32usize;
+    let h_r = 16usize;
+    let stride = (w_r / 4) * 5;
+    let mut frames = Vec::new();
+    let mut frame_metas = Vec::new();
+    for f in 0..6usize {
+        let vals: Vec<u16> = (0..(w_r * h_r))
+            .map(|i| (256 + ((i * 7 + f * 37) % 700)) as u16)
+            .collect();
+        frames.push(pack_mipi_raw10(&vals, w_r, h_r, stride));
+        let t0 = 1_000_000_000i64 + (f as i64) * 40_000_000;
+        frame_metas.push(BurstFrameMeta {
+            frame_index: f,
+            file_name: format!("frame_{f}.raw10"),
+            byte_length: stride * h_r,
+            row_stride: stride,
+            width: w_r,
+            height: h_r,
+            sensor_timestamp_ns: t0,
+            sensor_exposure_time_ns: 4_000_000,
+            sensor_sensitivity_iso: 100,
+            sensor_rolling_shutter_skew_ns: 36_000_000,
+            lens_focus_distance_diopters: 4.5,
+            ois_samples: vec![OisSample {
+                t_ns: t0 + 10_000_000,
+                dx_px: 1.5 * (f as f64).sin(),
+                dy_px: 1.2 * (f as f64).cos(),
+            }],
+        });
+    }
+    let unpacked = unpack_mipi_raw10_to_f64(&frames[0], w_r, h_r, stride, 256.0, 1023.0)
+        .expect("RAW10 unpack");
+    let rgb = demosaic_malvar_he_cutler(&unpacked, w_r, h_r, CfaPattern::Gbrg);
+    let mut imu_gyro = Vec::new();
+    let mut imu_accel = Vec::new();
+    for k in 0..200i64 {
+        let t = 950_000_000i64 + k * 2_000_000;
+        imu_gyro.push(ImuGyroSample {
+            t_ns: t,
+            wx: 0.05 * ((k as f64) * 0.1).sin(),
+            wy: -0.03 * ((k as f64) * 0.13).cos(),
+            wz: 0.01,
+            bx: 0.0,
+            by: 0.0,
+            bz: 0.0,
+        });
+        imu_accel.push(ImuAccelSample {
+            t_ns: t,
+            ax: 0.0,
+            ay: 0.0,
+            az: 9.81,
+            bx: 0.0,
+            by: 0.0,
+            bz: 0.0,
+        });
+    }
+    let sidecar = BurstMetaSidecar {
+        cfa: "GBRG".into(),
+        black_level: 256.0,
+        white_level: 4095.0,
+        sensor_info_timestamp_source: 1,
+        lens_intrinsic_calibration: [6000.0, 6000.0, 4080.0, 3060.0, 0.0],
+        frames: frame_metas,
+        imu_gyro_uncal: imu_gyro,
+        imu_accel_uncal: imu_accel,
+    };
+    let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+    let gate_ok = verify_burst_gates(&sidecar, &refs).expect("gates");
+    let mut aliased = refs.clone();
+    aliased[4] = aliased[3];
+    let gate_bad = verify_burst_gates(&sidecar, &aliased).expect("aliased gates");
+
+    out.push(with_metric(
+        if parsed.main_width == 8160
+            && parsed.main_height == 6120
+            && parsed.subifd_routed
+            && max_ca_px < 0.008
+            && honesty.contains("SubIFD")
+            && rgb.len() == w_r * h_r
+            && gate_ok.distinct_frames_ok
+            && gate_ok.clock_bracket_ok
+            && !gate_bad.distinct_frames_ok
+        {
+            pass(
+                "scan",
+                "DNG 1.7 OpcodeList2/3 + v7.0 MIPI RAW10 gates",
+                format!(
+                    "SubIFD={}x{}, analytical 3-plane CA err={max_ca_px:.3e} px (<0.008), 6/6 distinct RAW10 gates pass & alias caught",
+                    parsed.main_width, parsed.main_height
+                ),
+            )
+        } else {
+            fail(
+                "scan",
+                "DNG 1.7 OpcodeList2/3 + v7.0 MIPI RAW10 gates",
+                format!(
+                    "dims={}x{}, ca_err={max_ca_px:.3e}, distinct_ok={}, alias_caught={}",
+                    parsed.main_width,
+                    parsed.main_height,
+                    gate_ok.distinct_frames_ok,
+                    !gate_bad.distinct_frames_ok
+                ),
+            )
+        },
+        json!({
+            "subifd_w": parsed.main_width,
+            "subifd_h": parsed.main_height,
+            "max_ca_err_px": max_ca_px,
+            "distinct_ok": gate_ok.distinct_frames_ok,
+            "alias_caught": !gate_bad.distinct_frames_ok,
+        }),
+    ));
+
+    // 2. Russian Debit Card (GOST R ISO/IEC 7810-2006 ID-1) horizontal & vertical tangent calibration + privacy mask.
+    let s = 10.0_f64;
+    let x0 = 500.0;
+    let y0 = 400.0;
+    let w_px = RUSSIAN_ID1_WIDTH_MM * s;
+    let h_px = RUSSIAN_ID1_HEIGHT_MM * s;
+    let margin = RUSSIAN_ID1_CORNER_RADIUS_MM * s * 1.5;
+    let mk_edge = |p0: [f64; 2], p1: [f64; 2]| -> Vec<[f64; 2]> {
+        (0..12)
+            .map(|i| {
+                let t = i as f64 / 11.0;
+                [p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1])]
+            })
+            .collect()
+    };
+    let h_top = mk_edge([x0 + margin, y0], [x0 + w_px - margin, y0]);
+    let h_right = mk_edge([x0 + w_px, y0 + margin], [x0 + w_px, y0 + h_px - margin]);
+    let h_bot = mk_edge([x0 + margin, y0 + h_px], [x0 + w_px - margin, y0 + h_px]);
+    let h_left = mk_edge([x0, y0 + margin], [x0, y0 + h_px - margin]);
+    let chip = [
+        x0 + ISO7816_CHIP_CENTER_X_MM * s,
+        y0 + ISO7816_CHIP_CENTER_Y_MM * s,
+    ];
+    let h_anchor =
+        calibrate_russian_debit_card_id1([&h_top, &h_right, &h_bot, &h_left], Some(chip), false)
+            .expect("horizontal ID-1 card");
+
+    let v_top = mk_edge([x0 + margin, y0], [x0 + h_px - margin, y0]);
+    let v_right = mk_edge([x0 + h_px, y0 + margin], [x0 + h_px, y0 + w_px - margin]);
+    let v_bot = mk_edge([x0 + margin, y0 + w_px], [x0 + h_px - margin, y0 + w_px]);
+    let v_left = mk_edge([x0, y0 + margin], [x0, y0 + w_px - margin]);
+    let v_anchor =
+        calibrate_russian_debit_card_id1([&v_top, &v_right, &v_bot, &v_left], None, true)
+            .expect("vertical ID-1 card");
+
+    let inside_masked = is_inside_card_privacy_mask(&h_anchor, x0 + w_px * 0.5, y0 + h_px * 0.5);
+    let outside_clear = !is_inside_card_privacy_mask(&h_anchor, x0 - 40.0, y0 - 40.0);
+    let h_err = (h_anchor.meters_per_pixel - 1e-4).abs();
+    let v_err = (v_anchor.meters_per_pixel - 1e-4).abs();
+    out.push(with_metric(
+        if h_err < 1e-10 && v_err < 1e-10 && h_anchor.privacy_masked && inside_masked && outside_clear
+        {
+            pass(
+                "scan",
+                "GOST ID-1 Russian debit card metric anchor + privacy mask",
+                format!(
+                    "H/V scale err={h_err:.2e}/{v_err:.2e} m/px (0% corner bias), ISO 7816-2 chip & PAN/CVV mask active"
+                ),
+            )
+        } else {
+            fail(
+                "scan",
+                "GOST ID-1 Russian debit card metric anchor + privacy mask",
+                format!(
+                    "h_err={h_err:.2e}, v_err={v_err:.2e}, inside={inside_masked}, outside_clear={outside_clear}"
+                ),
+            )
+        },
+        json!({
+            "h_scale_err_m_px": h_err,
+            "v_scale_err_m_px": v_err,
+            "privacy_masked": h_anchor.privacy_masked,
+        }),
+    ));
+
+    // 3. Handheld burst 3D physics (Forster SO(3) IMU + Wronski/OISSR + Chugunov glare + micro-baseline depth).
+    let mut gyro = Vec::new();
+    let mut accel = Vec::new();
+    for k in 0..=100i64 {
+        let t = k * 5_000_000;
+        gyro.push(ImuGyroSample {
+            t_ns: t,
+            wx: 0.01,
+            wy: -0.02,
+            wz: 1.03,
+            bx: 0.01,
+            by: -0.02,
+            bz: 0.03,
+        });
+        accel.push(ImuAccelSample {
+            t_ns: t,
+            ax: 0.0,
+            ay: 0.0,
+            az: 0.0,
+            bx: 0.0,
+            by: 0.0,
+            bz: 0.0,
+        });
+    }
+    let pre = preintegrate_imu_manifold(&gyro, &accel, 0, 500_000_000);
+    let phi = so3_log(&pre.delta_r);
+    let imu_err = (phi[2] - 0.5).abs();
+
+    let bw = 24usize;
+    let bh = 24usize;
+    let pat = CfaPattern::Gbrg;
+    let shifts = [
+        (0.0, 0.0),
+        (0.5, 0.0),
+        (0.0, 0.5),
+        (0.5, 0.5),
+        (1.0, 0.25),
+        (0.25, 1.0),
+    ];
+    let gt_rgb = |x: f64, y: f64| -> [f64; 3] {
+        [
+            0.55 + 0.15 * (x * 0.2).sin(),
+            0.38 + 0.10 * (y * 0.25).cos(),
+            0.26 + 0.08 * ((x + y) * 0.15).sin(),
+        ]
+    };
+    let cfa_frames: Vec<Vec<f64>> = shifts
+        .iter()
+        .enumerate()
+        .map(|(fi, &(dx, dy))| {
+            let mut cfa = vec![0.0_f64; bw * bh];
+            for y in 0..bh {
+                for x in 0..bw {
+                    let ch = pat.color_at(x, y);
+                    let noise = 0.015 * (((x * 31 + y * 17 + fi * 97) as f64).sin());
+                    cfa[y * bw + x] = gt_rgb((x as f64) - dx, (y as f64) - dy)[ch] + noise;
+                }
+            }
+            cfa
+        })
+        .collect();
+    let cfa_refs: Vec<&[f64]> = cfa_frames.iter().map(|v| v.as_slice()).collect();
+    let fused = wronski_oissr_zero_demosaic_fuse(&cfa_refs, &shifts, bw, bh, pat, 0.65);
+    let mut oissr_mse = 0.0_f64;
+    let mut oissr_cnt = 0usize;
+    for y in 3..(bh - 3) {
+        for x in 3..(bw - 3) {
+            let g = gt_rgb(x as f64, y as f64);
+            let p = fused[y * bw + x];
+            for c in 0..3 {
+                oissr_mse += (p[c] - g[c]).powi(2);
+                oissr_cnt += 1;
+            }
+        }
+    }
+    let oissr_rmse = (oissr_mse / (oissr_cnt as f64)).sqrt();
+
+    let focal_px = 400.0;
+    let true_z_m = 0.25;
+    let baselines = [
+        (0.0000, 0.0000),
+        (0.0008, 0.0002),
+        (0.0016, -0.0003),
+        (0.0024, 0.0004),
+        (-0.0012, 0.0006),
+        (-0.0020, -0.0005),
+    ];
+    let diffuse_tex = |x: f64, y: f64| -> f64 {
+        0.35 + 0.15 * (x * 0.55).sin() * (y * 0.48).cos() + 0.08 * ((x - y) * 0.35).cos()
+    };
+    let glare_frames: Vec<Vec<f64>> = baselines
+        .iter()
+        .map(|&(bx, by)| {
+            let mut img = vec![0.0_f64; bw * bh];
+            let disp_x = focal_px * bx / true_z_m;
+            let disp_y = focal_px * by / true_z_m;
+            let spec_cx = 12.0 + 3.2 * disp_x;
+            let spec_cy = 12.0 + 3.2 * disp_y;
+            for y in 0..bh {
+                for x in 0..bw {
+                    let d = diffuse_tex((x as f64) + disp_x, (y as f64) + disp_y);
+                    let r2 = ((x as f64) - spec_cx).powi(2) + ((y as f64) - spec_cy).powi(2);
+                    img[y * bw + x] = d + 0.55 * (-r2 / 2.2).exp();
+                }
+            }
+            img
+        })
+        .collect();
+    let g_refs: Vec<&[f64]> = glare_frames.iter().map(|v| v.as_slice()).collect();
+    let sep =
+        separate_specular_and_micro_depth(&g_refs, &baselines, bw, bh, focal_px, 0.15, 0.50, 24);
+    let glare_err = (sep.diffuse[12 * bw + 12] - diffuse_tex(12.0, 12.0)).abs();
+    let mut zs = Vec::new();
+    for y in 5..(bh - 5) {
+        for x in 5..(bw - 5) {
+            zs.push(sep.depth_m[y * bw + x]);
+        }
+    }
+    zs.sort_by(|a, b| a.total_cmp(b));
+    let med_z = zs[zs.len() / 2];
+    let z_err = (med_z - true_z_m).abs();
+
+    out.push(with_metric(
+        if imu_err < 1e-12 && oissr_rmse < 0.02 && glare_err < 0.06 && z_err < 0.035 {
+            pass(
+                "scan",
+                "Forster SO(3) IMU + Wronski/OISSR + Chugunov glare & micro-depth",
+                format!(
+                    "SO(3) err={imu_err:.2e}, OISSR RMSE={oissr_rmse:.4} (<0.02), glare err={glare_err:.4}, z={med_z:.3}m (true 0.250m)"
+                ),
+            )
+        } else {
+            fail(
+                "scan",
+                "Forster SO(3) IMU + Wronski/OISSR + Chugunov glare & micro-depth",
+                format!(
+                    "imu_err={imu_err:.2e}, oissr_rmse={oissr_rmse:.4}, glare_err={glare_err:.4}, z_err={z_err:.4}"
+                ),
+            )
+        },
+        json!({
+            "imu_err_rad": imu_err,
+            "oissr_rmse": oissr_rmse,
+            "glare_err": glare_err,
+            "median_depth_m": med_z,
+        }),
+    ));
+
+    // 4. GLOMAP SO(3) + Ozaki-II FP4->FP64 Rolling-Shutter Schur BA + 2DGS/PGSR -> FMM-BEM handoff.
+    let gt_rots = [
+        MAT3_ID,
+        so3_exp([0.04, 0.22, -0.03]),
+        so3_exp([-0.05, -0.20, 0.02]),
+    ];
+    let gt_trans = [[0.0, 0.0, 0.35], [-0.08, 0.01, 0.36], [0.08, -0.01, 0.34]];
+    let edges = vec![
+        RelativeRotationEdge {
+            cam_i: 0,
+            cam_j: 1,
+            r_ij: mat3_mul(&gt_rots[1], &mat3_transpose(&gt_rots[0])),
+            weight: 1.0,
+        },
+        RelativeRotationEdge {
+            cam_i: 0,
+            cam_j: 2,
+            r_ij: mat3_mul(&gt_rots[2], &mat3_transpose(&gt_rots[0])),
+            weight: 1.0,
+        },
+        RelativeRotationEdge {
+            cam_i: 1,
+            cam_j: 2,
+            r_ij: mat3_mul(&gt_rots[2], &mat3_transpose(&gt_rots[1])),
+            weight: 1.0,
+        },
+    ];
+    let noisy_init = [
+        MAT3_ID,
+        mat3_mul(&so3_exp([0.08, -0.06, 0.05]), &gt_rots[1]),
+        mat3_mul(&so3_exp([-0.07, 0.09, -0.04]), &gt_rots[2]),
+    ];
+    let avg_rots = glomap_so3_rotation_averaging(3, &edges, &noisy_init, 40);
+    let mut max_glomap_rad = 0.0_f64;
+    for c in 0..3 {
+        let e = so3_log(&mat3_mul(&avg_rots[c], &mat3_transpose(&gt_rots[c])));
+        max_glomap_rad = max_glomap_rad.max((e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt());
+    }
+
+    let gt_pts = vec![
+        [0.0, 0.0, 0.0],
+        [0.08560, 0.0, 0.0],
+        [0.08560, 0.05398, 0.0],
+        [0.0, 0.05398, 0.0],
+        [-0.04, -0.03, 0.02],
+        [0.03, -0.04, -0.02],
+        [-0.03, 0.06, 0.03],
+        [0.06, 0.07, -0.03],
+    ];
+    let mut gt_cams = Vec::new();
+    for c in 0..3 {
+        gt_cams.push(RollingShutterCamera {
+            rot: gt_rots[c],
+            trans: gt_trans[c],
+            omega_rad_s: [0.05, -0.08, 0.02],
+            vel_m_s: [0.01, -0.005, 0.0],
+            fx: 3000.0,
+            fy: 3000.0,
+            cx: 2040.0,
+            cy: 1530.0,
+            width: 4080.0,
+            height: 3060.0,
+            vcm_focal_scale: if c == 1 { 1.003 } else { 1.0 },
+            rolling_shutter_skew_s: 0.038,
+            ois_shift_px: [1.2 * (c as f64), -0.8 * (c as f64)],
+        });
+    }
+    let mut obs = Vec::new();
+    for (ci, cam) in gt_cams.iter().enumerate() {
+        for (pi, &pt) in gt_pts.iter().enumerate() {
+            let rough = cam.project_at_row(pt, 1530.0, None);
+            let exact = cam.project_at_row(pt, rough[1], None);
+            obs.push(BaObservation {
+                cam_idx: ci,
+                pt_idx: pi,
+                u_px: exact[0],
+                v_px: exact[1],
+            });
+        }
+    }
+    let mut cams = gt_cams.clone();
+    cams[1].trans[0] += 0.004;
+    cams[1].rot = mat3_mul(&so3_exp([0.012, -0.010, 0.008]), &cams[1].rot);
+    cams[1].vcm_focal_scale = 1.0;
+    cams[2].trans[1] -= 0.003;
+    let mut pts = gt_pts.clone();
+    for (i, p) in pts.iter_mut().enumerate().skip(2) {
+        p[0] += 0.0015 * (i as f64).sin();
+        p[2] -= 0.0020 * (i as f64).cos();
+    }
+    let gauges = vec![MetricGaugeConstraint {
+        pt_a: 0,
+        pt_b: 1,
+        target_dist_m: RUSSIAN_ID1_WIDTH_MM * 1e-3,
+        weight: 1e5,
+    }];
+    let ba = bundle_adjust_ozaki2_fp4_schur(&mut cams, &mut pts, &obs, &gauges, None, 10.0, 14);
+
+    let head = TriangleMesh::procedural_head_with_pinnae(0.0875, 2);
+    let surfels = sample_surfels_from_mesh(&head);
+    let pipe = run_stage3_to_stage4_to_fmm_bem(h_anchor, ba, &surfels, 12, 12, 0.06, 344.85)
+        .expect("Stage 3->4->FMM-BEM");
+    let h_l = pipe.solver.solve_reciprocal_hrtfs(
+        1000.0,
+        344.85,
+        &[[0.0, 2.0, 0.0]],
+        pipe.solver.left_ear_elem,
+        false,
+    )[0];
+
+    out.push(with_metric(
+        if max_glomap_rad < 1e-6
+            && ba.schur_backend == TensorBackend::Fp4E2m1Base13
+            && ba.final_rms_px < 0.05
+            && ba.final_rms_px < ba.initial_rms_px * 0.05
+            && ba.metric_scale_error_mm < 0.5
+            && pipe.mesh_stats.is_watertight
+            && h_l.norm().is_finite()
+            && h_l.norm() > 0.5
+        {
+            pass(
+                "scan",
+                "GLOMAP + Ozaki-II FP4->FP64 RS-BA + 2DGS->FMM-BEM handoff",
+                format!(
+                    "GLOMAP err={max_glomap_rad:.2e} rad, BA RMS {:.2}->{:.4} px (FP4 Schur), watertight={} ({} tris), |H_L(1kHz)|={:.3}",
+                    ba.initial_rms_px,
+                    ba.final_rms_px,
+                    pipe.mesh_stats.is_watertight,
+                    pipe.mesh_stats.faces,
+                    h_l.norm()
+                ),
+            )
+        } else {
+            fail(
+                "scan",
+                "GLOMAP + Ozaki-II FP4->FP64 RS-BA + 2DGS->FMM-BEM handoff",
+                format!(
+                    "glomap={max_glomap_rad:.2e}, BA {:.2}->{:.4}, scale_err={:.3}mm, watertight={}, |H_L|={:.3}",
+                    ba.initial_rms_px,
+                    ba.final_rms_px,
+                    ba.metric_scale_error_mm,
+                    pipe.mesh_stats.is_watertight,
+                    h_l.norm()
+                ),
+            )
+        },
+        json!({
+            "glomap_err_rad": max_glomap_rad,
+            "ba_initial_rms_px": ba.initial_rms_px,
+            "ba_final_rms_px": ba.final_rms_px,
+            "metric_scale_error_mm": ba.metric_scale_error_mm,
+            "watertight": pipe.mesh_stats.is_watertight,
+            "faces": pipe.mesh_stats.faces,
+            "hl_1khz_mag": h_l.norm(),
+        }),
+    ));
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

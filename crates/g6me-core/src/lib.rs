@@ -46,22 +46,37 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::all)]
 
+pub mod atmosphere;
 pub mod batch;
+pub mod bem;
+pub mod blackwell;
+pub mod burst3d;
 pub mod child;
+pub mod cochlea;
+pub mod dng;
 pub mod dsp;
+pub mod enhance;
 pub mod error;
 pub mod fft;
+pub mod hoa;
 pub mod limiter;
 pub mod loudness;
 pub mod mask;
 pub mod meter;
+pub mod ntt;
 pub mod pcm;
 pub mod pipeline;
 pub mod plus;
 pub mod probe;
+pub mod room;
+pub mod scan;
+pub mod scattering;
 pub mod stage;
 pub mod stages;
+pub mod stn;
 pub mod tp;
+pub mod unmask;
+pub mod upmix;
 pub mod util;
 pub mod wav;
 

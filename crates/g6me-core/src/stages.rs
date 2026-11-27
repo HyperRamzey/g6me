@@ -23,13 +23,16 @@
 //! label differs from the order g6me resolved (an explicit `--order`, or a layout
 //! name read differently), folding a surround channel into the wrong slot.
 
+use crate::enhance::EnhanceCfg;
 use crate::error::{Error, Result};
-use crate::limiter::Cfg as LimiterCfg;
+use crate::limiter::{Cfg as LimiterCfg, LimiterStyle};
 use crate::mask::format_mask_hex;
 use crate::pcm::{BitDepth, Dither, Grid24};
 use crate::plus::{PlusCfg, RendererMode};
 use crate::probe::{AudioInfo, Caps};
 use crate::tp::Ratio;
+use crate::unmask::UnmaskCfg;
+use crate::upmix::UpmixCfg;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -300,6 +303,21 @@ pub struct RenderCfg {
     /// Acoustic parameters used when `renderer == RendererMode::Plus`.
     #[serde(default)]
     pub plus: PlusCfg,
+    /// Optional custom 3D room acoustics JSON file (`--room-json <PATH>`) for G6+ hybrid solver.
+    #[serde(default)]
+    pub room_json: Option<PathBuf>,
+    /// Optional 3D head/pinna Wavefront `.obj` scan (`--head-mesh <FILE.obj>`) for exact FMM-BEM Helmholtz HRTF.
+    #[serde(default)]
+    pub head_mesh: Option<PathBuf>,
+    /// Optional phase-coherent 2.0 -> 7.1 PAE upmixer feeding G6/G6+ (off by default).
+    #[serde(default)]
+    pub upmix: UpmixCfg,
+    /// Optional shared-STN virtual bass + micro-detail enhancer (off by default).
+    #[serde(default)]
+    pub enhance: EnhanceCfg,
+    /// Optional Moore-2016 ERB auditory-model perceptual unmasking EQ (off by default).
+    #[serde(default)]
+    pub unmask: UnmaskCfg,
     pub resample: ResampleCfg,
     pub ir: IrCfg,
     pub out: OutCfg,
@@ -803,15 +821,35 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
     } else {
         v.push("3. IR convolution: off".into());
     }
+    let effective_mask = if cfg.upmix.enable && mask == crate::dsp::MASK_STEREO {
+        crate::dsp::MASK_7_1
+    } else {
+        mask
+    };
+    let mut extras = Vec::new();
+    if cfg.upmix.enable && mask == crate::dsp::MASK_STEREO {
+        extras.push(cfg.upmix.summary());
+    }
+    if cfg.enhance.is_enabled() {
+        extras.push(cfg.enhance.summary());
+    }
+    if cfg.unmask.enable {
+        extras.push(cfg.unmask.summary());
+    }
+    let extra_note = if extras.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", extras.join("; "))
+    };
     match cfg.renderer {
         RendererMode::Reference => v.push(format!(
-            "4. downmix mask {mask:#06x} in {} -> stereo (bit-exact port, {})",
-            crate::mask::format_order(&order_for_mask(mask)),
+            "4. downmix mask {effective_mask:#06x} in {} -> stereo (bit-exact port, {}){extra_note}",
+            crate::mask::format_order(&order_for_mask(effective_mask)),
             f64::PRECISION_NAME
         )),
         RendererMode::Plus => v.push(format!(
-            "4. downmix mask {mask:#06x} in {} -> stereo ({}, {})",
-            crate::mask::format_order(&order_for_mask(mask)),
+            "4. downmix mask {effective_mask:#06x} in {} -> stereo ({}, {}){extra_note}",
+            crate::mask::format_order(&order_for_mask(effective_mask)),
             cfg.plus.summary(),
             f64::PRECISION_NAME
         )),
@@ -826,6 +864,16 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
     } else {
         format!("output gain {:+.2} dB, ", cfg.output_gain_db)
     };
+    let style_note = match la.style {
+        LimiterStyle::Transparent => String::new(),
+        LimiterStyle::Punchy => {
+            if la.clip_drive_db > 0.0 {
+                format!(", style punchy (ADAA2 clip {:.1} dB)", la.clip_drive_db)
+            } else {
+                ", style punchy".to_string()
+            }
+        }
+    };
     v.push(if !la.enable {
         format!(
             "5. {trim}true-peak: meter at {}x ({}), limiter off",
@@ -835,7 +883,7 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
     } else {
         format!(
             "5. {trim}true-peak: limit to {:.2} dBTP at {}x ({}), lookahead {:.2} ms -> \
-             {:.2} ms effective, +{} samples latency, aims {:.2} dB low ({}x meter)",
+             {:.2} ms effective, +{} samples latency, aims {:.2} dB low ({}x meter){style_note}",
             la.ceiling_db,
             la.ratio.n(),
             la.ratio.chain(),

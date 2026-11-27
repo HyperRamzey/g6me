@@ -12,7 +12,8 @@
 //! line and independently checkable with `--dry-run`.
 
 use crate::child::Proc;
-use crate::dsp::SLOTS;
+use crate::dsp::{MASK_7_1, MASK_STEREO, SLOTS};
+use crate::enhance::EnhanceProcessor;
 use crate::error::{Error, Result};
 use crate::limiter::{Limiter, Report as LimiterReport};
 use crate::loudness::{LoudnessMeter, LoudnessReport};
@@ -24,6 +25,8 @@ use crate::stages::{
     effective_input_rate, input_args, input_stage, loss_chain, output_args, InputStage, RenderCfg,
 };
 use crate::tp::{db_from_peak, Ratio, TruePeak};
+use crate::unmask::UnmaskEq;
+use crate::upmix::Upmixer;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -789,6 +792,15 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
             .validate()
             .map_err(|e| Error::msg(format!("plus renderer: {e}")))?;
     }
+    cfg.upmix
+        .validate()
+        .map_err(|e| Error::msg(format!("upmix: {e}")))?;
+    cfg.enhance
+        .validate()
+        .map_err(|e| Error::msg(format!("enhance: {e}")))?;
+    cfg.unmask
+        .validate()
+        .map_err(|e| Error::msg(format!("unmask: {e}")))?;
 
     // ---- true peak, and the limiter that owns it -----------------------------------
     //
@@ -832,15 +844,47 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         })
         .map_err(Error::Io)?;
 
-    // Stage 2 — the downmixer, on the calling thread. Nothing else touches `dsp`.
-    let mut dsp = Renderer::new(cfg.renderer, cfg.plus, mask, work_rate);
+    // Stage 2 — optional 2.0 -> 7.1 PAE upmixer, downmixer, and optional mastering stages
+    // (shared-STN virtual bass + micro-detail, Moore-2016 ERB perceptual unmasking EQ).
+    let upmix_active = cfg.upmix.enable && mask == MASK_STEREO;
+    let dsp_mask = if upmix_active { MASK_7_1 } else { mask };
+    let mut upmixer = upmix_active.then(|| Upmixer::new(cfg.upmix.clone(), work_rate));
+    let custom_room = match &cfg.room_json {
+        Some(path) => Some(crate::room::RoomGeometry::from_json_file(path).map_err(Error::msg)?),
+        None => None,
+    };
+    let custom_head_mesh = match &cfg.head_mesh {
+        Some(path) => Some(crate::bem::TriangleMesh::from_obj_file(path)?),
+        None => None,
+    };
+    let mut dsp = Renderer::new_with_assets(
+        cfg.renderer,
+        cfg.plus,
+        dsp_mask,
+        work_rate,
+        custom_room.as_ref(),
+        custom_head_mesh.as_ref(),
+    );
+    let mut enhancer = cfg
+        .enhance
+        .is_enabled()
+        .then(|| EnhanceProcessor::new(work_rate, cfg.enhance));
+    let mut unmasker = cfg
+        .unmask
+        .enable
+        .then(|| UnmaskEq::new(cfg.unmask.clone(), work_rate));
+
     // Reused across the whole file: one allocation, no per-block allocator churn
     // on a path that is supposed to stay ahead of a live device.
     let mut inter = vec![0f64; block * channels];
     let mut planar: [Vec<f64>; SLOTS] = std::array::from_fn(|_| Vec::with_capacity(block));
+    let mut up_planar: [Vec<f64>; 8] = std::array::from_fn(|_| Vec::new());
     let mut out_l = vec![0f64; block];
     let mut out_r = vec![0f64; block];
+    let mut unm_l = Vec::new();
+    let mut unm_r = Vec::new();
     let mut frames: u64 = 0;
+    let mut decoded_in: u64 = 0;
     let mut pipe_bytes_in: u64 = 0;
     // Rounds onto the 24-bit grid after the meter, where the encoder's own s32->s24
     // step would otherwise truncate (`OutCfg::grid24`).
@@ -851,6 +895,17 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     };
     // Which slot each interleaved column belongs to.
     let slots: Vec<usize> = order.iter().map(|s| s.index()).collect();
+    // 7.1 slot mapping for Upmixer output `[FL, FR, FC, LFE, BL, BR, SL, SR]`.
+    let upmix_slots: [usize; 8] = [
+        Slot::Fl.index(),
+        Slot::Fr.index(),
+        Slot::Fc.index(),
+        Slot::Lfe.index(),
+        Slot::Bl.index(),
+        Slot::Br.index(),
+        Slot::Sl.index(),
+        Slot::Sr.index(),
+    ];
 
     // Stop everything, join the peers, then report. Every exit from this loop
     // goes through here, so no path can leave a child process or a thread behind.
@@ -873,6 +928,68 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         }};
     }
 
+    // Helper: route a finished stereo block through peak -> tap -> grid -> encode.
+    // Returns `Ok(true)` if sent, `Ok(false)` if encoder closed, or `Err(NonFinite)`.
+    macro_rules! ship_stereo {
+        ($l:expr, $r:expr, $tap_refs:expr) => {{
+            let ls: &mut [f64] = $l;
+            let rs: &mut [f64] = $r;
+            let m = ls.len();
+            if m > 0 {
+                if !ls.iter().chain(rs.iter()).all(|v| v.is_finite()) {
+                    bail!(Error::NonFinite { frames });
+                }
+                peak.process(ls, rs);
+                if let Some(t) = &opts.tap {
+                    t.tap($tap_refs, ls, rs, m);
+                }
+                if let Some(g) = grid.as_mut() {
+                    g.process(ls, rs);
+                }
+                let mut out_buf = Vec::with_capacity(m * 16);
+                interleave_f64(ls, rs, &mut out_buf);
+                if !enc_tx.send(Encoded { bytes: out_buf }) {
+                    let wr = {
+                        aborted.store(true, Ordering::Relaxed);
+                        dec_rx.close();
+                        join_stages(reader, writer).1
+                    };
+                    if to_disk {
+                        discard_staged(&staged);
+                    }
+                    return Err(wr
+                        .result
+                        .err()
+                        .unwrap_or_else(|| Error::msg("encode stage stopped unexpectedly")));
+                }
+                frames += m as u64;
+                if let Some(p) = &opts.progress {
+                    p.update(frames, bytes_out.load(Ordering::Relaxed));
+                }
+            }
+        }};
+    }
+
+    // Helper: push stereo output of `dsp` through optional enhance -> unmask -> ship_stereo.
+    macro_rules! post_dsp_stereo {
+        ($l:expr, $r:expr, $tap_refs:expr) => {{
+            let ls: &mut [f64] = $l;
+            let rs: &mut [f64] = $r;
+            if let Some(enh) = enhancer.as_mut() {
+                enh.process(ls, rs);
+            }
+            if let Some(unm) = unmasker.as_mut() {
+                unm_l.clear();
+                unm_r.clear();
+                unm.process(ls, rs, &mut unm_l, &mut unm_r);
+                let empty_refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+                ship_stereo!(&mut unm_l, &mut unm_r, &empty_refs);
+            } else {
+                ship_stereo!(ls, rs, $tap_refs);
+            }
+        }};
+    }
+
     loop {
         if let Some(c) = &opts.cancel {
             if c.load(Ordering::Relaxed) {
@@ -881,106 +998,121 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         }
         let Some(dec) = dec_rx.recv() else { break };
         let n = dec.frames;
+        decoded_in += n as u64;
+        pipe_bytes_in += dec.bytes.len() as u64;
         bytes_to_f64_into(&dec.bytes, &mut inter[..n * channels]);
 
         // A short tail happens only at EOF, and is fine: the state simply runs
         // out mid-block, because the block sequence is contiguous.
         deinterleave(&inter[..n * channels], n, channels, &slots, &mut planar);
-        let refs: [Option<&[f64]>; SLOTS] = std::array::from_fn(|i| {
-            if planar[i].is_empty() {
-                None
-            } else {
-                Some(&planar[i][..n])
+
+        if let Some(up) = upmixer.as_mut() {
+            for v in &mut up_planar {
+                v.clear();
             }
-        });
-
-        // Always hand the block to the downmixer, including the two-channel case:
-        // `Dsp` implements the stereo bypass itself, and a second copy of that
-        // logic here would be one more place for a channel to go wrong.
-        dsp.process(&refs, &mut out_l[..n], &mut out_r[..n], n);
-        if !dsp.is_finite() {
-            bail!(Error::NonFinite { frames });
-        }
-        // The stereo bypass copies the source without touching the filter state checked
-        // above, so a NaN or Inf sample would otherwise reach the limiter and the file.
-        if !out_l[..n].iter().chain(&out_r[..n]).all(|v| v.is_finite()) {
-            bail!(Error::NonFinite { frames });
-        }
-
-        // Last stage to touch a sample, and deliberately before the tap: a monitor
-        // should hear what the file will contain, ceiling and all, and the latency it
-        // hears is real — which is why the report states it.
-        peak.process(&mut out_l[..n], &mut out_r[..n]);
-
-        // The tap runs before the encoder so a monitor that paces itself on a
-        // device FIFO sets the tempo of the whole chain.
-        if let Some(t) = &opts.tap {
-            t.tap(&refs, &out_l[..n], &out_r[..n], n);
-        }
-        if let Some(g) = grid.as_mut() {
-            g.process(&mut out_l[..n], &mut out_r[..n]);
-        }
-
-        let mut out_buf = Vec::with_capacity(n * 16);
-        interleave_f64(&out_l[..n], &out_r[..n], &mut out_buf);
-        if !enc_tx.send(Encoded { bytes: out_buf }) {
-            // The encoder died. Its own error is the informative one.
-            let wr = {
-                aborted.store(true, Ordering::Relaxed);
-                dec_rx.close();
-                join_stages(reader, writer).1
-            };
-            if to_disk {
-                discard_staged(&staged);
+            let fl_in = &planar[Slot::Fl.index()][..n];
+            let fr_in = &planar[Slot::Fr.index()][..n];
+            up.process(fl_in, fr_in, &mut up_planar);
+            let m = up_planar[0].len();
+            if m > 0 {
+                let mut up_refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+                for (ch, &slot_idx) in upmix_slots.iter().enumerate() {
+                    up_refs[slot_idx] = Some(&up_planar[ch][..m]);
+                }
+                if out_l.len() < m {
+                    out_l.resize(m, 0.0);
+                    out_r.resize(m, 0.0);
+                }
+                dsp.process(&up_refs, &mut out_l[..m], &mut out_r[..m], m);
+                if !dsp.is_finite() {
+                    bail!(Error::NonFinite { frames });
+                }
+                post_dsp_stereo!(&mut out_l[..m], &mut out_r[..m], &up_refs);
             }
-            return Err(wr
-                .result
-                .err()
-                .unwrap_or_else(|| Error::msg("encode stage stopped unexpectedly")));
-        }
-        frames += n as u64;
-        pipe_bytes_in += dec.bytes.len() as u64;
-        if let Some(p) = &opts.progress {
-            p.update(frames, bytes_out.load(Ordering::Relaxed));
-        }
-    }
+        } else {
+            let refs: [Option<&[f64]>; SLOTS] = std::array::from_fn(|i| {
+                if planar[i].is_empty() {
+                    None
+                } else {
+                    Some(&planar[i][..n])
+                }
+            });
 
-    // Drain any causal FIR / overlap-add impulse tail held by the renderer (e.g. G6+
-    // early reflections) BEFORE finishing the limiter, so the limiter protects the tail too.
-    let decoded = frames;
-    if decoded > 0 {
-        let (mut rl, mut rr) = dsp.flush();
-        if !rl.is_empty() {
-            if !rl.iter().chain(&rr).all(|v| v.is_finite()) {
+            // Always hand the block to the downmixer, including the two-channel case:
+            // `Dsp` implements the stereo bypass itself, and a second copy of that
+            // logic here would be one more place for a channel to go wrong.
+            dsp.process(&refs, &mut out_l[..n], &mut out_r[..n], n);
+            if !dsp.is_finite() {
                 bail!(Error::NonFinite { frames });
             }
-            peak.process(&mut rl, &mut rr);
-            if let Some(t) = &opts.tap {
-                let empty_refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
-                t.tap(&empty_refs, &rl, &rr, rl.len());
+            post_dsp_stereo!(&mut out_l[..n], &mut out_r[..n], &refs);
+        }
+    }
+
+    // Strict causal end-of-stream flush order:
+    //   upmix.flush -> dsp.process -> dsp.flush -> enhancer.flush -> unmasker.flush -> peak.finish_input
+    let decoded = decoded_in;
+    if decoded > 0 {
+        let empty_refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+
+        // 1. Flush upmixer tail into dsp -> post_dsp_stereo.
+        if let Some(up) = upmixer.as_mut() {
+            for v in &mut up_planar {
+                v.clear();
             }
-            if let Some(g) = grid.as_mut() {
-                g.process(&mut rl, &mut rr);
+            up.flush(&mut up_planar);
+            let m = up_planar[0].len();
+            if m > 0 {
+                let mut up_refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+                for (ch, &slot_idx) in upmix_slots.iter().enumerate() {
+                    up_refs[slot_idx] = Some(&up_planar[ch][..m]);
+                }
+                if out_l.len() < m {
+                    out_l.resize(m, 0.0);
+                    out_r.resize(m, 0.0);
+                }
+                dsp.process(&up_refs, &mut out_l[..m], &mut out_r[..m], m);
+                if !dsp.is_finite() {
+                    bail!(Error::NonFinite { frames });
+                }
+                post_dsp_stereo!(&mut out_l[..m], &mut out_r[..m], &empty_refs);
             }
-            frames += rl.len() as u64;
-            let mut rb = Vec::with_capacity(rl.len() * 16);
-            interleave_f64(&rl, &rr, &mut rb);
-            let _ = enc_tx.send(Encoded { bytes: rb });
-            if let Some(p) = &opts.progress {
-                p.update(frames, bytes_out.load(Ordering::Relaxed));
+        }
+
+        // 2. Drain any causal FIR / overlap-add impulse tail held by the renderer (e.g. G6+).
+        let (mut rl, mut rr) = dsp.flush();
+        if !rl.is_empty() {
+            post_dsp_stereo!(&mut rl, &mut rr, &empty_refs);
+        }
+
+        // 3. Flush shared-STN enhancer tail into unmasker (if active) -> peak.
+        if let Some(enh) = enhancer.as_mut() {
+            let (mut el, mut er) = enh.flush();
+            if !el.is_empty() {
+                if let Some(unm) = unmasker.as_mut() {
+                    unm_l.clear();
+                    unm_r.clear();
+                    unm.process(&el, &er, &mut unm_l, &mut unm_r);
+                    ship_stereo!(&mut unm_l, &mut unm_r, &empty_refs);
+                } else {
+                    ship_stereo!(&mut el, &mut er, &empty_refs);
+                }
+            }
+        }
+
+        // 4. Flush Moore-2016 ERB unmasker tail into peak.
+        if let Some(unm) = unmasker.as_mut() {
+            unm_l.clear();
+            unm_r.clear();
+            unm.flush(&mut unm_l, &mut unm_r);
+            if !unm_l.is_empty() {
+                ship_stereo!(&mut unm_l, &mut unm_r, &empty_refs);
             }
         }
     }
 
-    // The limiter holds the last `latency` frames of the file back. They are programme,
-    // not debris, and they have to reach the encoder before the stream closes: a file
-    // that lost its tail would be audibly truncated at exactly the point where the
-    // limiter added delay. If the encoder has already died the send fails quietly and the
-    // join below reports its error, which is the informative one.
+    // 5. Drain the limiter's delay line last so every trailing sample is ceiling-protected.
     let mut tail = peak.finish_input();
-    // No source samples means no programme to hold back: the tail would be `latency`
-    // frames of silence, and shipping them turned an empty decode into a "successful"
-    // 122-frame file.
     if decoded > 0 {
         if let [tl, tr, ..] = tail.as_mut_slice() {
             if !tl.is_empty() {

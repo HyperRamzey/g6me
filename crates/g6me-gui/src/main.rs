@@ -33,14 +33,16 @@ use crate::theme::Palette;
 use crate::widgets::{Browser, Mode};
 use eframe::CreationContext;
 use g6me_core::batch::{self, Phase};
+use g6me_core::cochlea::PersonalizationSession;
 use g6me_core::loudness::{Compliance, DeliveryTarget, LoudnessReport};
 use g6me_core::mask;
 use g6me_core::meter::{MeterTap, Meters};
 use g6me_core::pcm::{BitDepth, Dither};
 use g6me_core::pipeline;
 use g6me_core::pipeline::Report;
-use g6me_core::plus::{woodworth_itd_s, PlusCfg, PlusProfile, RendererMode};
+use g6me_core::plus::{woodworth_itd_s, PhysicsEngine, PlusCfg, PlusProfile, RendererMode};
 use g6me_core::probe::{probe_caps, Caps, Tools};
+use g6me_core::room::RoomPreset;
 use g6me_core::stages::Gtype;
 use g6me_core::util;
 use std::path::PathBuf;
@@ -108,6 +110,7 @@ fn row_matches_filter(row: &Row, filter: QueueFilter, query: &str) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Renderer,
+    Mastering,
     Output,
     TruePeak,
     Resample,
@@ -116,8 +119,9 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [
+    const ALL: [Tab; 7] = [
         Tab::Renderer,
+        Tab::Mastering,
         Tab::Output,
         Tab::TruePeak,
         Tab::Resample,
@@ -128,6 +132,7 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Renderer => "Renderer",
+            Tab::Mastering => "Mastering",
             Tab::Output => "Output",
             Tab::TruePeak => "True peak",
             Tab::Resample => "Resample",
@@ -260,9 +265,13 @@ pub struct App {
     queue_search: String,
     pick: Option<PickTarget>,
     browser: Browser,
-    /// Editable/pasteable path buffers kept synced with `settings.out_dir` / `settings.ir_file`.
+    /// Editable/pasteable path buffers kept synced with `settings.out_dir` / `settings.ir_file` / `settings.room_json`.
     out_dir_text: String,
     ir_file_text: String,
+    room_json_text: String,
+    head_mesh_text: String,
+    /// Interactive Hear-to-Hear Bayesian Active Personalization A/B loop state.
+    personalizer: PersonalizationSession,
     log: Vec<(Level, String)>,
     summary: Option<Summary>,
     /// Every file that has finished this session, with the levels it was measured at.
@@ -478,6 +487,9 @@ impl App {
             browser: Browser::default(),
             out_dir_text,
             ir_file_text,
+            room_json_text: String::new(),
+            head_mesh_text: String::new(),
+            personalizer: PersonalizationSession::new(),
             log: Vec::new(),
             summary: None,
             history: Vec::new(),
@@ -1118,6 +1130,7 @@ impl App {
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.tab {
                     Tab::Renderer => self.tab_renderer(ui),
+                    Tab::Mastering => self.tab_mastering(ui),
                     Tab::Output => self.tab_output(ui, caps.as_ref()),
                     Tab::TruePeak => self.tab_true_peak(ui),
                     Tab::Resample => self.tab_resample(ui, caps.as_ref()),
@@ -1129,7 +1142,7 @@ impl App {
         });
     }
 
-    /// Nugen Halo Upmix–inspired binaural renderer & soundfield profile controls.
+    /// Binaural renderer, physical acoustics, 3D room, and Bayesian personalization controls.
     fn tab_renderer(&mut self, ui: &mut egui::Ui) {
         let running = self.runner.is_running();
         ui.horizontal(|ui| {
@@ -1390,7 +1403,7 @@ impl App {
                             )
                             .on_hover_text(
                                 "Discrete `.1` LFE gain offset (-12 to +12 dB). 0.0 dB preserves exact \
-                                 Reference / Nuendo discrete LFE unity (when no bass is routed as objects \
+                                 Reference discrete LFE unity (when no bass is routed as objects \
                                  into LFE); boost (+6 to +10 dB) for theatrical `.1` rumble or cut if LFE overpowers.",
                             )
                             .changed()
@@ -1419,7 +1432,7 @@ impl App {
                             )
                             .on_hover_text(
                                 "Off (default): discrete `.1` LFE ignores the LF balance shelf and stays at your \
-                                 exact LFE level (0.0 dB for Nuendo discrete LFE). On: applies the same 340 Hz \
+                                 exact LFE level (0.0 dB for Reference discrete LFE). On: applies the same 340 Hz \
                                  LF balance shelf to `.1` so sub-bass tracks the main bed.",
                             )
                             .changed()
@@ -1452,8 +1465,197 @@ impl App {
                 ));
                 ui.weak(
                     "Universal non-personalized cues (no ear scan or SOFA needed). Direct-path \
-                     1-ERB DFEQ + Bauer LF balance preserve HyprEQ tonality across stereo & 7.1.",
+                     1-ERB DFEQ + Bauer LF balance preserve tonality across stereo & 7.1.",
                 );
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.strong("Acoustic Physics, Atmosphere & Hybrid 3D Room");
+                ui.add_enabled_ui(!running, |ui| {
+                    let p = &mut self.settings.plus;
+                    ui.horizontal(|ui| {
+                        ui.label("wave solver");
+                        for eng in PhysicsEngine::ALL {
+                            ui.selectable_value(&mut p.physics_engine, eng, eng.label());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("virtual room");
+                        for preset in [
+                            RoomPreset::Anechoic,
+                            RoomPreset::ControlRoom,
+                            RoomPreset::TheaterStage,
+                        ] {
+                            let label = match preset {
+                                RoomPreset::Anechoic => "Anechoic",
+                                RoomPreset::ControlRoom => "Control Room (3D FDTD+ISM+RT)",
+                                RoomPreset::TheaterStage => "Theater Stage (3D FDTD+ISM+RT)",
+                            };
+                            ui.selectable_value(&mut p.room_preset, preset, label);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("distance");
+                        ui.add(
+                            egui::Slider::new(&mut p.distance_m, 0.25..=10.0)
+                                .step_by(0.05)
+                                .fixed_decimals(2)
+                                .suffix(" m"),
+                        );
+                        ui.label("ear canal");
+                        ui.add(
+                            egui::Slider::new(&mut p.ear_canal_mm, 15.0..=38.0)
+                                .step_by(0.5)
+                                .fixed_decimals(1)
+                                .suffix(" mm"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut p.use_slepian_tail, "Slepian DPSS tail")
+                            .on_hover_text(
+                                "Replaces Half-Kaiser tail taper with exact Slepian DPSS eigenvector (Heisenberg-optimal).",
+                            );
+                        ui.checkbox(&mut p.use_fdn_velvet, "Paraunitary FDN + Velvet")
+                            .on_hover_text(
+                                "Engages Schlecht-Habets lossless paraunitary scattering FDN + ternary Velvet Noise tail.",
+                            );
+                        ui.checkbox(&mut p.use_warped_decorr, "Bark-warped AP")
+                            .on_hover_text(
+                                "Engages Kermit-Canfield & Abel Bark-warped all-pass decorrelator (0.000 dB ripple).",
+                            );
+                        ui.checkbox(&mut p.exact_ntt, "Goldilocks NTT (0 ULP)")
+                            .on_hover_text(
+                                "Executes binaural FIR convolution strictly inside the 64-bit Goldilocks prime field Z/(2^64-2^32+1)Z via NTT (--exact-ntt).",
+                            );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.use_room_json, "custom --room-json");
+                        if self.settings.use_room_json {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.room_json_text)
+                                    .desired_width(240.0)
+                                    .hint_text("path/to/room.json"),
+                            );
+                            if resp.changed() {
+                                self.settings.room_json =
+                                    widgets::clean_pasted_path(&self.room_json_text);
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.use_head_mesh, "3D --head-mesh (.obj)");
+                        if self.settings.use_head_mesh {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.head_mesh_text)
+                                    .desired_width(240.0)
+                                    .hint_text("path/to/myhead.obj (FMM-BEM)"),
+                            );
+                            if resp.changed() {
+                                self.settings.head_mesh =
+                                    widgets::clean_pasted_path(&self.head_mesh_text);
+                            }
+                        }
+                    });
+
+                    egui::CollapsingHeader::new("Atmosphere (Cramer 1993 + ISO 9613-1 O2/N2)")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("temp");
+                                ui.add(
+                                    egui::Slider::new(&mut p.atmosphere.temp_c, -20.0..=50.0)
+                                        .step_by(0.5)
+                                        .fixed_decimals(1)
+                                        .suffix(" °C"),
+                                );
+                                ui.label("RH");
+                                ui.add(
+                                    egui::Slider::new(&mut p.atmosphere.rh_pct, 0.0..=100.0)
+                                        .step_by(1.0)
+                                        .fixed_decimals(0)
+                                        .suffix(" %"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("CO₂");
+                                ui.add(
+                                    egui::Slider::new(&mut p.atmosphere.co2_ppm, 0.0..=10_000.0)
+                                        .step_by(10.0)
+                                        .fixed_decimals(0)
+                                        .suffix(" ppm"),
+                                );
+                                ui.label("pressure");
+                                ui.add(
+                                    egui::Slider::new(&mut p.atmosphere.pressure_kpa, 50.0..=120.0)
+                                        .step_by(0.1)
+                                        .fixed_decimals(2)
+                                        .suffix(" kPa"),
+                                );
+                            });
+                            let c_air = p.atmosphere.speed_of_sound_m_s();
+                            let a20 = p.atmosphere.alpha_db_per_m(20_000.0);
+                            ui.monospace(format!(
+                                "c = {c_air:.3} m/s · α(20 kHz) = {a20:.4} dB/m ({:.3} dB @ {:.2} m)",
+                                a20 * p.distance_m,
+                                p.distance_m
+                            ));
+                        });
+                });
+
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(format!(
+                    "Hear-to-Hear Bayesian Active Personalization (trial {}/12 · confidence {:.0}%)",
+                    self.personalizer.trial,
+                    self.personalizer.confidence() * 100.0
+                ))
+                .default_open(false)
+                .show(ui, |ui| {
+                    let (cand_a, cand_b) = self.personalizer.pair_params();
+                    let est = self.personalizer.posterior_mean();
+                    ui.weak(
+                        "BALD mutual-information A/B loop optimizing (head radius, torso spacing, pinna shelf) in 10–15 clicks.",
+                    );
+                    ui.monospace(format!(
+                        "Candidate A: head {:.1} mm · torso {:.0} mm · pinna {:+.2} dB",
+                        cand_a.head_radius_m * 1e3,
+                        cand_a.torso_height_m * 1e3,
+                        cand_a.pinna_shelf_db
+                    ));
+                    ui.monospace(format!(
+                        "Candidate B: head {:.1} mm · torso {:.0} mm · pinna {:+.2} dB",
+                        cand_b.head_radius_m * 1e3,
+                        cand_b.torso_height_m * 1e3,
+                        cand_b.pinna_shelf_db
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Prefer A").clicked() {
+                            self.personalizer.record_choice(true);
+                        }
+                        if ui.button("Prefer B").clicked() {
+                            self.personalizer.record_choice(false);
+                        }
+                        if ui
+                            .add_enabled(!running, egui::Button::new("Apply Posterior to G6+"))
+                            .clicked()
+                        {
+                            self.settings.plus.head_radius_m = est.head_radius_m;
+                            self.settings.plus.torso_height_m = est.torso_height_m;
+                            self.settings.plus.pinna_shelf_db = est.pinna_shelf_db;
+                            self.settings.plus.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+                            self.settings.plus.sync_profile();
+                        }
+                        if ui.button("Reset Loop").clicked() {
+                            self.personalizer = PersonalizationSession::new();
+                        }
+                    });
+                    ui.monospace(format!(
+                        "Posterior MMSE: head {:.1} mm · torso {:.0} mm · pinna {:+.2} dB · H = {:.2} bits",
+                        est.head_radius_m * 1e3,
+                        est.torso_height_m * 1e3,
+                        est.pinna_shelf_db,
+                        self.personalizer.entropy_bits()
+                    ));
+                });
                 if let Err(e) = self.settings.plus.validate() {
                     ui.colored_label(egui::Color32::from_rgb(226, 110, 90), e);
                 }
@@ -1599,8 +1801,172 @@ impl App {
     /// are computed by the core from the same functions the render uses, not restated,
     /// because a panel that recalculates them is a panel that will quietly disagree with
     /// the file it produced.
+    /// Patent-clean mastering & spatial enhancement suite:
+    /// 2.0 → 7.1 PAE Upmixer, Zero-IMD Virtual Bass, STN Micro-Detail, and Moore 2016 Unmasking EQ.
+    fn tab_mastering(&mut self, ui: &mut egui::Ui) {
+        let running = self.runner.is_running();
+        let st = &mut self.settings;
+        ui.add_enabled_ui(!running, |ui| {
+            ui.weak(
+                "All stages below are opt-in (off by default) and run in pure deterministic f64. \
+                 Signal order: 2.0→7.1 PAE Upmix → G6/G6+ Downmix → Shared-STN (Virtual Bass + \
+                 Micro-Detail) → Moore 2016 Perceptual Unmasking EQ → True-Peak Limiter.",
+            );
+            ui.add_space(6.0);
+
+            // 1. 2.0 -> 7.1 PAE Upmixer
+            ui.checkbox(
+                &mut st.upmix.enable,
+                "2.0 → 7.1 PAE Upmixer (He PCA+ASE + APES + Kraft–Zölzer all-pass decorrelators)",
+            )
+            .on_hover_text(
+                "Phase-coherent stereo-to-7.1 extraction for stereo inputs before G6/G6+ downmix. \
+                 Multichannel inputs bypass this stage automatically.",
+            );
+            if st.upmix.enable {
+                ui.indent("upmix-indent", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("center lock");
+                        ui.add(egui::Slider::new(&mut st.upmix.center_extract, 0.0..=1.0));
+                        ui.label("side");
+                        ui.add(egui::Slider::new(&mut st.upmix.surround_level, 0.0..=1.5));
+                        ui.label("rear");
+                        ui.add(egui::Slider::new(&mut st.upmix.rear_level, 0.0..=1.5));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut st.upmix.lfe_extract, "LR4 LFE");
+                        if st.upmix.lfe_extract {
+                            ui.add(
+                                egui::DragValue::new(&mut st.upmix.lfe_cutoff_hz)
+                                    .range(60.0..=160.0)
+                                    .speed(1.0)
+                                    .suffix(" Hz"),
+                            );
+                        }
+                        ui.label("decorrelation");
+                        ui.add(egui::Slider::new(&mut st.upmix.decorrelate, 0.0..=1.0));
+                    });
+                });
+            }
+            ui.separator();
+
+            // 2. Zero-IMD Psychoacoustic Virtual Bass
+            ui.checkbox(
+                &mut st.enhance.vbass.enable,
+                "Zero-IMD Psychoacoustic Virtual Bass (STN phase-vocoder tones + FEXP1 transients)",
+            )
+            .on_hover_text(
+                "Splits Sines, Transients, and Noise first: synthesizes missing upper bass harmonics \
+                 on tones with zero two-tone IMD and adds FEXP1 punch on kick transients only.",
+            );
+            if st.enhance.vbass.enable {
+                ui.indent("vbass-indent", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("cutoff");
+                        ui.add(
+                            egui::DragValue::new(&mut st.enhance.vbass.cutoff_hz)
+                                .range(40.0..=180.0)
+                                .speed(1.0)
+                                .suffix(" Hz"),
+                        );
+                        ui.label("amount");
+                        ui.add(egui::Slider::new(&mut st.enhance.vbass.amount, 0.0..=1.0));
+                        ui.label("gain");
+                        ui.add(
+                            egui::DragValue::new(&mut st.enhance.vbass.gain_db)
+                                .range(-12.0..=12.0)
+                                .speed(0.1)
+                                .suffix(" dB"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("harmonic decay");
+                        ui.add(egui::Slider::new(
+                            &mut st.enhance.vbass.harmonic_decay,
+                            0.2..=1.5,
+                        ));
+                        ui.label("transient punch");
+                        ui.add(egui::Slider::new(
+                            &mut st.enhance.vbass.transient_punch,
+                            0.0..=1.5,
+                        ));
+                    });
+                });
+            }
+            ui.separator();
+
+            // 3. STN Micro-Detail & Presence Enhancer
+            ui.checkbox(
+                &mut st.enhance.detail.enable,
+                "STN Micro-Detail & Presence Enhancer (upward soft-knee on Sines + Transients; Noise untouched)",
+            )
+            .on_hover_text(
+                "Shares the exact same Fierro–Välimäki Fuzzy STN front-end with Virtual Bass. \
+                 Lifts quiet tonal and transient micro-detail without dragging up hiss.",
+            );
+            if st.enhance.detail.enable {
+                ui.indent("detail-indent", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("intensity");
+                        ui.add(egui::Slider::new(&mut st.enhance.detail.intensity, 0.0..=1.0));
+                        ui.label("bias");
+                        ui.add(egui::Slider::new(&mut st.enhance.detail.bias, 0.0..=1.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("transients");
+                        ui.add(egui::Slider::new(
+                            &mut st.enhance.detail.transient_weight,
+                            0.0..=1.5,
+                        ));
+                        ui.label("presence tilt");
+                        ui.add(
+                            egui::DragValue::new(&mut st.enhance.detail.presence_tilt_db)
+                                .range(-3.0..=6.0)
+                                .speed(0.1)
+                                .suffix(" dB"),
+                        );
+                    });
+                });
+            }
+            ui.separator();
+
+            // 4. Moore 2016 / ISO 532-2 Perceptual Unmasking Dynamic EQ
+            ui.checkbox(
+                &mut st.unmask.enable,
+                "Moore 2016 / ISO 532-2 Perceptual Unmasking Dynamic EQ (minimum-phase FIR)",
+            )
+            .on_hover_text(
+                "75-band ERB auditory excitation + binaural inhibition comparing specific loudness \
+                 against an equal-information reference, applied via strictly causal minimum-phase FIR.",
+            );
+            if st.unmask.enable {
+                ui.indent("unmask-indent", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("recover");
+                        ui.add(egui::Slider::new(&mut st.unmask.recover, 0.0..=1.0));
+                        ui.label("tame");
+                        ui.add(egui::Slider::new(&mut st.unmask.tame, 0.0..=1.0));
+                        ui.label("max ±dB");
+                        ui.add(
+                            egui::DragValue::new(&mut st.unmask.max_gain_db)
+                                .range(0.5..=12.0)
+                                .speed(0.1)
+                                .suffix(" dB"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("bias");
+                        ui.add(egui::Slider::new(&mut st.unmask.bias, -1.0..=1.0));
+                        ui.label("brighten");
+                        ui.add(egui::Slider::new(&mut st.unmask.brighten, -1.0..=1.0));
+                    });
+                });
+            }
+        });
+    }
+
     fn tab_true_peak(&mut self, ui: &mut egui::Ui) {
-        use g6me_core::limiter::Cfg as LCfg;
+        use g6me_core::limiter::{Cfg as LCfg, LimiterStyle, MAX_CLIP_DRIVE_DB};
         use g6me_core::tp::Ratio;
 
         let running = self.runner.is_running();
@@ -1892,6 +2258,37 @@ impl App {
                 st.link_release_pct = lr;
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("character");
+            ui.selectable_value(
+                &mut st.limit_style,
+                LimiterStyle::Transparent,
+                "Transparent (linear ramp)",
+            )
+            .on_hover_text("Bit-exact default brickwall limiter with linear lookahead ramp.");
+            ui.selectable_value(
+                &mut st.limit_style,
+                LimiterStyle::Punchy,
+                "Punchy (Signalsmith + ADAA2)",
+            )
+            .on_hover_text(
+                "Signalsmith C^1 2-stage boxcar lookahead + Giannoulis log-domain slow stage + \
+                 optional Residual ADAA2 C^2 soft-knee pre-clipper.",
+            );
+            if st.limit_style == LimiterStyle::Punchy {
+                ui.label("clip drive");
+                ui.add(
+                    egui::DragValue::new(&mut st.limit_clip_db)
+                        .range(0.0..=MAX_CLIP_DRIVE_DB)
+                        .speed(0.1)
+                        .suffix(" dB"),
+                )
+                .on_hover_text(
+                    "Residual ADAA2 C^2 soft-clipper drive before lookahead true-peak limiting \
+                     (0 dB = bypass clipper, 1.5–3.0 dB = punchy transient shave).",
+                );
+            }
+        });
         let cfg = LCfg {
             enable: true,
             ceiling_db: st.setpoint_db.unwrap_or(st.ceiling_db),
@@ -1901,6 +2298,8 @@ impl App {
             release_ms: st.release_ms,
             link_transient: st.link_transient_pct / 100.0,
             link_release: st.link_release_pct / 100.0,
+            style: st.limit_style,
+            clip_drive_db: st.limit_clip_db,
         };
         let lat = cfg.latency_samples(rate);
         let asked = cfg.lookahead_ms;

@@ -29,6 +29,8 @@ struct Args {
     group: Option<String>,
     seconds: u64,
     frames: usize,
+    audit_cochlea: bool,
+    audit_wav: Option<std::path::PathBuf>,
 }
 
 fn main() {
@@ -39,6 +41,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if args.audit_cochlea {
+        match checks::audit_cochlea(args.audit_wav.as_deref(), args.json) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("g6me-verify --audit-cochlea: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let builds = reference::builds();
     let scratch = checks::Scratch::new("run");
@@ -105,6 +117,24 @@ fn main() {
     }
     if wanted(&args, "asm") {
         all.extend(checks::asm_guard(&builds));
+    }
+    if wanted(&args, "acoustics") {
+        all.extend(checks::acoustics());
+    }
+    if wanted(&args, "cochlea") {
+        all.extend(checks::cochlea());
+    }
+    if wanted(&args, "blackwell") {
+        all.extend(checks::blackwell());
+    }
+    if wanted(&args, "ntt") {
+        all.extend(checks::ntt());
+    }
+    if wanted(&args, "bem") {
+        all.extend(checks::bem());
+    }
+    if wanted(&args, "scan") {
+        all.extend(checks::scan());
     }
 
     let fails = all.iter().filter(|c| c.status == Status::Fail).count();
@@ -252,11 +282,20 @@ fn parse() -> Result<Args, String> {
                 }
                 i += 1;
             }
+            "--audit-cochlea" => {
+                a.audit_cochlea = true;
+                if let Some(next) = argv.get(i + 1) {
+                    if !next.starts_with('-') {
+                        a.audit_wav = Some(std::path::PathBuf::from(next));
+                        i += 1;
+                    }
+                }
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: g6me-verify [--json] [--group NAME] [--seconds N] [--frames N] \
-                     [--require-all]\ngroups: bitexact builds width chunk continuity phase \
-                     drift contraction asm"
+                     [--require-all] [--audit-cochlea [WAV]]\ngroups: bitexact builds width chunk \
+                     continuity phase drift contraction asm acoustics cochlea blackwell ntt bem scan"
                 );
                 std::process::exit(0);
             }
@@ -310,6 +349,12 @@ mod suite {
         all.extend(checks::contraction());
         all.extend(checks::adversarial(&builds, &scratch, frames));
         all.extend(checks::asm_guard(&builds));
+        all.extend(checks::acoustics());
+        all.extend(checks::cochlea());
+        all.extend(checks::blackwell());
+        all.extend(checks::ntt());
+        all.extend(checks::bem());
+        all.extend(checks::scan());
 
         let failed: Vec<&Check> = all.iter().filter(|c| c.status == Status::Fail).collect();
         let skipped: Vec<&Check> = all.iter().filter(|c| c.status == Status::Skip).collect();

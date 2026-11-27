@@ -1331,7 +1331,7 @@ pub fn clean_pasted_path(raw: &str) -> PathBuf {
     PathBuf::from(stripped.trim())
 }
 
-/// Nugen Halo Upmix–inspired interactive 2D binaural soundfield radar.
+/// Interactive 2D binaural soundfield radar visualization.
 ///
 /// Visualizes the active 7.1 speaker geometry, frontal stage width arc,
 /// center dialogue focus beam, surround/rear immersion envelope, dry studio

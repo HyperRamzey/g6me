@@ -7,11 +7,14 @@
 //! chain before a single sample moves.
 
 use clap::Parser;
+use g6me_core::atmosphere::AtmosphereCfg;
 use g6me_core::batch::{self, Batch, BatchCfg, Item, Phase, Progress};
+use g6me_core::enhance::{DetailCfg, EnhanceCfg, VirtualBassCfg};
 use g6me_core::limiter::{
-    Cfg as LimiterCfg, DEFAULT_ATTACK_MS, DEFAULT_CEILING_DB, DEFAULT_LOOKAHEAD_MS, DEFAULT_RATIO,
-    DEFAULT_RELEASE_MS, MAX_ATTACK_MS, MAX_CEILING_DB, MAX_LOOKAHEAD_MS, MAX_RELEASE_MS,
-    MIN_ATTACK_MS, MIN_CEILING_DB, MIN_LOOKAHEAD_MS, MIN_RELEASE_MS,
+    Cfg as LimiterCfg, LimiterStyle, DEFAULT_ATTACK_MS, DEFAULT_CEILING_DB, DEFAULT_LOOKAHEAD_MS,
+    DEFAULT_RATIO, DEFAULT_RELEASE_MS, MAX_ATTACK_MS, MAX_CEILING_DB, MAX_CLIP_DRIVE_DB,
+    MAX_LOOKAHEAD_MS, MAX_RELEASE_MS, MIN_ATTACK_MS, MIN_CEILING_DB, MIN_LOOKAHEAD_MS,
+    MIN_RELEASE_MS,
 };
 use g6me_core::mask::Slot;
 #[cfg(feature = "monitor")]
@@ -20,10 +23,13 @@ use g6me_core::pcm::{BitDepth, Dither};
 #[cfg(feature = "monitor")]
 use g6me_core::pipeline::RenderOpts;
 use g6me_core::pipeline::{self, Plan};
-use g6me_core::plus::{PlusCfg, PlusProfile, RendererMode};
+use g6me_core::plus::{PhysicsEngine, PlusCfg, PlusProfile, RendererMode};
 use g6me_core::probe::{probe_caps, Caps, Tools};
+use g6me_core::room::RoomPreset;
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
 use g6me_core::tp::Ratio;
+use g6me_core::unmask::UnmaskCfg;
+use g6me_core::upmix::UpmixCfg;
 use g6me_core::util;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -96,7 +102,7 @@ pub struct Cli {
     #[arg(long, value_parser = parse_plus_unit)]
     pub plus_decomb: Option<f64>,
 
-    /// G6+ discrete `.1` LFE gain offset in dB (-12.0 ..= 12.0; 0.0 matches Nuendo / Reference discrete LFE).
+    /// G6+ discrete `.1` LFE gain offset in dB (-12.0 ..= 12.0; 0.0 matches Reference discrete LFE).
     #[arg(long, allow_negative_numbers = true, value_parser = parse_plus_lfe_gain)]
     pub plus_lfe_gain: Option<f64>,
 
@@ -107,6 +113,75 @@ pub struct Cli {
     /// Disable the G6+ 120 Hz 4th-order Butterworth low-pass filter on the LFE channel.
     #[arg(long)]
     pub no_lfe_lpf: bool,
+
+    /// G6+ physical acoustic scattering engine: `brown-duda` (fast default) or `hankel-magls`
+    /// (exact 3D Spherical-Hankel + Coupled Snowman Torso + Order-7 HOA MagLS).
+    #[arg(long, default_value = "brown-duda", value_parser = parse_physics_engine)]
+    pub plus_physics: PhysicsEngine,
+
+    /// G6+ virtual speaker distance in meters for near-field parallax & air absorption (0.25 ..= 10.0, default 2.0).
+    #[arg(long, default_value_t = 2.0, value_parser = parse_plus_distance)]
+    pub plus_distance: f64,
+
+    /// G6+ rigid-sphere head radius in meters (0.065 ..= 0.115, default 0.0875).
+    #[arg(long, default_value_t = 0.0875, value_parser = parse_head_radius)]
+    pub plus_head_radius: f64,
+
+    /// G6+ Snowman head-to-torso spacing in meters (0.20 ..= 0.38, default 0.26).
+    #[arg(long, default_value_t = 0.26, value_parser = parse_torso_height)]
+    pub plus_torso_height: f64,
+
+    /// G6+ individualized broad pinna HF shelf in dB (-4.0 ..= +4.0, default 0.0).
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_pinna_shelf)]
+    pub plus_pinna_shelf: f64,
+
+    /// 1D Webster horn equation ear-canal length in mm (15.0 ..= 38.0; 25.0 = reference unity).
+    #[arg(long, default_value_t = 25.0, value_parser = parse_ear_canal_mm)]
+    pub ear_canal_mm: f64,
+
+    /// Use exact Slepian DPSS Heisenberg-optimal tail window instead of Half-Kaiser.
+    #[arg(long)]
+    pub plus_slepian: bool,
+
+    /// Enable Paraunitary Scattering FDN + ternary Velvet Noise late externalization tail.
+    #[arg(long)]
+    pub plus_fdn: bool,
+
+    /// Enable Kermit-Canfield & Abel Bark-warped all-pass decorrelation (0.000 dB ripple) on surrounds.
+    #[arg(long)]
+    pub plus_warped_decorr: bool,
+
+    /// Virtual room temperature in Celsius for Cramer (1993) speed of sound & ISO 9613-1 air absorption (-20 ..= 50, default 21.5).
+    #[arg(long, allow_negative_numbers = true, default_value_t = 21.5, value_parser = parse_room_temp_c)]
+    pub room_temp_c: f64,
+
+    /// Virtual room relative humidity in percent for O2/N2 vibrational relaxation (0 ..= 100, default 45.0).
+    #[arg(long, default_value_t = 45.0, value_parser = parse_room_rh)]
+    pub room_rh: f64,
+
+    /// Virtual room atmospheric CO2 concentration in ppm (0 ..= 10000, default 420.0).
+    #[arg(long, default_value_t = 420.0, value_parser = parse_co2_ppm)]
+    pub co2_ppm: f64,
+
+    /// Virtual room barometric pressure in kPa (50 ..= 120, default 101.325).
+    #[arg(long, default_value_t = 101.325, value_parser = parse_room_pressure_kpa)]
+    pub room_pressure_kpa: f64,
+
+    /// Hybrid 3D Room Acoustics engine preset: `anechoic` (default), `control-room`, or `theater`.
+    #[arg(long, default_value = "anechoic", value_parser = parse_room_preset)]
+    pub room: RoomPreset,
+
+    /// Optional JSON file defining custom 3D room dimensions, wall absorption, listener position, and desk baffle edges.
+    #[arg(long)]
+    pub room_json: Option<PathBuf>,
+
+    /// Optional 3D Wavefront `.obj` head & pinna scan for exact 3D Helmholtz FMM-BEM personalized HRTF synthesis.
+    #[arg(long)]
+    pub head_mesh: Option<PathBuf>,
+
+    /// Execute G6+ binaural FIR convolution strictly inside the 64-bit Goldilocks prime field (Z/pZ, p=2^64-2^32+1) via NTT (0 ULP intermediate rounding error).
+    #[arg(long)]
+    pub exact_ntt: bool,
 
     /// Over-sampling ratio the true peak is measured at: 2, 4, 8, 16 or 32 ("x4" works
     /// too). Every render reports the result, quoted with this ratio, because a dBTP
@@ -183,6 +258,111 @@ pub struct Cli {
     /// between grid points, and a ceiling cannot be held with a meter that low.
     #[arg(long, value_parser = parse_ratio)]
     pub limit_ratio: Option<Ratio>,
+
+    /// Limiter character style: `transparent` (bit-exact default linear ramp) or
+    /// `punchy` (Signalsmith C^1 2-stage boxcar lookahead + log-domain slow stage + optional ADAA2 soft clipper).
+    #[arg(long, default_value = "transparent", value_parser = parse_limiter_style)]
+    pub limit_style: LimiterStyle,
+
+    /// Pre-limiter Residual ADAA2 C^2 soft-clipper drive in dB (0.0 ..= 6.0; active in `--limit-style punchy`).
+    #[arg(long, default_value_t = 0.0, value_parser = parse_clip_drive_db)]
+    pub limit_clip_db: f64,
+
+    /// Enable patent-clean 2.0 → 7.1 Primary-Ambient Extraction (PAE) upmixer (He PCA+ASE + APES + Kraft-Zölzer decorrelators) before G6/G6+ downmix.
+    #[arg(long)]
+    pub upmix: bool,
+
+    /// Upmixer center dialogue lock strength (0.0 ..= 1.0, default 0.80).
+    #[arg(long, default_value_t = 0.80, value_parser = parse_unit_01)]
+    pub upmix_center: f64,
+
+    /// Upmixer side-surround (SL/SR) ambient bed weight (0.0 ..= 1.5, default 0.85).
+    #[arg(long, default_value_t = 0.85, value_parser = parse_upmix_level)]
+    pub upmix_surround: f64,
+
+    /// Upmixer rear-surround (BL/BR) ambient bed weight (0.0 ..= 1.5, default 0.75).
+    #[arg(long, default_value_t = 0.75, value_parser = parse_upmix_level)]
+    pub upmix_rear: f64,
+
+    /// Disable LR4 LFE sub-bass extraction in the 2.0 → 7.1 upmixer.
+    #[arg(long)]
+    pub upmix_no_lfe: bool,
+
+    /// Upmixer LR4 LFE crossover cutoff in Hz (60 ..= 160, default 120).
+    #[arg(long, default_value_t = 120.0, value_parser = parse_lfe_hz)]
+    pub upmix_lfe_hz: f64,
+
+    /// Upmixer Kraft-Zölzer Schroeder all-pass decorrelation blend on surrounds (0.0 ..= 1.0, default 1.0).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_unit_01)]
+    pub upmix_decorr: f64,
+
+    /// Enable zero-IMD STN psychoacoustic Virtual Bass (Moliner-Välimäki / Mu-Gan-Tan / Oo-Gan-Hawksford).
+    #[arg(long)]
+    pub vbass: bool,
+
+    /// Virtual Bass sub-bass upper fundamental cutoff in Hz (40 ..= 180, default 100).
+    #[arg(long, default_value_t = 100.0, value_parser = parse_vbass_cutoff)]
+    pub vbass_cutoff: f64,
+
+    /// Virtual Bass wet harmonic synthesis mix (0.0 ..= 1.0, default 0.45).
+    #[arg(long, default_value_t = 0.45, value_parser = parse_unit_01)]
+    pub vbass_amount: f64,
+
+    /// Virtual Bass harmonic synthesis drive trim in dB (-12.0 ..= +12.0, default 0.0).
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_vbass_gain)]
+    pub vbass_gain: f64,
+
+    /// Virtual Bass timbre-matched harmonic decay exponent (0.2 ..= 1.5, default 0.65).
+    #[arg(long, default_value_t = 0.65, value_parser = parse_vbass_decay)]
+    pub vbass_decay: f64,
+
+    /// Virtual Bass transient FEXP1 punch weight (0.0 ..= 1.5, default 0.60).
+    #[arg(long, default_value_t = 0.60, value_parser = parse_upmix_level)]
+    pub vbass_punch: f64,
+
+    /// Enable STN Micro-Detail & Presence Enhancer (Fierro-Välimäki Fuzzy STN upward contrast on Sines+Transients only, Noise untouched).
+    #[arg(long)]
+    pub detail: bool,
+
+    /// Micro-Detail upward contrast intensity (0.0 ..= 1.0, default 0.35).
+    #[arg(long, default_value_t = 0.35, value_parser = parse_unit_01)]
+    pub detail_intensity: f64,
+
+    /// Micro-Detail knee bias (0.0 ..= 1.0, default 0.50).
+    #[arg(long, default_value_t = 0.50, value_parser = parse_unit_01)]
+    pub detail_bias: f64,
+
+    /// Micro-Detail transient crispness relative weight (0.0 ..= 1.5, default 0.85).
+    #[arg(long, default_value_t = 0.85, value_parser = parse_upmix_level)]
+    pub detail_transients: f64,
+
+    /// Micro-Detail 2.5 kHz presence shelf emphasis in dB (-3.0 ..= +6.0, default 2.0).
+    #[arg(long, allow_negative_numbers = true, default_value_t = 2.0, value_parser = parse_detail_tilt)]
+    pub detail_tilt: f64,
+
+    /// Enable Moore 2016 / ISO 532-2 Auditory-Model Perceptual Unmasking Dynamic EQ (minimum-phase FIR).
+    #[arg(long)]
+    pub unmask: bool,
+
+    /// Perceptual Unmasking recovery strength for masked ERB bands (0.0 ..= 1.0, default 0.35).
+    #[arg(long, default_value_t = 0.35, value_parser = parse_unit_01)]
+    pub unmask_recover: f64,
+
+    /// Perceptual Unmasking taming strength for dominant masking ERB bands (0.0 ..= 1.0, default 0.35).
+    #[arg(long, default_value_t = 0.35, value_parser = parse_unit_01)]
+    pub unmask_tame: f64,
+
+    /// Perceptual Unmasking maximum per-band cut/boost in dB (0.5 ..= 12.0, default 4.5).
+    #[arg(long, default_value_t = 4.5, value_parser = parse_unmask_max_db)]
+    pub unmask_max_db: f64,
+
+    /// Perceptual Unmasking balance bias (-1.0 = tame-biased ..= +1.0 = recover-biased, default 0.0).
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_signed_unit)]
+    pub unmask_bias: f64,
+
+    /// Perceptual Unmasking equal-information ERB reference spectral tilt (-1.0 ..= +1.0, ±3 dB, default 0.0).
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0.0, value_parser = parse_signed_unit)]
+    pub unmask_brighten: f64,
 
     /// libsoxr precision in bits, 15..=33, used whenever a bit depth is reduced.
     #[arg(long, default_value_t = 33.0, value_parser = parse_precision_bits)]
@@ -353,6 +533,113 @@ fn parse_plus_bass_trim(s: &str) -> Result<f64, String> {
 
 fn parse_plus_lfe_gain(s: &str) -> Result<f64, String> {
     parse_span(s, "G6+ discrete LFE level in dB", -12.0, 12.0)
+}
+
+fn parse_physics_engine(s: &str) -> Result<PhysicsEngine, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "brown-duda" | "brownduda" | "classic" => Ok(PhysicsEngine::BrownDuda),
+        "hankel-magls" | "hankel" | "snowman" | "magls" => Ok(PhysicsEngine::HankelSnowmanMagLs),
+        other => Err(format!(
+            "unknown physics engine '{other}' (brown-duda, hankel-magls)"
+        )),
+    }
+}
+
+fn parse_room_preset(s: &str) -> Result<RoomPreset, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "anechoic" | "none" | "off" => Ok(RoomPreset::Anechoic),
+        "control-room" | "control" | "studio" => Ok(RoomPreset::ControlRoom),
+        "theater" | "theatre" | "theater-stage" | "cinema-hall" => Ok(RoomPreset::TheaterStage),
+        other => Err(format!(
+            "unknown room preset '{other}' (anechoic, control-room, theater)"
+        )),
+    }
+}
+
+fn parse_plus_distance(s: &str) -> Result<f64, String> {
+    parse_span(s, "virtual speaker distance in meters", 0.25, 10.0)
+}
+
+fn parse_head_radius(s: &str) -> Result<f64, String> {
+    parse_span(s, "head radius in meters", 0.065, 0.115)
+}
+
+fn parse_torso_height(s: &str) -> Result<f64, String> {
+    parse_span(s, "head-to-torso spacing in meters", 0.20, 0.38)
+}
+
+fn parse_pinna_shelf(s: &str) -> Result<f64, String> {
+    parse_span(s, "pinna shelf in dB", -4.0, 4.0)
+}
+
+fn parse_ear_canal_mm(s: &str) -> Result<f64, String> {
+    parse_span(s, "ear-canal length in mm", 15.0, 38.0)
+}
+
+fn parse_room_temp_c(s: &str) -> Result<f64, String> {
+    parse_span(s, "room temperature in Celsius", -20.0, 50.0)
+}
+
+fn parse_room_rh(s: &str) -> Result<f64, String> {
+    parse_span(s, "room relative humidity in percent", 0.0, 100.0)
+}
+
+fn parse_co2_ppm(s: &str) -> Result<f64, String> {
+    parse_span(s, "CO2 concentration in ppm", 0.0, 10_000.0)
+}
+
+fn parse_room_pressure_kpa(s: &str) -> Result<f64, String> {
+    parse_span(s, "barometric pressure in kPa", 50.0, 120.0)
+}
+
+fn parse_limiter_style(s: &str) -> Result<LimiterStyle, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "transparent" | "trans" | "classic" => Ok(LimiterStyle::Transparent),
+        "punchy" | "punch" | "adaa" => Ok(LimiterStyle::Punchy),
+        other => Err(format!(
+            "unknown limiter style '{other}' (transparent, punchy)"
+        )),
+    }
+}
+
+fn parse_clip_drive_db(s: &str) -> Result<f64, String> {
+    parse_span(s, "ADAA2 clip drive in dB", 0.0, MAX_CLIP_DRIVE_DB)
+}
+
+fn parse_unit_01(s: &str) -> Result<f64, String> {
+    parse_span(s, "parameter (0.0..=1.0)", 0.0, 1.0)
+}
+
+fn parse_signed_unit(s: &str) -> Result<f64, String> {
+    parse_span(s, "signed parameter (-1.0..=1.0)", -1.0, 1.0)
+}
+
+fn parse_upmix_level(s: &str) -> Result<f64, String> {
+    parse_span(s, "level/weight (0.0..=1.5)", 0.0, 1.5)
+}
+
+fn parse_lfe_hz(s: &str) -> Result<f64, String> {
+    parse_span(s, "LFE crossover in Hz", 60.0, 160.0)
+}
+
+fn parse_vbass_cutoff(s: &str) -> Result<f64, String> {
+    parse_span(s, "virtual bass cutoff in Hz", 40.0, 180.0)
+}
+
+fn parse_vbass_gain(s: &str) -> Result<f64, String> {
+    parse_span(s, "virtual bass gain in dB", -12.0, 12.0)
+}
+
+fn parse_vbass_decay(s: &str) -> Result<f64, String> {
+    parse_span(s, "virtual bass harmonic decay", 0.2, 1.5)
+}
+
+fn parse_detail_tilt(s: &str) -> Result<f64, String> {
+    parse_span(s, "micro-detail presence tilt in dB", -3.0, 6.0)
+}
+
+fn parse_unmask_max_db(s: &str) -> Result<f64, String> {
+    parse_span(s, "unmask max gain in dB", 0.5, 12.0)
 }
 
 fn parse_depth(s: &str) -> Result<BitDepth, String> {
@@ -665,10 +952,29 @@ impl Cli {
         if self.no_lfe_lpf {
             plus.lfe_lpf = false;
         }
+        plus.physics_engine = self.plus_physics;
+        plus.distance_m = self.plus_distance;
+        plus.head_radius_m = self.plus_head_radius;
+        plus.torso_height_m = self.plus_torso_height;
+        plus.pinna_shelf_db = self.plus_pinna_shelf;
+        plus.ear_canal_mm = self.ear_canal_mm;
+        plus.use_slepian_tail = self.plus_slepian;
+        plus.use_fdn_velvet = self.plus_fdn;
+        plus.use_warped_decorr = self.plus_warped_decorr;
+        plus.exact_ntt = self.exact_ntt;
+        plus.room_preset = self.room;
+        plus.atmosphere = AtmosphereCfg {
+            temp_c: self.room_temp_c,
+            rh_pct: self.room_rh,
+            co2_ppm: self.co2_ppm,
+            pressure_kpa: self.room_pressure_kpa,
+        };
         plus.sync_profile();
         let mut cfg = RenderCfg {
             renderer: self.mode,
             plus,
+            room_json: self.room_json.clone(),
+            head_mesh: self.head_mesh.clone(),
             resample: g6me_core::stages::ResampleCfg {
                 enable: self.rate.is_some(),
                 rate: self.rate.unwrap_or(48000),
@@ -691,6 +997,40 @@ impl Cli {
                 overwrite: self.force,
                 filter_threads: None,
             },
+            upmix: UpmixCfg {
+                enable: self.upmix,
+                center_extract: self.upmix_center,
+                surround_level: self.upmix_surround,
+                rear_level: self.upmix_rear,
+                lfe_extract: !self.upmix_no_lfe,
+                lfe_cutoff_hz: self.upmix_lfe_hz,
+                decorrelate: self.upmix_decorr,
+            },
+            enhance: EnhanceCfg {
+                vbass: VirtualBassCfg {
+                    enable: self.vbass,
+                    cutoff_hz: self.vbass_cutoff,
+                    gain_db: self.vbass_gain,
+                    amount: self.vbass_amount,
+                    harmonic_decay: self.vbass_decay,
+                    transient_punch: self.vbass_punch,
+                },
+                detail: DetailCfg {
+                    enable: self.detail,
+                    intensity: self.detail_intensity,
+                    bias: self.detail_bias,
+                    transient_weight: self.detail_transients,
+                    presence_tilt_db: self.detail_tilt,
+                },
+            },
+            unmask: UnmaskCfg {
+                enable: self.unmask,
+                recover: self.unmask_recover,
+                tame: self.unmask_tame,
+                max_gain_db: self.unmask_max_db,
+                bias: self.unmask_bias,
+                brighten: self.unmask_brighten,
+            },
             order: self.order.as_ref().map(|o| o.0.clone()),
             output_gain_db: self.gain,
             dc_block: self.dc_block,
@@ -706,6 +1046,8 @@ impl Cli {
                 release_ms: self.release,
                 link_transient: self.link_transient / 100.0,
                 link_release: self.link_release / 100.0,
+                style: self.limit_style,
+                clip_drive_db: self.limit_clip_db,
             },
             block: self.block,
             queue_blocks: self.queue,
@@ -881,6 +1223,9 @@ fn main() -> ExitCode {
             c.out.validate(&caps).map_err(|e| e.to_string())?;
         }
         c.limiter.validate()?;
+        c.upmix.validate()?;
+        c.enhance.validate()?;
+        c.unmask.validate()?;
         if c.renderer == g6me_core::plus::RendererMode::Plus {
             c.plus.validate()?;
         }
@@ -1852,6 +2197,81 @@ mod tests {
             "plain.flac".into(),
         ]);
         assert_eq!(cmd, "ffmpeg \"my \\\"quoted\\\" \\\\path.wav\" plain.flac");
+    }
+
+    #[test]
+    fn mastering_and_spatial_suite_flags_default_off_and_parse_overrides() {
+        let def = Cli::try_parse_from(["g6me", "x.mka"]).unwrap();
+        let cfg = def.render_cfg().unwrap();
+        assert!(!cfg.upmix.enable);
+        assert!(!cfg.enhance.is_enabled());
+        assert!(!cfg.unmask.enable);
+        assert_eq!(cfg.limiter.style, LimiterStyle::Transparent);
+        assert_eq!(cfg.limiter.clip_drive_db, 0.0);
+
+        let full = Cli::try_parse_from([
+            "g6me",
+            "--upmix",
+            "--upmix-center",
+            "0.9",
+            "--upmix-surround",
+            "1.1",
+            "--upmix-rear",
+            "0.8",
+            "--upmix-lfe-hz",
+            "100",
+            "--upmix-decorr",
+            "0.85",
+            "--vbass",
+            "--vbass-cutoff",
+            "90",
+            "--vbass-amount",
+            "0.6",
+            "--vbass-gain",
+            "3.0",
+            "--vbass-decay",
+            "0.55",
+            "--vbass-punch",
+            "0.75",
+            "--detail",
+            "--detail-intensity",
+            "0.5",
+            "--detail-bias",
+            "0.6",
+            "--detail-transients",
+            "1.1",
+            "--detail-tilt",
+            "2.5",
+            "--unmask",
+            "--unmask-recover",
+            "0.45",
+            "--unmask-tame",
+            "0.40",
+            "--unmask-max-db",
+            "6.0",
+            "--unmask-bias",
+            "-0.2",
+            "--unmask-brighten",
+            "0.3",
+            "--limit-style",
+            "punchy",
+            "--limit-clip-db",
+            "2.5",
+            "x.mka",
+        ])
+        .unwrap();
+        let c = full.render_cfg().unwrap();
+        c.upmix.validate().unwrap();
+        c.enhance.validate().unwrap();
+        c.unmask.validate().unwrap();
+        c.limiter.validate().unwrap();
+        assert!(c.upmix.enable);
+        assert!((c.upmix.center_extract - 0.9).abs() < 1e-9);
+        assert!(c.enhance.vbass.enable && (c.enhance.vbass.gain_db - 3.0).abs() < 1e-9);
+        assert!(c.enhance.detail.enable && (c.enhance.detail.intensity - 0.5).abs() < 1e-9);
+        assert!(c.unmask.enable && (c.unmask.max_gain_db - 6.0).abs() < 1e-9);
+        assert_eq!(c.limiter.style, LimiterStyle::Punchy);
+        assert!((c.limiter.clip_drive_db - 2.5).abs() < 1e-9);
     }
 
     trait StrErr {

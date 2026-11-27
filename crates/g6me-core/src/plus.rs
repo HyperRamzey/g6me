@@ -50,9 +50,21 @@ use std::f64::consts::PI;
 
 use serde::{Deserialize, Serialize};
 
+use crate::atmosphere::AtmosphereCfg;
+use crate::bem::{watertight_winding_repair, FmmBemSolver, TriangleMesh};
 use crate::dsp::{Dsp, MASK_STEREO, SLOTS};
 use crate::fft::{
-    half_kaiser_tail_apply, minimum_phase_spectrum, roex_smooth_power, Complex, FftPlan,
+    half_kaiser_tail_apply, half_slepian_tail_apply, minimum_phase_spectrum, roex_smooth_power,
+    Complex, FftPlan,
+};
+use crate::hoa::{kermit_canfield_warped_allpass, MagLsDecoder};
+use crate::ntt::{
+    field_to_i128, i64_to_field, mod_add, mod_mul, NttPlan, NTT_KERNEL_SCALE, NTT_PCM_SCALE,
+};
+use crate::room::{synthesize_hybrid_room_reflections, FdtdSolver3d, RoomGeometry, RoomPreset};
+use crate::scattering::{
+    ear_canal_compensation_mag, snowman_hrtf, sph_to_cart, SnowmanGeom, DEFAULT_EAR_CANAL_MM,
+    DEFAULT_HEAD_RADIUS_M,
 };
 
 /// Synthesis FFT size (`341.3 ms` at 48 kHz) — long enough that the causal LR4
@@ -167,6 +179,48 @@ impl PlusProfile {
     }
 }
 
+/// Acoustic diffraction physics solver for [`RendererMode::Plus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PhysicsEngine {
+    /// Fast analytic Brown–Duda (1998) spherical head shadow (default for instant synthesis).
+    #[default]
+    BrownDuda,
+    /// Exact 3D Helmholtz rigid-sphere (`h_m^(2)(ka)`) + coupled Snowman head/torso solver
+    /// (Duda & Martens 1998; Algazi et al. 2002) + Order-7 HOA MagLS + Hold SH tapering.
+    HankelSnowmanMagLs,
+}
+
+impl PhysicsEngine {
+    pub const ALL: [Self; 2] = [Self::BrownDuda, Self::HankelSnowmanMagLs];
+
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "brown-duda" | "fast" | "analytic" => Ok(Self::BrownDuda),
+            "hankel-magls" | "hankel" | "snowman" | "exact" | "magls" => {
+                Ok(Self::HankelSnowmanMagLs)
+            }
+            other => Err(format!(
+                "unknown physics engine `{other}` (expected: brown-duda, hankel-magls)"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BrownDuda => "brown-duda",
+            Self::HankelSnowmanMagLs => "hankel-magls",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BrownDuda => "Brown-Duda (Fast)",
+            Self::HankelSnowmanMagLs => "3D Hankel + Snowman + Order-7 MagLS",
+        }
+    }
+}
+
 /// Runtime-tweakable parameters for the `G6+` binaural renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -190,13 +244,40 @@ pub struct PlusCfg {
     /// Shirley–Kendrick adaptive 1-ERB phantom-center comb-notch fill (`0.00 ..= 1.00`).
     pub phantom_decomb: f64,
     /// Discrete `.1` LFE gain offset in dB (`-12.0 ..= +12.0 dB`; `0.0` = unity `1/sqrt(2)`
-    /// matching Reference / Nuendo 0 dB discrete LFE).
+    /// matching Reference 0 dB discrete LFE).
     pub lfe_gain_db: f64,
     /// Apply `bass_trim_db` (340 Hz LF balance shelf) to discrete `LFE` as well (`false` keeps
     /// discrete `LFE` at `0 dB` relative to untrimmed Reference; `true` trims `.1` with mains).
     pub lfe_lf_trim: bool,
     /// Apply 120 Hz 4th-order Butterworth low-pass filter to the LFE channel.
     pub lfe_lpf: bool,
+    /// Acoustic wave-scattering engine (`BrownDuda` fast vs `HankelSnowmanMagLs` exact 3D).
+    pub physics_engine: PhysicsEngine,
+    /// Virtual speaker distance in meters (`0.25 ..= 10.0`, default `2.0` m; near-field parallax).
+    pub distance_m: f64,
+    /// Listener spherical head radius in meters (`0.065 ..= 0.115`, default `0.0875` m).
+    pub head_radius_m: f64,
+    /// Listener head-to-torso spacing in meters (`0.20 ..= 0.38`, default `0.26` m).
+    pub torso_height_m: f64,
+    /// Personalization high-frequency pinna shelf tilt in dB (`-4.0 ..= +4.0`, default `0.0`).
+    pub pinna_shelf_db: f64,
+    /// Individualized ear-canal length in mm for Webster 1D horn impedance (`25.0` = neutral,
+    /// `15.0 ..= 38.0` active, `0.0` disables).
+    pub ear_canal_mm: f64,
+    /// Atmospheric thermodynamic & molecular `O₂`/`N₂` air state (Cramer 1993 / ISO 9613-1).
+    pub atmosphere: AtmosphereCfg,
+    /// Hybrid 3D Room Acoustics engine preset (`Anechoic`, `ControlRoom`, `TheaterStage`).
+    pub room_preset: RoomPreset,
+    /// Replace Half-Kaiser tail taper with exact Slepian DPSS eigenvector window (`Slepian 1961`).
+    pub use_slepian_tail: bool,
+    /// Engage Paraunitary Scattering FDN (Schlecht & Habets) + Velvet Noise late externalization.
+    pub use_fdn_velvet: bool,
+    /// Engage Kermit-Canfield & Abel (DAFx 2016) Bark-warped all-pass rear decorrelation.
+    pub use_warped_decorr: bool,
+    /// Execute binaural FIR Overlap-Add convolution strictly inside the 64-bit Goldilocks
+    /// prime field (`Z / pZ`, `p = 2^64 - 2^32 + 1`) via Number-Theoretic Transforms (`--exact-ntt`,
+    /// 0 ULPs of intermediate floating-point rounding error!).
+    pub exact_ntt: bool,
 }
 
 impl Default for PlusCfg {
@@ -207,6 +288,32 @@ impl Default for PlusCfg {
 
 impl PlusCfg {
     pub fn from_profile(profile: PlusProfile) -> Self {
+        let base_adv = (
+            PhysicsEngine::BrownDuda,
+            2.0_f64,
+            DEFAULT_HEAD_RADIUS_M,
+            0.26_f64,
+            0.0_f64,
+            DEFAULT_EAR_CANAL_MM,
+            AtmosphereCfg::default(),
+            RoomPreset::Anechoic,
+            false,
+            false,
+            false,
+        );
+        let (
+            physics_engine,
+            distance_m,
+            head_radius_m,
+            torso_height_m,
+            pinna_shelf_db,
+            ear_canal_mm,
+            atmosphere,
+            room_preset,
+            use_slepian_tail,
+            use_fdn_velvet,
+            use_warped_decorr,
+        ) = base_adv;
         match profile {
             PlusProfile::Pure => Self {
                 profile: PlusProfile::Pure,
@@ -220,6 +327,18 @@ impl PlusCfg {
                 lfe_gain_db: 0.0,
                 lfe_lf_trim: false,
                 lfe_lpf: true,
+                physics_engine,
+                distance_m,
+                head_radius_m,
+                torso_height_m,
+                pinna_shelf_db,
+                ear_canal_mm,
+                atmosphere,
+                room_preset,
+                use_slepian_tail,
+                use_fdn_velvet,
+                use_warped_decorr,
+                exact_ntt: false,
             },
             PlusProfile::Studio => Self {
                 profile: PlusProfile::Studio,
@@ -233,6 +352,18 @@ impl PlusCfg {
                 lfe_gain_db: 0.0,
                 lfe_lf_trim: false,
                 lfe_lpf: true,
+                physics_engine,
+                distance_m,
+                head_radius_m,
+                torso_height_m,
+                pinna_shelf_db,
+                ear_canal_mm,
+                atmosphere,
+                room_preset,
+                use_slepian_tail,
+                use_fdn_velvet,
+                use_warped_decorr,
+                exact_ntt: false,
             },
             PlusProfile::Cinema => Self {
                 profile: PlusProfile::Cinema,
@@ -246,6 +377,18 @@ impl PlusCfg {
                 lfe_gain_db: 0.0,
                 lfe_lf_trim: false,
                 lfe_lpf: true,
+                physics_engine,
+                distance_m,
+                head_radius_m,
+                torso_height_m,
+                pinna_shelf_db,
+                ear_canal_mm,
+                atmosphere,
+                room_preset,
+                use_slepian_tail,
+                use_fdn_velvet,
+                use_warped_decorr,
+                exact_ntt: false,
             },
             PlusProfile::Custom => Self {
                 profile: PlusProfile::Custom,
@@ -268,6 +411,17 @@ impl PlusCfg {
                 && (self.lfe_gain_db - r.lfe_gain_db).abs() < 0.05
                 && self.lfe_lf_trim == r.lfe_lf_trim
                 && self.lfe_lpf == r.lfe_lpf
+                && self.physics_engine == r.physics_engine
+                && (self.distance_m - r.distance_m).abs() < 1e-3
+                && (self.head_radius_m - r.head_radius_m).abs() < 1e-4
+                && (self.torso_height_m - r.torso_height_m).abs() < 1e-3
+                && (self.pinna_shelf_db - r.pinna_shelf_db).abs() < 1e-3
+                && (self.ear_canal_mm - r.ear_canal_mm).abs() < 1e-2
+                && self.room_preset == r.room_preset
+                && self.use_slepian_tail == r.use_slepian_tail
+                && self.use_fdn_velvet == r.use_fdn_velvet
+                && self.use_warped_decorr == r.use_warped_decorr
+                && self.exact_ntt == r.exact_ntt
             {
                 return p;
             }
@@ -328,11 +482,44 @@ impl PlusCfg {
                 self.lfe_gain_db
             ));
         }
+        if !self.distance_m.is_finite() || !(0.25..=10.0).contains(&self.distance_m) {
+            return Err(format!(
+                "plus.distance_m must be in 0.25..=10.0 m, got {}",
+                self.distance_m
+            ));
+        }
+        if !self.head_radius_m.is_finite() || !(0.065..=0.115).contains(&self.head_radius_m) {
+            return Err(format!(
+                "plus.head_radius_m must be in 0.065..=0.115 m, got {}",
+                self.head_radius_m
+            ));
+        }
+        if !self.torso_height_m.is_finite() || !(0.20..=0.38).contains(&self.torso_height_m) {
+            return Err(format!(
+                "plus.torso_height_m must be in 0.20..=0.38 m, got {}",
+                self.torso_height_m
+            ));
+        }
+        if !self.pinna_shelf_db.is_finite() || !(-4.0..=4.0).contains(&self.pinna_shelf_db) {
+            return Err(format!(
+                "plus.pinna_shelf_db must be in -4.0..=+4.0 dB, got {}",
+                self.pinna_shelf_db
+            ));
+        }
+        if !self.ear_canal_mm.is_finite()
+            || (self.ear_canal_mm != 0.0 && !(15.0..=38.0).contains(&self.ear_canal_mm))
+        {
+            return Err(format!(
+                "plus.ear_canal_mm must be 0 or in 15.0..=38.0 mm, got {}",
+                self.ear_canal_mm
+            ));
+        }
+        self.atmosphere.validate()?;
         Ok(())
     }
 
     pub fn summary(&self) -> String {
-        format!(
+        let mut s = format!(
             "G6+ {} (width {:.2}, focus {:.2}, surr {:.2}, ext {:.2}, bass-mono {:.0} Hz, lf {:+.1} dB{}, decomb {:.2}, lfe {:+.1} dB{})",
             self.profile.label(),
             self.width,
@@ -345,16 +532,47 @@ impl PlusCfg {
             self.phantom_decomb,
             self.lfe_gain_db,
             if self.lfe_lpf { ", lfe-lpf" } else { "" },
-        )
+        );
+        if self.physics_engine == PhysicsEngine::HankelSnowmanMagLs
+            || self.room_preset != RoomPreset::Anechoic
+            || self.use_slepian_tail
+            || self.use_fdn_velvet
+            || self.exact_ntt
+            || (self.distance_m - 2.0).abs() > 1e-3
+        {
+            s.push_str(&format!(
+                " [{}, {:.2}m, room:{}{}{}{}]",
+                self.physics_engine.as_str(),
+                self.distance_m,
+                self.room_preset.as_str(),
+                if self.use_slepian_tail {
+                    ", slepian"
+                } else {
+                    ""
+                },
+                if self.use_fdn_velvet {
+                    ", fdn+velvet"
+                } else {
+                    ""
+                },
+                if self.exact_ntt { ", exact-ntt" } else { "" },
+            ));
+        }
+        s
     }
 
     /// Estimate direct-to-reverberant ratio (dB) for center dialogue at current settings
     /// (for GUI acoustic readout).
     pub fn estimated_center_drr_db(&self) -> Option<f64> {
-        if self.externalize <= 1e-4 {
+        if self.externalize <= 1e-4 && self.room_preset == RoomPreset::Anechoic {
             return None;
         }
-        let refl_scale = self.externalize * (1.0 - 0.50 * self.center_focus);
+        let ext = if self.room_preset != RoomPreset::Anechoic {
+            self.externalize.max(0.45)
+        } else {
+            self.externalize
+        };
+        let refl_scale = ext * (1.0 - 0.50 * self.center_focus);
         let refl_e = 0.65 * refl_scale * refl_scale;
         if refl_e <= 1e-9 {
             return None;
@@ -427,6 +645,27 @@ pub struct KernelBank {
 impl KernelBank {
     /// Synthesize all 12×2 binaural FIR kernels deterministically in `f64`.
     pub fn synthesize(cfg: PlusCfg, sample_rate: u32) -> Self {
+        Self::synthesize_with_room(cfg, sample_rate, None)
+    }
+
+    /// Synthesize all 12×2 binaural FIR kernels with an optional custom 3D room JSON geometry.
+    pub fn synthesize_with_room(
+        cfg: PlusCfg,
+        sample_rate: u32,
+        custom_room: Option<&RoomGeometry>,
+    ) -> Self {
+        Self::synthesize_with_assets(cfg, sample_rate, custom_room, None)
+    }
+
+    /// Synthesize all 12×2 binaural FIR kernels with optional custom 3D room JSON geometry
+    /// and/or a user-scanned 3D head/pinna `.obj` mesh (`--head-mesh`) solved via Gumerov
+    /// FMM-BEM Helmholtz acoustic reciprocity!
+    pub fn synthesize_with_assets(
+        cfg: PlusCfg,
+        sample_rate: u32,
+        custom_room: Option<&RoomGeometry>,
+        custom_head_mesh: Option<&TriangleMesh>,
+    ) -> Self {
         let fs = (sample_rate.max(8_000)) as f64;
         let scale = sr_scale(sample_rate);
         let n_synth = N_SYNTH * scale;
@@ -452,28 +691,119 @@ impl KernelBank {
             }
         }
 
-        // Precompute DEE-safe 1st-order causal all-pass filter (650 Hz) for BL/BR.
-        let mut ap_rear = vec![Complex::ONE; nb];
-        let f_ap = 650.0_f64.min(0.4 * fs);
-        let tan_ap = (PI * f_ap / fs).tan();
-        let ap_coeff = (tan_ap - 1.0) / (tan_ap + 1.0);
-        for (k, &f) in freqs.iter().enumerate() {
-            let z1 = Complex::from_polar(1.0, -2.0 * PI * f / fs);
-            // H_ap(z) = (a + z^-1) / (1 + a * z^-1), |H_ap| == 1 everywhere, strictly causal.
-            let num = Complex::new(ap_coeff, 0.0).add(z1);
-            let den = Complex::ONE.add(z1.scale(ap_coeff));
-            ap_rear[k] = num.div(den);
-        }
+        // Precompute rear all-pass decorrelator: either Kermit-Canfield & Abel (DAFx 2016)
+        // Bark-warped 4-stage cascade or the classic 1st-order 650 Hz all-pass.
+        let (ap_rear_l, ap_rear_r) =
+            if cfg.use_warped_decorr || cfg.physics_engine == PhysicsEngine::HankelSnowmanMagLs {
+                (
+                    kermit_canfield_warped_allpass(&freqs, fs, 1.0),
+                    kermit_canfield_warped_allpass(&freqs, fs, -1.0),
+                )
+            } else {
+                let mut ap = vec![Complex::ONE; nb];
+                let f_ap = 650.0_f64.min(0.4 * fs);
+                let tan_ap = (PI * f_ap / fs).tan();
+                let ap_coeff = (tan_ap - 1.0) / (tan_ap + 1.0);
+                for (k, &f) in freqs.iter().enumerate() {
+                    let z1 = Complex::from_polar(1.0, -2.0 * PI * f / fs);
+                    let num = Complex::new(ap_coeff, 0.0).add(z1);
+                    let den = Complex::ONE.add(z1.scale(ap_coeff));
+                    ap[k] = num.div(den);
+                }
+                (ap.clone(), ap)
+            };
+
+        let active_room: Option<RoomGeometry> = if let Some(r) = custom_room {
+            Some(r.clone())
+        } else if cfg.room_preset != RoomPreset::Anechoic {
+            Some(RoomGeometry::from_preset(cfg.room_preset))
+        } else {
+            None
+        };
+
+        // Build Order-7 HOA MagLS decoder once when exact wave-scattering or hybrid room is active.
+        let snowman_geom = SnowmanGeom::from_head_and_torso(cfg.head_radius_m, cfg.torso_height_m);
+        let c_air = cfg.atmosphere.speed_of_sound_m_s();
+        let magls: Option<MagLsDecoder> =
+            if cfg.physics_engine == PhysicsEngine::HankelSnowmanMagLs || active_room.is_some() {
+                Some(MagLsDecoder::build(
+                    &freqs,
+                    snowman_geom,
+                    cfg.distance_m,
+                    c_air,
+                    true,
+                    0.35,
+                ))
+            } else {
+                None
+            };
 
         let mut dir_l: Vec<Vec<Complex>> = vec![vec![Complex::ZERO; nb]; SLOTS];
         let mut dir_r: Vec<Vec<Complex>> = vec![vec![Complex::ZERO; nb]; SLOTS];
         let mut chan_weights = [1.0_f64; SLOTS];
+
+        // If a real 3D head/pinna mesh (`--head-mesh`) was supplied, build the FMM-BEM Helmholtz
+        // solver (auto-repairing open holes with Generalized Winding Numbers) and solve exact
+        // personalized binaural spectra for all 11 full-range virtual speakers via reciprocity!
+        let bem_direct: Option<Vec<(Vec<f64>, Vec<f64>)>> = custom_head_mesh.and_then(|raw_mesh| {
+            let mesh = if raw_mesh.stats(c_air).is_watertight {
+                raw_mesh.clone()
+            } else {
+                watertight_winding_repair(raw_mesh, 16)
+            };
+            let solver = FmmBemSolver::new(&mesh).ok()?;
+            let mut srcs = Vec::with_capacity(SLOTS);
+            for (ch, &base_az) in SLOT_AZ_DEG.iter().enumerate() {
+                let eff_az = if matches!(ch, SLOT_FL | SLOT_FR | SLOT_FLC | SLOT_FRC) {
+                    (base_az * cfg.width).clamp(-55.0, 55.0)
+                } else {
+                    base_az
+                };
+                let el = if ch == SLOT_TC { 60.0 } else { 0.0 };
+                srcs.push(sph_to_cart(eff_az, el, cfg.distance_m));
+            }
+            Some(solver.synthesize_binaural_irs(&srcs, sample_rate, n_ir, &cfg.atmosphere))
+        });
 
         // 1. Synthesize each full-range slot's anechoic direct path first.
         for ch in 0..SLOTS {
             if ch == SLOT_LFE {
                 continue;
             }
+            if let Some(ref bem_irs) = bem_direct {
+                let (ref bil, ref bir) = bem_irs[ch];
+                let mut pad_l = vec![0.0_f64; n_synth];
+                let mut pad_r = vec![0.0_f64; n_synth];
+                let copy_len = bil.len().min(n_synth);
+                pad_l[..copy_len].copy_from_slice(&bil[..copy_len]);
+                pad_r[..copy_len].copy_from_slice(&bir[..copy_len]);
+                let mut sc = vec![Complex::ZERO; n_synth];
+                let mut sl = vec![Complex::ZERO; nb];
+                let mut sr = vec![Complex::ZERO; nb];
+                plan.rfft(&pad_l, &mut sc, &mut sl);
+                plan.rfft(&pad_r, &mut sc, &mut sr);
+                let cw = if ch == SLOT_FC {
+                    0.94 + 0.12 * cfg.center_focus
+                } else if matches!(ch, SLOT_SL | SLOT_SR | SLOT_BL | SLOT_BR) {
+                    0.60 + 0.40 * cfg.surround_depth
+                } else {
+                    1.0
+                };
+                let g = std::f64::consts::FRAC_1_SQRT_2 * cw;
+                for k in 0..nb {
+                    sl[k] = sl[k].scale(g);
+                    sr[k] = sr[k].scale(g);
+                }
+                dir_l[ch] = sl;
+                dir_r[ch] = sr;
+                chan_weights[ch] = cw;
+                continue;
+            }
+            let ap_rear = if SLOT_AZ_DEG[ch] >= 0.0 {
+                &ap_rear_l
+            } else {
+                &ap_rear_r
+            };
             let (sl, sr, cw) = synthesize_direct_spectrum(
                 ch,
                 &cfg,
@@ -482,7 +812,9 @@ impl KernelBank {
                 &freqs,
                 &lr4_lo,
                 &lr4_hi,
-                &ap_rear,
+                ap_rear,
+                snowman_geom,
+                c_air,
                 &plan,
             );
             dir_l[ch] = sl;
@@ -491,9 +823,7 @@ impl KernelBank {
         }
 
         // 2. Direct-path 1-ERB common Diffuse-Field Equalization (Zaunschirm,
-        //    Schörkhuber & Höldrich, JASA 2018): computing DFEQ on the direct 7.0
-        //    ring alone prevents `> 400 Hz` lateral room reflections from biasing DFEQ
-        //    into attenuating direct midrange vs sub-150 Hz bass.
+        //    Schörkhuber & Höldrich, JASA 2018).
         let mut p_dir = vec![0.0_f64; nb];
         for &ch in &DF_RING_SLOTS {
             for k in 0..nb {
@@ -522,10 +852,81 @@ impl KernelBank {
         let mut spec_l = dir_l.clone();
         let mut spec_r = dir_r.clone();
 
-        // 3. Add dry smooth alternating-polarity ITU-R BS.1116 / Hassager–Gran–Dau
-        //    lateral early reflections (`>= 8.5 ms`) when `externalize > 0`, filtered by
-        //    the direct diffuse envelope (`dfeq_min`) for clean spectral integration.
-        if cfg.externalize > 1e-6 {
+        // 3. Room / externalization reflections:
+        //    - If a 3D Hybrid Room (`ControlRoom`, `TheaterStage`, or `--room-json`) is active:
+        //      run 2 reciprocal 3D FDTD PDE simulations (Left ear & Right ear -> all 12 speakers!)
+        //      + 3D ISM + BTM desk edge diffraction + PCG64 Monte Carlo Ray Tracing -> Order-7 MagLS
+        //      (+ Paraunitary Scattering FDN & Velvet Noise).
+        //    - Otherwise, when `externalize > 0`, add dry ITU-R BS.1116 lateral early reflections.
+        if let (Some(room_geom), Some(decoder)) = (&active_room, &magls) {
+            // Compute virtual speaker Cartesian coordinates inside the room.
+            let mut spk_coords = [[0.0_f64; 3]; SLOTS];
+            for (ch, coord) in spk_coords.iter_mut().enumerate() {
+                let base_az = SLOT_AZ_DEG[ch];
+                let eff_az = if matches!(ch, SLOT_FL | SLOT_FR | SLOT_FLC | SLOT_FRC) {
+                    (base_az * cfg.width).clamp(-65.0, 65.0)
+                } else {
+                    base_az
+                };
+                let el = if ch == SLOT_TC { 60.0 } else { 0.0 };
+                let rel = sph_to_cart(eff_az, el, cfg.distance_m);
+                *coord = [
+                    (room_geom.listener_m[0] + rel[0]).clamp(0.25, room_geom.dims_m[0] - 0.25),
+                    (room_geom.listener_m[1] + rel[1]).clamp(0.25, room_geom.dims_m[1] - 0.25),
+                    (room_geom.listener_m[2] + rel[2]).clamp(0.25, room_geom.dims_m[2] - 0.25),
+                ];
+            }
+
+            // Acoustic Reciprocity shortcut: only 2 3D FDTD runs (L ear + R ear) record all 12 speakers!
+            let fdtd = FdtdSolver3d::new(room_geom, c_air, 0.28);
+            let ear_l_v = fdtd.coord_to_voxel([
+                room_geom.listener_m[0],
+                room_geom.listener_m[1] + cfg.head_radius_m,
+                room_geom.listener_m[2],
+            ]);
+            let ear_r_v = fdtd.coord_to_voxel([
+                room_geom.listener_m[0],
+                room_geom.listener_m[1] - cfg.head_radius_m,
+                room_geom.listener_m[2],
+            ]);
+            let spk_voxels: Vec<(usize, usize, usize)> =
+                spk_coords.iter().map(|&p| fdtd.coord_to_voxel(p)).collect();
+            let fdtd_steps = ((0.10 / fdtd.dt_s).ceil() as usize).clamp(40, 260);
+            let fdtd_l_all = fdtd.simulate(ear_l_v, &spk_voxels, fdtd_steps);
+            let fdtd_r_all = fdtd.simulate(ear_r_v, &spk_voxels, fdtd_steps);
+
+            let ext_mix = cfg.externalize.max(0.55);
+            for ch in 0..SLOTS {
+                if ch == SLOT_LFE {
+                    continue;
+                }
+                let refl_scale = if ch == SLOT_FC {
+                    ext_mix * (1.0 - 0.45 * cfg.center_focus)
+                } else {
+                    ext_mix
+                };
+                let (rl, rr) = synthesize_hybrid_room_reflections(
+                    room_geom,
+                    &cfg.atmosphere,
+                    decoder,
+                    &freqs,
+                    fs,
+                    pre_delay_s,
+                    spk_coords[ch],
+                    Some(&fdtd_l_all[ch]),
+                    Some(&fdtd_r_all[ch]),
+                    fdtd.dt_s,
+                    cfg.use_fdn_velvet,
+                    0x6736_4D45_0000_0001u64.wrapping_add(ch as u64 * 0x9E37_79B9),
+                    &plan,
+                );
+                let g = std::f64::consts::FRAC_1_SQRT_2 * chan_weights[ch] * refl_scale * 0.45;
+                for k in 0..nb {
+                    spec_l[ch][k] = spec_l[ch][k].add(rl[k].mul(dfeq_min[k]).scale(g));
+                    spec_r[ch][k] = spec_r[ch][k].add(rr[k].mul(dfeq_min[k]).scale(g));
+                }
+            }
+        } else if cfg.externalize > 1e-6 {
             for ch in 0..SLOTS {
                 if ch == SLOT_LFE {
                     continue;
@@ -542,6 +943,49 @@ impl KernelBank {
                     &mut spec_r[ch],
                     &plan,
                 );
+            }
+            // Optional Paraunitary Scattering FDN + Velvet Noise late shimmer in dry Studio/Cinema.
+            if cfg.use_fdn_velvet {
+                let tail_len = ((0.06 * fs).round() as usize).min(n_synth / 2);
+                let mut fdn = crate::room::ScatteringFdn::new(sample_rate, 0.22, 0.12);
+                let (fl, fr) = fdn.synthesize_stereo_tail(tail_len);
+                let vl = crate::room::generate_velvet_noise(tail_len, sample_rate, 2_200.0, 0xF00D);
+                let vr = crate::room::generate_velvet_noise(tail_len, sample_rate, 2_200.0, 0xCAFE);
+                let mut tl = vec![0.0_f64; n_synth];
+                let mut tr = vec![0.0_f64; n_synth];
+                let start = ((pre_delay_s + 0.014) * fs).round() as usize;
+                for i in 0..tail_len {
+                    if start + i >= n_synth {
+                        break;
+                    }
+                    let env = (-6.907_755 * (i as f64) / (0.20 * fs)).exp();
+                    tl[start + i] = 0.7 * fl[i] + 0.3 * vl[i] * env * 0.035;
+                    tr[start + i] = 0.7 * fr[i] + 0.3 * vr[i] * env * 0.035;
+                }
+                let mut scr = vec![Complex::ZERO; n_synth];
+                let mut fdn_l = vec![Complex::ZERO; nb];
+                let mut fdn_r = vec![Complex::ZERO; nb];
+                plan.rfft(&tl, &mut scr, &mut fdn_l);
+                plan.rfft(&tr, &mut scr, &mut fdn_r);
+                for ch in 0..SLOTS {
+                    if ch == SLOT_LFE {
+                        continue;
+                    }
+                    let g = 0.10
+                        * cfg.externalize
+                        * chan_weights[ch]
+                        * if ch == SLOT_FC {
+                            1.0 - 0.5 * cfg.center_focus
+                        } else {
+                            1.0
+                        };
+                    for (k, &f) in freqs.iter().enumerate() {
+                        let x_hp = f / 450.0;
+                        let hp = (x_hp * x_hp) / (1.0 + x_hp * x_hp);
+                        spec_l[ch][k] = spec_l[ch][k].add(fdn_l[k].mul(dfeq_min[k]).scale(g * hp));
+                        spec_r[ch][k] = spec_r[ch][k].add(fdn_r[k].mul(dfeq_min[k]).scale(g * hp));
+                    }
+                }
             }
         }
 
@@ -572,10 +1016,7 @@ impl KernelBank {
             );
         }
 
-        // 5. Audible-band Parseval 7.0 diffuse power preservation (`TARGET_DF_POWER = 3.5`)
-        //    over `0..=min(24 kHz, fs/2)` after reflections & de-comb so total loudness
-        //    matches stock `g6ct` (`3.5017`) identically at 48 kHz, 96 kHz, and 192 kHz
-        //    without ultrasonic bins biasing the gain or tilting the direct spectrum.
+        // 5. Audible-band Parseval 7.0 diffuse power preservation (`TARGET_DF_POWER = 3.5`).
         let f_ref = 24_000.0_f64.min(0.5 * fs);
         let k_end = ((f_ref * (n_synth as f64) / fs).round() as usize).clamp(1, nb - 1);
         let inv_band = 1.0 / ((2 * k_end) as f64);
@@ -610,10 +1051,7 @@ impl KernelBank {
             }
         }
 
-        // 6. Synthesize LFE: mono `1/sqrt(2)` per ear (so `gL^2 + gR^2 = 1.0`,
-        //    matching stock `g6ct` / Nuendo 0 dB discrete LFE energy by default),
-        //    scaled by `lfe_gain_db`, aligned to `pre_delay_s`, optional causal
-        //    120 Hz 4th-order Butterworth LPF, zero reflections.
+        // 6. Synthesize LFE: mono `1/sqrt(2)` per ear, optional 120 Hz Butterworth LPF.
         let lfe_gain = std::f64::consts::FRAC_1_SQRT_2 * 10.0_f64.powf(cfg.lfe_gain_db / 20.0);
         for (k, &f) in freqs.iter().enumerate() {
             let phase = Complex::from_polar(1.0, -2.0 * PI * f * pre_delay_s);
@@ -627,9 +1065,7 @@ impl KernelBank {
             spec_r[SLOT_LFE][k] = v;
         }
 
-        // 7. Bauer (1961) / Linkwitz (1971) / Völk–Fastl (AES 2011) causal minimum-phase
-        //    coherent LF trim shelf at 340 Hz across the full-range ring (and discrete
-        //    `LFE` only when `cfg.lfe_lf_trim` is enabled).
+        // 7. Bauer / Linkwitz / Völk–Fastl (AES 2011) causal minimum-phase coherent LF trim shelf.
         if cfg.bass_trim_db.abs() > 1e-6 {
             let fc_lf = 340.0_f64.min(0.45 * fs);
             let g_lf = 10.0_f64.powf(cfg.bass_trim_db / 20.0);
@@ -652,7 +1088,25 @@ impl KernelBank {
             }
         }
 
-        // 8. IFFT to time domain, truncate to `n_ir`, and apply half-Kaiser tail taper.
+        // 7b. Optional 1D Webster Horn Equation Ear-Canal Impedance personalization (`ear_canal_mm != 25.0`).
+        if cfg.ear_canal_mm > 0.0 && (cfg.ear_canal_mm - DEFAULT_EAR_CANAL_MM).abs() > 1e-3 {
+            let canal_mag: Vec<f64> = freqs
+                .iter()
+                .map(|&f| ear_canal_compensation_mag(f, cfg.ear_canal_mm, c_air))
+                .collect();
+            let canal_min = minimum_phase_spectrum(&canal_mag, &plan);
+            for ch in 0..SLOTS {
+                if ch == SLOT_LFE {
+                    continue;
+                }
+                for k in 0..nb {
+                    spec_l[ch][k] = spec_l[ch][k].mul(canal_min[k]);
+                    spec_r[ch][k] = spec_r[ch][k].mul(canal_min[k]);
+                }
+            }
+        }
+
+        // 8. IFFT to time domain, truncate to `n_ir`, and apply Half-Slepian DPSS or Half-Kaiser tail taper.
         let mut scratch = vec![Complex::ZERO; n_synth];
         let mut time_buf = vec![0.0_f64; n_synth];
         let mut ir_l = vec![vec![0.0_f64; n_ir]; SLOTS];
@@ -661,11 +1115,19 @@ impl KernelBank {
         for ch in 0..SLOTS {
             plan.irfft(&spec_l[ch], &mut scratch, &mut time_buf);
             ir_l[ch].copy_from_slice(&time_buf[..n_ir]);
-            half_kaiser_tail_apply(&mut ir_l[ch], kaiser_tail, KAISER_BETA);
+            if cfg.use_slepian_tail {
+                half_slepian_tail_apply(&mut ir_l[ch], kaiser_tail, 5.0);
+            } else {
+                half_kaiser_tail_apply(&mut ir_l[ch], kaiser_tail, KAISER_BETA);
+            }
 
             plan.irfft(&spec_r[ch], &mut scratch, &mut time_buf);
             ir_r[ch].copy_from_slice(&time_buf[..n_ir]);
-            half_kaiser_tail_apply(&mut ir_r[ch], kaiser_tail, KAISER_BETA);
+            if cfg.use_slepian_tail {
+                half_slepian_tail_apply(&mut ir_r[ch], kaiser_tail, 5.0);
+            } else {
+                half_kaiser_tail_apply(&mut ir_r[ch], kaiser_tail, KAISER_BETA);
+            }
         }
 
         Self {
@@ -743,6 +1205,8 @@ fn synthesize_direct_spectrum(
     lr4_lo: &[Complex],
     lr4_hi: &[Complex],
     ap_rear: &[Complex],
+    snowman_geom: SnowmanGeom,
+    c_air: f64,
     plan: &FftPlan,
 ) -> (Vec<Complex>, Vec<Complex>, f64) {
     let nb = freqs.len();
@@ -777,8 +1241,8 @@ fn synthesize_direct_spectrum(
         1.0
     };
 
-    // 1. Direct-path magnitude responses: Brown–Duda spherical head shadow +
-    //    broad non-individualized front–back pinna shading.
+    // 1. Direct-path magnitude responses: either exact 3D Spherical-Hankel + Coupled Snowman
+    //    head/torso scattering + ISO 9613-1 O2/N2 air absorption, or classic Brown–Duda.
     let mut mag_l = Vec::with_capacity(nb);
     let mut mag_r = Vec::with_capacity(nb);
     let pinna_scale = if is_side || is_back {
@@ -786,30 +1250,124 @@ fn synthesize_direct_spectrum(
     } else {
         1.0
     };
-    for &f in freqs {
-        let bdl = brown_duda_mag(f, eff_az, 1.0, shadow_depth);
-        let bdr = brown_duda_mag(f, eff_az, -1.0, shadow_depth);
-        let pinna = broad_pinna_mag(f, eff_az, ch == SLOT_TC, pinna_scale);
-        mag_l.push(bdl * pinna);
-        mag_r.push(bdr * pinna);
+    let el_deg = if ch == SLOT_TC { 60.0 } else { 0.0 };
+    let user_pinna_g = 10.0_f64.powf(cfg.pinna_shelf_db / 20.0);
+
+    if cfg.physics_engine == PhysicsEngine::HankelSnowmanMagLs {
+        // Evaluate exact 3D Helmholtz rigid-sphere + Snowman torso on a dense ~180-anchor
+        // frequency grid and log/linearly interpolate magnitudes across FFT bins for speed.
+        let mut anchors: Vec<usize> = Vec::with_capacity(200);
+        anchors.push(0);
+        let mut cur = 0usize;
+        let df = if nb > 1 { freqs[1] - freqs[0] } else { 10.0 };
+        while cur + 1 < nb {
+            let f = freqs[cur];
+            let step_hz = if f < 1_000.0 {
+                25.0
+            } else if f < 4_000.0 {
+                60.0
+            } else {
+                0.03 * f
+            };
+            let step = ((step_hz / df.max(1e-6)).round() as usize).max(1);
+            cur = (cur + step).min(nb - 1);
+            anchors.push(cur);
+        }
+        let mut ml_a = Vec::with_capacity(anchors.len());
+        let mut mr_a = Vec::with_capacity(anchors.len());
+        for &bin in &anchors {
+            let f = freqs[bin];
+            let hl = snowman_hrtf(
+                f,
+                snowman_geom,
+                eff_az,
+                el_deg,
+                cfg.distance_m,
+                1.0,
+                c_air,
+                true,
+            )
+            .norm();
+            let hr = snowman_hrtf(
+                f,
+                snowman_geom,
+                eff_az,
+                el_deg,
+                cfg.distance_m,
+                -1.0,
+                c_air,
+                true,
+            )
+            .norm();
+            let air = cfg.atmosphere.air_gain_linear(f, cfg.distance_m);
+            let pinna = broad_pinna_mag(f, eff_az, ch == SLOT_TC, pinna_scale);
+            let x_up = f / 4_000.0;
+            let user_shelf = if cfg.pinna_shelf_db.abs() > 1e-6 {
+                ((user_pinna_g * user_pinna_g * x_up * x_up + 1.0) / (x_up * x_up + 1.0)).sqrt()
+            } else {
+                1.0
+            };
+            ml_a.push((hl * air * pinna * user_shelf).max(1e-6));
+            mr_a.push((hr * air * pinna * user_shelf).max(1e-6));
+        }
+        mag_l.resize(nb, 1.0);
+        mag_r.resize(nb, 1.0);
+        for seg in 0..(anchors.len() - 1) {
+            let b0 = anchors[seg];
+            let b1 = anchors[seg + 1];
+            mag_l[b0] = ml_a[seg];
+            mag_r[b0] = mr_a[seg];
+            let span = b1 - b0;
+            if span > 1 {
+                let inv = 1.0 / (span as f64);
+                for off in 1..span {
+                    let t = (off as f64) * inv;
+                    mag_l[b0 + off] = ml_a[seg] + t * (ml_a[seg + 1] - ml_a[seg]);
+                    mag_r[b0 + off] = mr_a[seg] + t * (mr_a[seg + 1] - mr_a[seg]);
+                }
+            }
+        }
+        mag_l[nb - 1] = *ml_a.last().unwrap_or(&1.0);
+        mag_r[nb - 1] = *mr_a.last().unwrap_or(&1.0);
+    } else {
+        for &f in freqs {
+            let bdl = brown_duda_mag(f, eff_az, 1.0, shadow_depth);
+            let bdr = brown_duda_mag(f, eff_az, -1.0, shadow_depth);
+            let pinna = broad_pinna_mag(f, eff_az, ch == SLOT_TC, pinna_scale);
+            let user_shelf = if cfg.pinna_shelf_db.abs() > 1e-6 {
+                let x_up = f / 4_000.0;
+                ((user_pinna_g * user_pinna_g * x_up * x_up + 1.0) / (x_up * x_up + 1.0)).sqrt()
+            } else {
+                1.0
+            };
+            mag_l.push(bdl * pinna * user_shelf);
+            mag_r.push(bdr * pinna * user_shelf);
+        }
     }
 
     // 2. Hilbert-cepstral minimum-phase conversion.
     let hl_min = minimum_phase_spectrum(&mag_l, plan);
     let hr_min = minimum_phase_spectrum(&mag_r, plan);
 
-    // 3. Kulkarni–Isabelle–Colburn (1999) excess Woodworth ITD:
-    //    measure the natural minimum-phase ITD already present in `(hl_min, hr_min)`
-    //    between 350 Hz and 900 Hz, then add only the remaining excess propagation delay.
-    let ww_base = woodworth_itd_s(eff_az);
+    // 3. Kulkarni–Isabelle–Colburn (1999) excess Woodworth ITD using exact speed of sound & head radius
+    //    when HankelSnowmanMagLs is active (or stock constants in fast BrownDuda mode).
+    let ww_base = if cfg.physics_engine == PhysicsEngine::HankelSnowmanMagLs {
+        let r = eff_az.abs().to_radians().min(PI);
+        let path = if r <= 0.5 * PI {
+            r + r.sin()
+        } else {
+            PI - r + r.sin()
+        };
+        (cfg.head_radius_m / c_air) * path
+    } else {
+        woodworth_itd_s(eff_az)
+    };
     let target_itd = if is_side || is_back {
         ww_base * (0.85 + 0.15 * cfg.surround_depth).clamp(0.70, 1.15)
     } else {
         ww_base
     };
     let nat_itd = measure_unwrapped_itd_s(freqs, &hl_min, &hr_min, 350.0, 900.0);
-    // Positive `eff_az` is left => Left ear leads (`hl` ahead of `hr`), so contralateral
-    // Right ear gets `tau_r = excess`, ipsilateral Left ear gets `tau_l = 0`.
     let (tau_l, tau_r) = if eff_az > 1e-6 {
         (0.0, (target_itd - nat_itd.max(0.0)).max(0.0))
     } else if eff_az < -1e-6 {
@@ -1392,12 +1950,41 @@ pub struct BinauralPlus {
     acc_r: Vec<Complex>,
     y_l: Vec<f64>,
     y_r: Vec<f64>,
+    /// Optional 64-bit Goldilocks prime-field NTT OLA engine (`--exact-ntt`).
+    ntt_plan: Option<NttPlan>,
+    ntt_kern_l: Vec<Vec<u64>>,
+    ntt_kern_r: Vec<Vec<u64>>,
+    ntt_ov_l: Vec<i128>,
+    ntt_ov_r: Vec<i128>,
+    ntt_x: Vec<u64>,
+    ntt_acc_l: Vec<u64>,
+    ntt_acc_r: Vec<u64>,
     finite: bool,
 }
 
 impl BinauralPlus {
     pub fn new(mask: u32, cfg: PlusCfg, sample_rate: u32) -> Self {
-        let bank = KernelBank::synthesize(cfg, sample_rate);
+        Self::new_with_assets(mask, cfg, sample_rate, None, None)
+    }
+
+    pub fn new_with_room(
+        mask: u32,
+        cfg: PlusCfg,
+        sample_rate: u32,
+        custom_room: Option<&RoomGeometry>,
+    ) -> Self {
+        Self::new_with_assets(mask, cfg, sample_rate, custom_room, None)
+    }
+
+    pub fn new_with_assets(
+        mask: u32,
+        cfg: PlusCfg,
+        sample_rate: u32,
+        custom_room: Option<&RoomGeometry>,
+        custom_head_mesh: Option<&TriangleMesh>,
+    ) -> Self {
+        let bank =
+            KernelBank::synthesize_with_assets(cfg, sample_rate, custom_room, custom_head_mesh);
         let scale = sr_scale(sample_rate);
         let n_ir = N_IR * scale;
         let n_fft = N_FFT * scale;
@@ -1419,6 +2006,44 @@ impl BinauralPlus {
             plan.rfft(&pad, &mut scratch, &mut kern_r[ch]);
         }
 
+        let (ntt_plan, ntt_kern_l, ntt_kern_r, ntt_ov_l, ntt_ov_r, ntt_x, ntt_acc_l, ntt_acc_r) =
+            if cfg.exact_ntt {
+                let np = NttPlan::new(n_fft);
+                let mut nkl = vec![vec![0u64; n_fft]; SLOTS];
+                let mut nkr = vec![vec![0u64; n_fft]; SLOTS];
+                for ch in 0..SLOTS {
+                    for i in 0..n_ir {
+                        let ql = (bank.ir_l[ch][i] * NTT_KERNEL_SCALE).round() as i64;
+                        let qr = (bank.ir_r[ch][i] * NTT_KERNEL_SCALE).round() as i64;
+                        nkl[ch][i] = i64_to_field(ql);
+                        nkr[ch][i] = i64_to_field(qr);
+                    }
+                    np.forward(&mut nkl[ch]);
+                    np.forward(&mut nkr[ch]);
+                }
+                (
+                    Some(np),
+                    nkl,
+                    nkr,
+                    vec![0i128; n_ir - 1],
+                    vec![0i128; n_ir - 1],
+                    vec![0u64; n_fft],
+                    vec![0u64; n_fft],
+                    vec![0u64; n_fft],
+                )
+            } else {
+                (
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+
         Self {
             mask,
             sample_rate,
@@ -1438,6 +2063,14 @@ impl BinauralPlus {
             acc_r: vec![Complex::ZERO; nb],
             y_l: vec![0.0_f64; n_fft],
             y_r: vec![0.0_f64; n_fft],
+            ntt_plan,
+            ntt_kern_l,
+            ntt_kern_r,
+            ntt_ov_l,
+            ntt_ov_r,
+            ntt_x,
+            ntt_acc_l,
+            ntt_acc_r,
             finite: true,
         }
     }
@@ -1520,6 +2153,61 @@ impl BinauralPlus {
         m: usize,
     ) {
         debug_assert!((1..=self.ola_hop).contains(&m));
+        if let Some(ref np) = self.ntt_plan {
+            let n_fft = np.len();
+            self.ntt_acc_l.fill(0);
+            self.ntt_acc_r.fill(0);
+            for (ch, slot) in inputs.iter().enumerate() {
+                if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                    continue;
+                }
+                let Some(buf) = slot else { continue };
+                let slice = &buf[offset..offset + m];
+                if !slice.iter().any(|&v| v != 0.0) {
+                    continue;
+                }
+                self.ntt_x.fill(0);
+                for (dst, &sample) in self.ntt_x.iter_mut().take(m).zip(slice) {
+                    let q = (sample * NTT_PCM_SCALE)
+                        .round()
+                        .clamp(-8_388_608.0, 8_388_607.0) as i64;
+                    *dst = i64_to_field(q);
+                }
+                np.forward(&mut self.ntt_x);
+                let kl = &self.ntt_kern_l[ch];
+                let kr = &self.ntt_kern_r[ch];
+                for k in 0..n_fft {
+                    let xv = self.ntt_x[k];
+                    self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
+                    self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+                }
+            }
+            np.inverse(&mut self.ntt_acc_l);
+            np.inverse(&mut self.ntt_acc_r);
+
+            let inv_scale = 1.0 / (NTT_PCM_SCALE * NTT_KERNEL_SCALE);
+            let ov_len = self.n_ir - 1;
+            for i in 0..m {
+                let ol = if i < ov_len { self.ntt_ov_l[i] } else { 0 };
+                let or = if i < ov_len { self.ntt_ov_r[i] } else { 0 };
+                let vl = ((field_to_i128(self.ntt_acc_l[i]) + ol) as f64) * inv_scale;
+                let vr = ((field_to_i128(self.ntt_acc_r[i]) + or) as f64) * inv_scale;
+                if !vl.is_finite() || !vr.is_finite() {
+                    self.finite = false;
+                }
+                out_l[i] = vl;
+                out_r[i] = vr;
+            }
+            for j in 0..ov_len {
+                let src = m + j;
+                let prev_l = if src < ov_len { self.ntt_ov_l[src] } else { 0 };
+                let prev_r = if src < ov_len { self.ntt_ov_r[src] } else { 0 };
+                self.ntt_ov_l[j] = prev_l + field_to_i128(self.ntt_acc_l[src]);
+                self.ntt_ov_r[j] = prev_r + field_to_i128(self.ntt_acc_r[src]);
+            }
+            return;
+        }
+
         let nb = self.plan.len() / 2 + 1;
         self.acc_l.fill(Complex::ZERO);
         self.acc_r.fill(Complex::ZERO);
@@ -1583,6 +2271,22 @@ impl BinauralPlus {
         if self.mask == MASK_STEREO {
             return (Vec::new(), Vec::new());
         }
+        if self.ntt_plan.is_some() {
+            let inv_scale = 1.0 / (NTT_PCM_SCALE * NTT_KERNEL_SCALE);
+            let tl: Vec<f64> = self
+                .ntt_ov_l
+                .iter()
+                .map(|&v| (v as f64) * inv_scale)
+                .collect();
+            let tr: Vec<f64> = self
+                .ntt_ov_r
+                .iter()
+                .map(|&v| (v as f64) * inv_scale)
+                .collect();
+            self.ntt_ov_l.fill(0);
+            self.ntt_ov_r.fill(0);
+            return (tl, tr);
+        }
         let tl = self.ov_l.clone();
         let tr = self.ov_r.clone();
         self.ov_l.fill(0.0);
@@ -1599,9 +2303,36 @@ pub enum Renderer {
 
 impl Renderer {
     pub fn new(mode: RendererMode, plus: PlusCfg, mask: u32, sample_rate: u32) -> Self {
+        Self::new_with_assets(mode, plus, mask, sample_rate, None, None)
+    }
+
+    pub fn new_with_room(
+        mode: RendererMode,
+        plus: PlusCfg,
+        mask: u32,
+        sample_rate: u32,
+        custom_room: Option<&RoomGeometry>,
+    ) -> Self {
+        Self::new_with_assets(mode, plus, mask, sample_rate, custom_room, None)
+    }
+
+    pub fn new_with_assets(
+        mode: RendererMode,
+        plus: PlusCfg,
+        mask: u32,
+        sample_rate: u32,
+        custom_room: Option<&RoomGeometry>,
+        custom_head_mesh: Option<&TriangleMesh>,
+    ) -> Self {
         match mode {
             RendererMode::Reference => Self::Classic(Box::new(Dsp::<f64>::new(mask))),
-            RendererMode::Plus => Self::Plus(Box::new(BinauralPlus::new(mask, plus, sample_rate))),
+            RendererMode::Plus => Self::Plus(Box::new(BinauralPlus::new_with_assets(
+                mask,
+                plus,
+                sample_rate,
+                custom_room,
+                custom_head_mesh,
+            ))),
         }
     }
 
@@ -2303,6 +3034,113 @@ mod tests {
         assert!(
             ol.iter().chain(&or).all(|&v| v == 0.0),
             "unmasked BL slot leaked into output"
+        );
+    }
+
+    /// End-to-end integration of the full acoustic-physics stack:
+    /// Spherical-Hankel + Snowman torso + Order-7 MagLS + Hybrid 3D ControlRoom
+    /// (2-run reciprocal 3D FDTD + ISM + BTM + PCG64 Ray Tracing) + Slepian DPSS tail
+    /// + Paraunitary Scattering FDN/Velvet + Webster 1D Ear-Canal impedance.
+    #[test]
+    fn academic_nuke_hankel_room_slepian_externalization_integration() {
+        let pure_cfg = PlusCfg::from_profile(PlusProfile::Pure);
+        let mut nuke_cfg = PlusCfg::from_profile(PlusProfile::Studio);
+        nuke_cfg.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+        nuke_cfg.room_preset = RoomPreset::ControlRoom;
+        nuke_cfg.distance_m = 2.0;
+        nuke_cfg.use_slepian_tail = true;
+        nuke_cfg.use_fdn_velvet = true;
+        nuke_cfg.use_warped_decorr = true;
+        nuke_cfg.ear_canal_mm = 27.0;
+        nuke_cfg.atmosphere = crate::atmosphere::AtmosphereCfg {
+            temp_c: 21.5,
+            rh_pct: 45.0,
+            co2_ppm: 420.0,
+            pressure_kpa: 101.325,
+        };
+        nuke_cfg.validate().expect("nuke_cfg must validate");
+
+        let bank_pure = KernelBank::synthesize(pure_cfg, 48_000);
+        let bank_nuke = KernelBank::synthesize(nuke_cfg, 48_000);
+
+        for ch in 0..SLOTS {
+            assert!(bank_nuke.ir_l[ch].iter().all(|v| v.is_finite()));
+            assert!(bank_nuke.ir_r[ch].iter().all(|v| v.is_finite()));
+        }
+
+        // Baumgartner–Majdak Bayesian Auditory Externalization must score the
+        // 3D Hybrid ControlRoom higher than anechoic Pure on frontal speaker FL.
+        let ext_pure = crate::cochlea::baumgartner_majdak_externalization(
+            &bank_pure.ir_l[SLOT_FL],
+            &bank_pure.ir_r[SLOT_FL],
+            48_000,
+        );
+        let ext_nuke = crate::cochlea::baumgartner_majdak_externalization(
+            &bank_nuke.ir_l[SLOT_FL],
+            &bank_nuke.ir_r[SLOT_FL],
+            48_000,
+        );
+        assert!(
+            ext_nuke.score > ext_pure.score,
+            "ControlRoom externalization ({:.3}) must exceed Pure ({:.3})",
+            ext_nuke.score,
+            ext_pure.score
+        );
+    }
+
+    /// End-to-end integration of `--head-mesh` (3D FMM-BEM direct synthesis) +
+    /// `--exact-ntt` (0-ULP Goldilocks prime-field NTT overlap-add streaming).
+    #[test]
+    fn head_mesh_fmm_bem_and_exact_ntt_end_to_end() {
+        let mesh = crate::bem::TriangleMesh::procedural_head_with_pinnae(0.0875, 2);
+        let mut cfg_fft = PlusCfg::from_profile(PlusProfile::Pure);
+        cfg_fft.exact_ntt = false;
+        let mut cfg_ntt = cfg_fft;
+        cfg_ntt.exact_ntt = true;
+
+        let mut eng_fft =
+            BinauralPlus::new_with_assets(crate::dsp::MASK_5_1, cfg_fft, 48_000, None, Some(&mesh));
+        let mut eng_ntt =
+            BinauralPlus::new_with_assets(crate::dsp::MASK_5_1, cfg_ntt, 48_000, None, Some(&mesh));
+
+        let n = 1024usize;
+        let fl: Vec<f64> = (0..n)
+            .map(|i| 0.3 * (2.0 * PI * 1000.0 * i as f64 / 48_000.0).sin())
+            .collect();
+        let mut refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        refs[SLOT_FL] = Some(&fl);
+
+        let mut l_fft = vec![0.0_f64; n];
+        let mut r_fft = vec![0.0_f64; n];
+        let mut l_ntt = vec![0.0_f64; n];
+        let mut r_ntt = vec![0.0_f64; n];
+        eng_fft.process(&refs, &mut l_fft, &mut r_fft, n);
+        eng_ntt.process(&refs, &mut l_ntt, &mut r_ntt, n);
+        let (tl_fft, tr_fft) = eng_fft.flush();
+        let (tl_ntt, tr_ntt) = eng_ntt.flush();
+        l_fft.extend_from_slice(&tl_fft);
+        r_fft.extend_from_slice(&tr_fft);
+        l_ntt.extend_from_slice(&tl_ntt);
+        r_ntt.extend_from_slice(&tr_ntt);
+
+        assert!(eng_fft.is_finite() && eng_ntt.is_finite());
+        assert_eq!(l_fft.len(), l_ntt.len());
+        let max_diff = l_fft
+            .iter()
+            .zip(&l_ntt)
+            .chain(r_fft.iter().zip(&r_ntt))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 2e-6,
+            "Goldilocks --exact-ntt diverged from f64 FFT on FMM-BEM head-mesh IR: max_diff={max_diff:e}"
+        );
+        // Ipsilateral left ear must be louder than contralateral right ear for FL (+30 deg)
+        let rms_l = (l_ntt.iter().map(|v| v * v).sum::<f64>() / l_ntt.len() as f64).sqrt();
+        let rms_r = (r_ntt.iter().map(|v| v * v).sum::<f64>() / r_ntt.len() as f64).sqrt();
+        assert!(
+            rms_l > rms_r * 1.1,
+            "FMM-BEM head-mesh FL source should yield ipsilateral > contralateral energy (L={rms_l:.4}, R={rms_r:.4})"
         );
     }
 }

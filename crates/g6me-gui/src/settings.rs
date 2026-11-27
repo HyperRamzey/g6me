@@ -14,12 +14,16 @@
 //! leave the last value visible for re-checking.
 
 use g6me_core::batch::BatchCfg;
+use g6me_core::enhance::EnhanceCfg;
+use g6me_core::limiter::LimiterStyle;
 use g6me_core::mask::{self, Slot};
 use g6me_core::pcm::{BitDepth, Dither};
 use g6me_core::plus::{PlusCfg, RendererMode};
 use g6me_core::probe::Caps;
 use g6me_core::stages::{Gtype, IrCfg, OutFormat, RenderCfg};
 use g6me_core::tp::Ratio;
+use g6me_core::unmask::UnmaskCfg;
+use g6me_core::upmix::UpmixCfg;
 use g6me_core::util;
 use std::path::PathBuf;
 
@@ -106,6 +110,12 @@ pub struct Settings {
     pub renderer: RendererMode,
     /// Runtime-tweakable G6+ soundfield parameters & profile.
     pub plus: PlusCfg,
+    /// Optional custom 3D room geometry JSON path (`--room-json`).
+    pub use_room_json: bool,
+    pub room_json: PathBuf,
+    /// Optional 3D head/pinna `.obj` scan path (`--head-mesh`) for exact FMM-BEM Helmholtz HRTF.
+    pub use_head_mesh: bool,
+    pub head_mesh: PathBuf,
 
     // ---- output ------------------------------------------------------------
     pub format: Format,
@@ -152,6 +162,11 @@ pub struct Settings {
     /// Ratio the limiter's own detector runs at. `None` = the default ratio (X8),
     /// which enforces a sample-peak floor to guarantee brickwall ceiling protection.
     pub limit_ratio: Option<Ratio>,
+    /// Limiter character: `Transparent` (default bit-exact linear ramp) vs `Punchy`
+    /// (Signalsmith C^1 2-stage boxcar lookahead + log-domain slow stage + ADAA2 soft clipper).
+    pub limit_style: LimiterStyle,
+    /// Pre-limiter Residual ADAA2 C^2 soft-clipper drive in dB (`0.0..=6.0`, active in `Punchy`).
+    pub limit_clip_db: f64,
     /// Strip DC before the trim and the limiter, with a 5 Hz first-order blocker.
     ///
     /// Off by default, which is the bit-exact path: the downmixer's own contribution is a
@@ -161,6 +176,14 @@ pub struct Settings {
     /// limiter rather than inside it because it earns its keep with the limiter off too:
     /// an offset ships in the file either way.
     pub dc_block: bool,
+
+    // ---- mastering & spatial suite (all opt-in, default off) ---------------
+    /// 2.0 → 7.1 Primary-Ambient Extraction upmixer (He PCA+ASE + APES + Kraft-Zölzer decorrelators).
+    pub upmix: UpmixCfg,
+    /// Shared-STN Zero-IMD Psychoacoustic Virtual Bass + Micro-Detail & Presence Enhancer.
+    pub enhance: EnhanceCfg,
+    /// Moore 2016 / ISO 532-2 Auditory-Model Perceptual Unmasking Dynamic EQ (minimum-phase FIR).
+    pub unmask: UnmaskCfg,
 
     // ---- resample ----------------------------------------------------------
     pub resample: bool,
@@ -208,6 +231,10 @@ impl Default for Settings {
             threads: g6me_core::batch::default_workers(),
             renderer: RendererMode::Reference,
             plus: PlusCfg::default(),
+            use_room_json: false,
+            room_json: PathBuf::new(),
+            use_head_mesh: false,
+            head_mesh: PathBuf::new(),
             format: Format::Flac,
             flac_level: 8,
             depth: BitDepth::S24,
@@ -231,7 +258,12 @@ impl Default for Settings {
             link_transient_pct: default_link_transient(),
             link_release_pct: default_link_release(),
             limit_ratio: None,
+            limit_style: LimiterStyle::Transparent,
+            limit_clip_db: 0.0,
             dc_block: false,
+            upmix: UpmixCfg::default(),
+            enhance: EnhanceCfg::default(),
+            unmask: UnmaskCfg::default(),
             resample: false,
             rate: 48000,
             resample_depth: BitDepth::S32,
@@ -309,6 +341,8 @@ impl Settings {
         self.link_transient_pct = default_link_transient();
         self.link_release_pct = default_link_release();
         self.limit_ratio = None;
+        self.limit_style = LimiterStyle::Transparent;
+        self.limit_clip_db = 0.0;
         match preset {
             MasteringPreset::Transparent => {
                 self.limiter = true;
@@ -387,6 +421,10 @@ impl Settings {
         RenderCfg {
             renderer: self.renderer,
             plus: self.plus,
+            room_json: (self.use_room_json && !self.room_json.as_os_str().is_empty())
+                .then(|| self.room_json.clone()),
+            head_mesh: (self.use_head_mesh && !self.head_mesh.as_os_str().is_empty())
+                .then(|| self.head_mesh.clone()),
             dc_block: self.dc_block,
             resample: g6me_core::stages::ResampleCfg {
                 enable: self.resample,
@@ -408,6 +446,9 @@ impl Settings {
                 overwrite: self.overwrite,
                 filter_threads: None,
             },
+            upmix: self.upmix.clone(),
+            enhance: self.enhance,
+            unmask: self.unmask.clone(),
             order: self.order.clone(),
             true_peak: self.tp_ratio,
             output_gain_db: if self.limiter {
@@ -424,6 +465,8 @@ impl Settings {
                 release_ms: self.release_ms,
                 link_transient: self.link_transient_pct / 100.0,
                 link_release: self.link_release_pct / 100.0,
+                style: self.limit_style,
+                clip_drive_db: self.limit_clip_db,
             },
             block: self.block as usize,
             queue_blocks: self.queue_blocks as usize,
@@ -536,6 +579,18 @@ impl Settings {
             if let Err(e) = self.plus.validate() {
                 p.push(format!("G6+ renderer: {e}"));
             }
+            if self.use_room_json && !self.room_json.is_file() {
+                p.push(format!(
+                    "Room JSON {} does not exist.",
+                    self.room_json.display()
+                ));
+            }
+            if self.use_head_mesh && !self.head_mesh.is_file() {
+                p.push(format!(
+                    "Head mesh OBJ {} does not exist.",
+                    self.head_mesh.display()
+                ));
+            }
         }
         let cfg = self.render_cfg();
         if let Err(e) = cfg.out.validate(caps) {
@@ -554,6 +609,15 @@ impl Settings {
             if let Err(e) = cfg.limiter.validate() {
                 p.push(format!("Limiter: {e}"));
             }
+        }
+        if let Err(e) = cfg.upmix.validate() {
+            p.push(format!("PAE Upmix: {e}"));
+        }
+        if let Err(e) = cfg.enhance.validate() {
+            p.push(format!("STN Enhance: {e}"));
+        }
+        if let Err(e) = cfg.unmask.validate() {
+            p.push(format!("Unmask EQ: {e}"));
         }
         p
     }
@@ -650,6 +714,22 @@ pub fn describe(s: &Settings) -> String {
         RendererMode::Reference => v.push("f64 dsp (ref)".to_string()),
         RendererMode::Plus => v.push(format!("f64 {}", s.plus.summary())),
     }
+    if s.upmix.enable {
+        v.push("2.0→7.1 PAE".to_string());
+    }
+    if s.enhance.is_enabled() {
+        v.push(s.enhance.summary());
+    }
+    if s.unmask.enable {
+        v.push("Unmask EQ".to_string());
+    }
+    if s.limiter && s.limit_style == LimiterStyle::Punchy {
+        v.push(if s.limit_clip_db > 0.0 {
+            format!("Punchy +{:.1}dB ADAA2", s.limit_clip_db)
+        } else {
+            "Punchy".to_string()
+        });
+    }
     v.join(" · ")
 }
 
@@ -674,6 +754,11 @@ mod tests {
             "metadata is carried unless told otherwise"
         );
         assert!(!c.out.overwrite, "never clobber an existing file unasked");
+        assert!(!c.upmix.enable, "upmix must be opt-in");
+        assert!(!c.enhance.is_enabled(), "vbass/detail must be opt-in");
+        assert!(!c.unmask.enable, "unmask EQ must be opt-in");
+        assert_eq!(c.limiter.style, LimiterStyle::Transparent);
+        assert_eq!(c.limiter.clip_drive_db, 0.0);
     }
 
     #[test]

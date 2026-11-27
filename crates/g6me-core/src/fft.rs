@@ -579,6 +579,182 @@ fn roex_smooth_direct(freqs: &[f64], power: &[f64], scale: f64) -> Vec<f64> {
     out
 }
 
+/// Exact `0`-th order Slepian Discrete Prolate Spheroidal Sequence (DPSS) of length `n`
+/// and time-half-bandwidth product `nw` (`Slepian & Pollak, 1961`).
+///
+/// Solves the zero-cancellation shifted Grünbaum–Slepian commuting tridiagonal matrix
+/// `T_s = T - ((n-1)/2)^2 I`:
+/// `d[k] = -k*(n-1-k) - 2*((n-1)/2 - k)^2 * sin^2(π NW / n)`,
+/// `e[k] = 0.5*(k+1)*(n-1-k)`.
+///
+/// Shifting out `((n-1)/2)^2` reduces the spectral scale from `O(n^2)` to `O(n)`,
+/// eliminating catastrophic cancellation at large `n` (e.g. `n = 65,536`).
+/// Sturm-sequence bisection locates the dominant eigenvalue `λ_0` to full `f64`
+/// precision, followed by 4 steps of `O(n)` Thomas-algorithm shifted inverse
+/// iteration with `shift > λ_0` (strictly negative-definite, unconditionally stable).
+/// Peak-normalized so `max(w) == 1.0`, strictly symmetric and non-negative.
+pub fn slepian_dpss(n: usize, nw: f64) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![1.0];
+    }
+    if n == 2 {
+        return vec![1.0, 1.0];
+    }
+
+    let w_bw = (nw / (n as f64)).clamp(1e-6, 0.49);
+    let s = (PI * w_bw).sin();
+    let two_s2 = 2.0 * s * s;
+    let half = 0.5 * ((n - 1) as f64);
+
+    let mut d = Vec::with_capacity(n);
+    for k in 0..n {
+        let diff = half - (k as f64);
+        d.push(-((k as f64) * ((n - 1 - k) as f64)) - two_s2 * (diff * diff));
+    }
+    let mut e = Vec::with_capacity(n - 1);
+    let mut e2 = Vec::with_capacity(n - 1);
+    for k in 0..(n - 1) {
+        let val = 0.5 * ((k + 1) as f64) * ((n - 1 - k) as f64);
+        e.push(val);
+        e2.push(val * val);
+    }
+
+    // Gershgorin bracket on the shifted tridiagonal matrix T_s.
+    let mut hi = f64::NEG_INFINITY;
+    let mut lo = f64::INFINITY;
+    for k in 0..n {
+        let row_off = (if k > 0 { e[k - 1] } else { 0.0 }) + (if k + 1 < n { e[k] } else { 0.0 });
+        if d[k] + row_off > hi {
+            hi = d[k] + row_off;
+        }
+        if d[k] - row_off < lo {
+            lo = d[k] - row_off;
+        }
+    }
+    hi += 1.0;
+    lo -= 1.0;
+
+    // Sturm-sequence count of eigenvalues strictly greater than `mu`.
+    let count_gt = |mu: f64| -> usize {
+        let mut cnt = 0usize;
+        let mut q = d[0] - mu;
+        if q > 0.0 {
+            cnt += 1;
+        }
+        for i in 1..n {
+            if q == 0.0 {
+                q = 1e-300;
+            }
+            q = (d[i] - mu) - e2[i - 1] / q;
+            if q > 0.0 {
+                cnt += 1;
+            }
+        }
+        cnt
+    };
+
+    // Bisect to locate λ_0 to full f64 mantissa accuracy.
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        if mid == lo || mid == hi {
+            break;
+        }
+        if count_gt(mid) >= 1 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let lam0 = 0.5 * (lo + hi);
+    // Shift strictly above λ_0 so (T_s - shift * I) is negative definite.
+    let shift = hi + (1e-12 * lam0.abs()).max(1e-12);
+
+    // Smooth symmetric initial guess.
+    let mut v: Vec<f64> = (0..n)
+        .map(|k| {
+            let sv = (PI * ((k as f64) + 0.5) / (n as f64)).sin();
+            sv * sv
+        })
+        .collect();
+    let norm0 = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-30);
+    for x in &mut v {
+        *x /= norm0;
+    }
+
+    let mut cp = vec![0.0_f64; n - 1];
+    let mut dp = vec![0.0_f64; n];
+    let mut w = vec![0.0_f64; n];
+
+    // Precompute O(N) Thomas forward elimination pivots once since `shift` is fixed.
+    let b0 = d[0] - shift;
+    cp[0] = e[0] / b0;
+    let mut inv_den = Vec::with_capacity(n);
+    inv_den.push(1.0 / b0);
+    for i in 1..(n - 1) {
+        let denom = (d[i] - shift) - e[i - 1] * cp[i - 1];
+        let inv = 1.0 / denom;
+        inv_den.push(inv);
+        cp[i] = e[i] * inv;
+    }
+    let denom_last = (d[n - 1] - shift) - e[n - 2] * cp[n - 2];
+    inv_den.push(1.0 / denom_last);
+
+    for _ in 0..4 {
+        dp[0] = v[0] * inv_den[0];
+        for i in 1..n {
+            dp[i] = (v[i] - e[i - 1] * dp[i - 1]) * inv_den[i];
+        }
+        w[n - 1] = dp[n - 1];
+        for i in (0..(n - 1)).rev() {
+            w[i] = dp[i] - cp[i] * w[i + 1];
+        }
+
+        if w[n / 2] < 0.0 {
+            for x in &mut w {
+                *x = -*x;
+            }
+        }
+        for i in 0..(n / 2) {
+            let avg = 0.5 * (w[i] + w[n - 1 - i]);
+            w[i] = avg;
+            w[n - 1 - i] = avg;
+        }
+        let norm = w.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-30);
+        for i in 0..n {
+            v[i] = w[i] / norm;
+        }
+    }
+
+    let peak = v.iter().copied().fold(0.0_f64, f64::max).max(1e-30);
+    for x in &mut v {
+        *x = (*x / peak).max(0.0);
+    }
+    v
+}
+
+/// Apply the right half of an exact Slepian DPSS window (`2 * tail_len` samples,
+/// time-half-bandwidth `nw`) in-place to the final `tail_len` samples of `ir`.
+///
+/// Strictly Heisenberg–Gabor optimal in-band energy concentration; leaves the main
+/// impulse body `ir[..len - tail_len]` bit-identical.
+pub fn half_slepian_tail_apply(ir: &mut [f64], tail_len: usize, nw: f64) {
+    let n = ir.len();
+    if tail_len <= 1 || n == 0 {
+        return;
+    }
+    let t = tail_len.min(n);
+    let full_n = 2 * t;
+    let dpss = slepian_dpss(full_n, nw);
+    let start = n - t;
+    let peak = dpss[t - 1].max(dpss[t]).max(1e-30);
+    for (i, slot) in ir[start..].iter_mut().enumerate() {
+        *slot *= dpss[t + i] / peak;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +883,69 @@ mod tests {
         for i in 1665..2048 {
             assert!(ir[i] <= ir[i - 1], "tail not monotonic at {i}");
         }
+    }
+
+    #[test]
+    fn slepian_dpss_beats_kaiser_in_heisenberg_concentration_and_scales_to_65536() {
+        let n = 128;
+        let nw = 4.0;
+        let slep = slepian_dpss(n, nw);
+
+        // Build matched Kaiser(beta = pi * NW) for exact comparison.
+        let beta = PI * nw;
+        let denom = i0(beta);
+        let kais: Vec<f64> = (0..n)
+            .map(|k| {
+                let x = 2.0 * (k as f64) / ((n - 1) as f64) - 1.0;
+                i0(beta * (1.0 - x * x).max(0.0).sqrt()) / denom
+            })
+            .collect();
+
+        // Exact Dirichlet kernel out-of-band leakage `1 - lambda(w)` over [-W, +W].
+        let leakage = |w: &[f64]| -> f64 {
+            let bw = nw / (n as f64);
+            let mut num = 0.0_f64;
+            let mut den = 0.0_f64;
+            for i in 0..n {
+                den += w[i] * w[i];
+                for j in 0..n {
+                    let diff = (i as isize) - (j as isize);
+                    let kern = if diff == 0 {
+                        2.0 * bw
+                    } else {
+                        let d = diff as f64;
+                        (2.0 * PI * bw * d).sin() / (PI * d)
+                    };
+                    num += w[i] * w[j] * kern;
+                }
+            }
+            (1.0 - num / den).max(0.0)
+        };
+        let leak_slep = leakage(&slep);
+        let leak_kais = leakage(&kais);
+        assert!(
+            leak_slep < leak_kais * 0.5,
+            "Slepian leakage ({leak_slep:e}) must beat Kaiser ({leak_kais:e}) by >3 dB"
+        );
+
+        // Verify half_slepian_tail_apply preserves head and decays monotonically.
+        let mut ir = vec![1.0; 2048];
+        half_slepian_tail_apply(&mut ir, 384, 5.0);
+        assert_eq!(ir[0], 1.0);
+        assert_eq!(ir[1663], 1.0);
+        assert!(ir[2047] < 1e-4, "Slepian tail end too high: {}", ir[2047]);
+        for i in 1665..2048 {
+            assert!(
+                ir[i] <= ir[i - 1] + 1e-15,
+                "Slepian tail not monotonic at {i}"
+            );
+        }
+
+        // Verify O(N) Thomas tridiagonal solver handles N = 65,536 effortlessly!
+        let big = slepian_dpss(65_536, 5.0);
+        assert_eq!(big.len(), 65_536);
+        assert!((big[32_768] - 1.0).abs() < 1e-6);
+        assert!(big[0] < 1e-4 && (big[0] - big[65_535]).abs() < 1e-12);
     }
 
     #[test]

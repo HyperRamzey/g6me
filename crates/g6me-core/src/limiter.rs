@@ -175,6 +175,186 @@ pub const RELEASE_WINDOW_MS: f64 = 5.0;
 /// would be the slow stage's behaviour charged twice.
 pub const TRANSIENT_RELEASE_MS: f64 = 25.0;
 
+/// Maximum allowed pre-limiter ADAA2 soft-clipper drive in dB (`Punchy` style).
+pub const MAX_CLIP_DRIVE_DB: f64 = 6.0;
+
+/// Limiter envelope & peak-shaping style.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LimiterStyle {
+    /// Classic lookahead brickwall true-peak limiter (default, bit-exact with stock G6ME).
+    #[default]
+    Transparent,
+    /// Punchy mastering style: pre-limiter Residual ADAA2 `C^2` soft-knee clipper
+    /// (Parker, Zavalishin & Le Bivic DAFx-2016) + Signalsmith Audio (Geraint Luff 2022)
+    /// 2-stage cascaded moving-average lookahead smoother + Giannoulis, Massberg & Reiss
+    /// (JAES 2012) log-domain smooth branching slow stage.
+    Punchy,
+}
+
+impl LimiterStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            LimiterStyle::Transparent => "transparent",
+            LimiterStyle::Punchy => "punchy",
+        }
+    }
+}
+
+/// Residual 2nd-order Antiderivative Anti-Aliasing (ADAA2) `C^2` algebraic soft-knee clipper
+/// (Parker, Zavalishin & Le Bivic, DAFx-2016).
+///
+/// Splits the soft-clipper `f(x) = x + delta(x)` where `delta(x) == 0` identically for
+/// `|x| <= t0` (linear passband threshold) and smoothly saturates toward `c_lim = t0 + w`
+/// via `f(x) = sgn(x) * (t0 + w * u / sqrt(1 + u^2))` with `u = (|x| - t0) / w`.
+/// Applying ADAA2 strictly to the residual `delta(x)` gives **exact zero passband droop**
+/// (`y[n] == x[n-1]` bit-for-bit below `t0`) while suppressing high-frequency aliasing by
+/// `> 13 dB` above the knee, adding exactly 1 sample of latency.
+#[derive(Debug, Clone, Copy)]
+pub struct AdaaClipper {
+    t0: f64,
+    w: f64,
+    x1: f64,
+    x2: f64,
+}
+
+impl AdaaClipper {
+    /// Build a residual ADAA2 soft-knee clipper with linear passband up to `t0`
+    /// and asymptotic ceiling `c_lim > t0`.
+    #[must_use]
+    pub fn new(t0: f64, c_lim: f64) -> Self {
+        let t0 = t0.max(0.0);
+        let w = (c_lim - t0).max(1e-6);
+        Self {
+            t0,
+            w,
+            x1: 0.0,
+            x2: 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn delta(&self, x: f64) -> f64 {
+        let ax = x.abs();
+        if ax <= self.t0 {
+            return 0.0;
+        }
+        let sgn = if x >= 0.0 { 1.0 } else { -1.0 };
+        let d = ax - self.t0;
+        let u = d / self.w;
+        let r = (1.0 + u * u).sqrt();
+        sgn * (self.w * (u / r) - d)
+    }
+
+    #[inline]
+    pub fn d1(&self, x: f64) -> f64 {
+        let ax = x.abs();
+        if ax <= self.t0 {
+            return 0.0;
+        }
+        let d = ax - self.t0;
+        let u = d / self.w;
+        let r = (1.0 + u * u).sqrt();
+        self.w * self.w * (r - 1.0) - 0.5 * d * d
+    }
+
+    #[inline]
+    pub fn d2(&self, x: f64) -> f64 {
+        let ax = x.abs();
+        if ax <= self.t0 {
+            return 0.0;
+        }
+        let sgn = if x >= 0.0 { 1.0 } else { -1.0 };
+        let d = ax - self.t0;
+        let u = d / self.w;
+        let r = (1.0 + u * u).sqrt();
+        let ash = u.asinh();
+        let w = self.w;
+        sgn * (w * w * w * (0.5 * (u * r + ash) - u) - (d * d * d) / 6.0)
+    }
+
+    /// Naive memoryless soft-clipper `x + delta(x)` (for A/B aliasing comparison in tests).
+    #[inline]
+    pub fn naive(&self, x: f64) -> f64 {
+        x + self.delta(x)
+    }
+
+    /// Process one sample with exact 1-sample latency (`y[n] = x[n-1] + ADAA2(delta)`).
+    #[inline]
+    pub fn tick(&mut self, x0: f64) -> f64 {
+        const EPS: f64 = 1e-5;
+        let x1 = self.x1;
+        let x2 = self.x2;
+
+        // Fast exact passband path: when all three samples lie inside [-t0, +t0],
+        // delta == D1 == D2 == 0 identically, guaranteeing zero passband error.
+        let y = if x0.abs() <= self.t0 && x1.abs() <= self.t0 && x2.abs() <= self.t0 {
+            x1
+        } else {
+            let d1_cur = if (x0 - x1).abs() > EPS {
+                (self.d2(x0) - self.d2(x1)) / (x0 - x1)
+            } else {
+                self.d1(0.5 * (x0 + x1))
+            };
+            let d1_prev = if (x1 - x2).abs() > EPS {
+                (self.d2(x1) - self.d2(x2)) / (x1 - x2)
+            } else {
+                self.d1(0.5 * (x1 + x2))
+            };
+            let delta_adaa = if (x0 - x2).abs() > EPS {
+                2.0 * (d1_cur - d1_prev) / (x0 - x2)
+            } else {
+                0.5 * (self.delta(0.5 * (x0 + x1)) + self.delta(0.5 * (x1 + x2)))
+            };
+            x1 + delta_adaa
+        };
+
+        self.x2 = x1;
+        self.x1 = x0;
+        y
+    }
+}
+
+/// Signalsmith Audio (Geraint Luff 2022) 2-stage cascaded moving-average smoother
+/// for `C^1` parabolic S-curve lookahead gain smoothing with zero floating-point drift.
+#[derive(Debug, Clone)]
+struct BoxcarSmoother {
+    q1: Vec<f64>,
+    i1: usize,
+    q2: Vec<f64>,
+    i2: usize,
+}
+
+impl BoxcarSmoother {
+    fn new(window_len: usize) -> Self {
+        let w = window_len.max(1);
+        let l1 = w.div_ceil(2).max(1);
+        let l2 = (w - l1 + 1).max(1);
+        Self {
+            q1: vec![1.0; l1],
+            i1: 0,
+            q2: vec![1.0; l2],
+            i2: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, x: f64) -> f64 {
+        self.q1[self.i1] = x;
+        self.i1 += 1;
+        if self.i1 == self.q1.len() {
+            self.i1 = 0;
+        }
+        let m1 = self.q1.iter().sum::<f64>() / (self.q1.len() as f64);
+
+        self.q2[self.i2] = m1;
+        self.i2 += 1;
+        if self.i2 == self.q2.len() {
+            self.i2 = 0;
+        }
+        self.q2.iter().sum::<f64>() / (self.q2.len() as f64)
+    }
+}
+
 /// Settings for the true-peak limiter.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cfg {
@@ -207,6 +387,12 @@ pub struct Cfg {
     /// [`Cfg::link_transient`], and the one worth turning down first, because a slow gain
     /// movement shared across the image moves the image.
     pub link_release: f64,
+    /// Limiter character style (`Transparent` default bit-exact vs `Punchy` ADAA2 + cascaded boxcar).
+    #[serde(default)]
+    pub style: LimiterStyle,
+    /// Pre-limiter Residual ADAA2 soft-clipper knee depth in dB (`0.0..=6.0`, active in `Punchy`).
+    #[serde(default)]
+    pub clip_drive_db: f64,
 }
 
 impl Default for Cfg {
@@ -230,6 +416,8 @@ impl Default for Cfg {
             release_ms: DEFAULT_RELEASE_MS,
             link_transient: DEFAULT_LINK_TRANSIENT,
             link_release: DEFAULT_LINK_RELEASE,
+            style: LimiterStyle::Transparent,
+            clip_drive_db: 0.0,
         }
     }
 }
@@ -277,6 +465,14 @@ impl Cfg {
                     "{name} must be between 0 and 1 (got {v}; it is a fraction, so 75 % is 0.75)"
                 ));
             }
+        }
+        if !(self.clip_drive_db.is_finite()
+            && (0.0..=MAX_CLIP_DRIVE_DB).contains(&self.clip_drive_db))
+        {
+            return Err(format!(
+                "limiter clip_drive_db must be between 0.0 and {MAX_CLIP_DRIVE_DB} dB (got {})",
+                self.clip_drive_db
+            ));
         }
         Ok(())
     }
@@ -389,11 +585,21 @@ impl Cfg {
         self.lookahead_samples(rate) > self.requested_lookahead_samples(rate)
     }
 
+    /// Extra 1-sample latency contributed by the Residual ADAA2 pre-clipper when active.
+    #[must_use]
+    pub fn clip_latency_samples(&self) -> usize {
+        if self.style == LimiterStyle::Punchy && self.clip_drive_db > 0.0 {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Total added latency in samples: lookahead plus the interpolator's delay,
-    /// because the gain for a sample comes from a peak the detector emits late.
+    /// plus 1 sample if the ADAA2 pre-clipper is active in `Punchy` mode.
     #[must_use]
     pub fn latency_samples(&self, rate: u32) -> usize {
-        self.lookahead_samples(rate) + self.ratio.report_delay()
+        self.lookahead_samples(rate) + self.ratio.report_delay() + self.clip_latency_samples()
     }
 }
 
@@ -455,6 +661,12 @@ pub struct Report {
     /// See [`Cfg::band_caveat_db`].
     #[serde(default)]
     pub band_caveat_db: f64,
+    /// Active limiter style (`Transparent` vs `Punchy`).
+    #[serde(default)]
+    pub style: LimiterStyle,
+    /// Pre-limiter ADAA2 clip drive in dB (`0.0` when inactive).
+    #[serde(default)]
+    pub clip_drive_db: f64,
 }
 
 impl Report {
@@ -504,8 +716,15 @@ pub struct Limiter {
     lines: Vec<Vec<f64>>,
     /// Write/read cursor in the delay lines.
     pos: usize,
-    /// Total latency: lookahead + interpolator memory.
+    /// Total latency: lookahead + interpolator memory (+ 1 if ADAA2 pre-clipper is active).
     latency: usize,
+    /// Delay line length: lookahead + interpolator memory (excludes ADAA2 1-sample delay).
+    delay_len: usize,
+    /// Pre-limiter Residual ADAA2 clippers (used in `Punchy` mode when `clip_drive_db > 0`).
+    clippers: Vec<AdaaClipper>,
+    use_clipper: bool,
+    /// Signalsmith 2-stage cascaded moving-average lookahead smoothers (used in `Punchy` mode).
+    smoothers: Vec<BoxcarSmoother>,
     /// Interpolator memory in frames: how far either side of a peak has to be covered.
     delta: usize,
     /// Frames per slot ring.
@@ -590,6 +809,10 @@ impl Limiter {
             lines: Vec::new(),
             pos: 0,
             latency: 0,
+            delay_len: 0,
+            clippers: Vec::new(),
+            use_clipper: false,
+            smoothers: Vec::new(),
             delta: 0,
             ring_len: 0,
             scratch: Vec::new(),
@@ -623,15 +846,33 @@ impl Limiter {
     #[must_use]
     pub fn enabled(cfg: Cfg, rate: u32, channels: usize) -> Self {
         let delta = cfg.ratio.report_delay();
-        let latency = cfg.latency_samples(rate);
+        let delay_len = cfg.lookahead_samples(rate) + delta;
+        let use_clipper = cfg.style == LimiterStyle::Punchy && cfg.clip_drive_db > 0.0;
+        let latency = delay_len + usize::from(use_clipper);
         let ramp = cfg.ramp_frames(rate);
         // Every live index needs a slot: the emission cursor, the scheduling cursor
         // `delta + ramp` behind it, and the neighbourhood read `delta` ahead of the
         // scheduling cursor. Rounded up with room to spare.
-        let ring_len = (latency + 2 * delta + ramp + 8).max(16);
+        let ring_len = (delay_len + 2 * delta + ramp + 8).max(16);
         // One binding so the ring the hold lives in and the length the hold wraps on cannot
         // disagree about how long the window is.
         let release_window = cfg.release_window(rate).max(1);
+        let ceiling_lin = 10f64.powf((cfg.ceiling_db - cfg.guard_db()) / 20.0);
+        // Pre-limiter ADAA2 soft-knee clipper: asymptotic ceiling sits +1.0 dB above
+        // `ceiling_lin` so the true-peak stage still enforces the hard dBTP ceiling,
+        // while the linear passband extends up to `c_lim * 10^(-clip_drive_db / 20)`.
+        let clip_ceil = ceiling_lin * 10f64.powf(1.0 / 20.0);
+        let clip_t0 = clip_ceil * 10f64.powf(-cfg.clip_drive_db / 20.0);
+        let clippers = if use_clipper {
+            vec![AdaaClipper::new(clip_t0, clip_ceil); channels.max(1)]
+        } else {
+            Vec::new()
+        };
+        let smoothers = if cfg.style == LimiterStyle::Punchy {
+            vec![BoxcarSmoother::new(ramp + 1); channels.max(1)]
+        } else {
+            Vec::new()
+        };
         Self {
             cfg,
             rate,
@@ -639,9 +880,13 @@ impl Limiter {
                 .map(|_| Detector::new_floored(cfg.ratio))
                 .collect(),
             out_meter: TruePeak::new_floored(cfg.ratio, channels),
-            lines: vec![vec![0.0; latency.max(1)]; channels.max(1)],
+            lines: vec![vec![0.0; delay_len.max(1)]; channels.max(1)],
             pos: 0,
             latency,
+            delay_len,
+            clippers,
+            use_clipper,
+            smoothers,
             delta,
             ring_len,
             scratch: Vec::with_capacity(channels),
@@ -668,7 +913,7 @@ impl Limiter {
             slope: 1.0 / ramp as f64,
             ramp,
             ramp_target: vec![1.0; channels.max(1)],
-            ceiling_lin: 10f64.powf((cfg.ceiling_db - cfg.guard_db()) / 20.0),
+            ceiling_lin,
             report: Report {
                 ceiling_db: cfg.ceiling_db,
                 guard_db: cfg.guard_db(),
@@ -690,6 +935,8 @@ impl Limiter {
                 release_frames: 0,
                 engaged_frames: 0,
                 band_caveat_db: cfg.band_caveat_db(),
+                style: cfg.style,
+                clip_drive_db: if use_clipper { cfg.clip_drive_db } else { 0.0 },
             },
         }
     }
@@ -824,11 +1071,40 @@ impl Limiter {
     /// A demand past the last finalised frame is "nothing", which is what it means at end of
     /// file: there is no input left to protect. Deepening the gain for a future that never
     /// arrives is the mistake that closes.
-    fn ramp_schedule(&mut self, j: u64, live: bool) {
+    fn ramp_schedule(&mut self, j: u64, j_signed: i64, live: bool) {
         let ramp = self.ramp as u64;
+        let ramp_i = self.ramp as i64;
         let slope = self.slope;
         let ring_len = self.ring_len as u64;
         let scheduled = self.scheduled;
+        if self.cfg.style == LimiterStyle::Punchy {
+            // Signalsmith Audio (Geraint Luff 2022) 2-stage cascaded boxcar moving average
+            // over the lookahead sliding minimum `[j_signed ..= j_signed + ramp]`.
+            // Crucially, pre-roll feeds (`-ramp <= j_signed < 0`) MUST already scan
+            // `0 ..= j_signed + ramp` so every slot in the boxcar queues reflects frame 0's
+            // demand by the time `j_signed == 0` emits — guaranteeing `g_smooth[j] <= sched[j]`
+            // for ALL `j >= 0` with zero overshoot.
+            for c in 0..self.ramp_target.len() {
+                let mut g_min = 1.0f64;
+                if j_signed + ramp_i >= 0 {
+                    let start_m = j_signed.max(0) as u64;
+                    let end_m = (j_signed + ramp_i) as u64;
+                    for m in start_m..=end_m {
+                        let demand = if m < scheduled {
+                            self.sched_ring[c][(m % ring_len) as usize]
+                        } else {
+                            1.0
+                        };
+                        if demand < g_min {
+                            g_min = demand;
+                        }
+                    }
+                }
+                let smoothed = self.smoothers[c].push(g_min);
+                self.ramp_target[c] = if live { smoothed.clamp(0.0, 1.0) } else { 1.0 };
+            }
+            return;
+        }
         for c in 0..self.ramp_target.len() {
             let mut target = 1.0f64;
             if live {
@@ -883,7 +1159,16 @@ impl Limiter {
     /// has not already taken — so a loud passage is managed once instead of twice.
     fn step(&mut self, frame: &mut [f64]) {
         let nch = frame.len();
-        let latency = self.latency;
+        let delay_len = self.delay_len;
+
+        // Optional pre-limiter Residual ADAA2 soft-knee clipper (Punchy mode).
+        // Shaves sharp micro-transients smoothly with zero passband droop before the
+        // side-chain true-peak detector and slow-stage hold see them.
+        if self.use_clipper {
+            for (clip, x) in self.clippers.iter_mut().zip(frame.iter_mut()) {
+                *x = clip.tick(*x);
+            }
+        }
 
         // --- pass 1: per-channel true peak of the frame the side chain reports ---------
         // Measured per channel, because the two link controls exist to decide how much of
@@ -898,30 +1183,13 @@ impl Limiter {
         self.fed += 1;
 
         // --- slow stage: a sliding-window peak-hold, then attack and release on the gain ---
-        // The window is what makes this a level detector rather than a second peak detector,
-        // and it has to *slide*. It used to restart every `release_window` frames, which makes
-        // the window an observer cannot see and a signal cannot respect: a peak landing in the
-        // first frame of a window governed the slow stage for the whole window, the identical
-        // peak landing in the last frame governed it for one frame, and the difference was an
-        // offset from a boundary the file never had. Measured on the ring at 5 ms / 48 kHz
-        // (`RELEASE_WINDOW_MS`), a restart-on-boundary hold reports a peak that is already two
-        // windows old as current while reporting a full-scale peak 121 frames (2.5 ms) old as
-        // the level before it — see `the_slow_stage_hold_is_a_sliding_window`.
-        // The followers still run every frame and not once per window, so the time constants on
-        // the panel are the time constants rather than those divided by the window length.
         for c in 0..nch {
             let new_peak = self.peaks[c];
-            // The slot being overwritten holds the peak that leaves the window this frame.
             let old_peak = self.hold_ring[c][self.hold_idx];
             self.hold_ring[c][self.hold_idx] = new_peak;
             if new_peak >= self.hold[c] {
                 self.hold[c] = new_peak;
             } else if old_peak >= self.hold[c] - 1e-12 {
-                // Only the value that is leaving can lower the maximum, and only when it *was*
-                // the maximum — so the scan over the window costs at most one pass per frame,
-                // and a full window of steady level never triggers one. The 1e-12 slack keeps a
-                // tie from being resolved by rounding: over-holding by less than that is
-                // invisible, re-scanning on a tie is not.
                 let mut m = 0.0f64;
                 for &v in &self.hold_ring[c] {
                     if v > m {
@@ -932,14 +1200,6 @@ impl Limiter {
             }
         }
         self.hold_idx = (self.hold_idx + 1) % self.release_window;
-        // The demand, every frame now that the window moves every frame. Written as a ratio
-        // rather than as `10^((aim_db - lvl)/20)` because the two are the same number —
-        // measured: 84% bit-identical, worst case 9.5e-16 relative over every peak a real
-        // frame can produce (`the_level_demand_is_the_ceiling_over_the_hold`) — and this runs
-        // per channel per frame on the live path, where a `log10` and a `powf` per frame are
-        // money. The clamp is the same one: reduction demanded, never a boost, because the
-        // ceiling is a limit and a slow stage that could raise the level is an expander
-        // wearing its clothes.
         let mut group_hold = 0.0f64;
         for c in 0..nch {
             let h = self.hold[c];
@@ -951,17 +1211,25 @@ impl Limiter {
         self.g_target_group = (self.ceiling_lin / group_hold.max(f64::MIN_POSITIVE)).min(1.0);
         let atk = 1.0 - self.atk_coef;
         let rel = 1.0 - self.slow_rel_coef;
+        let log_branch = self.cfg.style == LimiterStyle::Punchy;
         for c in 0..nch {
             let t = self.g_target[c];
             let g = self.g_rel[c];
-            let next = if t < g {
+            let next = if log_branch {
+                // Giannoulis, Massberg & Reiss (JAES 2012) log-domain smooth branching detector.
+                let lg = g.max(f64::MIN_POSITIVE).ln();
+                let lt = t.max(f64::MIN_POSITIVE).ln();
+                let lnext = if lt < lg {
+                    lg + (lt - lg) * atk
+                } else {
+                    lg + (lt - lg) * rel
+                };
+                lnext.exp().min(1.0)
+            } else if t < g {
                 g + (t - g) * atk
             } else {
                 g + (t - g) * rel
             };
-            // Snap on arrival — see [`GAIN_DEADBAND`]. Applied to the follower and not to
-            // the arithmetic it converges towards, so a target the follower is merely
-            // approaching is untouched.
             self.g_rel[c] = if (t - next).abs() < GAIN_DEADBAND {
                 t
             } else {
@@ -970,7 +1238,16 @@ impl Limiter {
         }
         let tg = self.g_target_group;
         let gg = self.g_rel_group;
-        let next = if tg < gg {
+        let next = if log_branch {
+            let lg = gg.max(f64::MIN_POSITIVE).ln();
+            let lt = tg.max(f64::MIN_POSITIVE).ln();
+            let lnext = if lt < lg {
+                lg + (lt - lg) * atk
+            } else {
+                lg + (lt - lg) * rel
+            };
+            lnext.exp().min(1.0)
+        } else if tg < gg {
             gg + (tg - gg) * atk
         } else {
             gg + (tg - gg) * rel
@@ -1026,12 +1303,10 @@ impl Limiter {
         self.schedule_to(limit);
 
         // --- emit one frame: the delay line, scaled by transient gain times slow gain ---
-        // The frame coming out is input frame `fed - 1 - latency`, and its schedule is
-        // already final because the scheduling cursor trails the feed by `2 * delta` while
-        // the emission cursor trails it by `latency`, larger by construction.
-        let j = self.fed.saturating_sub(latency as u64 + 1);
+        let j_signed = (self.fed as i64) - 1 - (delay_len as i64);
+        let j = self.fed.saturating_sub(delay_len as u64 + 1);
         let jslot = self.slot(j);
-        let live = self.fed > latency as u64;
+        let live = self.fed > self.latency as u64;
         // Pass 3, the backward ramp, evaluated here. The gain at frame j may not fall
         // faster than `slope` per frame, and the only values that know that are the demands
         // at j+1 … j+ramp: a depth two frames ahead has to be arrived at from behind, one
@@ -1043,7 +1318,7 @@ impl Limiter {
         // A demand beyond the last finalised frame is treated as "nothing", which is what
         // it means at end of file: there is no input left to protect. Deepening the gain
         // for a future that never arrives is the mistake this closes.
-        self.ramp_schedule(j, live);
+        self.ramp_schedule(j, j_signed, live);
         for c in 0..nch {
             // Read into a local first: the value is Copy, and holding a borrow of the
             // vector across `advance_gain` would make the two halves of this loop fight
@@ -1124,7 +1399,7 @@ impl Limiter {
                 }
             }
         }
-        self.pos = if slot + 1 >= latency.max(1) {
+        self.pos = if slot + 1 >= delay_len.max(1) {
             0
         } else {
             slot + 1
@@ -2398,5 +2673,171 @@ mod diag {
                 20.0 * worst_hi.log10()
             );
         }
+    }
+
+    #[test]
+    fn adaa2_clipper_zero_passband_error_and_aliasing_suppression() {
+        let sr = 48_000.0;
+        let t0 = 0.5;
+        let c_lim = 0.9;
+        let mut clip = AdaaClipper::new(t0, c_lim);
+
+        // 1. Passband below knee: exact 0.000000 error (zero droop even at high frequency).
+        let n = 2048;
+        let quiet: Vec<f64> = (0..n)
+            .map(|i| 0.48 * (2.0 * std::f64::consts::PI * 14_321.0 * (i as f64) / sr).sin())
+            .collect();
+        let mut out_q = Vec::with_capacity(n);
+        for &s in &quiet {
+            out_q.push(clip.tick(s));
+        }
+        let max_passband_err = (1..n)
+            .map(|i| (out_q[i] - quiet[i - 1]).abs())
+            .fold(0.0_f64, f64::max);
+        assert_eq!(
+            max_passband_err, 0.0,
+            "residual ADAA2 must have exact 0.0 passband error below knee"
+        );
+
+        // 2. Aliasing suppression above knee: 6.17 kHz sine driven +6 dB above c_lim.
+        // Harmonics 1, 3, 5 -> 6.17 kHz, 18.51 kHz, 30.85 kHz (aliased to 17.15 kHz),
+        // 7th harmonic 43.19 kHz (aliased to 4.81 kHz), 9th harmonic 55.53 kHz (aliased to 7.53 kHz).
+        let n_fft = 4096;
+        let f0 = 6_170.0;
+        let drive = 1.8; // +6 dB above c_lim=0.9
+        let mut clip_a = AdaaClipper::new(t0, c_lim);
+        let mut y_adaa = Vec::with_capacity(n_fft + 32);
+        let mut y_naive = Vec::with_capacity(n_fft + 32);
+        for i in 0..(n_fft + 32) {
+            let x = drive * (2.0 * std::f64::consts::PI * f0 * (i as f64) / sr).sin();
+            y_adaa.push(clip_a.tick(x));
+            y_naive.push(clip_a.naive(x));
+        }
+
+        // Hann-windowed FFT to measure aliased non-harmonic distortion power (excluding 1st & 3rd).
+        let win: Vec<f64> = (0..n_fft)
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * (i as f64) / (n_fft as f64)).cos()))
+            .collect();
+        let wa: Vec<f64> = y_adaa[32..32 + n_fft]
+            .iter()
+            .zip(&win)
+            .map(|(a, w)| a * w)
+            .collect();
+        let wn: Vec<f64> = y_naive[32..32 + n_fft]
+            .iter()
+            .zip(&win)
+            .map(|(a, w)| a * w)
+            .collect();
+        let sa = crate::fft::rfft(&wa);
+        let sn = crate::fft::rfft(&wn);
+        let df = sr / (n_fft as f64);
+        let is_true_harm =
+            |f: f64| -> bool { (f - f0).abs() < 4.0 * df || (f - 3.0 * f0).abs() < 4.0 * df };
+        let mut alias_a = 0.0;
+        let mut alias_n = 0.0;
+        for k in 1..sa.len() {
+            let f = (k as f64) * df;
+            if !is_true_harm(f) {
+                alias_a += sa[k].norm_sq();
+                alias_n += sn[k].norm_sq();
+            }
+        }
+        let reduction_db = 10.0 * (alias_n / alias_a.max(1e-30)).log10();
+        assert!(
+            reduction_db > 12.0,
+            "expected ADAA2 aliasing reduction > 12 dB vs naive clipper, got {reduction_db:.2} dB"
+        );
+    }
+
+    #[test]
+    fn punchy_limiter_holds_hard_true_peak_ceiling_and_shaves_transients() {
+        const FS: f64 = 48_000.0;
+        let run_one = |c: Cfg, sig: &[f64], chunk: usize| -> Report {
+            let mut lim = Limiter::enabled(c, FS as u32, 1);
+            let mut buf = sig.to_vec();
+            for part in buf.chunks_mut(chunk) {
+                let mut chans: [&mut [f64]; 1] = [part];
+                lim.process(&mut chans);
+            }
+            let _ = lim.flush();
+            lim.report()
+        };
+
+        // Diverse probe materials: inter-sample crest, fast transient burst, swept sine.
+        let m_isp: Vec<f64> = (0..8_192)
+            .map(|i| 1.4 * (2.0 * PI * 11_987.0 * (i as f64) / FS + 0.785).sin())
+            .collect();
+        let mut m_imp = vec![0.0_f64; 4_096];
+        m_imp[500] = 2.5;
+        m_imp[501] = -2.5;
+        m_imp[1_500] = 3.0;
+        let m_mix: Vec<f64> = (0..8_192)
+            .map(|i| {
+                let t = (i as f64) / FS;
+                0.9 * (2.0 * PI * 180.0 * t).sin() + 0.9 * (2.0 * PI * 7_310.0 * t).cos()
+            })
+            .collect();
+
+        // Test 1: hard ceiling guarantee across Punchy (unclipped & clipped 2..4 dB).
+        for &clip_db in &[0.0, 2.0, 4.0] {
+            for &ceil in &[-1.0, -3.0, -6.0] {
+                let c = Cfg {
+                    enable: true,
+                    ceiling_db: ceil,
+                    style: LimiterStyle::Punchy,
+                    clip_drive_db: clip_db,
+                    ..Cfg::default()
+                };
+                for (i, m) in [&m_isp, &m_imp, &m_mix].iter().enumerate() {
+                    let r = run_one(c, m, 257);
+                    assert!(
+                        r.post_dbtp <= ceil,
+                        "Punchy (clip={clip_db} dB) exceeded ceiling {ceil} dBTP on material #{i}: {:.4} dBTP",
+                        r.post_dbtp
+                    );
+                }
+            }
+        }
+
+        // Test 2: Snare-spike over steady musical bed — ADAA2 pre-clipper in Punchy mode
+        // shaves the transient before the slow stage sees it, reducing slow-stage ducking.
+        let n = 24_000;
+        let mut sig: Vec<f64> = (0..n)
+            .map(|i| 0.35 * (2.0 * PI * 220.0 * (i as f64) / FS).sin())
+            .collect();
+        for start in (2_400..n - 500).step_by(4_800) {
+            for k in 0..144 {
+                let env = (-(k as f64) / 30.0).exp();
+                sig[start + k] += 1.6 * env * (2.0 * PI * 1_800.0 * (k as f64) / FS).sin();
+            }
+        }
+        let c_trans = Cfg {
+            enable: true,
+            ceiling_db: -3.0,
+            attack_ms: 10.0,
+            release_ms: 400.0,
+            style: LimiterStyle::Transparent,
+            clip_drive_db: 0.0,
+            ..Cfg::default()
+        };
+        let c_punch = Cfg {
+            enable: true,
+            ceiling_db: -3.0,
+            attack_ms: 10.0,
+            release_ms: 400.0,
+            style: LimiterStyle::Punchy,
+            clip_drive_db: 3.5,
+            ..Cfg::default()
+        };
+        let r_trans = run_one(c_trans, &sig, 512);
+        let r_punch = run_one(c_punch, &sig, 512);
+        assert!(r_trans.post_dbtp <= -3.0);
+        assert!(r_punch.post_dbtp <= -3.0);
+        assert!(
+            r_punch.release_reduction_db < r_trans.release_reduction_db,
+            "expected Punchy pre-clipper to reduce slow-stage ducking: punchy={:.3} dB vs transparent={:.3} dB",
+            r_punch.release_reduction_db,
+            r_trans.release_reduction_db
+        );
     }
 }
