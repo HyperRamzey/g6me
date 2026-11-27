@@ -1152,6 +1152,7 @@ mod tests {
         s.plus.exact_ntt = true;
         s.plus.room_quality = g6me_core::room::RoomQuality::Production;
         s.plus.use_cuda = true;
+        s.plus.cuda_tensor_precision = g6me_core::blackwell::CudaTensorPrecision::Fp8E4m3;
         s.dither = Dither::Wannamaker;
         s.transducer = TransducerProfile::HeadphoneDynamic32;
 
@@ -1169,6 +1170,10 @@ mod tests {
             g6me_core::room::RoomQuality::Production
         );
         assert!(cfg.plus.use_cuda);
+        assert_eq!(
+            cfg.plus.cuda_tensor_precision,
+            g6me_core::blackwell::CudaTensorPrecision::Fp8E4m3
+        );
         assert_eq!(cfg.out.dither, Dither::Wannamaker);
         assert_eq!(cfg.transducer, TransducerProfile::HeadphoneDynamic32);
         assert!((cfg.plus.head_radius_m - 0.092).abs() < 1e-9);

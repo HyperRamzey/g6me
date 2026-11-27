@@ -1488,6 +1488,7 @@ dependencies = [
  "eframe",
  "egui",
  "g6me-core",
+ "g6me-cuda",
  "rfd",
  "serde_json",
 ]

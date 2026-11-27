@@ -33,6 +33,10 @@ use crate::theme::Palette;
 use crate::widgets::{Browser, Mode};
 use eframe::CreationContext;
 use g6me_core::batch::{self, Phase};
+use g6me_core::blackwell::{
+    cuda_compiled_in, cuda_hardware_detail, CudaDeviceDetail, CudaTensorPrecision,
+    ALL_CUDA_ARCH_CAPABILITIES,
+};
 use g6me_core::cochlea::PersonalizationSession;
 use g6me_core::loudness::{Compliance, DeliveryTarget, LoudnessReport};
 use g6me_core::mask;
@@ -47,7 +51,7 @@ use g6me_core::stages::Gtype;
 use g6me_core::transducer::TransducerProfile;
 use g6me_core::util;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Filter for the queue list in the left sidebar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -290,6 +294,17 @@ pub struct App {
     dry_run: Mutex<Option<DryRun>>,
     log_scroll: bool,
     last_repaint: std::time::Instant,
+    /// Cached NVIDIA CUDA hardware probe (probed once at startup; never stalls the UI loop).
+    cuda_hw: Option<CudaDeviceDetail>,
+    /// Non-blocking background multi-arch `nvcc --fmad=false` + `cuobjdump --dump-sass` audit state.
+    cuda_audit: Arc<Mutex<CudaAuditUiState>>,
+}
+
+#[derive(Clone, Default)]
+struct CudaAuditUiState {
+    running: bool,
+    ok: Option<bool>,
+    lines: Vec<String>,
 }
 
 /// A planned render, shown without writing anything.
@@ -500,6 +515,8 @@ impl App {
             dry_run: Mutex::new(None),
             log_scroll: true,
             last_repaint: std::time::Instant::now(),
+            cuda_hw: cuda_hardware_detail(),
+            cuda_audit: Arc::new(Mutex::new(CudaAuditUiState::default())),
         };
         app.runner.set_context(cc.egui_ctx.clone());
         // Palette before the first frame: the window should not flash dark while a
@@ -1706,25 +1723,235 @@ impl App {
                         {
                             phys_changed = true;
                         }
-                        let cuda_tip = match g6me_core::blackwell::cuda_hardware_summary() {
-                            Some(dev) => format!(
-                                "Offloads zero-FMA 3D FDTD room stepping to live NVIDIA GPU via \
-                                 g6me-cuda ({dev}); deterministic CPU fallback on error."
-                            ),
-                            None => "Opt-in zero-FMA CUDA GPU offload (--cuda, requires building \
-                                     with --features cuda + NVIDIA GPU). Falls back deterministically \
-                                     to CPU when no GPU is detected."
-                                .to_string(),
-                        };
-                        if ui
-                            .checkbox(&mut p.use_cuda, "CUDA GPU offload")
-                            .on_hover_text(cuda_tip)
-                            .changed()
-                        {
-                            phys_changed = true;
-                        }
                     });
                     }
+
+                    // Dedicated GPU & Multi-Architecture Tensor Core Acceleration panel
+                    ui.add_space(6.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong("CUDA GPU & Multi-Arch Tensor Core Offload");
+                            if !cuda_compiled_in() {
+                                ui.colored_label(
+                                    ui.visuals().warn_fg_color,
+                                    "• not compiled in (rebuild with --features cuda)",
+                                );
+                            } else if let Some(ref d) = self.cuda_hw {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(80, 200, 120),
+                                    format!(
+                                        "• {} ({}, {}, CC {}.{})",
+                                        d.name,
+                                        d.sm_arch,
+                                        d.capability.arch_name,
+                                        d.compute_capability.0,
+                                        d.compute_capability.1
+                                    ),
+                                );
+                            } else {
+                                ui.colored_label(
+                                    ui.visuals().warn_fg_color,
+                                    "• compiled in, no NVIDIA GPU detected (deterministic CPU f64 fallback)",
+                                );
+                            }
+                        });
+
+                        let hw_clone = self.cuda_hw.clone();
+                        let p = &mut self.settings.plus;
+                        ui.add_space(3.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let gpu_ready = cuda_compiled_in() && hw_clone.is_some();
+                            let chk_label = if gpu_ready {
+                                "CUDA GPU offload (active GPU detected)"
+                            } else if cuda_compiled_in() {
+                                "CUDA GPU offload (CPU fallback — no GPU)"
+                            } else {
+                                "CUDA GPU offload (requires --features cuda)"
+                            };
+                            let cuda_tip = match &hw_clone {
+                                Some(d) => format!(
+                                    "Offloads zero-FMA 3D FDTD, stochastic PCG64 ray tracing, \
+                                     Helmholtz BEM matvec, Stockham FFT, Goldilocks NTT, and \
+                                     Ozaki-II CRT Tensor Core GEMM to {} ({}).",
+                                    d.name, d.sm_arch
+                                ),
+                                None => "Opt-in zero-FMA CUDA GPU offload (--cuda). Offloads all 6 \
+                                         compute kernels when built with --features cuda on an NVIDIA GPU; \
+                                         falls back deterministically to bit-exact CPU f64 otherwise."
+                                    .to_string(),
+                            };
+                            if ui
+                                .checkbox(&mut p.use_cuda, chk_label)
+                                .on_hover_text(cuda_tip)
+                                .changed()
+                            {
+                                phys_changed = true;
+                            }
+
+                            ui.separator();
+                            ui.label("Ozaki-II Tensor Core:");
+                            let prev_prec = p.cuda_tensor_precision;
+                            egui::ComboBox::from_id_salt("cuda_tensor_precision_combo")
+                                .selected_text(p.cuda_tensor_precision.short_tag())
+                                .show_ui(ui, |ui| {
+                                    for prec in CudaTensorPrecision::ALL {
+                                        ui.selectable_value(
+                                            &mut p.cuda_tensor_precision,
+                                            prec,
+                                            format!("{} — {}", prec.short_tag(), prec.label()),
+                                        );
+                                    }
+                                });
+                            if p.cuda_tensor_precision != prev_prec {
+                                phys_changed = true;
+                            }
+                        });
+
+                        // Honest per-architecture precision resolution readout
+                        if let Some(ref d) = hw_clone {
+                            let resolved = p.cuda_tensor_precision.resolve_for_cc(
+                                d.compute_capability.0,
+                                d.compute_capability.1,
+                            );
+                            let note = if p.cuda_tensor_precision != CudaTensorPrecision::Auto
+                                && resolved != p.cuda_tensor_precision
+                            {
+                                format!(
+                                    "Requested {} unsupported on {} → auto-resolved to {} ({})",
+                                    p.cuda_tensor_precision.short_tag(),
+                                    d.sm_arch,
+                                    resolved.short_tag(),
+                                    resolved.label()
+                                )
+                            } else {
+                                format!(
+                                    "Active path on {}: {} ({}) | Non-GEMM: {}",
+                                    d.sm_arch,
+                                    resolved.short_tag(),
+                                    resolved.label(),
+                                    d.capability.non_gemm_summary
+                                )
+                            };
+                            ui.small(note);
+                        } else {
+                            ui.small(
+                                "Auto picks 1-limb INT8→S32→u128 CRT→FP64 (highest effective FP64 TOPS on desktop Blackwell/Ada/Ampere/Turing IMMA & Pascal DP4A); NVFP4 OMMA.SF / FP8 QMMA / FP16 HMMA selectable where supported. GPU offloads 3D FDTD, RayTrace HOA, Helmholtz BEM, Ozaki-II Schur BA, and BinauralPlus FFT/NTT; serial stereo mastering IIR/STFT stages run on CPU f64.",
+                            );
+                        }
+
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new(
+                            "Architecture Capability Matrix & Multi-Arch SASS Audit",
+                        )
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("cuda_arch_cap_matrix")
+                                .striped(true)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Architecture");
+                                    ui.strong("Target");
+                                    ui.strong("NVFP4");
+                                    ui.strong("FP8");
+                                    ui.strong("INT8 / FP16");
+                                    ui.strong("Auto Path");
+                                    ui.strong("Hardware MMA / DP4A Pipeline");
+                                    ui.end_row();
+
+                                    for cap in &ALL_CUDA_ARCH_CAPABILITIES {
+                                        let is_active = hw_clone
+                                            .as_ref()
+                                            .is_some_and(|d| d.capability.sm_target == cap.sm_target);
+                                        let arch_lbl = if is_active {
+                                            format!("▶ {}", cap.arch_name)
+                                        } else {
+                                            cap.arch_name.to_string()
+                                        };
+                                        if is_active {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(80, 200, 120),
+                                                arch_lbl,
+                                            );
+                                        } else {
+                                            ui.label(arch_lbl);
+                                        }
+                                        ui.monospace(cap.sm_target);
+                                        ui.label(if cap.supports_nvfp4 { "✓" } else { "—" });
+                                        ui.label(if cap.supports_fp8 { "✓" } else { "—" });
+                                        ui.label(match (cap.supports_int8, cap.supports_fp16) {
+                                            (true, true) => "✓ / ✓",
+                                            (true, false) => "DP4A / —",
+                                            _ => "—",
+                                        });
+                                        ui.monospace(cap.default_precision.short_tag());
+                                        ui.small(cap.mma_summary);
+                                        ui.end_row();
+                                    }
+                                });
+
+                            ui.add_space(6.0);
+                            let audit_state = self
+                                .cuda_audit
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            ui.horizontal(|ui| {
+                                let btn = ui.add_enabled(
+                                    !audit_state.running,
+                                    egui::Button::new(if audit_state.running {
+                                        "Running nvcc --fmad=false + cuobjdump SASS audit…"
+                                    } else {
+                                        "Run Multi-Arch SASS & Zero-FMA Audit"
+                                    }),
+                                );
+                                if btn.clicked() {
+                                    let slot = Arc::clone(&self.cuda_audit);
+                                    let ctx = ui.ctx().clone();
+                                    {
+                                        let mut st = slot.lock().unwrap_or_else(|e| e.into_inner());
+                                        st.running = true;
+                                        st.ok = None;
+                                        st.lines = vec![
+                                            "Compiling embedded CUDA kernels via nvcc --fmad=false and disassembling with cuobjdump --dump-sass…".to_string(),
+                                        ];
+                                    }
+                                    std::thread::spawn(move || {
+                                        let (ok, lines) = run_cuda_sass_audit_report();
+                                        let mut st = slot.lock().unwrap_or_else(|e| e.into_inner());
+                                        st.running = false;
+                                        st.ok = Some(ok);
+                                        st.lines = lines;
+                                        ctx.request_repaint();
+                                    });
+                                }
+                                if let Some(ok) = audit_state.ok {
+                                    if ok {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(80, 200, 120),
+                                            "PASS (0 FMA verified)",
+                                        );
+                                    } else {
+                                        ui.colored_label(
+                                            ui.visuals().error_fg_color,
+                                            "AUDIT NOTICE / FAILED",
+                                        );
+                                    }
+                                }
+                            });
+
+                            if !audit_state.lines.is_empty() {
+                                ui.add_space(4.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("cuda_sass_audit_scroll")
+                                    .max_height(150.0)
+                                    .show(ui, |ui| {
+                                        for line in &audit_state.lines {
+                                            ui.monospace(line);
+                                        }
+                                    });
+                            }
+                        });
+                    });
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -3838,6 +4065,112 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         } else if self.last_repaint.elapsed() < std::time::Duration::from_millis(400) {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
+fn run_cuda_sass_audit_report() -> (bool, Vec<String>) {
+    #[cfg(feature = "cuda")]
+    {
+        let mut lines = Vec::new();
+        if !g6me_cuda::nvcc_toolchain_available() {
+            lines.push(
+                "nvcc / cuobjdump not found in PATH — install the NVIDIA CUDA Toolkit (12.8+ for sm_120a Blackwell) to run SASS verification."
+                    .to_string(),
+            );
+            return (false, lines);
+        }
+        let mut all_ok = true;
+        match g6me_cuda::audit_all_cuda_kernels_sass(None) {
+            Ok(audits) => {
+                let arch = audits.first().map(|a| a.arch.as_str()).unwrap_or("unknown");
+                lines.push(format!(
+                    "[1/3] All {} embedded CUDA kernels audited at {arch} (0 PTX/SASS FMA):",
+                    audits.len()
+                ));
+                for a in &audits {
+                    let mma = if a.mma_opcodes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · MMA: {}", a.mma_opcodes.join(", "))
+                    };
+                    lines.push(format!(
+                        "  ✓ {:<22} {} SASS instrs (0 FMA){}",
+                        a.name, a.sass_instructions, mma
+                    ));
+                }
+            }
+            Err(e) => {
+                all_ok = false;
+                lines.push(format!("[1/3] FAILED kernel SASS audit: {e}"));
+            }
+        }
+        match g6me_cuda::audit_multi_arch_ozaki2_sass() {
+            Ok(multi) => {
+                lines.push(format!(
+                    "[2/3] Multi-arch Ozaki-II CRT Tensor Core SASS audit ({} arch targets, 0 FMA):",
+                    multi.len()
+                ));
+                for a in &multi {
+                    lines.push(format!(
+                        "  ✓ {:<8} {:>5} SASS instrs · {}",
+                        a.arch,
+                        a.sass_instructions,
+                        a.mma_opcodes.join(", ")
+                    ));
+                }
+            }
+            Err(e) => {
+                all_ok = false;
+                lines.push(format!("[2/3] FAILED multi-arch Ozaki-II SASS audit: {e}"));
+            }
+        }
+        match g6me_cuda::verify_sass_auditor_catches_fmad_sabotage(None) {
+            Ok(hits) => {
+                lines.push(format!(
+                    "[3/3] Sabotage negative control (--fmad=true): caught {hits} DFMA/FFMA contraction(s) ✓"
+                ));
+            }
+            Err(e) => {
+                all_ok = false;
+                lines.push(format!("[3/3] FAILED sabotage control: {e}"));
+            }
+        }
+        (all_ok, lines)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let mut lines = Vec::new();
+        match g6me_core::blackwell::compile_and_audit_cuda_sass("sm_75") {
+            g6me_core::blackwell::CudaAuditStatus::VerifiedSass {
+                arch,
+                sass_instructions,
+            } => {
+                lines.push(format!(
+                    "✓ Verified core reference CUDA kernels at {arch}: {sass_instructions} SASS instructions, 0 FMA."
+                ));
+                lines.push(
+                    "Note: rebuild g6me-gui with `--features cuda` to enable full 6-kernel GPU offload and 5-arch Tensor Core SASS auditing."
+                        .to_string(),
+                );
+                (true, lines)
+            }
+            g6me_core::blackwell::CudaAuditStatus::ToolchainUnavailable {
+                ptx_reference_instructions,
+            } => {
+                lines.push(format!(
+                    "nvcc/cuobjdump unavailable in PATH; embedded PTX reference verified ({ptx_reference_instructions} instructions, 0 FMA)."
+                ));
+                lines.push(
+                    "Rebuild with `--features cuda` on a CUDA Toolkit host for full 6-kernel + 5-arch SASS verification."
+                        .to_string(),
+                );
+                (false, lines)
+            }
+            g6me_core::blackwell::CudaAuditStatus::Failed(msg) => {
+                lines.push(format!("CUDA SASS audit failed: {msg}"));
+                (false, lines)
+            }
         }
     }
 }

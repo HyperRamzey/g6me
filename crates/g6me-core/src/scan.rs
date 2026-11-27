@@ -27,7 +27,7 @@ use crate::bem::{
     extract_isosurface_marching_tetrahedra, isotropic_acoustic_remesh, v3_add, v3_cross, v3_dot,
     v3_norm, v3_scale, v3_sub, watertight_winding_repair, BemMeshStats, FmmBemSolver, TriangleMesh,
 };
-use crate::blackwell::{ozaki2_crt_gemm, TensorBackend};
+use crate::blackwell::{ozaki2_crt_gemm_with_cuda, CudaTensorPrecision, TensorBackend};
 use crate::burst3d::{mat3_mul, mat3_transpose, mat3_vec, so3_exp, so3_log, Mat3, MAT3_ID};
 use crate::dng::{OisSample, WarpRectilinearOpcode};
 use crate::error::{Error, Result};
@@ -542,6 +542,33 @@ pub fn bundle_adjust_ozaki2_fp4_schur(
     vcm_tikhonov_weight: f64,
     iters: usize,
 ) -> BundleAdjustmentReport {
+    bundle_adjust_ozaki2_fp4_schur_with_cuda(
+        cams,
+        points,
+        obs,
+        gauges,
+        warp,
+        vcm_tikhonov_weight,
+        iters,
+        false,
+        CudaTensorPrecision::Auto,
+    )
+}
+
+/// Same as [`bundle_adjust_ozaki2_fp4_schur`] with opt-in GPU Tensor Core offload for the
+/// Ozaki-II CRT Schur product `W * (V^-1 W^T)` (Blackwell NVFP4 / Hopper-Ada FP8 / Ampere-Turing INT8/FP16 → FP64).
+#[allow(clippy::too_many_arguments)]
+pub fn bundle_adjust_ozaki2_fp4_schur_with_cuda(
+    cams: &mut [RollingShutterCamera],
+    points: &mut [[f64; 3]],
+    obs: &[BaObservation],
+    gauges: &[MetricGaugeConstraint],
+    warp: Option<&WarpRectilinearOpcode>,
+    vcm_tikhonov_weight: f64,
+    iters: usize,
+    use_cuda: bool,
+    cuda_precision: CudaTensorPrecision,
+) -> BundleAdjustmentReport {
     let n_cams = cams.len();
     let n_pts = points.len();
     let cam_dof = 7usize; // [d_rx, d_ry, d_rz, d_tx, d_ty, d_tz, d_vcm_scale]
@@ -688,9 +715,15 @@ pub fn bundle_adjust_ozaki2_fp4_schur(
             }
         }
 
-        // SCHUR COMPLEMENT PRODUCT W * (V^{-1} W^T) ON BLACKWELL FP4 (E2M1 BASE-13) OZAKI-II CRT!!
+        // SCHUR COMPLEMENT PRODUCT W * (V^{-1} W^T) ON OZAKI-II CRT (GPU Tensor Cores when --cuda active, else CPU FP4 E2M1 Base-13 reference)
         let w_vinv_wt = if n_pts > 0 && n_cam_vars > 0 {
-            ozaki2_crt_gemm(&w_mat, &y_mat, TensorBackend::Fp4E2m1Base13)
+            ozaki2_crt_gemm_with_cuda(
+                &w_mat,
+                &y_mat,
+                TensorBackend::Fp4E2m1Base13,
+                use_cuda,
+                cuda_precision,
+            )
         } else {
             vec![vec![0.0_f64; n_cam_vars]; n_cam_vars]
         };
@@ -2395,6 +2428,8 @@ pub struct MultiViewScanConfig {
     pub winding_res: usize,
     pub max_edge_m: f64,
     pub speed_of_sound_m_s: f64,
+    pub use_cuda: bool,
+    pub cuda_tensor_precision: CudaTensorPrecision,
 }
 
 /// End-to-end **REAL** multi-view image photogrammetry pipeline (ZERO synthetic head fallback!):
@@ -2721,7 +2756,7 @@ pub fn reconstruct_from_multiview_images(
     }];
 
     // 5. Real Ozaki-II FP4 -> FP64 Rolling-Shutter Schur Bundle Adjustment!
-    let ba_report = bundle_adjust_ozaki2_fp4_schur(
+    let ba_report = bundle_adjust_ozaki2_fp4_schur_with_cuda(
         &mut cams,
         &mut pts_3d,
         &ba_obs,
@@ -2729,6 +2764,8 @@ pub fn reconstruct_from_multiview_images(
         warp_prior,
         5.0,
         8,
+        cfg.use_cuda,
+        cfg.cuda_tensor_precision,
     );
 
     // 6. Build oriented 2DGS/PGSR surfels from reconstructed 3D points (+ optional dense micro-depth),
@@ -3190,6 +3227,8 @@ mod tests {
             winding_res: 12,
             max_edge_m: 0.06,
             speed_of_sound_m_s: 344.85,
+            use_cuda: false,
+            cuda_tensor_precision: CudaTensorPrecision::Auto,
         };
         let out =
             reconstruct_from_multiview_images(&frames_rgb, &frames_luma, w, h, &cfg, None, None)

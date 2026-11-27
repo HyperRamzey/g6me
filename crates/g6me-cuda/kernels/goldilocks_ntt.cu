@@ -71,3 +71,36 @@ extern "C" __global__ void g6me_goldilocks_pointwise_mac(
     if (i >= n) return;
     acc[i] = gl_add(acc[i], gl_mul(a[i], b[i]));
 }
+
+extern "C" __global__ void g6me_goldilocks_bitrev(
+    const uint64_t* __restrict__ src,
+    uint64_t* __restrict__ dst,
+    int n,
+    int log_n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t j = (log_n > 0) ? (__brev((uint32_t)i) >> (32 - log_n)) : 0u;
+    dst[j] = src[i];
+}
+
+extern "C" __global__ void g6me_goldilocks_pointwise_mul(
+    uint64_t* __restrict__ a,
+    const uint64_t* __restrict__ b,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    a[i] = gl_mul(a[i], b[i]);
+}
+
+extern "C" __global__ void g6me_goldilocks_scale(
+    uint64_t* __restrict__ data,
+    uint64_t inv_n,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    data[i] = gl_mul(data[i], inv_n);
+}
+

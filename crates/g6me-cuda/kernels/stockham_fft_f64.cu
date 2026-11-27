@@ -65,3 +65,16 @@ extern "C" __global__ void g6me_complex_mac_f64(
     acc_re[i] = __dadd_rn(acc_re[i], pr);
     acc_im[i] = __dadd_rn(acc_im[i], pi);
 }
+
+extern "C" __global__ void g6me_stockham_scale_f64(
+    double* __restrict__ re,
+    double* __restrict__ im,
+    double scale,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    re[i] = __dmul_rn(re[i], scale);
+    im[i] = __dmul_rn(im[i], scale);
+}
+

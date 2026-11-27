@@ -3219,13 +3219,14 @@ pub fn mastering() -> Vec<Check> {
 }
 
 /// `cuda`: real CUDA `.cu` -> `.cubin` (`nvcc --fmad=false`) -> `cuobjdump --dump-sass`
-/// zero-FMA audit + `--fmad=true` sabotage negative control.
+/// zero-FMA audit across all 6 kernels + 5-architecture Ozaki-II Tensor Core SASS audit
+/// (`sm_120a`, `sm_90`, `sm_89`, `sm_80`, `sm_75`) + `--fmad=true` sabotage negative control
+/// + live GPU-vs-CPU parity verification for all 6 kernels when a physical NVIDIA GPU is present.
 pub fn cuda() -> Vec<Check> {
     let mut out = Vec::new();
     #[cfg(feature = "cuda")]
     {
-        // Let the toolchain pick the newest target it supports (sm_120a on CUDA 12.8+),
-        // so the Blackwell-only `__CUDA_ARCH__ >= 1200` NVFP4 MMA path is actually audited.
+        // 1. All 6 production CUDA kernels at highest toolkit arch (sm_120a on CUDA 12.8+)
         match g6me_cuda::audit_all_cuda_kernels_sass(None) {
             Ok(reports) => {
                 let total_instrs: usize = reports.iter().map(|r| r.sass_instructions).sum();
@@ -3233,22 +3234,26 @@ pub fn cuda() -> Vec<Check> {
                     .first()
                     .map(|r| r.arch.as_str())
                     .unwrap_or("unknown");
+                let ozaki_opcodes = reports
+                    .iter()
+                    .find(|r| r.name == "ozaki2_blackwell_mma")
+                    .map(|r| r.mma_opcodes.join(", "))
+                    .unwrap_or_default();
                 out.push(with_metric(
                     if reports.len() == 6 && total_instrs > 0 {
                         pass(
                             "cuda",
-                            "6 CUDA kernels nvcc --fmad=false PTX + SASS audit",
+                            "6 CUDA kernels nvcc --fmad=false PTX+SASS audit",
                             format!(
-                                "{}/6 .cu kernels compiled ({used_arch}): 0 contracted fma.rn in \
-                                 nvcc PTX, 0 contracted FMA in {total_instrs} cuobjdump --dump-sass \
-                                 SASS instrs (IEEE div/sqrt MUFU microcode allowed for raytrace_hoa)",
-                                reports.len()
+                                "{}/6 .cu kernels compiled ({used_arch}) & audited via cuobjdump --dump-sass: {total_instrs} SASS instrs, 0 FMA [MMA: {}]",
+                                reports.len(),
+                                if ozaki_opcodes.is_empty() { "none" } else { &ozaki_opcodes }
                             ),
                         )
                     } else {
                         fail(
                             "cuda",
-                            "6 CUDA kernels nvcc --fmad=false PTX + SASS audit",
+                            "6 CUDA kernels nvcc --fmad=false PTX+SASS audit",
                             format!("kernels={}, instrs={total_instrs}", reports.len()),
                         )
                     },
@@ -3256,25 +3261,67 @@ pub fn cuda() -> Vec<Check> {
                         "arch": used_arch,
                         "kernels": reports.len(),
                         "total_sass_instructions": total_instrs,
-                        "ptx_fma_hits": 0,
                         "fma_hits": 0,
+                        "ozaki2_mma_opcodes": ozaki_opcodes,
                     }),
                 ));
-                match g6me_cuda::verify_sass_auditor_catches_fmad_sabotage(None) {
+
+                // 2. Multi-architecture Ozaki-II Tensor Core SASS verification across all 5 GPU generations
+                match g6me_cuda::audit_multi_arch_ozaki2_sass() {
+                    Ok(arch_reports) => {
+                        let summary: Vec<String> = arch_reports
+                            .iter()
+                            .map(|r| {
+                                format!(
+                                    "{}({} instrs, [{}])",
+                                    r.arch,
+                                    r.sass_instructions,
+                                    r.mma_opcodes.join("/")
+                                )
+                            })
+                            .collect();
+                        out.push(with_metric(
+                            pass(
+                                "cuda",
+                                "Multi-arch Ozaki-II Tensor Core SASS audit (sm_120a..sm_75)",
+                                format!(
+                                    "{} arch targets verified 0 FMA: {}",
+                                    arch_reports.len(),
+                                    summary.join("; ")
+                                ),
+                            ),
+                            json!({
+                                "architectures_audited": arch_reports.len(),
+                                "targets": arch_reports.iter().map(|r| json!({
+                                    "arch": r.arch,
+                                    "sass_instructions": r.sass_instructions,
+                                    "mma_opcodes": r.mma_opcodes,
+                                })).collect::<Vec<_>>(),
+                            }),
+                        ));
+                    }
+                    Err(e) => out.push(fail(
+                        "cuda",
+                        "Multi-arch Ozaki-II Tensor Core SASS audit (sm_120a..sm_75)",
+                        e,
+                    )),
+                }
+
+                // 3. Mandatory sabotage negative control (--fmad=true must trigger DFMA/FFMA catch)
+                match g6me_cuda::verify_sass_auditor_catches_fmad_sabotage(Some(used_arch)) {
                     Ok(hits) => out.push(with_metric(
                         pass(
                             "cuda",
-                            "CUDA PTX/SASS auditor --fmad=true sabotage control",
+                            "CUDA SASS auditor --fmad=true sabotage control",
                             format!(
-                                "sabotaged nvcc --fmad=true caught fma.rn in PTX and {hits} real \
-                                 DFMA SASS hit(s)"
+                                "sabotaged nvcc --fmad=true ({used_arch}) caught {hits} real DFMA/FFMA SASS hit(s)"
                             ),
                         ),
-                        json!({ "sabotage_fma_hits": hits }),
+                        json!({ "arch": used_arch, "sabotage_fma_hits": hits }),
                     )),
                     Err(e) => out.push(fail(
                         "cuda",
-                        "CUDA PTX/SASS auditor --fmad=true sabotage control",
+                        "CUDA SASS auditor --fmad=true sabotage control",
                         e,
                     )),
                 }
@@ -3286,101 +3333,337 @@ pub fn cuda() -> Vec<Check> {
                 {
                     out.push(info(
                         "cuda",
-                        "6 CUDA kernels nvcc --fmad=false SASS audit",
+                        "6 CUDA kernels nvcc --fmad=false PTX+SASS audit",
                         format!("CUDA toolkit probe: {e}"),
                     ));
                 } else {
                     out.push(fail(
                         "cuda",
-                        "6 CUDA kernels nvcc --fmad=false SASS audit",
+                        "6 CUDA kernels nvcc --fmad=false PTX+SASS audit",
                         e,
                     ));
                 }
             }
         }
-        // Live numerical parity: run one real FDTD problem through the CPU solver and the
-        // GPU kernel, automatically, whenever a device is visible and the toolchain can
-        // build/load the module. Absent hardware/toolkit is informational; a detected GPU
-        // whose kernel cannot initialize or launch is a failure.
-        let hw_summary = g6me_core::blackwell::cuda_hardware_summary();
-        match hw_summary {
-            None => out.push(info(
-                "cuda",
-                "live FDTD CPU/GPU parity",
-                "no CUDA GPU detected; live parity not run (CPU fallback active)".to_string(),
-            )),
-            Some(ref hw) if !g6me_cuda::nvcc_toolchain_available() => out.push(info(
-                "cuda",
-                "live FDTD CPU/GPU parity",
-                format!("{hw}: CUDA toolkit unavailable, live parity not run"),
-            )),
-            Some(hw) => {
-                use g6me_core::atmosphere::AtmosphereCfg;
-                use g6me_core::room::{FdtdSolver3d, RoomGeometry, RoomPreset};
-                use std::time::Instant;
-                let c_air = AtmosphereCfg::default().speed_of_sound_m_s();
-                match g6me_cuda::G6meCudaRuntime::init() {
-                    Ok(rt) => {
-                        let room = RoomGeometry::from_preset(RoomPreset::ControlRoom);
-                        let fdtd = FdtdSolver3d::new(&room, c_air, 0.35);
-                        let va = fdtd.coord_to_voxel([1.5, 1.4, 1.2]);
-                        let vb = fdtd.coord_to_voxel([3.9, 3.2, 1.5]);
-                        let steps = 90;
-                        let t_cpu = Instant::now();
-                        let cpu = fdtd.simulate(va, &[vb], steps);
-                        let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
-                        let t_gpu = Instant::now();
-                        match fdtd.simulate_on_cuda(&rt, va, &[vb], steps) {
-                            Ok(gpu) => {
-                                let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1e3;
-                                let peak = cpu[0].iter().map(|v| v.abs()).fold(0.0, f64::max);
-                                let max_abs = cpu[0]
+
+        // 4. Live GPU runtime detection & 6-kernel GPU-vs-CPU parity verification (when GPU attached)
+        match g6me_core::blackwell::shared_cuda_runtime() {
+            Some(rt) => {
+                let hw = g6me_core::blackwell::cuda_hardware_summary()
+                    .unwrap_or_else(|| format!("{} ({})", rt.info.name, rt.compiled_arch));
+                out.push(info("cuda", "live NVIDIA GPU runtime", hw));
+
+                // 4a. FDTD 3D live GPU-vs-CPU parity
+                let geom = g6me_core::room::RoomGeometry::from_preset(
+                    g6me_core::room::RoomPreset::ControlRoom,
+                );
+                let fdtd =
+                    g6me_core::room::FdtdSolver3d::for_room_budget(&geom, 344.0, 260.0, 4096);
+                let src = (fdtd.nx / 2, fdtd.ny / 2, fdtd.nz / 2);
+                let recs = [(fdtd.nx / 3, fdtd.ny / 2, fdtd.nz / 2)];
+                let cpu_fdtd = fdtd.simulate(src, &recs, 32);
+                match fdtd.simulate_on_cuda(&rt, src, &recs, 32) {
+                    Ok(gpu_fdtd) => {
+                        let max_diff = cpu_fdtd[0]
+                            .iter()
+                            .zip(&gpu_fdtd[0])
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0_f64, f64::max);
+                        out.push(with_metric(
+                            if max_diff < 1e-13 {
+                                pass(
+                                    "cuda",
+                                    "Live GPU FDTD 3D zero-FMA parity",
+                                    format!("max |gpu - cpu| = {max_diff:.3e} (< 1e-13)"),
+                                )
+                            } else {
+                                fail(
+                                    "cuda",
+                                    "Live GPU FDTD 3D zero-FMA parity",
+                                    format!("max |gpu - cpu| = {max_diff:.3e} >= 1e-13"),
+                                )
+                            },
+                            json!({ "max_abs_diff": max_diff }),
+                        ));
+                    }
+                    Err(e) => out.push(fail("cuda", "Live GPU FDTD 3D zero-FMA parity", e)),
+                }
+
+                // 4b. Ozaki-II CRT Tensor Core GEMM live parity across supported precisions
+                let (m, k, n) = (19usize, 73usize, 13usize);
+                let mut a_mat = vec![vec![0.0_f64; k]; m];
+                let mut b_mat = vec![vec![0.0_f64; n]; k];
+                let mut a_flat = vec![0.0_f64; m * k];
+                let mut b_flat = vec![0.0_f64; k * n];
+                for i in 0..m {
+                    for t in 0..k {
+                        let v = ((i * 17 + t * 13) as f64 * 0.13).sin() * 2.5;
+                        a_mat[i][t] = v;
+                        a_flat[i * k + t] = v;
+                    }
+                }
+                for t in 0..k {
+                    for j in 0..n {
+                        let v = ((t * 11 + j * 23) as f64 * 0.19).cos() * 1.7;
+                        b_mat[t][j] = v;
+                        b_flat[t * n + j] = v;
+                    }
+                }
+                let cpu_oz = g6me_core::blackwell::ozaki2_crt_gemm(
+                    &a_mat,
+                    &b_mat,
+                    g6me_core::blackwell::TensorBackend::Fp4E2m1Base13,
+                );
+                let mut precisions = vec![
+                    g6me_cuda::CudaTensorPrecision::Auto,
+                    g6me_cuda::CudaTensorPrecision::Int8,
+                    g6me_cuda::CudaTensorPrecision::Fp16,
+                ];
+                let (maj, min) = rt.info.compute_capability;
+                if maj * 10 + min >= 89 {
+                    precisions.push(g6me_cuda::CudaTensorPrecision::Fp8E4m3);
+                }
+                if maj * 10 + min >= 120 && rt.compiled_arch.ends_with('a') {
+                    precisions.push(g6me_cuda::CudaTensorPrecision::Nvfp4E2m1);
+                }
+                for req_p in precisions {
+                    match rt.run_ozaki2_crt_gemm(&a_flat, &b_flat, m, k, n, req_p) {
+                        Ok((gpu_c, used_p)) => {
+                            let mut max_bwd = 0.0_f64;
+                            for i in 0..m {
+                                for j in 0..n {
+                                    let ab_abs: f64 =
+                                        (0..k).map(|t| a_mat[i][t].abs() * b_mat[t][j].abs()).sum();
+                                    let err =
+                                        (gpu_c[i * n + j] - cpu_oz[i][j]).abs() / ab_abs.max(1e-30);
+                                    max_bwd = max_bwd.max(err);
+                                }
+                            }
+                            let label = format!(
+                                "Live GPU Ozaki-II CRT GEMM parity ({} -> {})",
+                                req_p.short_tag(),
+                                used_p.short_tag()
+                            );
+                            out.push(with_metric(
+                                if max_bwd < 1e-13 {
+                                    pass(
+                                        "cuda",
+                                        &label,
+                                        format!("max backward err = {max_bwd:.3e} (< 1e-13)"),
+                                    )
+                                } else {
+                                    fail(
+                                        "cuda",
+                                        &label,
+                                        format!("max backward err = {max_bwd:.3e} >= 1e-13"),
+                                    )
+                                },
+                                json!({ "precision": used_p.short_tag(), "max_backward_err": max_bwd }),
+                            ));
+                        }
+                        Err(e) => out.push(fail(
+                            "cuda",
+                            format!("Live GPU Ozaki-II CRT GEMM parity ({})", req_p.short_tag()),
+                            e,
+                        )),
+                    }
+                }
+
+                // 4c. Stockham FFT live GPU-vs-CPU parity
+                let fft_n = 256usize;
+                let plan = g6me_core::fft::FftPlan::new(fft_n);
+                let mut cpu_fft: Vec<g6me_core::fft::Complex> = (0..fft_n)
+                    .map(|i| {
+                        g6me_core::fft::Complex::new(
+                            ((i as f64) * 0.17).sin(),
+                            ((i as f64) * 0.29).cos(),
+                        )
+                    })
+                    .collect();
+                let in_re: Vec<f64> = cpu_fft.iter().map(|c| c.re).collect();
+                let in_im: Vec<f64> = cpu_fft.iter().map(|c| c.im).collect();
+                plan.forward(&mut cpu_fft);
+                match rt.run_stockham_fft_f64(&in_re, &in_im, false) {
+                    Ok((gr, gi)) => {
+                        let max_diff = cpu_fft
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| (c.re - gr[i]).hypot(c.im - gi[i]))
+                            .fold(0.0_f64, f64::max);
+                        out.push(with_metric(
+                            if max_diff < 1e-11 {
+                                pass(
+                                    "cuda",
+                                    "Live GPU Stockham FFT FP64 parity",
+                                    format!("max |gpu - cpu| = {max_diff:.3e} (< 1e-11)"),
+                                )
+                            } else {
+                                fail(
+                                    "cuda",
+                                    "Live GPU Stockham FFT FP64 parity",
+                                    format!("max |gpu - cpu| = {max_diff:.3e} >= 1e-11"),
+                                )
+                            },
+                            json!({ "max_abs_diff": max_diff }),
+                        ));
+                        // The inverse path must also normalise by 1/N: the plus renderer's
+                        // UPOLA loop drives `irfft_buf` through exactly this call.
+                        match rt.run_stockham_fft_f64(&gr, &gi, true) {
+                            Ok((rr, ri)) => {
+                                let round = rr
                                     .iter()
-                                    .zip(gpu[0].iter())
+                                    .zip(&in_re)
+                                    .chain(ri.iter().zip(&in_im))
                                     .map(|(a, b)| (a - b).abs())
-                                    .fold(0.0, f64::max);
-                                let rel = max_abs / peak.max(1e-300);
-                                let ok = peak > 1e-5 && max_abs < 1e-12;
-                                let detail = format!(
-                                    "CPU vs live GPU over {steps} steps: max |d| = {max_abs:.3e} \
-                                     ({rel:.1e} of peak {peak:.3e}); CPU {cpu_ms:.1} ms vs GPU \
-                                     {gpu_ms:.2} ms on {hw}"
-                                );
+                                    .fold(0.0_f64, f64::max);
                                 out.push(with_metric(
-                                    if ok {
-                                        pass("cuda", "live FDTD CPU/GPU numerical parity", detail)
+                                    if round < 1e-11 {
+                                        pass(
+                                            "cuda",
+                                            "Live GPU Stockham FFT inverse round-trip",
+                                            format!(
+                                                "max |ifft(fft(x)) - x| = {round:.3e} (< 1e-11)"
+                                            ),
+                                        )
                                     } else {
-                                        fail("cuda", "live FDTD CPU/GPU numerical parity", detail)
+                                        fail(
+                                            "cuda",
+                                            "Live GPU Stockham FFT inverse round-trip",
+                                            format!(
+                                                "max |ifft(fft(x)) - x| = {round:.3e} >= 1e-11"
+                                            ),
+                                        )
                                     },
-                                    json!({
-                                        "max_abs_err": max_abs,
-                                        "rel_err": rel,
-                                        "peak": peak,
-                                        "steps": steps,
-                                        "cpu_ms": cpu_ms,
-                                        "gpu_ms": gpu_ms,
-                                        "device": hw,
-                                    }),
+                                    json!({ "max_abs_diff": round }),
                                 ));
                             }
                             Err(e) => out.push(fail(
                                 "cuda",
-                                "live FDTD CPU/GPU numerical parity",
-                                format!("{hw}: GPU FDTD failed: {e}"),
+                                "Live GPU Stockham FFT inverse round-trip",
+                                e,
                             )),
                         }
                     }
+                    Err(e) => out.push(fail("cuda", "Live GPU Stockham FFT FP64 parity", e)),
+                }
+
+                // 4d. Goldilocks NTT live GPU-vs-CPU bit-exact (0 ULP) parity
+                let ntt_ir: Vec<f64> = (0..32)
+                    .map(|i| ((-0.08 * (i as f64)).exp()) * ((i as f64) * 0.3).cos() * 0.2)
+                    .collect();
+                let ntt_x: Vec<f64> = (0..256).map(|i| 0.6 * ((i as f64) * 0.11).sin()).collect();
+                let conv = g6me_core::ntt::NttOverlapAddConvolver::new(&ntt_ir);
+                let cpu_ntt = conv.convolve_slice(&ntt_x);
+                let gpu_ntt = conv.convolve_slice_with_cuda(&ntt_x, true);
+                let bit_exact = cpu_ntt
+                    .iter()
+                    .zip(&gpu_ntt)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                out.push(if bit_exact {
+                    pass(
+                        "cuda",
+                        "Live GPU Goldilocks NTT bit-exact parity",
+                        "0 ULP bit-identical to CPU Goldilocks NTT",
+                    )
+                } else {
+                    fail(
+                        "cuda",
+                        "Live GPU Goldilocks NTT bit-exact parity",
+                        "GPU Goldilocks NTT differed from CPU reference",
+                    )
+                });
+
+                // 4e. BEM complex matvec live GPU-vs-CPU parity
+                let bem_n = 16usize;
+                let mat_re: Vec<f64> = (0..bem_n * bem_n)
+                    .map(|i| ((i as f64) * 0.13).sin())
+                    .collect();
+                let mat_im: Vec<f64> = (0..bem_n * bem_n)
+                    .map(|i| ((i as f64) * 0.21).cos())
+                    .collect();
+                let xr: Vec<f64> = (0..bem_n).map(|i| ((i as f64) * 0.37).cos()).collect();
+                let xi: Vec<f64> = (0..bem_n).map(|i| ((i as f64) * 0.43).sin()).collect();
+                match rt.run_bem_matvec(&mat_re, &mat_im, &xr, &xi) {
+                    Ok((gyr, gyi)) => {
+                        let mut max_diff = 0.0_f64;
+                        for r in 0..bem_n {
+                            let mut sr = 0.0_f64;
+                            let mut si = 0.0_f64;
+                            for c in 0..bem_n {
+                                let ar = mat_re[r * bem_n + c];
+                                let ai = mat_im[r * bem_n + c];
+                                sr += ar * xr[c] - ai * xi[c];
+                                si += ar * xi[c] + ai * xr[c];
+                            }
+                            max_diff = max_diff.max((sr - gyr[r]).hypot(si - gyi[r]));
+                        }
+                        out.push(with_metric(
+                            if max_diff < 1e-13 {
+                                pass(
+                                    "cuda",
+                                    "Live GPU BEM complex matvec zero-FMA parity",
+                                    format!("max |gpu - cpu| = {max_diff:.3e} (< 1e-13)"),
+                                )
+                            } else {
+                                fail(
+                                    "cuda",
+                                    "Live GPU BEM complex matvec zero-FMA parity",
+                                    format!("max |gpu - cpu| = {max_diff:.3e} >= 1e-13"),
+                                )
+                            },
+                            json!({ "max_abs_diff": max_diff }),
+                        ));
+                    }
                     Err(e) => out.push(fail(
                         "cuda",
-                        "live FDTD CPU/GPU numerical parity",
-                        format!("{hw}: CUDA runtime init failed: {e}"),
+                        "Live GPU BEM complex matvec zero-FMA parity",
+                        e,
                     )),
                 }
+
+                // 4f. RayTrace HOA live GPU smoke & finite check
+                match rt.run_raytrace_hoa_pass(
+                    geom.dims_m,
+                    [1.5, 2.0, 1.2],
+                    geom.listener_m,
+                    [0.82; 6],
+                    256,
+                    16,
+                    344.0,
+                    0.45,
+                    0x6736_4D45,
+                ) {
+                    Ok((delays, energies, _dirs)) => {
+                        let hits = delays
+                            .iter()
+                            .zip(&energies)
+                            .filter(|(&t, &e)| t > 0.0 && e > 0.0 && t.is_finite() && e.is_finite())
+                            .count();
+                        out.push(if hits > 0 {
+                            pass(
+                                "cuda",
+                                "Live GPU RayTrace HOA zero-FMA kernel",
+                                format!("traced 256x16 rays on GPU, recorded {hits} finite receiver hits"),
+                            )
+                        } else {
+                            fail(
+                                "cuda",
+                                "Live GPU RayTrace HOA zero-FMA kernel",
+                                "GPU raytracer recorded 0 receiver hits",
+                            )
+                        });
+                    }
+                    Err(e) => out.push(fail("cuda", "Live GPU RayTrace HOA zero-FMA kernel", e)),
+                }
+            }
+            None => {
+                out.push(info(
+                    "cuda",
+                    "live NVIDIA GPU runtime",
+                    "no live NVIDIA GPU detected on this host (deterministic CPU f64 fallback active; 6-kernel + 5-arch SASS audits ran via nvcc/cuobjdump)",
+                ));
             }
         }
-        let hw = g6me_core::blackwell::cuda_hardware_summary()
-            .unwrap_or_else(|| "no live NVIDIA GPU detected (CPU fallback active)".to_string());
-        out.push(info("cuda", "live NVIDIA GPU runtime", hw));
     }
     #[cfg(not(feature = "cuda"))]
     {

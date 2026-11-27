@@ -779,7 +779,7 @@ impl FdtdSolver3d {
     ) -> Vec<Vec<f64>> {
         #[cfg(feature = "cuda")]
         if use_cuda {
-            if let Ok(rt) = crate::blackwell::try_init_cuda_runtime() {
+            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
                 if let Ok(out) = self.simulate_on_cuda(&rt, src_voxel, receivers, steps) {
                     return out;
                 }
@@ -790,9 +790,7 @@ impl FdtdSolver3d {
         self.simulate(src_voxel, receivers, steps)
     }
 
-    /// Run the FDTD loop on a live GPU with no CPU fallback. `simulate_with_cuda` silently
-    /// falls back when the runtime or a launch fails; this entry point returns the error so
-    /// callers (the verifier's live parity check) can prove the kernel actually executed.
+    /// Execute the entire 3D SRL FDTD wave simulation device-resident on a live CUDA runtime.
     #[cfg(feature = "cuda")]
     pub fn simulate_on_cuda(
         &self,
@@ -811,9 +809,9 @@ impl FdtdSolver3d {
             *slot = 1.0 / (1.0 + half_lam_beta * (kb as f64));
         }
         let src_id = self.idx(src_voxel.0, src_voxel.1, src_voxel.2);
-        // Step 0 records p_curr after the impulse injection and before the first update;
-        // both happen on the host so the GPU loop sees exactly the CPU solver's state.
-        p_curr[src_id] += 1.0;
+        if steps > 0 {
+            p_curr[src_id] = 1.0;
+        }
         let rec_ids: Vec<usize> = receivers
             .iter()
             .map(|&(i, j, k)| self.idx(i, j, k))
@@ -863,8 +861,8 @@ impl FdtdSolver3d {
             if step == 0 {
                 p_curr[src_id] += 1.0;
             }
-            for (row, &rid) in out.iter_mut().zip(rec_ids.iter()) {
-                row[step] = p_curr[rid];
+            for (r, &rid) in rec_ids.iter().enumerate() {
+                out[r][step] = p_curr[rid];
             }
 
             // Fast branchless interior 7-point 3D SRL stencil (`1..nx-1, 1..ny-1, 1..nz-1`).
@@ -1246,6 +1244,85 @@ pub fn raytrace_hoa_histogram(
     hist
 }
 
+/// Optional GPU-offloaded deterministic PCG64 Monte Carlo Acoustic Ray Tracer (`raytrace_hoa.cu`).
+/// Uses `g6me-cuda` when `use_cuda` is true and a live NVIDIA GPU is detected, otherwise falls
+/// back deterministically to [`raytrace_hoa_histogram`].
+#[allow(clippy::too_many_arguments)]
+pub fn raytrace_hoa_histogram_with_cuda(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+    use_cuda: bool,
+) -> Vec<[f64; HOA_CH]> {
+    #[cfg(feature = "cuda")]
+    if use_cuda && n_rays > 0 && n_time_bins > 0 && max_bounces > 0 {
+        if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+            let c = atm.speed_of_sound_m_s();
+            // Map RoomGeometry wall ordering (+x=0, -x=1, +y=2, -y=3, -z=4, +z=5) to
+            // raytrace_hoa.cu axis-aligned ordering (-x=0, +x=1, -y=2, +y=3, -z=4, +z=5).
+            let r_of = |idx: usize| 1.0 - geom.walls[idx].absorption[3].clamp(0.01, 0.99);
+            let wall_refl = [r_of(1), r_of(0), r_of(3), r_of(2), r_of(4), r_of(5)];
+            if let Ok((delays, energies, dirs)) = rt.run_raytrace_hoa_pass(
+                geom.dims_m,
+                src_m,
+                geom.listener_m,
+                wall_refl,
+                n_rays,
+                max_bounces,
+                c,
+                0.45,
+                seed,
+            ) {
+                let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
+                for ray_id in 0..n_rays {
+                    let base = ray_id * max_bounces;
+                    // Orders >= 4 (0-indexed bounce >= 3); orders 1..=3 come from exact ISM.
+                    for b in 3..max_bounces {
+                        let idx = base + b;
+                        let t_hit = delays[idx];
+                        let energy = energies[idx];
+                        if t_hit <= 0.0 || energy <= 0.0 {
+                            continue;
+                        }
+                        let bin = (t_hit / bin_dt_s) as usize;
+                        if bin >= n_time_bins {
+                            continue;
+                        }
+                        let inc = [dirs[idx * 3], dirs[idx * 3 + 1], dirs[idx * 3 + 2]];
+                        let az = inc[1].atan2(inc[0]);
+                        let el = inc[2].clamp(-1.0, 1.0).asin();
+                        let sh = eval_sh_order7(az, el);
+                        let d_hit = t_hit * c;
+                        let air = atm.air_gain_linear(2_000.0, d_hit);
+                        let w = energy * air * air;
+                        for c_idx in 0..HOA_CH {
+                            hist[bin][c_idx] += w * sh[c_idx];
+                        }
+                    }
+                }
+                return hist;
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = use_cuda;
+    raytrace_hoa_histogram(
+        geom,
+        atm,
+        src_m,
+        n_rays,
+        max_bounces,
+        n_time_bins,
+        bin_dt_s,
+        seed,
+    )
+}
+
 /// Strictly single-threaded reference evaluation of [`raytrace_hoa_histogram`] (used to
 /// verify bit-for-bit thread-count invariance).
 #[allow(clippy::too_many_arguments)]
@@ -1310,6 +1387,47 @@ pub fn synthesize_hybrid_room_reflections(
     tail_duration_s: f64,
     seed: u64,
     plan: &FftPlan,
+) -> (Vec<Complex>, Vec<Complex>) {
+    synthesize_hybrid_room_reflections_with_cuda(
+        geom,
+        atm,
+        magls,
+        freqs,
+        fs,
+        pre_delay_s,
+        src_m,
+        fdtd_l_low,
+        fdtd_r_low,
+        fdtd_dt_s,
+        use_fdn_velvet,
+        quality,
+        tail_duration_s,
+        seed,
+        plan,
+        false,
+    )
+}
+
+/// Same as [`synthesize_hybrid_room_reflections`] with opt-in zero-FMA CUDA GPU offload for
+/// stochastic PCG64 ray tracing (`raytrace_hoa.cu`).
+#[allow(clippy::too_many_arguments)]
+pub fn synthesize_hybrid_room_reflections_with_cuda(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    magls: &MagLsDecoder,
+    freqs: &[f64],
+    fs: f64,
+    pre_delay_s: f64,
+    src_m: [f64; 3],
+    fdtd_l_low: Option<&[f64]>,
+    fdtd_r_low: Option<&[f64]>,
+    fdtd_dt_s: f64,
+    use_fdn_velvet: bool,
+    quality: RoomQuality,
+    tail_duration_s: f64,
+    seed: u64,
+    plan: &FftPlan,
+    use_cuda: bool,
 ) -> (Vec<Complex>, Vec<Complex>) {
     let nb = freqs.len();
     let n_fft = (nb - 1) * 2;
@@ -1423,7 +1541,7 @@ pub fn synthesize_hybrid_room_reflections(
         RoomQuality::Preview => (2_048usize, 48usize),
         RoomQuality::Production => (50_000usize, 72usize),
     };
-    let hist = raytrace_hoa_histogram(
+    let hist = raytrace_hoa_histogram_with_cuda(
         geom,
         atm,
         src_m,
@@ -1432,6 +1550,7 @@ pub fn synthesize_hybrid_room_reflections(
         n_bins,
         bin_dt_s,
         seed,
+        use_cuda,
     );
     let bin_energies: Vec<f64> = hist
         .iter()

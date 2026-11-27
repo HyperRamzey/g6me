@@ -220,6 +220,18 @@ impl NttPlan {
         self.n == 0
     }
 
+    pub fn twiddles_fwd(&self) -> &[Vec<u64>] {
+        &self.twiddles_fwd
+    }
+
+    pub fn twiddles_inv(&self) -> &[Vec<u64>] {
+        &self.twiddles_inv
+    }
+
+    pub fn inv_n(&self) -> u64 {
+        self.inv_n
+    }
+
     /// Execute in-place forward Number-Theoretic Transform over `Z / pZ`.
     pub fn forward(&self, buf: &mut [u64]) {
         self.transform(buf, false);
@@ -382,6 +394,63 @@ impl NttOverlapAddConvolver {
             .iter()
             .map(|&v| (v as f64) * inv_scale)
             .collect()
+    }
+
+    /// Convolve an entire slice of `f64` audio samples through the exact 64-bit Goldilocks
+    /// prime field NTT convolver, optionally offloading NTT butterfly stages & pointwise
+    /// field multiplication to a live NVIDIA GPU via `g6me-cuda` when `use_cuda` is true.
+    /// Falls back bit-identically (0 ULP) to [`Self::convolve_slice`] on CPU-only hosts.
+    pub fn convolve_slice_with_cuda(&self, x: &[f64], use_cuda: bool) -> Vec<f64> {
+        #[cfg(feature = "cuda")]
+        if use_cuda && !x.is_empty() {
+            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+                let inv_scale = 1.0 / (NTT_PCM_SCALE * NTT_KERNEL_SCALE);
+                let n = self.plan.len();
+                let mut out = vec![0i128; x.len() + self.ir_len - 1];
+                let mut blk = vec![0u64; n];
+                let mut offset = 0usize;
+                let mut gpu_ok = true;
+                while offset < x.len() {
+                    let take = (x.len() - offset).min(self.block_size);
+                    blk.fill(0);
+                    for i in 0..take {
+                        let q = (x[offset + i] * NTT_PCM_SCALE)
+                            .round()
+                            .clamp(-8_388_608.0, 8_388_607.0)
+                            as i64;
+                        blk[i] = i64_to_field(q);
+                    }
+                    match rt.run_goldilocks_ntt_convolve(
+                        &blk,
+                        &self.ir_ntt,
+                        self.plan.twiddles_fwd(),
+                        self.plan.twiddles_inv(),
+                        self.plan.inv_n(),
+                    ) {
+                        Ok(res) => {
+                            let conv_len = take + self.ir_len - 1;
+                            for i in 0..conv_len {
+                                out[offset + i] += field_to_i128(res[i]);
+                            }
+                        }
+                        Err(_) => {
+                            gpu_ok = false;
+                            break;
+                        }
+                    }
+                    offset += take;
+                }
+                if gpu_ok {
+                    return out[..x.len()]
+                        .iter()
+                        .map(|&v| (v as f64) * inv_scale)
+                        .collect();
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = use_cuda;
+        self.convolve_slice(x)
     }
 
     /// Process a streaming block of `f64` samples in place with exact block-size-invariant

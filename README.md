@@ -102,7 +102,7 @@ rather than sampled from a head:
     spherical-Hankel head scattering with a coupled snowman torso and order-7 HOA
     MagLS, alongside the fast Brown–Duda default. Head radius, torso spacing, pinna
     shelf and Webster ear-canal length are explicit controls.
-12. **Hybrid 3D room** (`--room anechoic|control-room|theater`, `--room-quality preview|production`, `--room-json`, `--cuda`) —
+12. **Hybrid 3D room** (`--room anechoic|control-room|theater`, `--room-quality preview|production`, `--room-json`, `--cuda`, `--cuda-precision`) —
     FDTD + image-source + boundary-transmission + parallel deterministic PCG64 ray-traced late field,
     convolved via zero-latency UPOLA (341.3 ms Control Room, 682.7 ms Theater Stage at 48 kHz) with
     SHA-256 kernel caching, and temperature, humidity, CO₂ and pressure driving Cramer (1993) speed of
@@ -192,7 +192,7 @@ cargo run -p g6me-cli -- --caps
 
 ```sh
 cargo build --release            # g6me, g6me-scan and g6me-gui in target/release/
-cargo test --workspace           # 371 tests (289 core, 25 CLI, 43 GUI, 1 CUDA, 13 harness)
+cargo test --workspace           # 374 tests (289 core, 25 CLI, 43 GUI, 4 CUDA, 13 harness)
 cargo run -p g6me-verify         # the bit-exactness evidence (129 checks)
 scripts/build-install.sh         # optimized x86-64-v3 build, verified, installed
 ```
@@ -257,7 +257,7 @@ than folded.
 | `--detail`, `--detail-intensity`, `--detail-bias`, `--detail-transients`, `--detail-tilt` | Sines+Transients micro-detail and presence enhancement. |
 | `--unmask`, `--unmask-recover`, `--unmask-tame`, `--unmask-max-db`, `--unmask-bias`, `--unmask-brighten` | Moore 2016 / ISO 532-2 perceptual unmasking dynamic EQ. |
 | `--plus-physics`, `--plus-distance`, `--plus-head-radius`, `--plus-torso-height`, `--plus-pinna-shelf`, `--ear-canal-mm` | Physical head/torso scattering model and near-field parallax. |
-| `--room`, `--room-quality`, `--room-json`, `--room-temp-c`, `--room-rh`, `--co2-ppm`, `--room-pressure-kpa`, `--cuda` | Hybrid 3D room (`preview` or `production` 670 Hz FDTD + 50k rays), ISO 9613-1/Cramer air absorption, and optional `--features cuda` FDTD GPU offload. |
+| `--room`, `--room-quality`, `--room-json`, `--room-temp-c`, `--room-rh`, `--co2-ppm`, `--room-pressure-kpa`, `--cuda`, `--cuda-precision` | Hybrid 3D room (`preview` or `production` 670 Hz FDTD + 50k rays), ISO 9613-1/Cramer air absorption, and optional `--features cuda` offload of FDTD, ray tracing, BEM matvec, Stockham FFT, Goldilocks NTT and Ozaki-II CRT GEMM (`auto|nvfp4|fp8|int8|fp16`). |
 | `--head-mesh` | OBJ head/pinna scan for CHIEF-regularized FMM-BEM personalised HRTF synthesis. |
 | `--exact-ntt` | Goldilocks-field NTT convolution with zero intermediate rounding. |
 | `--plus-slepian`, `--plus-fdn`, `--plus-warped-decorr` | Exact Slepian window, scattering FDN late tail, Bark-warped surround decorrelation. |
@@ -302,17 +302,23 @@ g6me-scan --burst burst/ --anchor russian-card --max-edge-mm 2.5 -o head.obj
 in the renderer. The optional `crates/g6me-cuda` crate (`--features cuda`) ships 6
 standalone `.cu` kernels (`fdtd_3d.cu`, `raytrace_hoa.cu`, `stockham_fft_f64.cu`,
 `goldilocks_ntt.cu`, `bem_matvec.cu`, `ozaki2_blackwell_mma.cu`) compiled with
-`nvcc --fmad=false` and audited for 0 contracted `fma.rn` in the PTX and 0 fused
-FMA in the `cuobjdump --dump-sass` hardware SASS (with a `--fmad=true` sabotage
-negative control) in `g6me-verify --group cuda`. The audit targets the newest arch
-the toolkit supports (`sm_120a` on CUDA 12.8+, so the Blackwell NVFP4 MMA path is
-compiled rather than skipped) and requires the `OMMA` instruction to be present in
-that SASS — an unused wrapper cannot leave the arch-gated path silently dead. The same group automatically runs one real 3D FDTD
-problem through both the CPU solver and the GPU kernel whenever a device and `nvcc`
-are present, requiring `max |d| < 1e-12` over 90 steps (observed 9.3e-16, 2.8e-14 of
-peak) and reporting both timings; on a host with no GPU it reports that instead of
-failing. 3D FDTD GPU offload (`--cuda`) keeps the grids resident in VRAM for the whole
-run — one upload, one download — with a deterministic pure-Rust CPU fallback.
+`nvcc --fmad=false`. `g6me-verify --group cuda` audits every kernel's PTX for 0
+contracted `fma.rn` and its `cuobjdump --dump-sass` hardware SASS for 0 fused
+`FFMA`/`HFMA2`/`DMAD`/`FMAD` (the IEEE `div.rn`/`sqrt.rn` MUFU+DFMA microcode in
+`raytrace_hoa` is one correctly-rounded operation, not a contraction), runs a
+mandatory `--fmad=true` sabotage negative control, and recompiles the Ozaki-II
+kernel for every architecture the installed toolkit accepts (`sm_120a`, `sm_90`,
+`sm_89`, `sm_80`, `sm_75` here, plus `sm_61` where nvcc still targets Pascal),
+requiring the Tensor Core / DP4A opcode each target should emit (`OMMA.SF` NVFP4,
+`QMMA` FP8, `IMMA`, `HMMA`, `IDP.4A`). On a live NVIDIA GPU the same group runs CPU-vs-GPU
+parity for all six kernels — 3D FDTD, Ozaki-II CRT GEMM across every supported
+precision, Stockham FFT, bit-exact Goldilocks NTT, BEM complex matvec, plus a
+ray-tracing smoke test — and on a host with no GPU it reports that instead of
+failing. `--cuda` offloads all six paths when an NVIDIA GPU is present; the FDTD
+grids stay resident in VRAM for the whole run (one upload, one download), and every
+dispatch falls back deterministically to the pure-Rust CPU solver. `--cuda-precision
+auto|nvfp4|fp8|int8|fp16` selects the Ozaki-II Tensor Core format (`auto` picks
+single-limb INT8 on desktop GPUs, NVFP4 on Blackwell Ultra `sm_103a`).
 
 Design notes: `docs/G6ME_SCAN_FMM_BEM_NTT.md` (scan, FMM-BEM, NTT),
 `docs/ACADEMIC_NUKE_ACOUSTICS.md` (room, CUDA, noise shaping, transducer, and perceptual models), and
@@ -610,10 +616,15 @@ and runs:
 Run it through `cargo run -p g6me-verify` (or `cargo test -p g6me-verify`) rather
 than a stale binary in `target/` — an out-of-date verifier is worse than none. Every
 check also runs per-group (`--group bitexact` …), so a failure can be reproduced
-without waiting for the whole suite.
+without waiting for the whole suite. The count above assumes a sibling `g6me` binary
+exists to disassemble, as in the release archive; a bare `cargo run -p g6me-verify`
+builds only the verifier, finds no sibling, and reports 128. With `--features cuda`
+the suite grows to 141 checks (142 with the sibling): the six-kernel PTX/SASS audit,
+the multi-architecture Ozaki-II opcode audit, and the live six-kernel GPU-vs-CPU
+parity group, including the Stockham FFT inverse round-trip.
 
-The workspace test suite covers what the verifier does not: 371 tests across the
-core (289), CLI (25), GUI (43), CUDA (1) and harness (13). The G6+ invariants live there —
+The workspace test suite covers what the verifier does not: 374 tests across the
+core (289), CLI (25), GUI (43), CUDA (4) and harness (13). The G6+ invariants live there —
 a flat 1-ERB diffuse field across all three profiles, measured ITD against
 Woodworth, sub-bass coherence, exact L/R mirror symmetry, a clean kernel tail with
 no pre-ringing, chunk-size-invariant overlap-add streaming, stereo bypass, LFE gain
@@ -721,8 +732,8 @@ into `g6me-scan`):
 
 | build | instructions | contracted FMA (DSP) | `%ymm` refs | verifier |
 |---|---|---|---|---|
-| generic (default) | 490,656 | **0** | 123 | 129/129 |
-| x86-64-v3 + thin LTO + O3 + unroll | 534,463 | **0** | 13,928 | 129/129 |
+| generic (default) | 492,394 | **0** | 123 | 129/129 |
+| x86-64-v3 + thin LTO + O3 + unroll | 535,742 | **0** | 13,983 | 129/129 |
 
 The FMA column is what `g6me-verify` enforces: it disassembles the `g6me*` symbols and
 fails on any FMA mnemonic. A whole-binary `objdump` additionally finds two `vfmaddsd`
@@ -752,7 +763,8 @@ crates/g6me-core     DSP port, G6+ renderer, FFT/NTT, room (UPOLA + FDTD + raytr
                      anchors, TSDF, winding repair, CHIEF FMM-BEM), pipeline,
                      batch engine, capabilities probe, meters, loudness, WAV I/O
 crates/g6me-cuda     optional `--features cuda` zero-FMA `.cu` kernels, `nvcc` +
-                     `cuobjdump --dump-sass` auditor, and `cudarc` FDTD offload
+                     `cuobjdump --dump-sass` auditor, and `cudarc` offload of all
+                     six kernels with deterministic CPU fallback
 crates/g6me-cli      `g6me` and `g6me-scan`
 crates/g6me-gui      `g6me-gui` — eframe, no audio backend
 crates/g6me-verify   bit-exactness, zero-FMA ASM/SASS, acoustics, mastering, and scan harness

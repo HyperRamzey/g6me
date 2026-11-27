@@ -11,24 +11,12 @@ extern "C" __global__ void g6me_fdtd_3d_srl_step(
     int ny,
     int nz,
     double lam2,
-    double half_lam_beta,
-    const int* __restrict__ rec_ids,
-    int n_rec,
-    double* __restrict__ rec_out,
-    int step_idx
+    double half_lam_beta
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
     if (i >= nx || j >= ny || k >= nz) return;
-
-    // Record the receiver samples for this step (p_curr is read-only here). One thread
-    // per launch does the tiny gather, so the whole simulation needs a single dtoh at
-    // the end instead of a per-step host round trip.
-    if (n_rec > 0 && i == 0 && j == 0 && k == 0) {
-        for (int r = 0; r < n_rec; ++r)
-            rec_out[step_idx * n_rec + r] = p_curr[rec_ids[r]];
-    }
 
     int s_x = ny * nz;
     int id = i * s_x + j * nz + k;
@@ -57,3 +45,16 @@ extern "C" __global__ void g6me_fdtd_3d_srl_step(
         p_next[id] = __dmul_rn(num, inv_den[kb]);
     }
 }
+
+extern "C" __global__ void g6me_fdtd_record_receivers(
+    const double* __restrict__ p_curr,
+    const int* __restrict__ rec_ids,
+    double* __restrict__ rec_out,
+    int n_rec,
+    int step
+) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_rec) return;
+    rec_out[step * n_rec + r] = p_curr[rec_ids[r]];
+}
+

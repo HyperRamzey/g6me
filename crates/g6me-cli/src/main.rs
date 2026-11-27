@@ -9,6 +9,7 @@
 use clap::Parser;
 use g6me_core::atmosphere::AtmosphereCfg;
 use g6me_core::batch::{self, Batch, BatchCfg, Item, Phase, Progress};
+use g6me_core::blackwell::{cuda_compiled_in, cuda_hardware_detail, CudaTensorPrecision};
 use g6me_core::enhance::{DetailCfg, EnhanceCfg, VirtualBassCfg};
 use g6me_core::limiter::{
     Cfg as LimiterCfg, LimiterStyle, DEFAULT_ATTACK_MS, DEFAULT_CEILING_DB, DEFAULT_LOOKAHEAD_MS,
@@ -189,10 +190,17 @@ pub struct Cli {
     #[arg(long)]
     pub exact_ntt: bool,
 
-    /// Opt-in zero-FMA CUDA GPU offload for 3D FDTD room acoustics when built with `--features cuda`
-    /// and an NVIDIA GPU is attached (falls back deterministically to CPU otherwise).
+    /// Opt-in zero-FMA CUDA GPU offload (3D FDTD, ray tracing, BEM matvec, Ozaki-II Tensor Core
+    /// GEMM, Stockham FFT, Goldilocks NTT) when built with `--features cuda` and an NVIDIA GPU is
+    /// attached (falls back deterministically to CPU otherwise).
     #[arg(long)]
     pub cuda: bool,
+
+    /// Tensor Core precision for Ozaki-II CRT FP64 GEMM when `--cuda` is active:
+    /// `auto` (NVFP4 on Blackwell sm_120a, FP8 on Hopper/Ada sm_89+, INT8 on Ampere/Turing),
+    /// `nvfp4`, `fp8`, `int8`, or `fp16`.
+    #[arg(long, default_value = "auto", value_parser = parse_cuda_precision)]
+    pub cuda_precision: CudaTensorPrecision,
 
     /// Non-intrusive Klippel (2006) + King–Agerkvist (JAES 2018) electro-mechanical-thermal
     /// transducer assessment: `none` (default), `headphone-dynamic`, `headphone-planar`, or `studio-monitor`.
@@ -799,6 +807,12 @@ fn parse_span(s: &str, what: &str, lo: f64, hi: f64) -> Result<f64, String> {
     Ok(v)
 }
 
+fn parse_cuda_precision(s: &str) -> Result<CudaTensorPrecision, String> {
+    CudaTensorPrecision::parse(s).ok_or_else(|| {
+        format!("unknown --cuda-precision '{s}' (expected: auto, nvfp4, fp8, int8, or fp16)")
+    })
+}
+
 fn parse_attack_ms(s: &str) -> Result<f64, String> {
     parse_span(s, "attack time in ms", MIN_ATTACK_MS, MAX_ATTACK_MS)
 }
@@ -994,6 +1008,7 @@ impl Cli {
         plus.room_preset = self.room;
         plus.room_quality = self.room_quality;
         plus.use_cuda = self.cuda;
+        plus.cuda_tensor_precision = self.cuda_precision;
         plus.atmosphere = AtmosphereCfg {
             temp_c: self.room_temp_c,
             rh_pct: self.room_rh,
@@ -1572,6 +1587,28 @@ fn caps_report(tools: &Tools, json: bool) -> std::io::Result<()> {
         println!("flac enc    {}", yes(caps.flac));
         println!("lavfi       {}", yes(caps.lavfi));
         println!("24-bit FLAC {}", caps.flac_summary());
+        if cuda_compiled_in() {
+            match cuda_hardware_detail() {
+                Some(d) => {
+                    println!(
+                        "cuda gpu    {} ({}, {}, CC {}.{})",
+                        d.name,
+                        d.sm_arch,
+                        d.capability.arch_name,
+                        d.compute_capability.0,
+                        d.compute_capability.1
+                    );
+                    println!(
+                        "cuda tensor {} ({})",
+                        d.capability.default_precision.short_tag(),
+                        d.capability.mma_summary
+                    );
+                }
+                None => println!("cuda gpu    compiled in (--features cuda), no live NVIDIA GPU detected (CPU fallback)"),
+            }
+        } else {
+            println!("cuda gpu    not compiled in (rebuild with --features cuda)");
+        }
         for n in &caps.notes {
             println!("note        {n}");
         }

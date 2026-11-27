@@ -38,6 +38,7 @@
 //!    Ozaki-II CRT, paired with an exact **Kulisch Fixed-Point Superaccumulator**!
 
 use crate::fft::Complex;
+use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
 // ============================================================================
@@ -617,6 +618,50 @@ pub fn ozaki2_crt_gemm(a: &[Vec<f64>], b: &[Vec<f64>], backend: TensorBackend) -
         }
     }
     c
+}
+
+/// Execute Ozaki-II CRT FP64 matrix multiply `C = A * B`, optionally offloading all 4 stages
+/// (device FP64 residue reduction → precision pack → Tensor Core MMA → `u128` CRT → `f64`)
+/// to a live NVIDIA GPU via `g6me-cuda` when `use_cuda` is true and `--features cuda` is built.
+/// Falls back deterministically to the bit-identical CPU [`ozaki2_crt_gemm`] when no GPU is present.
+pub fn ozaki2_crt_gemm_with_cuda(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    backend: TensorBackend,
+    use_cuda: bool,
+    precision: CudaTensorPrecision,
+) -> Vec<Vec<f64>> {
+    if a.is_empty() || b.is_empty() || a[0].is_empty() || b[0].is_empty() {
+        return Vec::new();
+    }
+    #[cfg(feature = "cuda")]
+    if use_cuda {
+        if let Some(rt) = shared_cuda_runtime() {
+            let m = a.len();
+            let k = a[0].len();
+            let n = b[0].len();
+            let mut a_flat = Vec::with_capacity(m * k);
+            for row in a {
+                a_flat.extend_from_slice(row);
+            }
+            let mut b_flat = Vec::with_capacity(k * n);
+            for row in b {
+                b_flat.extend_from_slice(row);
+            }
+            if let Ok((c_flat, _actual_prec)) =
+                rt.run_ozaki2_crt_gemm(&a_flat, &b_flat, m, k, n, precision.to_cuda())
+            {
+                let mut out = vec![vec![0.0_f64; n]; m];
+                for i in 0..m {
+                    out[i].copy_from_slice(&c_flat[i * n..(i + 1) * n]);
+                }
+                return out;
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = (use_cuda, precision);
+    ozaki2_crt_gemm(a, b, backend)
 }
 
 /// Complex matrix multiply `C = A * B` executed strictly via real Ozaki-II CRT GEMMs
@@ -1291,16 +1336,287 @@ pub fn compile_and_audit_cuda_sass(arch: &str) -> CudaAuditStatus {
     }
 }
 
-/// Probe for a live NVIDIA CUDA device when built with `--features cuda`.
+/// User-selectable or architecture-optimal Tensor Core precision for Ozaki-II CRT FP64 GEMM.
+///
+/// Tensor Cores accumulate low-precision operands in FP32 (`OMMA`/`QMMA`/`HMMA`) or S32 (`IMMA`);
+/// IEEE-754 `f64` exactness is achieved via 20-moduli Chinese Remainder Theorem reconstruction
+/// (`log2(∏ m_j) = 124.31 bits`) outside the MMA instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CudaTensorPrecision {
+    /// Automatically pick the highest-throughput Tensor Core format for the detected GPU:
+    /// single-limb `INT8` (one MMA per modulus) on desktop Blackwell/Hopper/Ada/Ampere/Turing,
+    /// and `NVFP4 E2M1` only on Blackwell Ultra (`sm_103a`), where INT8 Tensor Core rate drops.
+    #[default]
+    Auto,
+    /// Blackwell (`sm_120a`) NVFP4 E2M1 Base-13 2-limb (`OMMA.SF.16864` with UE4M3=2.0 → FP32 → u128 CRT → FP64).
+    Nvfp4E2m1,
+    /// Hopper/Ada/Blackwell (`sm_89+`) FP8 E4M3 Base-16 2-limb (`m16n8k32` → FP32 → u128 CRT → FP64).
+    Fp8E4m3,
+    /// Turing/Ampere+ (`sm_75+`) INT8 single-limb (`IMMA` → S32 → u128 CRT → FP64).
+    Int8,
+    /// Turing/Ampere+ (`sm_75+`) IEEE FP16 single-limb (`HMMA` → FP32 → u128 CRT → FP64).
+    Fp16,
+}
+
+impl CudaTensorPrecision {
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Nvfp4E2m1,
+        Self::Fp8E4m3,
+        Self::Int8,
+        Self::Fp16,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "nvfp4" | "fp4" | "nvfp4-e2m1" | "e2m1" => Some(Self::Nvfp4E2m1),
+            "fp8" | "fp8-e4m3" | "e4m3" => Some(Self::Fp8E4m3),
+            "int8" | "s8" => Some(Self::Int8),
+            "fp16" | "f16" => Some(Self::Fp16),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nvfp4E2m1 => "nvfp4",
+            Self::Fp8E4m3 => "fp8",
+            Self::Int8 => "int8",
+            Self::Fp16 => "fp16",
+        }
+    }
+
+    pub fn short_tag(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Nvfp4E2m1 => "NVFP4→FP64",
+            Self::Fp8E4m3 => "FP8→FP64",
+            Self::Int8 => "INT8→FP64",
+            Self::Fp16 => "FP16→FP64",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (Peak Desktop TOPS Optimal)",
+            Self::Nvfp4E2m1 => "NVFP4 E2M1 Base-13 → FP32 OMMA.SF → u128 CRT → FP64",
+            Self::Fp8E4m3 => "FP8 E4M3 Base-16 → FP32 QMMA → u128 CRT → FP64",
+            Self::Int8 => "INT8 S8 (1-limb IMMA / Pascal DP4A) → S32 → u128 CRT → FP64",
+            Self::Fp16 => "FP16 → FP32 HMMA → u128 CRT → FP64",
+        }
+    }
+
+    /// Resolve `Auto` or downgrade an unsupported format for a given compute capability `(major, minor)`.
+    ///
+    /// For Ozaki-II (`m_j <= 113`, residues in `[-56, +56]`):
+    /// - Single-limb INT8 fits in 1 byte (`1 MMA/mod`, exact S32 accumulation) and delivers the highest
+    ///   effective Ozaki-II FP64 throughput on every desktop generation: Blackwell (41.9 TF),
+    ///   Ada (33.0 TF), Ampere (14.2 TF), Turing (10.8 TF), and Pascal `__dp4a` (2.27 TF).
+    /// - Blackwell Ultra (`cc == 103`, B300) drops native INT8 TC rate, so `Auto` picks `Nvfp4E2m1`.
+    pub fn resolve_for_cc(self, major: i32, minor: i32) -> Self {
+        let cc = major * 10 + minor;
+        let has_fp4 = cc >= 120 || cc == 100 || cc == 103;
+        let has_fp8 = cc >= 89;
+        let has_fp16_tc = cc >= 75;
+        match self {
+            Self::Auto => {
+                if cc == 103 && has_fp4 {
+                    Self::Nvfp4E2m1
+                } else {
+                    Self::Int8
+                }
+            }
+            Self::Nvfp4E2m1 => {
+                if has_fp4 {
+                    Self::Nvfp4E2m1
+                } else if has_fp8 {
+                    Self::Fp8E4m3
+                } else {
+                    Self::Int8
+                }
+            }
+            Self::Fp8E4m3 => {
+                if has_fp8 {
+                    Self::Fp8E4m3
+                } else {
+                    Self::Int8
+                }
+            }
+            Self::Int8 => Self::Int8,
+            Self::Fp16 => {
+                if has_fp16_tc {
+                    Self::Fp16
+                } else {
+                    Self::Int8
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn to_cuda(self) -> g6me_cuda::CudaTensorPrecision {
+        match self {
+            Self::Auto => g6me_cuda::CudaTensorPrecision::Auto,
+            Self::Nvfp4E2m1 => g6me_cuda::CudaTensorPrecision::Nvfp4E2m1,
+            Self::Fp8E4m3 => g6me_cuda::CudaTensorPrecision::Fp8E4m3,
+            Self::Int8 => g6me_cuda::CudaTensorPrecision::Int8,
+            Self::Fp16 => g6me_cuda::CudaTensorPrecision::Fp16,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn from_cuda(p: g6me_cuda::CudaTensorPrecision) -> Self {
+        match p {
+            g6me_cuda::CudaTensorPrecision::Auto => Self::Auto,
+            g6me_cuda::CudaTensorPrecision::Nvfp4E2m1 => Self::Nvfp4E2m1,
+            g6me_cuda::CudaTensorPrecision::Fp8E4m3 => Self::Fp8E4m3,
+            g6me_cuda::CudaTensorPrecision::Int8 => Self::Int8,
+            g6me_cuda::CudaTensorPrecision::Fp16 => Self::Fp16,
+        }
+    }
+}
+
+/// Per-architecture NVIDIA GPU Tensor Core / DP4A & zero-FMA FP64 capability entry (for GUI/CLI status).
+#[derive(Debug, Clone, Copy)]
+pub struct CudaArchCapability {
+    pub arch_name: &'static str,
+    pub sm_target: &'static str,
+    pub cc_range: &'static str,
+    pub supports_nvfp4: bool,
+    pub supports_fp8: bool,
+    pub supports_int8: bool,
+    pub supports_fp16: bool,
+    pub default_precision: CudaTensorPrecision,
+    pub mma_summary: &'static str,
+    pub non_gemm_summary: &'static str,
+}
+
+/// Capability matrix across all 6 supported desktop & datacenter NVIDIA GPU generations.
+pub const ALL_CUDA_ARCH_CAPABILITIES: [CudaArchCapability; 6] = [
+    CudaArchCapability {
+        arch_name: "Blackwell (RTX 5090 / 5080)",
+        sm_target: "sm_120a",
+        cc_range: "CC 12.0+",
+        supports_nvfp4: true,
+        supports_fp8: true,
+        supports_int8: true,
+        supports_fp16: true,
+        default_precision: CudaTensorPrecision::Int8,
+        mma_summary: "IMMA.16832 S8→S32 (838 eff TOPS, ~41.9 TF FP64); opt OMMA.SF NVFP4 (419 eff)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+    CudaArchCapability {
+        arch_name: "Hopper (H100 / H200)",
+        sm_target: "sm_90",
+        cc_range: "CC 9.0",
+        supports_nvfp4: false,
+        supports_fp8: true,
+        supports_int8: true,
+        supports_fp16: true,
+        default_precision: CudaTensorPrecision::Int8,
+        mma_summary: "IMMA.16832 S8→S32 (1-limb exact); opt FP8 QMMA / FP16 HMMA (no HW FP4)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+    CudaArchCapability {
+        arch_name: "Ada Lovelace (RTX 4090 / 4080)",
+        sm_target: "sm_89",
+        cc_range: "CC 8.9",
+        supports_nvfp4: false,
+        supports_fp8: true,
+        supports_int8: true,
+        supports_fp16: true,
+        default_precision: CudaTensorPrecision::Int8,
+        mma_summary: "IMMA.16832 S8→S32 (661 eff TOPS, ~33.0 TF FP64, 8x > FP8-FP32 QMMA)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+    CudaArchCapability {
+        arch_name: "Ampere (RTX 3090 / A100)",
+        sm_target: "sm_80",
+        cc_range: "CC 8.0–8.7",
+        supports_nvfp4: false,
+        supports_fp8: false,
+        supports_int8: true,
+        supports_fp16: true,
+        default_precision: CudaTensorPrecision::Int8,
+        mma_summary: "IMMA.16832 S8→S32 (284 eff TOPS, ~14.2 TF FP64, 4x > FP16 HMMA)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+    CudaArchCapability {
+        arch_name: "Turing (RTX 2080 Ti / T4)",
+        sm_target: "sm_75",
+        cc_range: "CC 7.5",
+        supports_nvfp4: false,
+        supports_fp8: false,
+        supports_int8: true,
+        supports_fp16: true,
+        default_precision: CudaTensorPrecision::Int8,
+        mma_summary: "IMMA.8816 S8→S32 (215 eff TOPS, ~10.8 TF FP64, 4x > FP16 HMMA)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+    CudaArchCapability {
+        arch_name: "Pascal (GTX 1080 Ti / 1080)",
+        sm_target: "sm_61",
+        cc_range: "CC 6.1",
+        supports_nvfp4: false,
+        supports_fp8: false,
+        supports_int8: true,
+        supports_fp16: false,
+        default_precision: CudaTensorPrecision::Int8,
+        mma_summary: "IDP.4A.S8.S8 (__dp4a→S32, 45.4 eff TOPS, ~2.27 TF FP64, 6.5x native FP64)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+];
+
+/// Map a CUDA compute capability `(major, minor)` to its architecture capability profile.
+pub fn arch_capability_for_cc(major: i32, minor: i32) -> CudaArchCapability {
+    let cc = major * 10 + minor;
+    if cc >= 120 {
+        ALL_CUDA_ARCH_CAPABILITIES[0]
+    } else if cc >= 90 {
+        ALL_CUDA_ARCH_CAPABILITIES[1]
+    } else if cc >= 89 {
+        ALL_CUDA_ARCH_CAPABILITIES[2]
+    } else if cc >= 80 {
+        ALL_CUDA_ARCH_CAPABILITIES[3]
+    } else if cc >= 75 {
+        ALL_CUDA_ARCH_CAPABILITIES[4]
+    } else {
+        ALL_CUDA_ARCH_CAPABILITIES[5]
+    }
+}
+
+/// Structured live NVIDIA CUDA device details for GUI and CLI inspection.
+#[derive(Debug, Clone)]
+pub struct CudaDeviceDetail {
+    pub index: usize,
+    pub name: String,
+    pub compute_capability: (i32, i32),
+    pub sm_arch: String,
+    pub capability: CudaArchCapability,
+}
+
+/// Returns true if `g6me-core` was compiled with `--features cuda`.
+pub fn cuda_compiled_in() -> bool {
+    cfg!(feature = "cuda")
+}
+
+/// Probe live NVIDIA CUDA device details when built with `--features cuda`.
 /// Returns `None` on CPU-only builds or machines without an active NVIDIA driver/GPU.
-pub fn cuda_hardware_summary() -> Option<String> {
+pub fn cuda_hardware_detail() -> Option<CudaDeviceDetail> {
     #[cfg(feature = "cuda")]
     {
         g6me_cuda::cuda_device_info().map(|info| {
-            format!(
-                "{} (sm_{}{}, dev #{})",
-                info.name, info.compute_capability.0, info.compute_capability.1, info.index
-            )
+            let cap = arch_capability_for_cc(info.compute_capability.0, info.compute_capability.1);
+            CudaDeviceDetail {
+                index: info.index,
+                name: info.name.clone(),
+                compute_capability: info.compute_capability,
+                sm_arch: info.sm_arch(),
+                capability: cap,
+            }
         })
     }
     #[cfg(not(feature = "cuda"))]
@@ -1309,10 +1625,40 @@ pub fn cuda_hardware_summary() -> Option<String> {
     }
 }
 
+/// Probe for a live NVIDIA CUDA device when built with `--features cuda`.
+/// Returns `None` on CPU-only builds or machines without an active NVIDIA driver/GPU.
+pub fn cuda_hardware_summary() -> Option<String> {
+    cuda_hardware_detail().map(|d| {
+        format!(
+            "{} ({}, {}, dev #{}, default: {})",
+            d.name,
+            d.sm_arch,
+            d.capability.arch_name,
+            d.index,
+            d.capability.default_precision.short_tag()
+        )
+    })
+}
+
 /// Initialize the real zero-FMA CUDA Driver runtime (`g6me-cuda`) on device 0.
 #[cfg(feature = "cuda")]
 pub fn try_init_cuda_runtime() -> std::result::Result<g6me_cuda::G6meCudaRuntime, String> {
     g6me_cuda::G6meCudaRuntime::init()
+}
+
+/// Process-wide cached CUDA runtime (`OnceLock`) so `nvcc --fmad=false` PTX compilation and
+/// CUDA module loading happen at most once per process across FDTD, BEM, RayTrace, Ozaki-II,
+/// Stockham FFT, and Goldilocks NTT.
+#[cfg(feature = "cuda")]
+pub fn shared_cuda_runtime() -> Option<std::sync::Arc<g6me_cuda::G6meCudaRuntime>> {
+    use std::sync::{Arc, OnceLock};
+    static RUNTIME: OnceLock<std::result::Result<Arc<g6me_cuda::G6meCudaRuntime>, String>> =
+        OnceLock::new();
+    RUNTIME
+        .get_or_init(|| g6me_cuda::G6meCudaRuntime::init().map(Arc::new))
+        .as_ref()
+        .ok()
+        .cloned()
 }
 
 #[cfg(test)]

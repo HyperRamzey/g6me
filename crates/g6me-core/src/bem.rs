@@ -1183,6 +1183,64 @@ impl FmmBemSolver {
         y
     }
 
+    /// Execute dense exact Helmholtz BEM matrix-vector product `y = (0.5 I - K) x` (forward
+    /// or adjoint transpose) on a live NVIDIA GPU via `bem_matvec.cu` (zero-FMA FP64).
+    #[cfg(feature = "cuda")]
+    pub fn matvec_exact_on_cuda(
+        &self,
+        rt: &g6me_cuda::G6meCudaRuntime,
+        k: f64,
+        x: &[Complex],
+        adjoint: bool,
+    ) -> std::result::Result<Vec<Complex>, String> {
+        let n = self.elements.len();
+        let mut mat_re = vec![0.0_f64; n * n];
+        let mut mat_im = vec![0.0_f64; n * n];
+        for i in 0..n {
+            mat_re[i * n + i] = self.solid_angle_diag[i];
+            let xi = self.elements[i].centroid;
+            for (j, ej) in self.elements.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let coeff = helmholtz_dgreen_dny(k, xi, ej.centroid, ej.normal).scale(-ej.area);
+                let idx = if !adjoint { i * n + j } else { j * n + i };
+                mat_re[idx] = coeff.re;
+                mat_im[idx] = coeff.im;
+            }
+        }
+        let x_re: Vec<f64> = x.iter().map(|c| c.re).collect();
+        let x_im: Vec<f64> = x.iter().map(|c| c.im).collect();
+        let (yr, yi) = rt.run_bem_matvec(&mat_re, &mat_im, &x_re, &x_im)?;
+        Ok(yr
+            .into_iter()
+            .zip(yi)
+            .map(|(r, im)| Complex::new(r, im))
+            .collect())
+    }
+
+    /// Exact BEM matrix-vector product with optional CUDA GPU offload (`bem_matvec.cu`),
+    /// falling back bit-identically to [`Self::matvec_exact`] on CPU-only hosts.
+    pub fn matvec_exact_with_cuda(
+        &self,
+        k: f64,
+        x: &[Complex],
+        adjoint: bool,
+        use_cuda: bool,
+    ) -> Vec<Complex> {
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+                if let Ok(y) = self.matvec_exact_on_cuda(&rt, k, x, adjoint) {
+                    return y;
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = use_cuda;
+        self.matvec_exact(k, x, adjoint)
+    }
+
     /// 3D Octree FMM-accelerated matrix-vector product `y = (0.5 I - K) x` (forward or adjoint).
     ///
     /// Aggregates source moments `(M_0 = sum A_j n_j x_j, M_1 = sum A_j (y_j - c) (n_j . d) x_j)`
@@ -1374,6 +1432,32 @@ impl FmmBemSolver {
         chief_alpha: f64,
         chief_mat: &[Vec<Complex>],
     ) -> Vec<Complex> {
+        self.solve_gmres_with_chief_cuda(
+            k,
+            rhs,
+            adjoint,
+            use_fmm,
+            tol,
+            max_iters,
+            chief_alpha,
+            chief_mat,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn solve_gmres_with_chief_cuda(
+        &self,
+        k: f64,
+        rhs: &[Complex],
+        adjoint: bool,
+        use_fmm: bool,
+        tol: f64,
+        max_iters: usize,
+        chief_alpha: f64,
+        chief_mat: &[Vec<Complex>],
+        use_cuda: bool,
+    ) -> Vec<Complex> {
         let n = rhs.len();
         let inv_diag: Vec<f64> = self
             .solid_angle_diag
@@ -1382,10 +1466,10 @@ impl FmmBemSolver {
             .collect();
 
         let matvec = |v: &[Complex]| -> Vec<Complex> {
-            let mut raw = if use_fmm {
+            let mut raw = if use_fmm && n > 192 && !use_cuda {
                 self.matvec_fmm(k, v, adjoint)
             } else {
-                self.matvec_exact(k, v, adjoint)
+                self.matvec_exact_with_cuda(k, v, adjoint, use_cuda)
             };
             if chief_alpha > 0.0 && !chief_mat.is_empty() {
                 if !adjoint {
@@ -1582,6 +1666,19 @@ impl FmmBemSolver {
         ear_elem: usize,
         use_fmm: bool,
     ) -> Vec<Complex> {
+        self.solve_reciprocal_hrtfs_with_cuda(f_hz, c_m_s, sources, ear_elem, use_fmm, false)
+    }
+
+    /// Reciprocal adjoint BEM solve with optional zero-FMA CUDA GPU offload (`bem_matvec.cu`).
+    pub fn solve_reciprocal_hrtfs_with_cuda(
+        &self,
+        f_hz: f64,
+        c_m_s: f64,
+        sources: &[[f64; 3]],
+        ear_elem: usize,
+        use_fmm: bool,
+        use_cuda: bool,
+    ) -> Vec<Complex> {
         if f_hz <= 1e-6 {
             return vec![Complex::ONE; sources.len()];
         }
@@ -1594,8 +1691,9 @@ impl FmmBemSolver {
         };
         let mut e_vec = vec![Complex::ZERO; self.elements.len()];
         e_vec[ear_elem] = Complex::ONE;
-        let q =
-            self.solve_gmres_with_chief(k, &e_vec, true, use_fmm, 1e-12, 120, alpha, &chief_mat);
+        let q = self.solve_gmres_with_chief_cuda(
+            k, &e_vec, true, use_fmm, 1e-12, 120, alpha, &chief_mat, use_cuda,
+        );
 
         // Precompute CHIEF adjoint weights w_m = alpha * sum_j conj(C_{m,j}) * q_j once per frequency.
         let chief_weights: Vec<Complex> = if alpha > 0.0 {
@@ -1645,6 +1743,18 @@ impl FmmBemSolver {
         ir_len: usize,
         atm: &AtmosphereCfg,
     ) -> Vec<(Vec<f64>, Vec<f64>)> {
+        self.synthesize_binaural_irs_with_cuda(sources, sample_rate, ir_len, atm, false)
+    }
+
+    /// Same as [`Self::synthesize_binaural_irs`] with optional zero-FMA CUDA GPU offload (`bem_matvec.cu`).
+    pub fn synthesize_binaural_irs_with_cuda(
+        &self,
+        sources: &[[f64; 3]],
+        sample_rate: u32,
+        ir_len: usize,
+        atm: &AtmosphereCfg,
+        use_cuda: bool,
+    ) -> Vec<(Vec<f64>, Vec<f64>)> {
         let n_fft = ir_len.next_power_of_two().max(256);
         let n_bins = n_fft / 2 + 1;
         let fs = sample_rate as f64;
@@ -1669,8 +1779,22 @@ impl FmmBemSolver {
             if fi == 0 {
                 continue;
             }
-            let hl = self.solve_reciprocal_hrtfs(f_hz, c, sources, self.left_ear_elem, true);
-            let hr = self.solve_reciprocal_hrtfs(f_hz, c, sources, self.right_ear_elem, true);
+            let hl = self.solve_reciprocal_hrtfs_with_cuda(
+                f_hz,
+                c,
+                sources,
+                self.left_ear_elem,
+                true,
+                use_cuda,
+            );
+            let hr = self.solve_reciprocal_hrtfs_with_cuda(
+                f_hz,
+                c,
+                sources,
+                self.right_ear_elem,
+                true,
+                use_cuda,
+            );
             for s in 0..n_src {
                 h_l_anch[s][fi] = hl[s];
                 h_r_anch[s][fi] = hr[s];

@@ -21,6 +21,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use g6me_core::atmosphere::AtmosphereCfg;
+use g6me_core::blackwell::CudaTensorPrecision;
 use g6me_core::burst3d::{
     preintegrate_imu_manifold, separate_specular_and_micro_depth, wronski_oissr_zero_demosaic_fuse,
 };
@@ -99,6 +100,22 @@ struct Cli {
     /// Output path for the conditioned watertight Wavefront `.obj` head/pinna mesh.
     #[arg(short, long)]
     out: Option<PathBuf>,
+
+    /// Opt-in zero-FMA CUDA GPU offload for Ozaki-II Tensor Core Schur Bundle Adjustment and
+    /// FMM-BEM verification (requires `--features cuda` + NVIDIA GPU; deterministic CPU fallback).
+    #[arg(long)]
+    cuda: bool,
+
+    /// Tensor Core precision for Ozaki-II CRT FP64 Schur GEMM when `--cuda` is active:
+    /// `auto` (NVFP4 on Blackwell sm_120a, FP8 on Hopper/Ada, INT8 on Ampere/Turing), `nvfp4`, `fp8`, `int8`, `fp16`.
+    #[arg(long, default_value = "auto", value_parser = parse_cuda_precision)]
+    cuda_precision: CudaTensorPrecision,
+}
+
+fn parse_cuda_precision(s: &str) -> Result<CudaTensorPrecision, String> {
+    CudaTensorPrecision::parse(s).ok_or_else(|| {
+        format!("unknown --cuda-precision '{s}' (expected: auto, nvfp4, fp8, int8, or fp16)")
+    })
 }
 
 enum ScanError {
@@ -157,6 +174,7 @@ fn print_and_export_result(
     c_air: f64,
     out_path: Option<&Path>,
     label: &str,
+    use_cuda: bool,
 ) -> Result<(), ScanError> {
     println!(
         "Stage 1 Anchor  : {:?} | scale={:.4} mm/px | residual={:.6} mm | privacy_mask={}",
@@ -182,19 +200,21 @@ fn print_and_export_result(
         out.mesh_stats.center_winding,
         out.mesh_stats.max_edge_m * 1e3
     );
-    let hl = out.solver.solve_reciprocal_hrtfs(
+    let hl = out.solver.solve_reciprocal_hrtfs_with_cuda(
         2000.0,
         c_air,
         &[[0.0, 2.0, 0.0]],
         out.solver.left_ear_elem,
         true,
+        use_cuda,
     )[0];
-    let hr = out.solver.solve_reciprocal_hrtfs(
+    let hr = out.solver.solve_reciprocal_hrtfs_with_cuda(
         2000.0,
         c_air,
         &[[0.0, 2.0, 0.0]],
         out.solver.right_ear_elem,
         true,
+        use_cuda,
     )[0];
     let ild = 20.0 * (hl.norm() / hr.norm().max(1e-12)).log10();
     println!(
@@ -289,6 +309,8 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 winding_res: grid_res,
                 max_edge_m: (cli.max_edge_mm * 1e-3).max(0.0025),
                 speed_of_sound_m_s: c_air,
+                use_cuda: cli.cuda,
+                cuda_tensor_precision: cli.cuda_precision,
             };
             let warp_prior = ref_meta.as_ref().and_then(|m| m.warp_rectilinear.as_ref());
             let out = reconstruct_from_multiview_images(
@@ -305,7 +327,7 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                     "real multi-view DNG reconstruction failed: {e}"
                 ))
             })?;
-            print_and_export_result(&out, c_air, Some(out_path), "real multi-view DNG")?;
+            print_and_export_result(&out, c_air, Some(out_path), "real multi-view DNG", cli.cuda)?;
             return Ok(());
         }
     }
@@ -485,6 +507,8 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 winding_res: grid_res,
                 max_edge_m: (cli.max_edge_mm * 1e-3).max(0.0025),
                 speed_of_sound_m_s: c_air,
+                use_cuda: cli.cuda,
+                cuda_tensor_precision: cli.cuda_precision,
             };
             let warp_prior = ref_meta.as_ref().and_then(|m| m.warp_rectilinear.as_ref());
             let out = reconstruct_from_multiview_images(
@@ -499,7 +523,13 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
             .map_err(|e| {
                 ScanError::RealInputRefused(format!("real RAW10 burst reconstruction failed: {e}"))
             })?;
-            print_and_export_result(&out, c_air, Some(out_path), "real v7.0 RAW10 burst")?;
+            print_and_export_result(
+                &out,
+                c_air,
+                Some(out_path),
+                "real v7.0 RAW10 burst",
+                cli.cuda,
+            )?;
             return Ok(());
         }
         return Ok(());

@@ -55,6 +55,7 @@ use sha2::Digest;
 
 use crate::atmosphere::AtmosphereCfg;
 use crate::bem::{watertight_winding_repair, FmmBemSolver, TriangleMesh};
+use crate::blackwell::CudaTensorPrecision;
 use crate::dsp::{Dsp, MASK_STEREO, SLOTS};
 use crate::fft::{
     half_kaiser_tail_apply, half_slepian_tail_apply, minimum_phase_spectrum, roex_smooth_power,
@@ -66,7 +67,8 @@ use crate::ntt::{
     NTT_PCM_SCALE,
 };
 use crate::room::{
-    synthesize_hybrid_room_reflections, FdtdSolver3d, RoomGeometry, RoomPreset, RoomQuality,
+    synthesize_hybrid_room_reflections_with_cuda, FdtdSolver3d, RoomGeometry, RoomPreset,
+    RoomQuality,
 };
 use crate::scattering::{
     ear_canal_compensation_mag, snowman_hrtf, sph_to_cart, SnowmanGeom, DEFAULT_EAR_CANAL_MM,
@@ -295,6 +297,9 @@ pub struct PlusCfg {
     /// Optional NVIDIA CUDA GPU offload (`--cuda`, requires `--features cuda` & CUDA driver;
     /// falls back cleanly to deterministic CPU `f64` when no GPU is present).
     pub use_cuda: bool,
+    /// Tensor Core precision for Ozaki-II CRT FP64 GEMM when CUDA GPU offload is active
+    /// (`Auto` selects NVFP4 on Blackwell `sm_120a`, FP8 on Hopper/Ada `sm_89+`, INT8 on Ampere/Turing).
+    pub cuda_tensor_precision: CudaTensorPrecision,
 }
 
 impl Default for PlusCfg {
@@ -358,6 +363,7 @@ impl PlusCfg {
                 use_warped_decorr,
                 exact_ntt: false,
                 use_cuda: false,
+                cuda_tensor_precision: CudaTensorPrecision::Auto,
             },
             PlusProfile::Studio => Self {
                 profile: PlusProfile::Studio,
@@ -385,6 +391,7 @@ impl PlusCfg {
                 use_warped_decorr,
                 exact_ntt: false,
                 use_cuda: false,
+                cuda_tensor_precision: CudaTensorPrecision::Auto,
             },
             PlusProfile::Cinema => Self {
                 profile: PlusProfile::Cinema,
@@ -412,6 +419,7 @@ impl PlusCfg {
                 use_warped_decorr,
                 exact_ntt: false,
                 use_cuda: false,
+                cuda_tensor_precision: CudaTensorPrecision::Auto,
             },
             PlusProfile::Custom => Self {
                 profile: PlusProfile::Custom,
@@ -562,10 +570,16 @@ impl PlusCfg {
             || self.use_slepian_tail
             || self.use_fdn_velvet
             || self.exact_ntt
+            || self.use_cuda
             || (self.distance_m - 2.0).abs() > 1e-3
         {
+            let cuda_tag = if self.use_cuda {
+                format!(", cuda:{}", self.cuda_tensor_precision.as_str())
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
-                " [{}, {:.2}m, room:{}{}{}{}]",
+                " [{}, {:.2}m, room:{}{}{}{}{}]",
                 self.physics_engine.as_str(),
                 self.distance_m,
                 self.room_preset.as_str(),
@@ -580,6 +594,7 @@ impl PlusCfg {
                     ""
                 },
                 if self.exact_ntt { ", exact-ntt" } else { "" },
+                cuda_tag,
             ));
         }
         s
@@ -884,7 +899,13 @@ impl KernelBank {
                 let el = if ch == SLOT_TC { 60.0 } else { 0.0 };
                 srcs.push(sph_to_cart(eff_az, el, cfg.distance_m));
             }
-            Some(solver.synthesize_binaural_irs(&srcs, sample_rate, n_ir, &cfg.atmosphere))
+            Some(solver.synthesize_binaural_irs_with_cuda(
+                &srcs,
+                sample_rate,
+                n_ir,
+                &cfg.atmosphere,
+                cfg.use_cuda,
+            ))
         });
 
         // 1. Synthesize each full-range slot's anechoic direct path first.
@@ -1038,7 +1059,7 @@ impl KernelBank {
                 } else {
                     ext_mix
                 };
-                let (rl, rr) = synthesize_hybrid_room_reflections(
+                let (rl, rr) = synthesize_hybrid_room_reflections_with_cuda(
                     room_geom,
                     &cfg.atmosphere,
                     decoder,
@@ -1054,6 +1075,7 @@ impl KernelBank {
                     tail_duration_s,
                     0x6736_4D45_0000_0001u64.wrapping_add(ch as u64 * 0x9E37_79B9),
                     &plan,
+                    cfg.use_cuda,
                 );
                 let g = std::f64::consts::FRAC_1_SQRT_2 * chan_weights[ch] * refl_scale * 0.45;
                 for k in 0..nb {
@@ -2379,6 +2401,95 @@ impl BinauralPlus {
         }
     }
 
+    #[inline]
+    fn ntt_forward_buf(use_cuda: bool, np: &NttPlan, buf: &mut [u64]) {
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+                if let Ok(out) = rt.run_goldilocks_ntt_transform(buf, np.twiddles_fwd(), None) {
+                    buf.copy_from_slice(&out);
+                    return;
+                }
+            }
+        }
+        let _ = use_cuda;
+        np.forward(buf);
+    }
+
+    #[inline]
+    fn ntt_inverse_buf(use_cuda: bool, np: &NttPlan, buf: &mut [u64]) {
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+                if let Ok(out) =
+                    rt.run_goldilocks_ntt_transform(buf, np.twiddles_inv(), Some(np.inv_n()))
+                {
+                    buf.copy_from_slice(&out);
+                    return;
+                }
+            }
+        }
+        let _ = use_cuda;
+        np.inverse(buf);
+    }
+
+    #[inline]
+    fn rfft_buf(
+        use_cuda: bool,
+        plan: &FftPlan,
+        input: &[f64],
+        scratch: &mut [Complex],
+        out_bins: &mut [Complex],
+    ) {
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+                let zeros = vec![0.0_f64; input.len()];
+                if let Ok((re, im)) = rt.run_stockham_fft_f64(input, &zeros, false) {
+                    for (k, slot) in out_bins.iter_mut().enumerate() {
+                        *slot = Complex::new(re[k], im[k]);
+                    }
+                    return;
+                }
+            }
+        }
+        let _ = use_cuda;
+        plan.rfft(input, scratch, out_bins);
+    }
+
+    #[inline]
+    fn irfft_buf(
+        use_cuda: bool,
+        plan: &FftPlan,
+        bins: &[Complex],
+        scratch: &mut [Complex],
+        out_real: &mut [f64],
+    ) {
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+                let n = plan.len();
+                let nb = bins.len();
+                let mut re = vec![0.0_f64; n];
+                let mut im = vec![0.0_f64; n];
+                for k in 0..nb {
+                    re[k] = bins[k].re;
+                    im[k] = bins[k].im;
+                }
+                for k in 1..(n / 2) {
+                    re[n - k] = bins[k].re;
+                    im[n - k] = -bins[k].im;
+                }
+                if let Ok((out_re, _)) = rt.run_stockham_fft_f64(&re, &im, true) {
+                    out_real.copy_from_slice(&out_re);
+                    return;
+                }
+            }
+        }
+        let _ = use_cuda;
+        plan.irfft(bins, scratch, out_real);
+    }
+
     /// Push the completed `B`-sample `cur_in` block into the UPOLA Frequency-Domain Delay Line
     /// and accumulate partitions `p = 1..n_parts` directly into `ov_l`/`ov_r` (or `ntt_ov_l`/`ntt_ov_r`).
     fn push_completed_upola_block(&mut self) {
@@ -2386,6 +2497,7 @@ impl BinauralPlus {
         let head = self.fdl_head;
         let b = self.ola_hop;
         let ov_len = 2 * b - 1;
+        let use_cuda = self.cfg.use_cuda;
 
         if let Some(ref np) = self.ntt_plan {
             let n_fft = np.len();
@@ -2402,7 +2514,7 @@ impl BinauralPlus {
                         let q = (s * NTT_PCM_SCALE).round().clamp(-8_388_608.0, 8_388_607.0) as i64;
                         *d = i64_to_field(q);
                     }
-                    np.forward(dst);
+                    Self::ntt_forward_buf(use_cuda, np, dst);
                 }
             }
 
@@ -2428,8 +2540,8 @@ impl BinauralPlus {
                     }
                 }
             }
-            np.inverse(&mut self.ntt_acc_l);
-            np.inverse(&mut self.ntt_acc_r);
+            Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_l);
+            Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_r);
             for i in 0..ov_len {
                 self.ntt_ov_l[i] += field_to_i128(self.ntt_acc_l[i]);
                 self.ntt_ov_r[i] += field_to_i128(self.ntt_acc_r[i]);
@@ -2444,7 +2556,9 @@ impl BinauralPlus {
                 if src.iter().any(|&v| v != 0.0) {
                     self.in_pad[..b].copy_from_slice(src);
                     self.in_pad[b..].fill(0.0);
-                    self.plan.rfft(
+                    Self::rfft_buf(
+                        use_cuda,
+                        &self.plan,
                         &self.in_pad,
                         &mut self.fft_scratch,
                         &mut self.fdl_fft[head][ch],
@@ -2473,10 +2587,20 @@ impl BinauralPlus {
                     }
                 }
             }
-            self.plan
-                .irfft(&self.acc_l, &mut self.fft_scratch, &mut self.y_l);
-            self.plan
-                .irfft(&self.acc_r, &mut self.fft_scratch, &mut self.y_r);
+            Self::irfft_buf(
+                use_cuda,
+                &self.plan,
+                &self.acc_l,
+                &mut self.fft_scratch,
+                &mut self.y_l,
+            );
+            Self::irfft_buf(
+                use_cuda,
+                &self.plan,
+                &self.acc_r,
+                &mut self.fft_scratch,
+                &mut self.y_r,
+            );
             for i in 0..ov_len {
                 self.ov_l[i] += self.y_l[i];
                 self.ov_r[i] += self.y_r[i];
@@ -2498,6 +2622,7 @@ impl BinauralPlus {
         debug_assert!((1..=self.ola_hop).contains(&m));
         let use_upola = self.n_parts > 1;
         let full_aligned_upola = use_upola && self.cur_fill == 0 && m == self.ola_hop;
+        let use_cuda = self.cfg.use_cuda;
 
         if let Some(ref np) = self.ntt_plan {
             let n_fft = np.len();
@@ -2535,7 +2660,7 @@ impl BinauralPlus {
                         .clamp(-8_388_608.0, 8_388_607.0) as i64;
                     *dst = i64_to_field(q);
                 }
-                np.forward(&mut self.ntt_x);
+                Self::ntt_forward_buf(use_cuda, np, &mut self.ntt_x);
                 if full_aligned_upola {
                     self.ntt_fdl[head][ch].copy_from_slice(&self.ntt_x);
                 }
@@ -2547,8 +2672,8 @@ impl BinauralPlus {
                     self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
                 }
             }
-            np.inverse(&mut self.ntt_acc_l);
-            np.inverse(&mut self.ntt_acc_r);
+            Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_l);
+            Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_r);
 
             let inv_scale = 1.0 / (NTT_PCM_SCALE * self.ntt_kernel_scale);
             let ov_len = self.ntt_ov_l.len();
@@ -2610,8 +2735,8 @@ impl BinauralPlus {
                         }
                     }
                 }
-                np.inverse(&mut self.ntt_acc_l);
-                np.inverse(&mut self.ntt_acc_r);
+                Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_l);
+                Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_r);
                 for i in 0..ov_len {
                     self.ntt_ov_l[i] += field_to_i128(self.ntt_acc_l[i]);
                     self.ntt_ov_r[i] += field_to_i128(self.ntt_acc_r[i]);
@@ -2658,8 +2783,13 @@ impl BinauralPlus {
             }
             self.in_pad[..m].copy_from_slice(slice);
             self.in_pad[m..].fill(0.0);
-            self.plan
-                .rfft(&self.in_pad, &mut self.fft_scratch, &mut self.x_bins);
+            Self::rfft_buf(
+                use_cuda,
+                &self.plan,
+                &self.in_pad,
+                &mut self.fft_scratch,
+                &mut self.x_bins,
+            );
             if full_aligned_upola {
                 self.fdl_fft[head][ch].copy_from_slice(&self.x_bins);
             }
@@ -2673,10 +2803,20 @@ impl BinauralPlus {
             }
         }
 
-        self.plan
-            .irfft(&self.acc_l, &mut self.fft_scratch, &mut self.y_l);
-        self.plan
-            .irfft(&self.acc_r, &mut self.fft_scratch, &mut self.y_r);
+        Self::irfft_buf(
+            use_cuda,
+            &self.plan,
+            &self.acc_l,
+            &mut self.fft_scratch,
+            &mut self.y_l,
+        );
+        Self::irfft_buf(
+            use_cuda,
+            &self.plan,
+            &self.acc_r,
+            &mut self.fft_scratch,
+            &mut self.y_r,
+        );
 
         let ov_len = self.ov_l.len();
         for i in 0..m {
@@ -2728,10 +2868,20 @@ impl BinauralPlus {
                     }
                 }
             }
-            self.plan
-                .irfft(&self.acc_l, &mut self.fft_scratch, &mut self.y_l);
-            self.plan
-                .irfft(&self.acc_r, &mut self.fft_scratch, &mut self.y_r);
+            Self::irfft_buf(
+                use_cuda,
+                &self.plan,
+                &self.acc_l,
+                &mut self.fft_scratch,
+                &mut self.y_l,
+            );
+            Self::irfft_buf(
+                use_cuda,
+                &self.plan,
+                &self.acc_r,
+                &mut self.fft_scratch,
+                &mut self.y_r,
+            );
             for i in 0..ov_len {
                 self.ov_l[i] += self.y_l[i];
                 self.ov_r[i] += self.y_r[i];

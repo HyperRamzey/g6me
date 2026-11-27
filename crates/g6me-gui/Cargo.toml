@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 g6me-core = { workspace = true }
+g6me-cuda = { workspace = true, optional = true }
 serde_json.workspace = true
 # eframe's default features already cover the three platforms this project
 # promises: winit's X11 and Wayland backends, native Windows, and AccessKit for
@@ -34,4 +35,4 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 # no portal — see `g6me_core::meter::MeterTap`.
 default = ["native-dialogs"]
 native-dialogs = ["dep:rfd"]
-cuda = ["g6me-core/cuda"]
+cuda = ["g6me-core/cuda", "dep:g6me-cuda"]
