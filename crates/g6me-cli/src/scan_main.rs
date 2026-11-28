@@ -6,10 +6,11 @@
 //! watertight, acoustically conditioned (`h <= lambda_min / 6`) `.obj` head/pinna mesh ready for
 //! `g6me --mode plus --head-mesh <FILE.obj>` (or direct in-memory FMM-BEM Helmholtz synthesis).
 //!
-//! Supports AprilTag3, ChArUco, AND **Russian Debit Cards (GOST R ISO/IEC 7810-2006 ID-1
-//! `85.60 × 53.98 mm`, horizontal & vertical)** with `3.18 mm` rounded-corner tangent extrapolation,
-//! ISO/IEC 7816-2 contact-chip orientation anchoring, and automatic in-place card-face privacy
-//! scrubbing.
+//! Supports **square fiducial boards (AprilTag3/ChArUco-style outer quad; the detector fits the
+//! four outer edges only and does not decode any tag ID or payload)** AND **Russian Debit Cards
+//! (GOST R ISO/IEC 7810-2006 ID-1 `85.60 × 53.98 mm`, horizontal & vertical)** with `3.18 mm`
+//! rounded-corner tangent extrapolation, ISO/IEC 7816-2 contact-chip orientation anchoring, and
+//! automatic in-place card-face privacy scrubbing.
 //!
 //! **Zero synthetic fallback**: `g6me-scan` processes ONLY real `--dng` and `--burst` inputs.
 //! If a live capture fails validation, pixel decode, anchor detection, or multi-view
@@ -23,7 +24,8 @@ use clap::{Parser, ValueEnum};
 use g6me_core::atmosphere::AtmosphereCfg;
 use g6me_core::blackwell::CudaTensorPrecision;
 use g6me_core::burst3d::{
-    preintegrate_imu_manifold, separate_specular_and_micro_depth, wronski_oissr_zero_demosaic_fuse,
+    interpolate_ois_at_scanline, preintegrate_imu_manifold, separate_specular_and_micro_depth,
+    wronski_oissr_zero_demosaic_fuse,
 };
 use g6me_core::dng::{
     decode_dng_file, demosaic_malvar_he_cutler, parse_dng_file, unpack_mipi_raw10_to_f64,
@@ -39,9 +41,11 @@ enum AnchorArg {
     RussianCard,
     /// Russian debit card (GOST R ISO/IEC 7810-2006 ID-1 vertical 53.98 x 85.60 mm, r=3.18 mm).
     RussianCardVertical,
-    /// AprilTag3 (tag36h11) square fiducial.
+    /// Square fiducial with an AprilTag3-style (tag36h11) outer border. The detector fits the
+    /// outer quad only — no tag ID or payload is decoded; `--anchor-mm` supplies the scale.
     Apriltag3,
-    /// ChArUco checkerboard-AprilTag fiducial.
+    /// Square fiducial taken from a ChArUco target. The detector fits one square's outer quad
+    /// only — no chessboard or ID decode; `--anchor-mm` supplies the square pitch.
     Charuco,
 }
 
@@ -54,10 +58,9 @@ impl AnchorArg {
             Self::RussianCardVertical => MetricAnchorKind::RussianDebitCardId1 {
                 vertical_layout: true,
             },
-            Self::Apriltag3 => MetricAnchorKind::AprilTag3 { side_mm: anchor_mm },
-            Self::Charuco => MetricAnchorKind::ChArUco {
-                square_mm: anchor_mm,
-            },
+            Self::Apriltag3 | Self::Charuco => {
+                MetricAnchorKind::SquareFiducial { side_mm: anchor_mm }
+            }
         }
     }
 }
@@ -85,7 +88,8 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = AnchorArg::RussianCard)]
     anchor: AnchorArg,
 
-    /// Side length in mm when using `--anchor apriltag3` or `--anchor charuco`.
+    /// Outer black-border side length in mm when using `--anchor apriltag3` or
+    /// `--anchor charuco` (square-fiducial detectors; no ID decode, this value sets the scale).
     #[arg(long, default_value_t = 40.0)]
     anchor_mm: f64,
 
@@ -209,19 +213,20 @@ fn print_and_export_result(
     use_cuda: bool,
 ) -> Result<(), ScanError> {
     println!(
-        "Stage 1 Anchor  : {:?} | scale={:.4} mm/px | residual={:.6} mm | privacy_mask={}",
+        "Stage 1 Anchor  : {} | scale={:.4} mm/px | residual={:.6} mm | privacy_mask={}",
         out.anchor.kind,
         out.anchor.meters_per_pixel * 1e3,
         out.anchor.fit_residual_mm,
         out.anchor.privacy_masked
     );
     println!(
-        "Stage 2 BA      : Ozaki-II {:?} Schur | RMS {:.3} -> {:.4} px | VCM +-{:.2}% f | scale err {:.3} mm",
+        "Stage 2 BA      : Schur {} | RMS {:.3} -> {:.4} px | VCM +-{:.2}% f | scale err {:.3} mm | accepted LM steps {}",
         out.ba_report.schur_backend,
         out.ba_report.initial_rms_px,
         out.ba_report.final_rms_px,
         out.ba_report.max_vcm_breathing_pct,
-        out.ba_report.metric_scale_error_mm
+        out.ba_report.metric_scale_error_mm,
+        out.ba_report.iterations
     );
     println!(
         "Stage 3-4 Mesh  : {} verts, {} tris, watertight={} (boundary={}, w={:.4}), max_edge={:.2} mm ({label})",
@@ -438,11 +443,15 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
             let mut baselines = Vec::with_capacity(sidecar.frames.len());
 
             let t_ref = sidecar.frames[0].sensor_timestamp_ns;
-            let ois_ref = sidecar.frames[0]
-                .ois_samples
-                .first()
-                .map(|s| (s.dx_px, s.dy_px))
-                .unwrap_or((0.0, 0.0));
+            // Reference OIS shift at frame 0's mid-row, interpolated along the rolling-shutter
+            // trajectory rather than frozen at the first Hall sample.
+            let ois_ref = interpolate_ois_at_scanline(
+                &sidecar.frames[0].ois_samples,
+                sidecar.frames[0].sensor_timestamp_ns,
+                sidecar.frames[0].sensor_rolling_shutter_skew_ns,
+                height as f64 * 0.5,
+                height as f64,
+            );
 
             for (fi, (fm, blob)) in sidecar.frames.iter().zip(&blobs).enumerate() {
                 if fm.width != width || fm.height != height {
@@ -465,12 +474,16 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                     .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
                     .collect();
 
-                let ois = fm
-                    .ois_samples
-                    .first()
-                    .map(|s| (s.dx_px - ois_ref.0, s.dy_px - ois_ref.1))
-                    .unwrap_or((0.0, 0.0));
-                ois_shifts.push(ois);
+                // Mid-row principal-point shift for whole-frame OISSR fusion, synced to this
+                // frame's own start timestamp and rolling-shutter skew.
+                let ois_mid = interpolate_ois_at_scanline(
+                    &fm.ois_samples,
+                    fm.sensor_timestamp_ns,
+                    fm.sensor_rolling_shutter_skew_ns,
+                    height as f64 * 0.5,
+                    height as f64,
+                );
+                ois_shifts.push((ois_mid.0 - ois_ref.0, ois_mid.1 - ois_ref.1));
 
                 let pre = preintegrate_imu_manifold(
                     &sidecar.imu_gyro_uncal,
@@ -526,6 +539,15 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                     .depth_m,
                 )
             } else {
+                let reason = if max_base <= 2e-4 {
+                    format!("IMU micro-baseline {:.3} mm <= 0.2 mm", max_base * 1e3)
+                } else {
+                    format!(
+                        "{}x{} exceeds the {}-pixel single-pass limit",
+                        width, height, 262_144
+                    )
+                };
+                println!("  Dense Micro-Depth: skipped ({reason}; no depth hint supplied to SfM)");
                 None
             };
 

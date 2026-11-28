@@ -4,17 +4,19 @@
 //! directly into a watertight, isotropically remeshed (`h <= lambda_min / 6`), FMM-BEM-ready
 //! personalized 3D head & pinna acoustic mesh:
 //!
-//! - **Stage 1**: Dense skin-proof correlation matching + **AprilTag3 / ChArUco** +
-//!   **Russian Debit Card (GOST R ISO/IEC 7810-2006 ID-1 `85.60 × 53.98 mm`)** metric anchor
-//!   with `3.18 mm` rounded-corner tangent-intersection compensation, ISO/IEC 7816-2 contact-chip
-//!   orientation landmark, horizontal/vertical support, and automatic card-face privacy masking.
+//! - **Stage 1**: Dense skin-proof correlation matching + **square fiducial (AprilTag3/ChArUco-
+//!   style outer quad; no tag ID or payload decode)** + **Russian Debit Card (GOST R ISO/IEC
+//!   7810-2006 ID-1 `85.60 × 53.98 mm`)** metric anchor with `3.18 mm` rounded-corner
+//!   tangent-intersection compensation, ISO/IEC 7816-2 contact-chip orientation landmark,
+//!   horizontal/vertical support, and automatic card-face privacy masking.
 //! - **Stage 2**: **GLOMAP** (Pan et al., ECCV 2024) global `SO(3)` Lie-algebra rotation averaging
 //!   and **Rolling-Shutter Bundle Adjustment** (Hedborg et al., CVPR 2012) solving the sparse
 //!   **Schur Complement** `(U - W V^-1 W^T) dc = g` on **Ozaki-II CRT FP4 (E2M1 Base-13) → FP64**
 //!   with per-frame VCM focus-breathing Tikhonov prior & metric gauge constraints!
-//! - **Stage 3**: **2D Gaussian Splatting (2DGS, SIGGRAPH 2024) + PGSR (IEEE TVCG 2025)**
-//!   oriented planar surface disks with depth-distortion & surface-normal consistency losses +
-//!   dense **TSDF** Marching Tetrahedra surface extraction.
+//! - **Stage 3**: **Surfel photometric refinement (2DGS/PGSR-inspired)** — oriented planar
+//!   surface disks refined by coordinate descent on multi-view photometric variance with
+//!   depth-distortion & surface-normal consistency losses, then dense **TSDF** Marching
+//!   Tetrahedra surface extraction. This is not the papers' differentiable rasterizer.
 //! - **Stage 4**: **Generalized Winding Numbers** (Jacobson et al., SIGGRAPH 2013) watertight
 //!   manifold conditioning + **Isotropic Acoustic Remeshing** (`h <= lambda_min / 6`) → direct
 //!   in-memory handoff into `crate::bem::FmmBemSolver` without touching disk!
@@ -27,13 +29,13 @@ use crate::bem::{
     extract_isosurface_marching_tetrahedra, isotropic_acoustic_remesh, v3_add, v3_cross, v3_dot,
     v3_norm, v3_scale, v3_sub, watertight_winding_repair, BemMeshStats, FmmBemSolver, TriangleMesh,
 };
-use crate::blackwell::{ozaki2_crt_gemm_with_cuda, CudaTensorPrecision, TensorBackend};
+use crate::blackwell::{ozaki2_crt_gemm_with_cuda_precision, CudaTensorPrecision, TensorBackend};
 use crate::burst3d::{mat3_mul, mat3_transpose, mat3_vec, so3_exp, so3_log, Mat3, MAT3_ID};
-use crate::dng::{OisSample, WarpRectilinearOpcode};
+use crate::dng::WarpRectilinearOpcode;
 use crate::error::{Error, Result};
 
 // ============================================================================
-// Stage 1: Metric Anchors — AprilTag3 / ChArUco + Russian Debit Card (GOST ID-1)
+// Stage 1: Metric Anchors — Square Fiducial (no ID decode) + Russian Debit Card (GOST ID-1)
 // ============================================================================
 
 /// Exact **GOST R ISO/IEC 7810-2006 ID-1** Russian debit card physical dimensions (mm).
@@ -51,14 +53,33 @@ pub const ISO7816_CHIP_HEIGHT_MM: f64 = 9.32;
 /// Metric calibration anchor target type supported by `g6me-scan`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MetricAnchorKind {
-    /// AprilTag3 (`tag36h11`) square fiducial of given outer black-border side length (mm).
-    AprilTag3 { side_mm: f64 },
-    /// ChArUco chessboard-AprilTag hybrid square pitch (mm).
-    ChArUco { square_mm: f64 },
+    /// Square fiducial board (AprilTag3/ChArUco-style outer quad) of the given outer
+    /// black-border side length (mm). The detector fits the four outer edges only: no tag ID
+    /// or payload is decoded, and the known side length is what supplies the metric scale.
+    SquareFiducial { side_mm: f64 },
     /// Russian Debit Card (**GOST R ISO/IEC 7810-2006 ID-1**, `85.60 × 53.98 mm`,
     /// `r = 3.18 mm` rounded-corner tangent compensation + ISO/IEC 7816-2 chip landmark,
     /// horizontal or vertical layout, with automatic PAN/CVV face privacy masking).
     RussianDebitCardId1 { vertical_layout: bool },
+}
+
+impl std::fmt::Display for MetricAnchorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SquareFiducial { side_mm } => {
+                write!(f, "square fiducial (no ID decode), side {side_mm:.2} mm")
+            }
+            Self::RussianDebitCardId1 { vertical_layout } => write!(
+                f,
+                "Russian debit card ID-1 (GOST R ISO/IEC 7810-2006), {} layout",
+                if *vertical_layout {
+                    "vertical"
+                } else {
+                    "horizontal"
+                }
+            ),
+        }
+    }
 }
 
 /// Detected metric anchor with sub-pixel sharp corners, scale, and privacy mask bounding box.
@@ -235,12 +256,15 @@ pub fn is_inside_card_privacy_mask(anchor: &DetectedMetricAnchor, px: f64, py: f
     pos == 4 || neg == 4
 }
 
-/// Calibrate an **AprilTag3 (`tag36h11`)** or **ChArUco** square fiducial from its 4 sub-pixel
-/// saddle-point corners `[TL, TR, BR, BL]`.
-pub fn calibrate_apriltag3_anchor(
+/// Calibrate a **square fiducial** (AprilTag3/ChArUco-style board) from its four sub-pixel
+/// outer corners `[TL, TR, BR, BL]`.
+///
+/// This is a pure geometric fit: the side length must be known in advance, and no tag ID,
+/// payload, or chessboard layout is decoded. The measured mean side in pixels times the known
+/// side in metres gives `meters_per_pixel`; the aspect residual is reported as an honesty check.
+pub fn calibrate_square_fiducial_anchor(
     corners_px: [[f64; 2]; 4],
     side_mm: f64,
-    is_charuco: bool,
 ) -> Result<DetectedMetricAnchor> {
     let px_w = 0.5
         * ((corners_px[1][0] - corners_px[0][0]).hypot(corners_px[1][1] - corners_px[0][1])
@@ -249,17 +273,15 @@ pub fn calibrate_apriltag3_anchor(
         * ((corners_px[3][0] - corners_px[0][0]).hypot(corners_px[3][1] - corners_px[0][1])
             + (corners_px[2][0] - corners_px[1][0]).hypot(corners_px[2][1] - corners_px[1][1]));
     if px_w < 4.0 || px_h < 4.0 {
-        return Err(Error::msg("AprilTag3 quad too small"));
+        return Err(Error::msg(
+            "square fiducial quad too small (need >= 4 px per side)",
+        ));
     }
     let s_m = side_mm * 1e-3;
     let meters_per_pixel = s_m / (0.5 * (px_w + px_h));
     let fit_residual_mm = ((px_w - px_h).abs() * meters_per_pixel * 1e3) * 0.5;
     Ok(DetectedMetricAnchor {
-        kind: if is_charuco {
-            MetricAnchorKind::ChArUco { square_mm: side_mm }
-        } else {
-            MetricAnchorKind::AprilTag3 { side_mm }
-        },
+        kind: MetricAnchorKind::SquareFiducial { side_mm },
         sharp_corners_px: corners_px,
         object_corners_m: [
             [0.0, 0.0, 0.0],
@@ -508,14 +530,71 @@ pub struct BaObservation {
     pub v_px: f64,
 }
 
-/// Metric distance gauge constraint between two 3D landmarks (e.g., AprilTag3 corner pair or
-/// Russian Debit Card GOST ID-1 virtual sharp corners `85.60 mm` / `53.98 mm`).
+/// Metric distance gauge constraint between two 3D landmarks (e.g., a square-fiducial corner
+/// pair or Russian Debit Card GOST ID-1 virtual sharp corners `85.60 mm` / `53.98 mm`).
 #[derive(Debug, Clone, Copy)]
 pub struct MetricGaugeConstraint {
     pub pt_a: usize,
     pub pt_b: usize,
     pub target_dist_m: f64,
     pub weight: f64,
+}
+
+/// Arithmetic substrate that actually produced the Schur-complement product `W * (V^-1 W^T)`
+/// in a [`BundleAdjustmentReport`].
+///
+/// The CPU reference always runs Ozaki-II CRT on FP4 E2M1 Base-13. On the GPU the runtime
+/// resolves `Auto` and downgrades unsupported formats for the detected compute capability, so
+/// the report records what actually ran rather than what was requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchurBackend {
+    /// Deterministic CPU Ozaki-II CRT reference on FP4 E2M1 Base-13.
+    CpuFp4Base13,
+    /// Live GPU Tensor Core Ozaki-II CRT at the runtime-selected precision.
+    Gpu(CudaTensorPrecision),
+}
+
+impl SchurBackend {
+    /// The GPU precision that actually ran, or `None` when the CPU reference produced the
+    /// Schur product.
+    pub fn gpu_precision(self) -> Option<CudaTensorPrecision> {
+        match self {
+            Self::CpuFp4Base13 => None,
+            Self::Gpu(p) => Some(p),
+        }
+    }
+}
+
+impl std::fmt::Display for SchurBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CpuFp4Base13 => write!(f, "CPU FP4 E2M1 Base-13 reference"),
+            Self::Gpu(CudaTensorPrecision::Auto) => write!(f, "GPU Auto (unresolved)"),
+            Self::Gpu(p) => write!(f, "GPU {}", p.short_tag()),
+        }
+    }
+}
+
+/// Compare the recorded substrate against a CPU [`TensorBackend`] label. Equality holds only
+/// when the same low-precision arithmetic really ran: the CPU reference is FP4 E2M1 Base-13,
+/// and a GPU dispatch equals it only at NVFP4 E2M1 (also Base-13). A GPU run at FP8, INT8, or
+/// FP16 therefore never compares equal to `Fp4E2m1Base13`.
+impl PartialEq<TensorBackend> for SchurBackend {
+    fn eq(&self, other: &TensorBackend) -> bool {
+        matches!(
+            (self, other),
+            (Self::CpuFp4Base13, TensorBackend::Fp4E2m1Base13)
+                | (
+                    Self::Gpu(CudaTensorPrecision::Nvfp4E2m1),
+                    TensorBackend::Fp4E2m1Base13
+                )
+                | (
+                    Self::Gpu(CudaTensorPrecision::Fp8E4m3),
+                    TensorBackend::Fp8E4m3
+                )
+                | (Self::Gpu(CudaTensorPrecision::Int8), TensorBackend::Int8)
+        )
+    }
 }
 
 /// Summary report from Stage 2 Ozaki-II FP4→FP64 Schur-Complement Bundle Adjustment.
@@ -525,7 +604,9 @@ pub struct BundleAdjustmentReport {
     pub final_rms_px: f64,
     pub max_vcm_breathing_pct: f64,
     pub metric_scale_error_mm: f64,
-    pub schur_backend: TensorBackend,
+    /// Substrate that actually ran the Schur product (GPU precision, or the CPU reference).
+    pub schur_backend: SchurBackend,
+    /// Levenberg–Marquardt steps that were accepted (reduced RMS), not the iteration budget.
     pub iterations: usize,
 }
 
@@ -591,6 +672,8 @@ pub fn bundle_adjust_ozaki2_fp4_schur_with_cuda(
     let initial_rms_px = compute_rms(cams, points);
     let mut lambda = 1e-2_f64;
     let eps = 1e-6_f64;
+    let mut accepted_steps = 0usize;
+    let mut schur_backend = SchurBackend::CpuFp4Base13;
 
     for _ in 0..iters {
         let mut u_mat = vec![vec![0.0_f64; n_cam_vars]; n_cam_vars];
@@ -671,7 +754,7 @@ pub fn bundle_adjust_ozaki2_fp4_schur_with_cuda(
             }
         }
 
-        // Metric gauge constraints (AprilTag3 / Russian Debit Card GOST ID-1 exact mm scale!)
+        // Metric gauge constraints (square fiducial / Russian Debit Card GOST ID-1 exact mm scale!)
         for g in gauges {
             if g.pt_a >= n_pts || g.pt_b >= n_pts {
                 continue;
@@ -717,13 +800,17 @@ pub fn bundle_adjust_ozaki2_fp4_schur_with_cuda(
 
         // SCHUR COMPLEMENT PRODUCT W * (V^{-1} W^T) ON OZAKI-II CRT (GPU Tensor Cores when --cuda active, else CPU FP4 E2M1 Base-13 reference)
         let w_vinv_wt = if n_pts > 0 && n_cam_vars > 0 {
-            ozaki2_crt_gemm_with_cuda(
+            let (product, actual_precision) = ozaki2_crt_gemm_with_cuda_precision(
                 &w_mat,
                 &y_mat,
                 TensorBackend::Fp4E2m1Base13,
                 use_cuda,
                 cuda_precision,
-            )
+            );
+            if let Some(p) = actual_precision {
+                schur_backend = SchurBackend::Gpu(p);
+            }
+            product
         } else {
             vec![vec![0.0_f64; n_cam_vars]; n_cam_vars]
         };
@@ -783,6 +870,7 @@ pub fn bundle_adjust_ozaki2_fp4_schur_with_cuda(
         if new_rms <= cur_rms + 1e-12 {
             cams.clone_from_slice(&cand_cams);
             points.clone_from_slice(&cand_pts);
+            accepted_steps += 1;
             lambda = (lambda * 0.35).max(1e-7);
         } else {
             lambda = (lambda * 4.0).min(1e6);
@@ -805,8 +893,8 @@ pub fn bundle_adjust_ozaki2_fp4_schur_with_cuda(
         final_rms_px,
         max_vcm_breathing_pct,
         metric_scale_error_mm,
-        schur_backend: TensorBackend::Fp4E2m1Base13,
-        iterations: iters,
+        schur_backend,
+        iterations: accepted_steps,
     }
 }
 
@@ -889,12 +977,12 @@ fn solve_linear_system_f64(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 }
 
 // ============================================================================
-// Stage 3: 2D Gaussian Splatting (2DGS, SIGGRAPH 2024) + PGSR (IEEE TVCG 2025)
+// Stage 3: Surfel Photometric Refinement (2DGS/PGSR-inspired)
 //          + Dense TSDF Fusion & Surface Extraction
 // ============================================================================
 
-/// Oriented 2D planar disk surfel primitive (2DGS / PGSR) collapsing volumetric 3D blobs
-/// onto razor-sharp oriented ear cartilage surfaces.
+/// Oriented 2D planar disk surfel primitive (2DGS/PGSR-inspired) collapsing volumetric 3D
+/// blobs onto razor-sharp oriented ear cartilage surfaces.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanarSurfel2D {
     pub center: [f64; 3],
@@ -963,10 +1051,11 @@ impl PlanarSurfel2D {
     }
 }
 
-/// Evaluate **2DGS / PGSR** multi-view depth-distortion loss `L_d` and surface-normal
-/// consistency loss `L_n` along a camera ray traversing sorted surfel hits `(t_i, alpha_i, n_i)`
-/// (Huang et al., ACM SIGGRAPH 2024; Chen et al., IEEE TVCG 2025).
-pub fn evaluate_2dgs_pgsr_ray_losses(
+/// Evaluate the **2DGS/PGSR-inspired** multi-view depth-distortion loss `L_d` and surface-normal
+/// consistency loss `L_n` along a camera ray traversing sorted surfel hits `(t_i, alpha_i, n_i)`.
+/// The loss formulas follow Huang et al. (ACM SIGGRAPH 2024) and Chen et al. (IEEE TVCG 2025);
+/// the surrounding optimizer is coordinate descent, not their differentiable rasterizer.
+pub fn evaluate_surfel_ray_losses(
     hits: &[(f64, f64, [f64; 3])],
     expected_surface_normal: [f64; 3],
 ) -> (f64, f64, f64) {
@@ -1000,9 +1089,9 @@ pub fn evaluate_2dgs_pgsr_ray_losses(
     (mean_depth, l_dist, l_normal)
 }
 
-/// Fuse a cloud of oriented **2DGS / PGSR** planar surfels into a dense 3D **Truncated Signed
-/// Distance Field (TSDF)** (`grid_res^3`) and extract the zero-level surface mesh (`TSDF = 0`)
-/// via exact Marching Tetrahedra!
+/// Fuse a cloud of oriented surfels into a dense 3D **Truncated Signed Distance Field (TSDF)**
+/// (`grid_res^3`) and extract the zero-level surface mesh (`TSDF = 0`) via exact Marching
+/// Tetrahedra!
 pub fn fuse_surfels_tsdf_to_mesh(
     surfels: &[PlanarSurfel2D],
     grid_res: usize,
@@ -1010,7 +1099,7 @@ pub fn fuse_surfels_tsdf_to_mesh(
 ) -> Result<TriangleMesh> {
     if surfels.len() < 8 {
         return Err(Error::msg(
-            "need at least 8 oriented 2DGS surfels for TSDF fusion",
+            "need at least 8 oriented surfels for TSDF fusion",
         ));
     }
     let n = grid_res.clamp(10, 48);
@@ -1109,7 +1198,7 @@ pub fn run_stage3_to_stage4_to_fmm_bem(
     c_m_s: f64,
     use_cuda: bool,
 ) -> Result<ScanPipelineOutput> {
-    // Stage 3: 2DGS / PGSR -> TSDF Marching Tetrahedra
+    // Stage 3: surfel photometric refinement (2DGS/PGSR-inspired) -> TSDF Marching Tetrahedra
     let tsdf_mesh = fuse_surfels_tsdf_to_mesh(surfels, tsdf_res, 0.025)?;
     // Stage 4a: Generalized Winding Number watertight manifold solid conditioning
     let watertight = if tsdf_mesh.stats(c_m_s).is_watertight {
@@ -1131,7 +1220,7 @@ pub fn run_stage3_to_stage4_to_fmm_bem(
     })
 }
 
-/// Helper to create a synthetic oriented 2DGS surfel set sampled from a reference head/pinna
+/// Helper to create a synthetic oriented surfel set sampled from a reference head/pinna
 /// mesh (for CLI self-test, synthetic demo, and CI verification).
 pub fn sample_surfels_from_mesh(mesh: &TriangleMesh) -> Vec<PlanarSurfel2D> {
     mesh.elements()
@@ -1202,25 +1291,8 @@ extern "C" __global__ void g6me_scan_dense_zncc(
 }
 "#;
 
-/// Convenience helper for interpolating OIS into a `RollingShutterCamera` at frame mid-row.
-pub fn apply_ois_midframe(
-    cam: &mut RollingShutterCamera,
-    samples: &[OisSample],
-    t0_ns: i64,
-    skew_ns: i64,
-) {
-    let (dx, dy) = crate::burst3d::interpolate_ois_at_scanline(
-        samples,
-        t0_ns,
-        skew_ns,
-        cam.height * 0.5,
-        cam.height,
-    );
-    cam.ois_shift_px = [dx, dy];
-}
-
 // ============================================================================
-// Stage 1b..3b: Real Image-Space Anchor Detection, Multi-View SfM & 2DGS Optimization
+// Stage 1b..3b: Real Image-Space Anchor Detection, Multi-View SfM & Surfel Refinement
 // ============================================================================
 
 /// Compute 3×3 Sobel gradient magnitude and components `(gx, gy, mag)` on a linear luminance buffer.
@@ -1623,14 +1695,16 @@ pub fn detect_russian_card_in_image(
     calibrate_russian_debit_card_id1([&top, &right, &bot, &left], chip_opt, vertical_layout)
 }
 
-/// Real image-space square fiducial (**AprilTag3 / ChArUco**) detector using Sobel edge
-/// extraction and 4-side TLS line intersections.
+/// Real image-space **square fiducial detector** (AprilTag3/ChArUco-style board) using Sobel
+/// edge extraction and 4-side TLS line intersections.
+///
+/// Fits the outer quadrilateral only. It deliberately does not decode a tag ID, payload, or
+/// chessboard corner layout; `side_mm` must be supplied by the caller.
 pub fn detect_square_fiducial_in_image(
     luma: &[f64],
     width: usize,
     height: usize,
     side_mm: f64,
-    is_charuco: bool,
 ) -> Result<DetectedMetricAnchor> {
     let [top, right, bot, left] = detect_rect_edge_points(luma, width, height, 1.0, 0.22)?;
     let l_top = fit_line_tls(&top)?;
@@ -1641,11 +1715,11 @@ pub fn detect_square_fiducial_in_image(
     let tr = intersect_lines(l_top, l_right)?;
     let br = intersect_lines(l_bot, l_right)?;
     let bl = intersect_lines(l_bot, l_left)?;
-    calibrate_apriltag3_anchor([tl, tr, br, bl], side_mm, is_charuco)
+    calibrate_square_fiducial_anchor([tl, tr, br, bl], side_mm)
 }
 
 /// Permanently scrub all pixels inside the detected Russian debit card's privacy mask in-place
-/// (zeroing PAN/CVV/holder name before SfM feature extraction or 2DGS texture optimization).
+/// (zeroing PAN/CVV/holder name before SfM feature extraction or surfel photometric refinement).
 pub fn scrub_card_privacy_in_place(
     rgb: &mut [[f64; 3]],
     luma: &mut [f64],
@@ -2266,11 +2340,13 @@ pub fn estimate_essential_ransac_and_pose(
     Ok((best_pose.0, best_pose.1, best_inliers))
 }
 
-/// Real differentiable **2DGS / PGSR** surfel optimizer: minimizes multi-view planar-disk
-/// photometric variance across observing cameras + normal-depth consistency by jointly optimizing
-/// each surfel's center depth along its normal, its tangent-plane normal orientation (2-DOF tilt),
-/// and its diffuse albedo. Returns `(initial_loss, final_loss)`.
-pub fn optimize_2dgs_pgsr_surfels(
+/// Surfel photometric refinement (2DGS/PGSR-inspired): minimizes multi-view planar-disk
+/// photometric variance across observing cameras plus normal-depth consistency by coordinate
+/// descent on each surfel's center depth along its normal and its tangent-plane normal
+/// orientation (2-DOF tilt). This is not the published 2DGS/PGSR differentiable rasterizer;
+/// the losses are evaluated at a 5-point stencil and each parameter is probed by finite
+/// differences. Returns `(initial_loss, final_loss)`.
+pub fn refine_surfels_photometric(
     surfels: &mut [PlanarSurfel2D],
     cams: &[RollingShutterCamera],
     frames_luma: &[&[f64]],
@@ -2283,7 +2359,7 @@ pub fn optimize_2dgs_pgsr_surfels(
     }
 
     let eval_surfel_loss = |s: &PlanarSurfel2D| -> f64 {
-        // 5-point planar disk stencil on the surfel's tangent plane (PGSR multi-view patch consistency)
+        // 5-point planar disk stencil on the surfel's tangent plane (PGSR-inspired multi-view patch consistency)
         let du = v3_scale(s.tangent_u, 0.5 * s.scale_u);
         let dv = v3_scale(s.tangent_v, 0.5 * s.scale_v);
         let stencil = [
@@ -2337,7 +2413,7 @@ pub fn optimize_2dgs_pgsr_surfels(
             photo_var += patches.iter().map(|p| (p[si] - mean).powi(2)).sum::<f64>() * inv_k;
         }
         photo_var *= 0.2;
-        let (_, l_dist, l_norm) = evaluate_2dgs_pgsr_ray_losses(&ray_hits, s.normal);
+        let (_, l_dist, l_norm) = evaluate_surfel_ray_losses(&ray_hits, s.normal);
         photo_var + 0.05 * l_dist + 0.02 * l_norm
     };
 
@@ -2367,7 +2443,7 @@ pub fn optimize_2dgs_pgsr_surfels(
                 s.center = orig_center;
             }
 
-            // 2. Joint 2-DOF tangent-plane normal orientation refinement (PGSR planar disk tilt).
+            // 2. Joint 2-DOF tangent-plane normal orientation refinement (PGSR-inspired planar disk tilt).
             let axes = [s.tangent_u, s.tangent_v];
             for axis in axes {
                 let n0 = s.normal;
@@ -2436,16 +2512,17 @@ pub struct MultiViewScanConfig {
 
 /// End-to-end **REAL** multi-view image photogrammetry pipeline (ZERO synthetic head fallback!):
 ///
-/// 1. Detects the physical metric anchor (`GOST ID-1` debit card or `AprilTag3`/`ChArUco`)
-///    directly on frame 0 luminance pixels and scrubs card interior pixels in-place.
+/// 1. Detects the physical metric anchor (`GOST ID-1` debit card or a square fiducial outer
+///    quad, with no tag ID decode) directly on frame 0 luminance pixels and scrubs card
+///    interior pixels in-place.
 /// 2. Extracts Harris-Stephens keypoints + bidirectional ZNCC matches across all views.
 /// 3. Estimates calibrated poses via normalized 8-point RANSAC Essential matrix plus
 ///    Cheirality, GLOMAP `SO(3)` rotation averaging, and DLT 3D triangulation (or fuses
 ///    optional dense `burst3d` micro-depth points from a RAW10 OIS/IMU burst).
 /// 4. Scales the 3D cloud to metric meters from the detected anchor and refines cameras +
 ///    3D structure via **Ozaki-II FP4→FP64 Rolling-Shutter Schur Bundle Adjustment**.
-/// 5. Builds oriented 2DGS/PGSR surfels with outward PCA normals, optimizes them via
-///    `optimize_2dgs_pgsr_surfels`, fuses TSDF → Generalized Winding Repair → Isotropic
+/// 5. Builds oriented surfels (2DGS/PGSR-inspired) with outward PCA normals, refines them via
+///    `refine_surfels_photometric`, fuses TSDF → Generalized Winding Repair → Isotropic
 ///    Acoustic Remesh → `FmmBemSolver`!
 pub fn reconstruct_from_multiview_images(
     frames_rgb: &[Vec<[f64; 3]>],
@@ -2467,11 +2544,8 @@ pub fn reconstruct_from_multiview_images(
         MetricAnchorKind::RussianDebitCardId1 { vertical_layout } => {
             detect_russian_card_in_image(&frames_luma_in[0], width, height, vertical_layout)?
         }
-        MetricAnchorKind::AprilTag3 { side_mm } => {
-            detect_square_fiducial_in_image(&frames_luma_in[0], width, height, side_mm, false)?
-        }
-        MetricAnchorKind::ChArUco { square_mm } => {
-            detect_square_fiducial_in_image(&frames_luma_in[0], width, height, square_mm, true)?
+        MetricAnchorKind::SquareFiducial { side_mm } => {
+            detect_square_fiducial_in_image(&frames_luma_in[0], width, height, side_mm)?
         }
     };
 
@@ -2732,10 +2806,7 @@ pub fn reconstruct_from_multiview_images(
         MetricAnchorKind::RussianDebitCardId1 { .. } => {
             (RUSSIAN_ID1_WIDTH_MM * 1e-3).hypot(RUSSIAN_ID1_HEIGHT_MM * 1e-3)
         }
-        MetricAnchorKind::AprilTag3 { side_mm }
-        | MetricAnchorKind::ChArUco { square_mm: side_mm } => {
-            (side_mm * 1e-3) * std::f64::consts::SQRT_2
-        }
+        MetricAnchorKind::SquareFiducial { side_mm } => (side_mm * 1e-3) * std::f64::consts::SQRT_2,
     };
     let mut gauge_a = 0usize;
     let mut gauge_b = 1usize;
@@ -2770,7 +2841,7 @@ pub fn reconstruct_from_multiview_images(
         cfg.cuda_tensor_precision,
     );
 
-    // 6. Build oriented 2DGS/PGSR surfels from reconstructed 3D points (+ optional dense micro-depth),
+    // 6. Build oriented surfels from reconstructed 3D points (+ optional dense micro-depth),
     //    rejecting any post-BA stray outliers before computing the TSDF domain.
     let mut cloud: Vec<[f64; 3]> = Vec::with_capacity(pts_3d.len());
     {
@@ -2827,13 +2898,13 @@ pub fn reconstruct_from_multiview_images(
         })
         .collect();
 
-    // Shift cameras into the centered object frame for 2DGS photometric/normal optimization.
+    // Shift cameras into the centered object frame for surfel photometric/normal refinement.
     let mut centered_cams = cams.clone();
     for cam in &mut centered_cams {
         cam.trans = v3_add(cam.trans, mat3_vec(&cam.rot, centroid));
     }
     let luma_refs: Vec<&[f64]> = luma_work.iter().map(|v| v.as_slice()).collect();
-    let _ = optimize_2dgs_pgsr_surfels(&mut surfels, &centered_cams, &luma_refs, width, height, 4);
+    let _ = refine_surfels_photometric(&mut surfels, &centered_cams, &luma_refs, width, height, 4);
 
     // 7. Stage 3 -> Stage 4 -> FMM-BEM watertight acoustic mesh!
     run_stage3_to_stage4_to_fmm_bem(
@@ -2920,6 +2991,36 @@ mod tests {
             calibrate_russian_debit_card_id1([&v_top, &v_right, &v_bot, &v_left], None, true)
                 .expect("calibrate vertical Russian ID-1 debit card");
         assert!((v_anchor.meters_per_pixel - 1e-4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn schur_backend_reports_actual_precision_not_the_fp4_request() {
+        // The CPU reference genuinely runs FP4 E2M1 Base-13, so it compares equal to that label.
+        assert_eq!(SchurBackend::CpuFp4Base13, TensorBackend::Fp4E2m1Base13);
+        assert_eq!(SchurBackend::CpuFp4Base13.gpu_precision(), None);
+        // A GPU dispatch that resolved to FP8 or INT8 must not be reported as FP4 Base-13.
+        for (precision, label) in [
+            (CudaTensorPrecision::Fp8E4m3, TensorBackend::Fp8E4m3),
+            (CudaTensorPrecision::Int8, TensorBackend::Int8),
+        ] {
+            let backend = SchurBackend::Gpu(precision);
+            assert_eq!(backend, label);
+            assert_ne!(
+                backend,
+                TensorBackend::Fp4E2m1Base13,
+                "{backend} must not claim the FP4 arithmetic ran"
+            );
+            assert_eq!(backend.gpu_precision(), Some(precision));
+        }
+        let fp16 = SchurBackend::Gpu(CudaTensorPrecision::Fp16);
+        assert_ne!(fp16, TensorBackend::Fp4E2m1Base13);
+        assert_eq!(fp16.gpu_precision(), Some(CudaTensorPrecision::Fp16));
+        assert!(fp16.to_string().contains("FP16"));
+        // NVFP4 E2M1 is the Blackwell Base-13 FP4 path, so it does equal the FP4 label.
+        assert_eq!(
+            SchurBackend::Gpu(CudaTensorPrecision::Nvfp4E2m1),
+            TensorBackend::Fp4E2m1Base13
+        );
     }
 
     #[test]
@@ -3038,11 +3139,20 @@ mod tests {
         let rep =
             bundle_adjust_ozaki2_fp4_schur(&mut cams, &mut pts, &obs, &gauges, None, 10.0, 14);
         assert_eq!(rep.schur_backend, TensorBackend::Fp4E2m1Base13);
+        assert_eq!(rep.schur_backend, SchurBackend::CpuFp4Base13);
+        assert_eq!(rep.schur_backend.gpu_precision(), None);
         assert!(
             rep.final_rms_px < 0.05 && rep.final_rms_px < rep.initial_rms_px * 0.05,
             "Ozaki-II FP4 Schur BA failed to converge: init={:.3} px -> final={:.4} px",
             rep.initial_rms_px,
             rep.final_rms_px
+        );
+        // `iterations` reports accepted LM steps, not the 14-iteration budget: LM rejects an
+        // overshooting step (raising lambda) whenever a Gauss-Newton step increases the RMS.
+        assert!(
+            rep.iterations >= 1 && rep.iterations < 14,
+            "accepted LM steps must be a strict subset of the 14 attempted iterations, got {}",
+            rep.iterations
         );
         assert!(
             rep.metric_scale_error_mm < 0.5,
@@ -3056,13 +3166,13 @@ mod tests {
         let head = TriangleMesh::procedural_head_with_pinnae(0.0875, 2);
         let surfels = sample_surfels_from_mesh(&head);
 
-        // Verify 2DGS/PGSR depth-distortion & normal-consistency losses are 0 for an aligned single plane
+        // Verify the 2DGS/PGSR-inspired depth-distortion & normal-consistency losses are 0 for an aligned single plane
         let hits = vec![(0.25, 0.95, [0.0, 0.0, 1.0])];
-        let (depth, l_dist, l_norm) = evaluate_2dgs_pgsr_ray_losses(&hits, [0.0, 0.0, 1.0]);
+        let (depth, l_dist, l_norm) = evaluate_surfel_ray_losses(&hits, [0.0, 0.0, 1.0]);
         assert!((depth - 0.25).abs() < 1e-12);
         assert!(l_dist < 1e-12 && l_norm < 1e-12);
 
-        let anchor = calibrate_apriltag3_anchor(
+        let anchor = calibrate_square_fiducial_anchor(
             [
                 [100.0, 100.0],
                 [300.0, 100.0],
@@ -3070,7 +3180,6 @@ mod tests {
                 [100.0, 300.0],
             ],
             40.0,
-            false,
         )
         .expect("anchor");
         let ba = BundleAdjustmentReport {
@@ -3078,7 +3187,7 @@ mod tests {
             final_rms_px: 0.02,
             max_vcm_breathing_pct: 0.31,
             metric_scale_error_mm: 0.04,
-            schur_backend: TensorBackend::Fp4E2m1Base13,
+            schur_backend: SchurBackend::CpuFp4Base13,
             iterations: 10,
         };
 
