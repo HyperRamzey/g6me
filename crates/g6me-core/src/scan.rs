@@ -26,8 +26,9 @@ use std::f64::consts::PI;
 use serde::{Deserialize, Serialize};
 
 use crate::bem::{
-    extract_isosurface_marching_tetrahedra, isotropic_acoustic_remesh, v3_add, v3_cross, v3_dot,
-    v3_norm, v3_scale, v3_sub, watertight_winding_repair, BemMeshStats, FmmBemSolver, TriangleMesh,
+    extract_isosurface_marching_tetrahedra, isotropic_acoustic_remesh_with_budget, v3_add,
+    v3_cross, v3_dot, v3_norm, v3_scale, v3_sub, watertight_winding_repair, BemMeshStats,
+    FmmBemSolver, RemeshBudgetReport, TriangleMesh, DEFAULT_MAX_REMESH_FACES,
 };
 use crate::blackwell::{ozaki2_crt_gemm_with_cuda_precision, CudaTensorPrecision, TensorBackend};
 use crate::burst3d::{mat3_mul, mat3_transpose, mat3_vec, so3_exp, so3_log, Mat3, MAT3_ID};
@@ -1181,12 +1182,19 @@ pub struct ScanPipelineOutput {
     pub ba_report: BundleAdjustmentReport,
     pub mesh: TriangleMesh,
     pub mesh_stats: BemMeshStats,
+    /// Face budget requested by the caller, face count achieved, and whether the `h_max_m`
+    /// element bound was met. `target_met = false` means the budget stopped subdivision early.
+    pub remesh_report: RemeshBudgetReport,
     pub solver: FmmBemSolver,
 }
 
 /// Run the full 4-stage `g6me-scan` reconstruction pipeline from oriented surfels + calibrated
 /// metric anchor + bundle-adjusted cameras directly into a watertight, isotropically remeshed
 /// (`h <= h_max_m`) in-memory `FmmBemSolver` without touching disk!
+///
+/// Uses [`DEFAULT_MAX_REMESH_FACES`] as the conforming-subdivision face budget. Call
+/// [`run_stage3_to_stage4_to_fmm_bem_with_remesh_budget`] to choose the budget and read the
+/// [`RemeshBudgetReport`] back from the returned [`ScanPipelineOutput`].
 #[allow(clippy::too_many_arguments)]
 pub fn run_stage3_to_stage4_to_fmm_bem(
     anchor: DetectedMetricAnchor,
@@ -1198,6 +1206,36 @@ pub fn run_stage3_to_stage4_to_fmm_bem(
     c_m_s: f64,
     use_cuda: bool,
 ) -> Result<ScanPipelineOutput> {
+    run_stage3_to_stage4_to_fmm_bem_with_remesh_budget(
+        anchor,
+        ba_report,
+        surfels,
+        tsdf_res,
+        winding_res,
+        h_max_m,
+        c_m_s,
+        use_cuda,
+        DEFAULT_MAX_REMESH_FACES,
+    )
+}
+
+/// [`run_stage3_to_stage4_to_fmm_bem`] with a caller-chosen conforming-subdivision face budget.
+///
+/// The budget is a hard ceiling: a subdivision round that would exceed it is refused, and the
+/// resulting `target_met = false` is reported in [`ScanPipelineOutput::remesh_report`] instead of
+/// silently shipping a mesh that violates `h_max_m`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_stage3_to_stage4_to_fmm_bem_with_remesh_budget(
+    anchor: DetectedMetricAnchor,
+    ba_report: BundleAdjustmentReport,
+    surfels: &[PlanarSurfel2D],
+    tsdf_res: usize,
+    winding_res: usize,
+    h_max_m: f64,
+    c_m_s: f64,
+    use_cuda: bool,
+    max_remesh_faces: usize,
+) -> Result<ScanPipelineOutput> {
     // Stage 3: surfel photometric refinement (2DGS/PGSR-inspired) -> TSDF Marching Tetrahedra
     let tsdf_mesh = fuse_surfels_tsdf_to_mesh(surfels, tsdf_res, 0.025)?;
     // Stage 4a: Generalized Winding Number watertight manifold solid conditioning
@@ -1207,7 +1245,8 @@ pub fn run_stage3_to_stage4_to_fmm_bem(
         watertight_winding_repair(&tsdf_mesh, winding_res)
     };
     // Stage 4b: Isotropic Acoustic Remeshing enforcing h <= lambda_min / 6
-    let conditioned = isotropic_acoustic_remesh(&watertight, h_max_m, 3);
+    let (conditioned, remesh_report) =
+        isotropic_acoustic_remesh_with_budget(&watertight, h_max_m, 3, max_remesh_faces);
     let mesh_stats = conditioned.stats(c_m_s);
     // Stage 4c: Direct in-memory / VRAM handoff into Gumerov FMM-BEM Helmholtz Solver!
     let solver = FmmBemSolver::new_with_cuda(&conditioned, use_cuda)?;
@@ -1216,6 +1255,7 @@ pub fn run_stage3_to_stage4_to_fmm_bem(
         ba_report,
         mesh: conditioned,
         mesh_stats,
+        remesh_report,
         solver,
     })
 }
@@ -2505,6 +2545,9 @@ pub struct MultiViewScanConfig {
     pub tsdf_res: usize,
     pub winding_res: usize,
     pub max_edge_m: f64,
+    /// Conforming-subdivision face ceiling for the Stage 4b acoustic remesh. Use
+    /// [`DEFAULT_MAX_REMESH_FACES`] for the historical default.
+    pub max_remesh_faces: usize,
     pub speed_of_sound_m_s: f64,
     pub use_cuda: bool,
     pub cuda_tensor_precision: CudaTensorPrecision,
@@ -2907,7 +2950,7 @@ pub fn reconstruct_from_multiview_images(
     let _ = refine_surfels_photometric(&mut surfels, &centered_cams, &luma_refs, width, height, 4);
 
     // 7. Stage 3 -> Stage 4 -> FMM-BEM watertight acoustic mesh!
-    run_stage3_to_stage4_to_fmm_bem(
+    run_stage3_to_stage4_to_fmm_bem_with_remesh_budget(
         anchor,
         ba_report,
         &surfels,
@@ -2916,6 +2959,7 @@ pub fn reconstruct_from_multiview_images(
         cfg.max_edge_m,
         cfg.speed_of_sound_m_s,
         cfg.use_cuda,
+        cfg.max_remesh_faces,
     )
 }
 
@@ -3339,6 +3383,7 @@ mod tests {
             tsdf_res: 12,
             winding_res: 12,
             max_edge_m: 0.06,
+            max_remesh_faces: DEFAULT_MAX_REMESH_FACES,
             speed_of_sound_m_s: 344.85,
             use_cuda: false,
             cuda_tensor_precision: CudaTensorPrecision::Auto,

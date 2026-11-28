@@ -28,8 +28,16 @@
 //! symmetric zero-phase mask and cropped the inverse transform to
 //! `[0, len)`, which discarded the negative-time half of the direct-sound
 //! response: 49.0–49.9 % of the band energy of a direct impulse between 63 Hz
-//! and 1 kHz, biasing C80, D50 and EDT. A causal filter keeps all of that
-//! energy at t ≥ 0 and needs no time-origin shift.
+//! and 1 kHz, biasing C80, D50 and EDT.
+//!
+//! A causal class-1 filter necessarily delays its band's direct sound
+//! (group delay ≈ 2.5 periods here: 2.5 ms at 1 kHz, 20 ms at 125 Hz), so the
+//! ISO integration windows must not be anchored to the filter input's t = 0.
+//! `kernel_delay_samples` returns the kernel's energy centroid
+//! `Σ k·h[k]² / Σ h[k]²`; `metrics::analyze` shifts that band's windows by it.
+//! For a pure delay this makes the shifted windows exactly equivalent to the
+//! undelayed ones, and for these filters it aligns the ISO time origin with
+//! the direct sound's energy.
 //!
 //! The bank is a verification-grade reference, not a certified IEC 61260-1
 //! instrument: it matches the class-1 magnitude mask at the tabulated
@@ -37,7 +45,6 @@
 //! uncertainty analysis or conformance test per IEC 61260-2/-3 is performed.
 
 use g6me_core::fft::{Complex, FftPlan};
-use std::f64::consts::PI;
 
 /// ISO 266 *nominal* octave-band centre frequencies, 31.5 Hz to 16 kHz.
 /// These are labels; the filters are placed at the exact base-2 centres.
@@ -104,10 +111,8 @@ impl OctaveBank {
         let mut ranges = [None; 10];
         let nyquist_bin = n / 2;
         if fs > 0.0 {
-            for (band, (slot, centre)) in ranges
-                .iter_mut()
-                .zip(DESIGN_CENTERS_HZ.iter())
-                .enumerate()
+            for (band, (slot, centre)) in
+                ranges.iter_mut().zip(DESIGN_CENTERS_HZ.iter()).enumerate()
             {
                 let (lo, hi) = octave_band_edges(*centre);
                 // The upper nominal edge must stay strictly below Nyquist,
@@ -139,7 +144,8 @@ impl OctaveBank {
         }
     }
 
-    /// Transform length used by this bank.
+    /// Transform length used by this bank (test/reference API).
+    #[cfg(test)]
     pub fn fft_len(&self) -> usize {
         self.n
     }
@@ -166,10 +172,10 @@ impl OctaveBank {
         // Outside the outermost centres the bank is filled flat by the nearest
         // edge band, so the partition covers DC .. Nyquist exactly.
         if f < DESIGN_CENTERS_HZ[0] {
-            return f64::from(u8::from(band == 0));
+            return if band == 0 { 1.0 } else { 0.0 };
         }
         if f > DESIGN_CENTERS_HZ[9] {
-            return f64::from(u8::from(band == 9));
+            return if band == 9 { 1.0 } else { 0.0 };
         }
         let t = (f / centre).log2().abs();
         crossfade_power(t).sqrt()
@@ -220,6 +226,30 @@ impl OctaveBank {
         Some(out)
     }
 
+    /// Energy centroid of a band kernel, in samples: `Σ k·h[k]² / Σ h[k]²`.
+    ///
+    /// This is the delay the causal filter imposes on the direct sound's
+    /// energy. Callers pass it to the metric code as the band's time origin so
+    /// the ISO integration windows stay anchored to the direct sound.
+    pub fn kernel_delay_samples(&self, kernel: &[Complex]) -> usize {
+        debug_assert_eq!(kernel.len(), self.n / 2 + 1);
+        let mut scratch = vec![Complex::ZERO; self.n];
+        let mut h = vec![0.0; self.n];
+        self.plan.irfft(kernel, &mut scratch, &mut h);
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for (k, v) in h.iter().enumerate() {
+            let e = v * v;
+            num += k as f64 * e;
+            den += e;
+        }
+        if den > 0.0 && den.is_finite() && num.is_finite() {
+            (num / den).round() as usize
+        } else {
+            0
+        }
+    }
+
     /// Apply a band kernel to a signal spectrum; the result is the full
     /// zero-padded linear-convolution output of length `n`.
     pub fn apply(&self, spec: &[Complex], kernel: &[Complex]) -> Vec<f64> {
@@ -235,14 +265,16 @@ impl OctaveBank {
         out
     }
 
-    /// Full-length band output for `spec` (convenience wrapper that builds the
+    /// Full-length band output for `spec` (test/reference API that builds the
     /// kernel on demand).
+    #[cfg(test)]
     pub fn inverse_band_full(&self, spec: &[Complex], band: usize) -> Option<Vec<f64>> {
         let kernel = self.min_phase_spectrum(band)?;
         Some(self.apply(spec, &kernel))
     }
 
-    /// Band output truncated to the original signal length.
+    /// Band output truncated to the original signal length (test/reference API).
+    #[cfg(test)]
     pub fn inverse_band(&self, spec: &[Complex], band: usize) -> Option<Vec<f64>> {
         let mut out = self.inverse_band_full(spec, band)?;
         out.truncate(self.len);
@@ -306,7 +338,11 @@ mod tests {
         assert!(db(0.375) <= 1.3, "3/8-octave attenuation {} dB", db(0.375));
         assert!(db(0.5) <= 5.0, "edge attenuation {} dB", db(0.5));
         assert!(db(0.75) >= 9.75, "3/4-octave attenuation {} dB", db(0.75));
-        assert!(db(7.0 / 8.0) >= 13.6, "7/8-octave attenuation {} dB", db(7.0 / 8.0));
+        assert!(
+            db(7.0 / 8.0) >= 13.6,
+            "7/8-octave attenuation {} dB",
+            db(7.0 / 8.0)
+        );
     }
 
     #[test]
@@ -381,6 +417,24 @@ mod tests {
     }
 
     #[test]
+    fn causal_kernel_delay_is_about_two_and_a_half_periods() {
+        // The minimum-phase class-1 kernel is front-loaded but not at t = 0:
+        // its energy centroid sits at ≈2.5 periods of the band centre. That is
+        // the delay the metric code compensates per band.
+        let fs = 48_000.0;
+        let bank = OctaveBank::new(9600, fs);
+        for band in [2usize, 4, 5, 6] {
+            let kernel = bank.min_phase_spectrum(band).expect("supported band");
+            let delay = bank.kernel_delay_samples(&kernel);
+            let periods = delay as f64 * DESIGN_CENTERS_HZ[band] / fs;
+            assert!(
+                (2.0..=3.0).contains(&periods),
+                "band {band}: delay {delay} samples = {periods:.3} periods"
+            );
+        }
+    }
+
+    #[test]
     fn direct_impulse_energy_is_preserved_in_the_1_khz_band() {
         // The old zero-phase mask + [0, len) crop retained only ~51 % here.
         let fs = 48_000.0;
@@ -394,6 +448,7 @@ mod tests {
         let total: f64 = full.iter().map(|v| v * v).sum();
         let kept: f64 = cropped.iter().map(|v| v * v).sum();
         let retained = kept / total;
+        println!("1 kHz impulse retained {retained:.9} of its band energy");
         assert!(
             retained >= 0.999,
             "1 kHz impulse retained {:.6} of its band energy (need >= 0.999)",
@@ -417,6 +472,10 @@ mod tests {
             let full = bank.inverse_band_full(&spec, band).expect("band");
             sum += full.iter().map(|v| v * v).sum::<f64>();
         }
+        println!(
+            "band energy sum {sum:.17} vs total {total:.17} (diff {:.3e})",
+            (sum - total).abs()
+        );
         assert!(
             (sum - total).abs() < 1e-9,
             "band energies {sum:.15} vs total {total:.15}"
@@ -444,7 +503,10 @@ mod tests {
         };
         let total: f64 = tone.iter().map(|v| v * v).sum();
         let pass = energy(5) / total; // 1 kHz band
-        assert!(pass > 0.98, "1 kHz band passed only {pass:.12} of a 1 kHz tone");
+        assert!(
+            pass > 0.98,
+            "1 kHz band passed only {pass:.12} of a 1 kHz tone"
+        );
         assert!(
             energy(4) / total < 1e-3,
             "500 Hz band leaked {} of the 1 kHz tone",
@@ -456,17 +518,33 @@ mod tests {
             energy(6) / total
         );
         // The filter itself has a null at the neighbouring octave centre; the
-        // residual above is finite-record leakage, not mask response.
+        // residual above is finite-record leakage, not mask response. The
+        // 1 kHz centre falls between bins here (341.33), so the nearest bin
+        // sees the skirt of the null rather than the null itself.
         let k_tone = (1000.0 * bank.n as f64 / fs).round() as usize;
-        assert_eq!(bank.band_weight(4, k_tone), 0.0);
-        assert_eq!(bank.band_weight(6, k_tone), 0.0);
+        let f_bin = k_tone as f64 * fs / bank.n as f64;
+        assert!((f_bin - 1000.0).abs() < fs / bank.n as f64);
+        assert!(
+            bank.band_weight(4, k_tone) < 1e-3,
+            "500 Hz mask weight at the 1 kHz bin is {}",
+            bank.band_weight(4, k_tone)
+        );
+        assert!(
+            bank.band_weight(6, k_tone) < 1e-3,
+            "2 kHz mask weight at the 1 kHz bin is {}",
+            bank.band_weight(6, k_tone)
+        );
+        assert_eq!(crossfade_power(1.0), 0.0, "designed null at one octave out");
     }
 
     #[test]
     fn band_availability_follows_nyquist() {
         // 44.1 kHz cannot represent the 16 kHz octave (upper edge 22.6 kHz).
         let bank = OctaveBank::new(4096, 44_100.0);
-        assert!(!bank.supported(9), "16 kHz band must be unavailable at 44.1 kHz");
+        assert!(
+            !bank.supported(9),
+            "16 kHz band must be unavailable at 44.1 kHz"
+        );
         assert!(bank.supported(8), "8 kHz band is available at 44.1 kHz");
         // 32 kHz loses only the 16 kHz octave: the 8 kHz upper edge, 11.3 kHz,
         // is still below its 16 kHz Nyquist.

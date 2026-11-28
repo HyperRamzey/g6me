@@ -9,28 +9,38 @@
 //! * **T30** — decay time from −5 dB to −35 dB, slope ×60.
 //! * **C80** — clarity, `10·log10(E(0..80 ms) / E(80 ms..end))`.
 //! * **D50** — definition, `E(0..50 ms) / E(0..end)`.
-//! * **LF** — lateral energy fraction, the figure-of-eight energy in
-//!   `5..80 ms` over the omnidirectional energy over the whole response. With a
-//!   stereo pair the figure-of-eight signal is the difference channel
-//!   `p_8 = (L − R)/√2` and the omni signal is `(L + R)/√2`.
+//! * **LF** — early lateral energy fraction, ISO 3382-1:2009 Eq. A.14:
+//!   `LF = ∫_5ms^80ms p_L² dt / ∫_0^80ms p² dt`, both integrals over the first
+//!   80 ms, with the figure-of-eight pressure `p_L` and the omnidirectional
+//!   pressure `p`. For native B-format (W, X, Y, Z) `p_L` is Y and `p` is W,
+//!   which is the definition. A stereo pair carries no figure-of-eight channel,
+//!   so the harness keeps that calculation only under the explicit name
+//!   `lateral_fraction_stereo_approx`, where `p_L = (L − R)/√2` and
+//!   `p = (L + R)/√2`; that value is an approximation with no defined relation
+//!   to the ISO quantity and is never reported as LF.
 //! * **IACC** — interaural cross-correlation coefficient, the maximum absolute
 //!   normalized cross-correlation of L and R over ±1 ms, evaluated over the
 //!   first 80 ms after the direct sound.
 //!
 //! The decay curve is the Schroeder backward integral of the squared impulse
-//! response. A linear least-squares fit of the decay in dB is used over each
-//! stated range, because the standard specifies a straight-line fit rather than
-//! a two-point difference; on an exactly exponential decay the two agree.
+//! response, accumulated with Neumaier compensated summation (a local port of
+//! HyprEQ's `accum::RunningSum`) so a loud direct sound followed by a long
+//! quiet tail does not absorb the tail. A linear least-squares fit of the decay
+//! in dB is used over each stated range, because the standard specifies a
+//! straight-line fit rather than a two-point difference; on an exactly
+//! exponential decay the two agree.
 //!
 //! Mono/stereo handling: mono responses produce C80/D50/decay values and no LF
 //! or IACC (a single pressure channel carries no interaural or lateral
-//! information). Stereo responses produce both. Four-channel B-format is treated
-//! as multichannel: W is used as the omni signal and spatial metrics are not
-//! fabricated from W/X/Y/Z.
+//! information). Stereo responses produce both spatial values, with LF under
+//! the explicitly approximate stereo definition above. Four-channel B-format
+//! uses W as the omni signal, gives the ISO LF from W and Y, and reports no
+//! IACC (there are no ear signals to correlate).
 //!
-//! Limitations stated rather than hidden: no noise-floor subtraction (Lundeby)
-//! and no IEC 61260 class-1 band filters (see `filterbank`); the band metrics
-//! are computed through ideal rectangular octave filters.
+//! Limitations stated rather than hidden: no noise-floor subtraction (Lundeby),
+//! and the octave bands use the verification-grade power-complementary bank in
+//! `filterbank`; it follows the IEC 61260-1 class-1 magnitude mask at the
+//! tabulated breakpoints but is not a certified IEC 61260 instrument.
 
 use crate::filterbank::{OctaveBank, OCTAVE_CENTERS_HZ};
 
@@ -84,6 +94,13 @@ impl ChannelLayout {
     pub fn has_stereo_pair(self) -> bool {
         matches!(self, ChannelLayout::Stereo)
     }
+
+    /// Native B-format (W, X, Y, Z) carries the omnidirectional pressure in W
+    /// and the left-right figure-of-eight pressure in Y, which is what ISO
+    /// 3382-1 Eq. A.14 needs.
+    pub fn has_bformat(self) -> bool {
+        matches!(self, ChannelLayout::BFormat)
+    }
 }
 
 /// One ISO 3382-1 metric set. `None` means the metric is undefined for this
@@ -132,13 +149,59 @@ pub struct Analysis {
     pub bands: Vec<BandRow>,
 }
 
-/// Schroeder backward integral of `x²`: `edc[i] = Σ_{k=i}^{N-1} x[k]²`.
+/// Neumaier compensated running sum, a local port of HyprEQ's
+/// `accum::RunningSum`: each term is added once to the running total and once
+/// to a correction that captures the rounding of that addition, so small terms
+/// are not absorbed by a large partial sum. Non-finite input propagates.
+#[derive(Clone, Copy, Debug, Default)]
+struct CompensatedSum {
+    sum: f64,
+    comp: f64,
+}
+
+impl CompensatedSum {
+    fn add(&mut self, value: f64) {
+        if !value.is_finite() || !self.sum.is_finite() {
+            self.sum += value;
+            self.comp = 0.0;
+            return;
+        }
+        let next = self.sum + value;
+        if !next.is_finite() {
+            self.sum = next;
+            self.comp = 0.0;
+            return;
+        }
+        self.comp += if self.sum.abs() >= value.abs() {
+            (self.sum - next) + value
+        } else {
+            (value - next) + self.sum
+        };
+        self.sum = next;
+    }
+
+    fn total(self) -> f64 {
+        self.sum + self.comp
+    }
+}
+
+/// `Σ x[i]²` with compensated summation.
+fn sum_squares(x: &[f64]) -> f64 {
+    let mut acc = CompensatedSum::default();
+    for v in x {
+        acc.add(v * v);
+    }
+    acc.total()
+}
+
+/// Schroeder backward integral of `x²`: `edc[i] = Σ_{k=i}^{N-1} x[k]²`,
+/// accumulated with compensated summation.
 pub fn schroeder_edc(x: &[f64]) -> Vec<f64> {
     let mut edc = vec![0.0; x.len()];
-    let mut acc = 0.0;
+    let mut acc = CompensatedSum::default();
     for (out, sample) in edc.iter_mut().rev().zip(x.iter().rev()) {
-        acc += sample * sample;
-        *out = acc;
+        acc.add(sample * sample);
+        *out = acc.total();
     }
     edc
 }
@@ -196,12 +259,11 @@ pub fn decay_time_db(edc: &[f64], sample_rate: f64, hi_db: f64, lo_db: f64) -> O
     Some(-60.0 / (slope * sample_rate))
 }
 
-/// Energy in `[0, split)` and `[split, end)` of a squared signal.
+/// Energy in `[0, split)` and `[split, end)` of a squared signal, with
+/// compensated summation in both ranges.
 fn split_energy(x: &[f64], split: usize) -> (f64, f64) {
     let split = split.min(x.len());
-    let early: f64 = x[..split].iter().map(|v| v * v).sum();
-    let late: f64 = x[split..].iter().map(|v| v * v).sum();
-    (early, late)
+    (sum_squares(&x[..split]), sum_squares(&x[split..]))
 }
 
 fn split_index(sample_rate: f64, t_s: f64) -> usize {
@@ -213,8 +275,14 @@ fn split_index(sample_rate: f64, t_s: f64) -> usize {
 
 /// Clarity in dB for an integration boundary of `t_s` (C80 for 80 ms, C50 for
 /// 50 ms): `10·log10(E_early / E_late)`.
-pub fn clarity_db(x: &[f64], sample_rate: f64, t_s: f64) -> Option<f64> {
-    let (early, late) = split_energy(x, split_index(sample_rate, t_s));
+///
+/// `origin_samples` is the sample treated as t = 0 — 0 for the broadband
+/// response, the band filter's energy-centroid delay for an octave band. The
+/// split sits at `origin + t_s`; everything before it, including the leading
+/// edge of the direct sound, is early. For a pure delay `D`, `x` delayed by
+/// `D` with `origin_samples = D` gives exactly the undelayed result.
+pub fn clarity_db(x: &[f64], sample_rate: f64, t_s: f64, origin_samples: usize) -> Option<f64> {
+    let (early, late) = split_energy(x, origin_samples + split_index(sample_rate, t_s));
     if !early.is_finite() || early <= 0.0 || !late.is_finite() || late <= 0.0 {
         return None;
     }
@@ -223,9 +291,10 @@ pub fn clarity_db(x: &[f64], sample_rate: f64, t_s: f64) -> Option<f64> {
 }
 
 /// Definition for an integration boundary of `t_s` (D50 for 50 ms):
-/// `E_early / (E_early + E_late)`.
-pub fn definition(x: &[f64], sample_rate: f64, t_s: f64) -> Option<f64> {
-    let (early, late) = split_energy(x, split_index(sample_rate, t_s));
+/// `E_early / (E_early + E_late)`. `origin_samples` has the same meaning as in
+/// [`clarity_db`].
+pub fn definition(x: &[f64], sample_rate: f64, t_s: f64, origin_samples: usize) -> Option<f64> {
+    let (early, late) = split_energy(x, origin_samples + split_index(sample_rate, t_s));
     let total = early + late;
     if !total.is_finite() || total <= 0.0 || !early.is_finite() || early < 0.0 {
         return None;
@@ -233,11 +302,21 @@ pub fn definition(x: &[f64], sample_rate: f64, t_s: f64) -> Option<f64> {
     Some((early / total).clamp(0.0, 1.0))
 }
 
-/// ISO lateral energy fraction from a stereo pair:
-/// `LF = Σ_{5ms..80ms} ((L−R)/√2)² / Σ_{0..end} ((L+R)/√2)²`.
+/// **Approximate** lateral energy fraction from a stereo pair:
+/// `Σ_{5ms..80ms} ((L−R)/√2)² / Σ_{0..80ms} ((L+R)/√2)²`.
 ///
-/// The constant 1/2 cancels in the ratio, so it is omitted from the arithmetic.
-pub fn lateral_fraction(left: &[f64], right: &[f64], sample_rate: f64) -> Option<f64> {
+/// This is not ISO 3382-1 Eq. A.14. A stereo pair carries no figure-of-eight
+/// pressure channel, and `(L−R)/√2` has no defined relation to one; the window
+/// is the ISO one, but the spatial interpretation is not. It is kept for
+/// datasets that ship L/R only, under a name that says so. The constant 1/2
+/// cancels in the ratio and is omitted from the arithmetic.
+/// `origin_samples` is the sample treated as t = 0, as in [`clarity_db`].
+pub fn lateral_fraction_stereo_approx(
+    left: &[f64],
+    right: &[f64],
+    sample_rate: f64,
+    origin_samples: usize,
+) -> Option<f64> {
     if left.len() != right.len()
         || left.len() < 16
         || !sample_rate.is_finite()
@@ -245,21 +324,51 @@ pub fn lateral_fraction(left: &[f64], right: &[f64], sample_rate: f64) -> Option
     {
         return None;
     }
-    let start = split_index(sample_rate, 0.005).min(left.len());
-    let end = split_index(sample_rate, 0.080).min(left.len());
+    let start = (origin_samples + split_index(sample_rate, 0.005)).min(left.len());
+    let end = (origin_samples + split_index(sample_rate, 0.080)).min(left.len());
     if end <= start {
         return None;
     }
-    let mut lateral = 0.0;
+    let mut lateral = CompensatedSum::default();
     for i in start..end {
         let d = left[i] - right[i];
-        lateral += d * d;
+        lateral.add(d * d);
     }
-    let mut omni = 0.0;
-    for i in 0..left.len() {
+    let mut omni = CompensatedSum::default();
+    for i in 0..end {
         let s = left[i] + right[i];
-        omni += s * s;
+        omni.add(s * s);
     }
+    let (lateral, omni) = (lateral.total(), omni.total());
+    if !omni.is_finite() || omni <= 0.0 || !lateral.is_finite() {
+        return None;
+    }
+    Some((lateral / omni).clamp(0.0, 1.0))
+}
+
+/// ISO 3382-1:2009 Eq. A.14 lateral energy fraction from native B-format:
+/// `LF = Σ_{5ms..80ms} Y² / Σ_{0ms..80ms} W²`.
+///
+/// W is the omnidirectional pressure and Y the left-right figure-of-eight
+/// pressure (FuMa channel order W, X, Y, Z). Any common scale factor on W and Y
+/// cancels in the ratio. `origin_samples` is the sample treated as t = 0, as in
+/// [`clarity_db`].
+pub fn lateral_fraction_bformat(
+    w: &[f64],
+    y: &[f64],
+    sample_rate: f64,
+    origin_samples: usize,
+) -> Option<f64> {
+    if w.len() != y.len() || w.len() < 16 || !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return None;
+    }
+    let start = (origin_samples + split_index(sample_rate, 0.005)).min(w.len());
+    let end = (origin_samples + split_index(sample_rate, 0.080)).min(w.len());
+    if end <= start {
+        return None;
+    }
+    let lateral = sum_squares(&y[start..end]);
+    let omni = sum_squares(&w[..end]);
     if !omni.is_finite() || omni <= 0.0 || !lateral.is_finite() {
         return None;
     }
@@ -269,8 +378,9 @@ pub fn lateral_fraction(left: &[f64], right: &[f64], sample_rate: f64) -> Option
 /// IACC: maximum absolute normalized cross-correlation of L and R over ±1 ms,
 /// evaluated on the first 80 ms. Zero-padded correlation (one channel is
 /// outside its window treated as zero) with both channels' window energies as
-/// the normalizer.
-pub fn iacc(left: &[f64], right: &[f64], sample_rate: f64) -> Option<Iacc> {
+/// the normalizer. `origin_samples` is the sample treated as t = 0, as in
+/// [`clarity_db`].
+pub fn iacc(left: &[f64], right: &[f64], sample_rate: f64, origin_samples: usize) -> Option<Iacc> {
     if left.len() != right.len()
         || left.len() < 16
         || !sample_rate.is_finite()
@@ -278,7 +388,7 @@ pub fn iacc(left: &[f64], right: &[f64], sample_rate: f64) -> Option<Iacc> {
     {
         return None;
     }
-    let window = split_index(sample_rate, 0.080).min(left.len());
+    let window = (origin_samples + split_index(sample_rate, 0.080)).min(left.len());
     if window < 16 {
         return None;
     }
@@ -286,8 +396,8 @@ pub fn iacc(left: &[f64], right: &[f64], sample_rate: f64) -> Option<Iacc> {
     if max_lag < 1 {
         return None;
     }
-    let el: f64 = left[..window].iter().map(|v| v * v).sum();
-    let er: f64 = right[..window].iter().map(|v| v * v).sum();
+    let el = sum_squares(&left[..window]);
+    let er = sum_squares(&right[..window]);
     if !el.is_finite() || el <= 0.0 || !er.is_finite() || er <= 0.0 {
         return None;
     }
@@ -304,11 +414,11 @@ pub fn iacc(left: &[f64], right: &[f64], sample_rate: f64) -> Option<Iacc> {
         if t0 >= t1 {
             continue;
         }
-        let mut acc = 0.0;
+        let mut acc = CompensatedSum::default();
         for t in t0..t1 {
-            acc += left[t] * right[(t as isize + lag) as usize];
+            acc.add(left[t] * right[(t as isize + lag) as usize]);
         }
-        let c = (acc / denom).abs();
+        let c = (acc.total() / denom).abs();
         if c > best {
             best = c;
             best_lag = lag;
@@ -329,14 +439,13 @@ pub fn onset_sample(x: &[f64]) -> usize {
         return 0;
     }
     let threshold = peak * 0.1;
-    x.iter()
-        .position(|v| v.abs() >= threshold)
-        .unwrap_or(0)
+    x.iter().position(|v| v.abs() >= threshold).unwrap_or(0)
 }
 
 /// Omnidirectional pressure for a channel layout: the channel itself for mono,
-/// `(L+R)/√2` for stereo, the W channel for B-format, and the energetic RMS sum
-/// for arbitrary multichannel inputs (documented, not an ISO measurement).
+/// `(L+R)/√2` for stereo, the W channel for B-format (FuMa order W, X, Y, Z),
+/// and the energetic RMS sum for arbitrary multichannel inputs (documented, not
+/// an ISO measurement).
 fn omni_signal(channels: &[Vec<f64>]) -> Vec<f64> {
     match channels {
         [] => Vec::new(),
@@ -346,6 +455,7 @@ fn omni_signal(channels: &[Vec<f64>]) -> Vec<f64> {
             .zip(r.iter())
             .map(|(a, b)| (a + b) * std::f64::consts::FRAC_1_SQRT_2)
             .collect(),
+        [w, _, _, _] => w.clone(),
         _ => {
             let n = channels[0].len();
             let scale = 1.0 / (channels.len() as f64).sqrt();
@@ -360,16 +470,44 @@ fn omni_signal(channels: &[Vec<f64>]) -> Vec<f64> {
     }
 }
 
-fn metrics_of(omni: &[f64], stereo: Option<(&[f64], &[f64])>, sample_rate: f64) -> Metrics {
+/// Which physical signals back the spatial metrics.
+#[derive(Clone, Copy)]
+enum Spatial<'a> {
+    /// Stereo pair; LF is the explicitly approximate difference-channel value.
+    Stereo { left: &'a [f64], right: &'a [f64] },
+    /// Native B-format: W is omni, Y is the figure-of-eight pressure.
+    BFormat { w: &'a [f64], y: &'a [f64] },
+}
+
+fn metrics_of(
+    omni: &[f64],
+    spatial: Option<Spatial<'_>>,
+    sample_rate: f64,
+    origin_samples: usize,
+) -> Metrics {
     let edc = schroeder_edc(omni);
+    let (lf, iacc) = match spatial {
+        Some(Spatial::Stereo { left, right }) => (
+            lateral_fraction_stereo_approx(left, right, sample_rate, origin_samples),
+            iacc(left, right, sample_rate, origin_samples),
+        ),
+        // No ear signals exist in B-format; IACC stays undefined.
+        Some(Spatial::BFormat { w, y }) => (
+            lateral_fraction_bformat(w, y, sample_rate, origin_samples),
+            None,
+        ),
+        None => (None, None),
+    };
     Metrics {
+        // The decay fits are self-referenced to edc[0], so the filter delay
+        // does not move them.
         t20_s: decay_time_db(&edc, sample_rate, -5.0, -25.0),
         t30_s: decay_time_db(&edc, sample_rate, -5.0, -35.0),
         edt_s: decay_time_db(&edc, sample_rate, 0.0, -10.0),
-        c80_db: clarity_db(omni, sample_rate, 0.080),
-        d50: definition(omni, sample_rate, 0.050),
-        lf: stereo.and_then(|(l, r)| lateral_fraction(l, r, sample_rate)),
-        iacc: stereo.and_then(|(l, r)| iacc(l, r, sample_rate)),
+        c80_db: clarity_db(omni, sample_rate, 0.080, origin_samples),
+        d50: definition(omni, sample_rate, 0.050, origin_samples),
+        lf,
+        iacc,
     }
 }
 
@@ -379,6 +517,10 @@ fn metrics_of(omni: &[f64], stereo: Option<(&[f64], &[f64])>, sample_rate: f64) 
 /// `align` shifts the response so the detected direct-sound onset becomes
 /// sample 0 (the ISO time origin). Without it, index 0 is used as t = 0, which
 /// is only correct for pre-aligned responses.
+///
+/// Spatial channels follow the layout: stereo filters both channels for the
+/// approximate LF and IACC; B-format filters W and Y and reports the ISO
+/// Eq. A.14 LF.
 pub fn analyze(rir: &Rir, align: bool) -> Result<Analysis, String> {
     let frames = rir.frames();
     if rir.channels.is_empty() || rir.sample_rate == 0 {
@@ -404,17 +546,32 @@ pub fn analyze(rir: &Rir, align: bool) -> Result<Analysis, String> {
     let frames = channels[0].len();
     let fs = rir.sample_rate as f64;
     let omni = omni_signal(&channels);
-    let stereo = if layout.has_stereo_pair() {
-        Some((channels[0].as_slice(), channels[1].as_slice()))
+    let spatial = if layout.has_bformat() {
+        Some(Spatial::BFormat {
+            w: channels[0].as_slice(),
+            y: channels[2].as_slice(),
+        })
+    } else if layout.has_stereo_pair() {
+        Some(Spatial::Stereo {
+            left: channels[0].as_slice(),
+            right: channels[1].as_slice(),
+        })
     } else {
         None
     };
 
-    let broadband = metrics_of(&omni, stereo, fs);
+    let broadband = metrics_of(&omni, spatial, fs, 0);
 
     let bank = OctaveBank::new(frames, fs);
     let spec_omni = bank.forward(&omni);
-    let spec_lr = stereo.map(|(l, r)| (bank.forward(l), bank.forward(r)));
+    let spec_lr = match spatial {
+        Some(Spatial::Stereo { left, right }) => Some((bank.forward(left), bank.forward(right))),
+        _ => None,
+    };
+    let spec_y = match spatial {
+        Some(Spatial::BFormat { y, .. }) => Some(bank.forward(y)),
+        _ => None,
+    };
 
     let mut bands = Vec::with_capacity(OCTAVE_CENTERS_HZ.len());
     for (band, center) in OCTAVE_CENTERS_HZ.iter().enumerate() {
@@ -426,20 +583,42 @@ pub fn analyze(rir: &Rir, align: bool) -> Result<Analysis, String> {
             });
             continue;
         }
-        let band_omni = bank
-            .inverse_band(&spec_omni, band)
-            .ok_or_else(|| format!("band {center} Hz: omnidirectional inverse failed"))?;
-        let band_metrics = match &spec_lr {
-            Some((sl, sr)) => {
-                let bl = bank
-                    .inverse_band(sl, band)
-                    .ok_or_else(|| format!("band {center} Hz: left inverse failed"))?;
-                let br = bank
-                    .inverse_band(sr, band)
-                    .ok_or_else(|| format!("band {center} Hz: right inverse failed"))?;
-                metrics_of(&band_omni, Some((&bl, &br)), fs)
-            }
-            None => metrics_of(&band_omni, None, fs),
+        let kernel = bank
+            .min_phase_spectrum(band)
+            .ok_or_else(|| format!("band {center} Hz: filter design failed"))?;
+        // The causal filter delays the band's direct sound; anchor this band's
+        // ISO windows to the kernel's energy centroid.
+        let origin = bank.kernel_delay_samples(&kernel);
+        let mut band_omni = bank.apply(&spec_omni, &kernel);
+        band_omni.truncate(frames);
+        let band_metrics = if let Some((sl, sr)) = &spec_lr {
+            let mut bl = bank.apply(sl, &kernel);
+            bl.truncate(frames);
+            let mut br = bank.apply(sr, &kernel);
+            br.truncate(frames);
+            metrics_of(
+                &band_omni,
+                Some(Spatial::Stereo {
+                    left: &bl,
+                    right: &br,
+                }),
+                fs,
+                origin,
+            )
+        } else if let Some(sy) = &spec_y {
+            let mut by = bank.apply(sy, &kernel);
+            by.truncate(frames);
+            metrics_of(
+                &band_omni,
+                Some(Spatial::BFormat {
+                    w: &band_omni,
+                    y: &by,
+                }),
+                fs,
+                origin,
+            )
+        } else {
+            metrics_of(&band_omni, None, fs, origin)
         };
         bands.push(BandRow {
             band_hz: *center,
@@ -555,8 +734,8 @@ mod tests {
         let want_c80 = 10.0 * (e80 / (etot - e80)).log10();
         let want_d50 = e50 / etot;
 
-        let got_c80 = clarity_db(&x, fs, 0.080).expect("C80");
-        let got_d50 = definition(&x, fs, 0.050).expect("D50");
+        let got_c80 = clarity_db(&x, fs, 0.080, 0).expect("C80");
+        let got_d50 = definition(&x, fs, 0.050, 0).expect("D50");
         assert!(
             (got_c80 - want_c80).abs() < 1e-9,
             "C80 {got_c80:.9} dB vs closed form {want_c80:.9} dB"
@@ -569,44 +748,167 @@ mod tests {
     }
 
     #[test]
-    fn lateral_fraction_matches_the_geometric_closed_form() {
+    fn stereo_lateral_fraction_matches_the_geometric_closed_form() {
         let fs = 48_000.0;
         let (x, a) = geometric_rir(0.5, fs, 1.8);
         let q = a * a;
         let n = x.len();
         let m5 = (0.005 * fs).round() as usize;
         let m80 = (0.080 * fs).round() as usize;
-        let want = geometric_sum(q, m80).min(geometric_sum(q, n))
-            - geometric_sum(q, m5).min(geometric_sum(q, n));
-        let want = want / geometric_sum(q, n);
+        // ISO 3382-1 Eq. A.14 puts both integrals in the first 80 ms.
+        let windowed = geometric_sum(q, m80);
+        let want = (windowed - geometric_sum(q, m5)) / windowed;
 
         // Fully lateral difference channel: R = 0.
         let zeros = vec![0.0; n];
-        let got = lateral_fraction(&x, &zeros, fs).expect("LF with R=0");
+        let got = lateral_fraction_stereo_approx(&x, &zeros, fs, 0).expect("LF with R=0");
         assert!(
             (got - want).abs() < 1e-12,
             "LF {got:.12} vs closed form {want:.12}"
         );
+        // The pre-fix whole-record denominator reports a smaller number; this
+        // guards against silently reverting to it.
+        let whole_record = (windowed - geometric_sum(q, m5)) / geometric_sum(q, n);
+        assert!(
+            got > whole_record + 1e-3,
+            "LF {got:.6} is indistinguishable from the whole-record denominator {whole_record:.6}"
+        );
 
         // Centred image: L == R means no lateral energy at all.
-        let centred = lateral_fraction(&x, &x, fs).expect("LF with L=R");
+        let centred = lateral_fraction_stereo_approx(&x, &x, fs, 0).expect("LF with L=R");
         assert_eq!(centred, 0.0, "L == R must give exactly zero lateral energy");
 
-        let silent = lateral_fraction(&zeros, &zeros, fs);
+        let silent = lateral_fraction_stereo_approx(&zeros, &zeros, fs, 0);
         assert!(silent.is_none(), "silence has no defined LF");
+    }
+
+    #[test]
+    fn bformat_lateral_fraction_is_iso_eq_a14() {
+        let fs = 48_000.0;
+        let (w, a) = geometric_rir(0.5, fs, 1.8);
+        let q = a * a;
+        let n = w.len();
+        let m5 = (0.005 * fs).round() as usize;
+        let m80 = (0.080 * fs).round() as usize;
+        // Y = 0.5·W: a purely lateral field at half the omni amplitude, so the
+        // Eq. A.14 value is 0.25 × the W-only window ratio.
+        let windowed = geometric_sum(q, m80);
+        let want = 0.25 * (windowed - geometric_sum(q, m5)) / windowed;
+        let zeros = vec![0.0; n];
+        let y: Vec<f64> = w.iter().map(|v| 0.5 * v).collect();
+        let rir = Rir {
+            sample_rate: 48_000,
+            channels: vec![w.clone(), zeros.clone(), y, zeros.clone()],
+        };
+        let an = analyze(&rir, true).expect("B-format analysis");
+        assert_eq!(an.layout, ChannelLayout::BFormat);
+        let lf = an.broadband.lf.expect("B-format must report the ISO LF");
+        assert!((lf - want).abs() < 1e-12, "LF {lf:.12} vs {want:.12}");
+        assert!(
+            an.broadband.iacc.is_none(),
+            "B-format has no ear signals, so IACC must stay undefined"
+        );
+
+        // W is the omni signal: the non-spatial metrics must equal a mono
+        // analysis of W exactly.
+        let mono = analyze(
+            &Rir {
+                sample_rate: 48_000,
+                channels: vec![w],
+            },
+            true,
+        )
+        .expect("mono analysis");
+        assert_eq!(an.broadband.edt_s, mono.broadband.edt_s);
+        assert_eq!(an.broadband.t30_s, mono.broadband.t30_s);
+        assert_eq!(an.broadband.c80_db, mono.broadband.c80_db);
+        assert_eq!(an.broadband.d50, mono.broadband.d50);
+
+        // Without a Y signal there is no lateral energy at all.
+        let lateral_zero = Rir {
+            sample_rate: 48_000,
+            channels: vec![vec![1.0; n], zeros.clone(), zeros.clone(), zeros.clone()],
+        };
+        let flat = analyze(&lateral_zero, false).expect("B-format with silent Y");
+        assert_eq!(flat.broadband.lf, Some(0.0));
+    }
+
+    #[test]
+    fn compensated_sums_keep_bits_a_naive_walk_drops() {
+        // The Schroeder integral walks backward, so the absorbing large term
+        // is last in the record: after 1e16 is in the accumulator each 1.0 is
+        // exactly half an ulp and a naive sum loses all of them to
+        // ties-to-even. The exact total, 1e16 + 2000, is representable.
+        let mut x = vec![1.0; 2001];
+        x[2000] = 1e8;
+        let edc = schroeder_edc(&x);
+        assert_eq!(edc[0], 1e16 + 2000.0, "compensated EDC must keep the tail");
+        let naive: f64 = x.iter().rev().map(|v| v * v).sum();
+        assert_eq!(naive, 1e16, "fixture must actually lose the tail naively");
+
+        // split_energy walks forward, so the same fixture puts the large term
+        // first. Bound: the compensated result is exact (equality); the naive
+        // result is off by the full 1000.
+        let mut y = vec![1.0; 2001];
+        y[0] = 1e8;
+        let (early, late) = split_energy(&y, 1001);
+        assert_eq!(early, 1e16 + 1000.0);
+        assert_eq!(late, 1000.0);
+        let naive_early: f64 = y[..1001].iter().map(|v| v * v).sum();
+        assert_eq!(
+            naive_early, 1e16,
+            "fixture must actually lose the tail naively"
+        );
+    }
+
+    #[test]
+    fn origin_shift_compensates_a_pure_delay_exactly() {
+        // Prepending D zeros and passing origin = D must reproduce the
+        // undelayed metrics: the ISO windows are anchored to the direct sound,
+        // not to the array start. This is the mechanism `analyze` uses for the
+        // causal band filters, whose kernels carry the direct sound's energy
+        // centroid a few milliseconds late.
+        let fs = 48_000.0;
+        let (x, _) = geometric_rir(0.4, fs, 0.6);
+        let d = 1000; // 20.8 ms at 48 kHz
+        let mut delayed = vec![0.0; d];
+        delayed.extend_from_slice(&x);
+
+        let c0 = clarity_db(&x, fs, 0.080, 0).expect("C80");
+        let c1 = clarity_db(&delayed, fs, 0.080, d).expect("C80 delayed");
+        assert!((c0 - c1).abs() < 1e-12, "C80 {c0:.12} vs {c1:.12}");
+        let d0 = definition(&x, fs, 0.050, 0).expect("D50");
+        let d1 = definition(&delayed, fs, 0.050, d).expect("D50 delayed");
+        assert!((d0 - d1).abs() < 1e-12, "D50 {d0:.12} vs {d1:.12}");
+
+        let zeros = vec![0.0; x.len()];
+        let mut delayed_zeros = vec![0.0; d];
+        delayed_zeros.extend_from_slice(&zeros);
+        let lf0 = lateral_fraction_stereo_approx(&x, &zeros, fs, 0).expect("LF");
+        let lf1 =
+            lateral_fraction_stereo_approx(&delayed, &delayed_zeros, fs, d).expect("LF delayed");
+        assert!((lf0 - lf1).abs() < 1e-12, "LF {lf0:.12} vs {lf1:.12}");
+
+        let i0 = iacc(&x, &x, fs, 0).expect("IACC");
+        let i1 = iacc(&delayed, &delayed, fs, d).expect("IACC delayed");
+        assert!((i0.value - i1.value).abs() < 1e-12);
+        assert_eq!(i0.lag_samples, i1.lag_samples);
     }
 
     #[test]
     fn iacc_is_one_for_identical_and_delayed_impulses() {
         let fs = 48_000.0;
         let (x, _) = geometric_rir(0.5, fs, 0.2);
-        let same = iacc(&x, &x, fs).expect("IACC identical");
+        let same = iacc(&x, &x, fs, 0).expect("IACC identical");
         assert!((same.value - 1.0).abs() < 1e-12, "IACC {same:?}");
         assert_eq!(same.lag_samples, 0);
 
         let negated: Vec<f64> = x.iter().map(|v| -v).collect();
-        let inverted = iacc(&x, &negated, fs).expect("IACC inverted");
-        assert!((inverted.value - 1.0).abs() < 1e-12, "|ρ| is used: {inverted:?}");
+        let inverted = iacc(&x, &negated, fs, 0).expect("IACC inverted");
+        assert!(
+            (inverted.value - 1.0).abs() < 1e-12,
+            "|ρ| is used: {inverted:?}"
+        );
         assert_eq!(inverted.lag_samples, 0);
 
         // A 1 ms interaural delay is the maximum of the correlation.
@@ -614,12 +916,12 @@ mod tests {
         let mut right = vec![0.0; 256];
         left[0] = 1.0;
         right[48] = 1.0; // 1 ms at 48 kHz
-        let delayed = iacc(&left, &right, fs).expect("IACC delayed");
+        let delayed = iacc(&left, &right, fs, 0).expect("IACC delayed");
         assert_eq!(delayed.lag_samples, 48);
         assert!((delayed.value - 1.0).abs() < 1e-12, "{delayed:?}");
         assert!((delayed.lag_ms - 1.0).abs() < 1e-12);
 
-        let swapped = iacc(&right, &left, fs).expect("IACC swapped");
+        let swapped = iacc(&right, &left, fs, 0).expect("IACC swapped");
         assert_eq!(swapped.lag_samples, -48);
     }
 
@@ -634,8 +936,12 @@ mod tests {
         };
         let left: Vec<f64> = (0..4800).map(|_| next()).collect();
         let right: Vec<f64> = (0..4800).map(|_| next()).collect();
-        let c = iacc(&left, &right, 48_000.0).expect("IACC noise");
-        assert!(c.value < 0.95, "independent noise produced IACC {}", c.value);
+        let c = iacc(&left, &right, 48_000.0, 0).expect("IACC noise");
+        assert!(
+            c.value < 0.95,
+            "independent noise produced IACC {}",
+            c.value
+        );
         assert!((0.0..=1.0).contains(&c.value));
     }
 
@@ -763,13 +1069,17 @@ mod tests {
             if !row.supported || !(125.0..=8000.0).contains(&row.band_hz) {
                 continue;
             }
-            if let Some(t) = row.metrics.t30_s {
-                assert!(
-                    (t - t60).abs() / t60 < 0.10,
-                    "band {} T30 {t:.4} s should track 1 s",
+            let t = row.metrics.t30_s.unwrap_or_else(|| {
+                panic!(
+                    "band {} has no T30 after filtering",
                     band_label(row.band_hz)
-                );
-            }
+                )
+            });
+            assert!(
+                (t - t60).abs() / t60 < 0.10,
+                "band {} T30 {t:.4} s should track 1 s",
+                band_label(row.band_hz)
+            );
         }
     }
 }

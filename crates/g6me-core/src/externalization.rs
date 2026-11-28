@@ -59,7 +59,7 @@ pub const EXT_SPEED_OF_SOUND: f64 = 343.0;
 /// Template source distance, m (the production renderer's default 2 m).
 pub const EXT_TEMPLATE_DISTANCE_M: f64 = 2.0;
 
-/// Numerical guard for the template denominators of Eqs. 1, 2, 4, 5 and 7. The paper
+/// Numerical guard for the template denominators of Eqs. 1–5 and 7–8. The paper
 /// specifies no floor; this value only prevents division by exactly zero.
 const EXT_DENOM_FLOOR: f64 = 1e-12;
 

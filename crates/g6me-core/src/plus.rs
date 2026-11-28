@@ -2161,6 +2161,7 @@ thread_local! {
     static UPOLA_INVERSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(feature = "cuda")]
 #[inline(always)]
 fn upola_device_failpoint(stage: u8) -> Result<(), String> {
     #[cfg(all(test, feature = "cuda"))]
@@ -2181,6 +2182,7 @@ fn upola_device_failpoint(stage: u8) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 #[inline(always)]
 fn upola_note_inverse() {
     #[cfg(all(test, feature = "cuda"))]
@@ -3137,7 +3139,8 @@ impl BinauralPlus {
                             for (dst, &sample) in self.ntt_x.iter_mut().take(m).zip(slice) {
                                 let q = (sample * NTT_PCM_SCALE)
                                     .round()
-                                    .clamp(-8_388_608.0, 8_388_607.0) as i64;
+                                    .clamp(-8_388_608.0, 8_388_607.0)
+                                    as i64;
                                 *dst = i64_to_field(q);
                             }
                             Self::ntt_forward_buf(use_cuda, np, &mut self.ntt_x);
@@ -3173,7 +3176,8 @@ impl BinauralPlus {
                     for (dst, &sample) in self.ntt_x.iter_mut().take(m).zip(slice) {
                         let q = (sample * NTT_PCM_SCALE)
                             .round()
-                            .clamp(-8_388_608.0, 8_388_607.0) as i64;
+                            .clamp(-8_388_608.0, 8_388_607.0)
+                            as i64;
                         *dst = i64_to_field(q);
                     }
                     Self::ntt_forward_buf(use_cuda, np, &mut self.ntt_x);
@@ -4606,7 +4610,10 @@ mod tests {
             eprintln!("skipping: device-resident UPOLA state unavailable");
             return None;
         }
-        assert!(eng.n_parts > 1, "ControlRoom must use multi-partition UPOLA");
+        assert!(
+            eng.n_parts > 1,
+            "ControlRoom must use multi-partition UPOLA"
+        );
         Some(eng)
     }
 
@@ -4704,6 +4711,58 @@ mod tests {
             assert_eq!(eng.fdl_head, head, "stage {stage}: fdl_head mutated");
             assert_eq!(eng.cur_fill, fill, "stage {stage}: cur_fill mutated");
             assert_eq!(eng.finite, finite, "stage {stage}: finite flag mutated");
+        }
+
+        // Partial-block start: the deferred tail T is inverse-transformed at the first hop
+        // of a block and added to the overlap buffer, so the same seam must fire before that
+        // host add and before any sample is emitted.
+        let mp = m / 2;
+        let mut refs_p: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        refs_p[SLOT_FL] = Some(&fl[..mp]);
+        refs_p[SLOT_FR] = Some(&fr[..mp]);
+        let mut out_pl = vec![0.0_f64; mp];
+        let mut out_pr = vec![0.0_f64; mp];
+        for stage in [1u8, 2] {
+            let sentinel_l = vec![9.5_f64; mp];
+            let sentinel_r = vec![-3.25_f64; mp];
+            out_pl.copy_from_slice(&sentinel_l);
+            out_pr.copy_from_slice(&sentinel_r);
+            UPOLA_FAIL_STAGE.with(|f| f.set(stage));
+            let err = eng
+                .process_hop_ntt_cuda(&state, &refs_p, 0, &mut out_pl, &mut out_pr, mp)
+                .expect_err("injected partial-hop device failure must propagate");
+            assert!(
+                err.contains("injected"),
+                "partial stage {stage}: unexpected error text: {err}"
+            );
+            assert_eq!(
+                out_pl, sentinel_l,
+                "partial stage {stage}: out_l mutated before the device call failed"
+            );
+            assert_eq!(
+                out_pr, sentinel_r,
+                "partial stage {stage}: out_r mutated before the device call failed"
+            );
+            assert_eq!(
+                eng.ntt_ov_l, ov_l,
+                "partial stage {stage}: left overlap tail mutated on device failure"
+            );
+            assert_eq!(
+                eng.ntt_ov_r, ov_r,
+                "partial stage {stage}: right overlap tail mutated on device failure"
+            );
+            assert_eq!(
+                eng.fdl_head, head,
+                "partial stage {stage}: fdl_head mutated"
+            );
+            assert_eq!(
+                eng.cur_fill, fill,
+                "partial stage {stage}: cur_fill mutated"
+            );
+            assert_eq!(
+                eng.finite, finite,
+                "partial stage {stage}: finite flag mutated"
+            );
         }
     }
 }

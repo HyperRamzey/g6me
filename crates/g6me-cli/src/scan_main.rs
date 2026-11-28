@@ -97,6 +97,12 @@ struct Cli {
     #[arg(long, default_value_t = 25.0)]
     max_edge_mm: f64,
 
+    /// Conforming-subdivision face ceiling for the Stage 4b acoustic remesh. A round that would
+    /// exceed the ceiling is refused and reported (`target_met=false`) instead of silently
+    /// shipping a mesh that violates `--max-edge-mm`.
+    #[arg(long, default_value_t = g6me_core::bem::DEFAULT_MAX_REMESH_FACES)]
+    remesh_max_faces: usize,
+
     /// TSDF and generalized-winding voxel grid resolution per axis (10..=48, default 24).
     #[arg(long, default_value_t = 24)]
     grid_res: usize,
@@ -237,6 +243,19 @@ fn print_and_export_result(
         out.mesh_stats.center_winding,
         out.mesh_stats.max_edge_m * 1e3
     );
+    println!(
+        "Remesh budget   : requested <= {} tris | achieved {} | target_met={}",
+        out.remesh_report.requested_max_faces,
+        out.remesh_report.achieved_faces,
+        out.remesh_report.target_met
+    );
+    if !out.remesh_report.target_met {
+        eprintln!(
+            "g6me-scan warning: remesh target not met ({} faces, budget {}): the mesh \
+             still violates the edge bound or the budget stopped subdivision early",
+            out.remesh_report.achieved_faces, out.remesh_report.requested_max_faces
+        );
+    }
     let hl = out.solver.solve_reciprocal_hrtfs_with_cuda(
         2000.0,
         c_air,
@@ -345,6 +364,7 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 tsdf_res: grid_res,
                 winding_res: grid_res,
                 max_edge_m: (cli.max_edge_mm * 1e-3).max(0.0025),
+                max_remesh_faces: cli.remesh_max_faces,
                 speed_of_sound_m_s: c_air,
                 use_cuda: cli.cuda,
                 cuda_tensor_precision: cli.cuda_precision,
@@ -560,6 +580,7 @@ fn run(cli: &Cli) -> Result<(), ScanError> {
                 tsdf_res: grid_res,
                 winding_res: grid_res,
                 max_edge_m: (cli.max_edge_mm * 1e-3).max(0.0025),
+                max_remesh_faces: cli.remesh_max_faces,
                 speed_of_sound_m_s: c_air,
                 use_cuda: cli.cuda,
                 cuda_tensor_precision: cli.cuda_precision,

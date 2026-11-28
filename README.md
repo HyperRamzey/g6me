@@ -35,13 +35,22 @@ bit-identical; float stages are gated at the smallest measured difference. A CUD
 never "missing" and never satisfied by a silent host fallback; a GPU-only feature gets a
 bit-exact CPU counterpart. A paper's name appears only on an implementation of that paper.
 
-**Wave 1 — correctness (in progress).** Room late-tail per-band RT60 (envelope floor,
-double ISO 9613-1 air absorption, 125 Hz interpolation step), Bruce–Erfani–Zilany (BEZ2018a)
-auditory periphery (tail padding, decimator phase, PLA/chirp gains, SPL calibration, integer
-step counter), ISO 3382-1 LF denominator + IEC 61260 class-1 filterbank, Baumgartner–Majdak
-7-cue externalization (true Butterworth, pinna template), DNG float/GainMap edge cases and
-remesh budget reporting, spherical near-field HRTF series (r_hi cutoff, scaled Miller J_m),
+**Wave 1 — correctness (complete).** Room late-tail per-band RT60 (envelope floor,
+single ISO 9613-1 air absorption, PCHIP cross-band interpolation), Bruce–Erfani–Zilany
+(BEZ2018a) auditory periphery (tail padding held at resting drive, 31-sample decimator
+alignment, SPL calibration against the C reference, integer redock clock; PLA/chirp gains
+confirmed correct), ISO 3382-1 LF denominator + IEC 61260 class-1 filterbank (energy
+0.99963, band-sum error 1e-11), Baumgartner–Majdak 7-cue externalization, DNG float/GainMap
+edge cases, remesh budget reporting wired through `g6me-scan` (`--remesh-max-faces`,
+`target_met` warning), spherical near-field HRTF series (r_hi cutoff, scaled Miller J_m),
 UPOLA single-inverse and rollback atomicity, and the CUDA E2E stage gate.
+
+**Wave 1.5 — integration (in progress).** Head-mesh/room junction: one shared 1 ms causal
+pre-delay (the old `n_fft/8` delay put direct sound 42–85 ms behind the room), ear-canal
+entrance instead of helix rim, phase-unwrapped anchor interpolation, and room reflections
+decoded through the BEM head rather than the snowman. Plus: verifier gate requiring every
+exercised CUDA stage, SOFA AES69 / PLY I/O, adaptive scan reconstruction (card detector,
+dense burst depth, high-resolution TSDF), and optimal-Q Ozaki-II.
 
 **Wave 2 — measured room validation.** Lundeby cross-point truncation and noise handling,
 Tier-A shoebox presets in CLI/GUI, OpenAIR/dEchorate gates, passive frequency-dependent FDTD
