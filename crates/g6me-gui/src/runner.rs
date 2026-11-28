@@ -13,10 +13,19 @@
 use g6me_core::batch::{self, Batch, BatchCfg, Counters, Item, Outcome, Phase};
 use g6me_core::pipeline::Report;
 use g6me_core::probe::{Caps, Tools};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Target of a file or folder picker dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickTarget {
+    Queue,
+    OutDir,
+    Ir,
+}
 
 /// Severity, so the log can colour and count problems.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +56,12 @@ pub enum Event {
     /// launches ffmpeg several times, and a window that appears a second later
     /// beats a window that appears frozen.
     Caps(Caps, String),
+    /// A non-blocking native OS file/folder dialog returned selected paths.
+    #[cfg_attr(not(feature = "native-dialogs"), allow(dead_code))]
+    Picked {
+        target: PickTarget,
+        paths: Vec<PathBuf>,
+    },
 }
 
 /// Final tally of one batch, in the shape the status bar wants.

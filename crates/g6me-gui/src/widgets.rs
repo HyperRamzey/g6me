@@ -16,9 +16,10 @@
 //! portal, and this project promises to run on a plain Wayland or dwm session.
 //! A pure-egui browser has no such dependency.
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
 use g6me_core::batch;
 use g6me_core::meter::{Meters, IN_CHANNELS, OUT_CHANNELS, TOTAL};
+use g6me_core::plus::{PlusCfg, RendererMode};
 use std::path::{Path, PathBuf};
 
 /// dB grid lines, drawn where the eye expects them. -60 is the floor the parameter
@@ -812,13 +813,17 @@ fn dirs_home() -> PathBuf {
 
 impl Browser {
     fn refresh(&mut self) {
-        self.path_text = self.path.display().to_string();
         if self.entries_loaded
             && self.entries_for == self.path
             && self.entries_filter == self.filter_audio
             && self.entries_mode == self.mode
         {
             return;
+        }
+        // Only sync the address bar when navigating to a new folder (or on first load)
+        // so user typing/pasting into the path bar is never overwritten mid-edit.
+        if self.entries_for != self.path || !self.entries_loaded {
+            self.path_text = self.path.display().to_string();
         }
         self.entries.clear();
         self.entries_for = self.path.clone();
@@ -924,11 +929,19 @@ impl Browser {
             ui.weak("nothing in this folder reports a creation time — showing the modified date");
         }
         if self.path_bar(ui) {
-            let want = PathBuf::from(self.path_text.trim());
+            let want = clean_pasted_path(&self.path_text);
             if want.is_dir() {
+                self.message = None;
                 self.goto(want);
+            } else if want.is_file() {
+                self.message = None;
+                if let Some(parent) = want.parent() {
+                    let parent = parent.to_path_buf();
+                    self.goto(parent);
+                }
+                self.picked = vec![want];
             } else {
-                self.message = Some(format!("{} is not a folder", self.path_text.trim()));
+                self.message = Some(format!("{} does not exist", want.display()));
             }
         }
 
@@ -1064,14 +1077,19 @@ impl Browser {
         }
     }
 
-    /// The editable path. Returns true when "go" was pressed.
+    /// The editable, pasteable path bar. Returns true when Enter or "go" was pressed.
     fn path_bar(&mut self, ui: &mut egui::Ui) -> bool {
         let mut go = false;
         ui.horizontal(|ui| {
-            ui.add_sized(
+            let resp = ui.add_sized(
                 [ui.available_width() - 60.0, 0.0],
-                egui::TextEdit::singleline(&mut self.path_text).font(FontId::monospace(11.0)),
+                egui::TextEdit::singleline(&mut self.path_text)
+                    .font(FontId::monospace(11.0))
+                    .hint_text("paste a folder or file path and press Enter…"),
             );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                go = true;
+            }
             if ui.button("go").clicked() {
                 go = true;
             }
@@ -1200,6 +1218,321 @@ pub fn short_path(p: &Path, max: usize) -> String {
     let head: String = chars[..head_n].iter().collect();
     let tail: String = chars[chars.len() - tail_n..].iter().collect();
     format!("{head}…{tail}")
+}
+
+/// Normalize a user-pasted filesystem path: trims whitespace and strips matching
+/// surrounding single or double quotes (e.g. Windows Explorer "Copy as path" or
+/// shell-quoted Linux paths).
+pub fn clean_pasted_path(raw: &str) -> PathBuf {
+    let t = raw.trim();
+    let stripped = if (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+        || (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
+    {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    };
+    PathBuf::from(stripped.trim())
+}
+
+/// Nugen Halo Upmix–inspired interactive 2D binaural soundfield radar.
+///
+/// Visualizes the active 7.1 speaker geometry, frontal stage width arc,
+/// center dialogue focus beam, surround/rear immersion envelope, dry studio
+/// lateral externalization reflections, and optional live input channel activity.
+pub fn soundfield_radar(
+    ui: &mut Ui,
+    mode: RendererMode,
+    cfg: &PlusCfg,
+    live_in_params: Option<[f32; 8]>,
+    size: f32,
+) {
+    let (rect, _resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let p = ui.painter_at(rect);
+    let dark = ui.visuals().dark_mode;
+
+    let bg = if dark {
+        Color32::from_rgb(13, 16, 22)
+    } else {
+        Color32::from_rgb(241, 244, 248)
+    };
+    let ring_col = if dark {
+        Color32::from_rgba_unmultiplied(120, 145, 180, 38)
+    } else {
+        Color32::from_rgba_unmultiplied(60, 80, 110, 44)
+    };
+    let axis_col = if dark {
+        Color32::from_rgba_unmultiplied(120, 145, 180, 26)
+    } else {
+        Color32::from_rgba_unmultiplied(60, 80, 110, 32)
+    };
+    let text_col = if dark {
+        Color32::from_rgb(198, 210, 226)
+    } else {
+        Color32::from_rgb(38, 48, 62)
+    };
+    let muted_col = if dark {
+        Color32::from_rgb(122, 136, 156)
+    } else {
+        Color32::from_rgb(104, 118, 136)
+    };
+
+    let is_plus = mode == RendererMode::Plus;
+    let accent_front = if is_plus {
+        Color32::from_rgb(76, 194, 232)
+    } else {
+        Color32::from_rgb(206, 164, 92)
+    };
+    let accent_center = if is_plus {
+        Color32::from_rgb(112, 228, 178)
+    } else {
+        Color32::from_rgb(220, 186, 120)
+    };
+    let accent_surr = if is_plus {
+        Color32::from_rgb(142, 146, 245)
+    } else {
+        Color32::from_rgb(176, 148, 102)
+    };
+    let accent_room = Color32::from_rgb(240, 182, 92);
+
+    p.rect_filled(rect, 8.0, bg);
+    p.rect_stroke(
+        rect,
+        8.0,
+        Stroke::new(1.0_f32, ring_col),
+        StrokeKind::Inside,
+    );
+
+    let c = rect.center();
+    let r_max = size * 0.42;
+
+    // Helper: azimuth in degrees (`0°` = front/top, `+` = left/CCW, `-` = right/CW) -> screen Pos2.
+    let polar = |az_deg: f32, r_norm: f32| -> Pos2 {
+        let rad = az_deg.to_radians();
+        let rr = r_norm * r_max;
+        Pos2::new(c.x - rr * rad.sin(), c.y - rr * rad.cos())
+    };
+
+    // 1. Concentric reference rings + radial axes.
+    for frac in [0.34_f32, 0.67, 1.0] {
+        p.circle_stroke(c, r_max * frac, Stroke::new(1.0_f32, ring_col));
+    }
+    for az in [0.0_f32, 90.0, 180.0, -90.0] {
+        p.line_segment([c, polar(az, 1.0)], Stroke::new(1.0_f32, axis_col));
+    }
+
+    // 2. Dry ITU-BS.1116 studio lateral reflection envelope (reacts live to `externalize`).
+    if is_plus && cfg.externalize > 0.01 {
+        let ext = cfg.externalize as f32;
+        let halo_alpha = (28.0 + 70.0 * ext) as u8;
+        let halo_r = 0.80 + 0.22 * ext;
+        for sign in [-1.0_f32, 1.0] {
+            let mut pts = Vec::with_capacity(18);
+            for i in 0..=16 {
+                let t = i as f32 / 16.0;
+                let az = sign * (48.0 + 78.0 * t);
+                pts.push(polar(az, halo_r));
+            }
+            p.add(Shape::line(
+                pts,
+                Stroke::new(
+                    2.0 + 2.5 * ext,
+                    Color32::from_rgba_unmultiplied(
+                        accent_room.r(),
+                        accent_room.g(),
+                        accent_room.b(),
+                        halo_alpha,
+                    ),
+                ),
+            ));
+        }
+    }
+
+    // 3. Frontal stage arc (reacts to `width`: `±30° * width`).
+    let fl_az = if is_plus {
+        (30.0 * cfg.width as f32).clamp(15.0, 65.0)
+    } else {
+        30.0
+    };
+    {
+        let mut pts = Vec::with_capacity(28);
+        for i in 0..=24 {
+            let t = i as f32 / 24.0;
+            let az = fl_az - 2.0 * fl_az * t;
+            pts.push(polar(az, 0.78));
+        }
+        p.add(Shape::line(
+            pts,
+            Stroke::new(
+                3.0_f32,
+                Color32::from_rgba_unmultiplied(
+                    accent_front.r(),
+                    accent_front.g(),
+                    accent_front.b(),
+                    165,
+                ),
+            ),
+        ));
+    }
+
+    // 4. Center dialogue focus beam (narrows & sharpens as `center_focus` rises).
+    {
+        let focus = if is_plus {
+            cfg.center_focus as f32
+        } else {
+            0.7
+        };
+        let half_beam = 22.0 - 15.0 * focus; // 22° wide when 0.0 -> 7° tight when 1.0
+        let beam_r = 0.74 + 0.10 * focus;
+        let mut poly = Vec::with_capacity(16);
+        poly.push(c);
+        for i in 0..=12 {
+            let t = i as f32 / 12.0;
+            let az = half_beam - 2.0 * half_beam * t;
+            poly.push(polar(az, beam_r));
+        }
+        p.add(Shape::convex_polygon(
+            poly,
+            Color32::from_rgba_unmultiplied(
+                accent_center.r(),
+                accent_center.g(),
+                accent_center.b(),
+                (26.0 + 44.0 * focus) as u8,
+            ),
+            Stroke::NONE,
+        ));
+    }
+
+    // 5. Surround & rear immersion arc (`SL -> BL -> BR -> SR`, reacts to `surround_depth`).
+    {
+        let depth = if is_plus {
+            cfg.surround_depth as f32
+        } else {
+            1.0
+        };
+        let sr_r = (0.66 + 0.16 * depth).clamp(0.68, 0.90);
+        let mut pts = Vec::with_capacity(34);
+        for i in 0..=32 {
+            let t = i as f32 / 32.0;
+            let az = 100.0 + 160.0 * t; // 100° -> 180° -> 260° (-100°)
+            pts.push(polar(az, sr_r));
+        }
+        p.add(Shape::line(
+            pts,
+            Stroke::new(
+                2.0 + 1.5 * depth,
+                Color32::from_rgba_unmultiplied(
+                    accent_surr.r(),
+                    accent_surr.g(),
+                    accent_surr.b(),
+                    (75.0 + 75.0 * depth.min(1.5) / 1.5) as u8,
+                ),
+            ),
+        ));
+    }
+
+    // 6. Listener head silhouette at center.
+    let head_r = size * 0.072;
+    p.circle_filled(
+        c,
+        head_r,
+        if dark {
+            Color32::from_rgb(32, 39, 50)
+        } else {
+            Color32::from_rgb(208, 216, 228)
+        },
+    );
+    p.circle_stroke(c, head_r, Stroke::new(1.3_f32, text_col));
+    // Nose pointer facing forward (up).
+    let nose_tip = Pos2::new(c.x, c.y - head_r * 1.45);
+    let nose_l = Pos2::new(c.x - head_r * 0.35, c.y - head_r * 0.92);
+    let nose_r = Pos2::new(c.x + head_r * 0.35, c.y - head_r * 0.92);
+    p.add(Shape::convex_polygon(
+        vec![nose_tip, nose_l, nose_r],
+        text_col,
+        Stroke::NONE,
+    ));
+    // Ear capsules.
+    for side in [-1.0_f32, 1.0] {
+        p.circle_filled(
+            Pos2::new(c.x + side * head_r * 1.06, c.y),
+            head_r * 0.24,
+            text_col,
+        );
+    }
+
+    // 7. 7.1 speaker nodes (`FL, FR, FC, BL, BR, SL, SR`) + live meter activity rings.
+    let surr_r = if is_plus {
+        (0.66 + 0.16 * cfg.surround_depth as f32).clamp(0.68, 0.90)
+    } else {
+        0.78
+    };
+    let nodes: [(&str, f32, f32, usize, Color32); 7] = [
+        ("FL", fl_az, 0.78, 0, accent_front),
+        ("FR", -fl_az, 0.78, 1, accent_front),
+        ("FC", 0.0, 0.80, 2, accent_center),
+        ("BL", 142.5, surr_r, 4, accent_surr),
+        ("BR", -142.5, surr_r, 5, accent_surr),
+        ("SL", 100.0, surr_r, 6, accent_surr),
+        ("SR", -100.0, surr_r, 7, accent_surr),
+    ];
+
+    for (label, az, r_norm, meter_idx, col) in nodes {
+        let pos = polar(az, r_norm);
+        let energy = live_in_params.map(|m| m[meter_idx]).unwrap_or(0.0);
+        if energy > 0.02 {
+            p.circle_filled(
+                pos,
+                5.0 + 10.0 * energy,
+                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (95.0 * energy) as u8),
+            );
+        }
+        p.circle_filled(pos, 4.5, col);
+        let lbl_pos = polar(az, (r_norm + 0.14).min(1.06));
+        p.text(
+            lbl_pos,
+            Align2::CENTER_CENTER,
+            label,
+            FontId::monospace(9.5),
+            text_col,
+        );
+    }
+
+    // 8. Corner badges: mode + LFE indicator.
+    let badge = if is_plus {
+        format!("G6+ {}", cfg.profile.display_name().to_uppercase())
+    } else {
+        "G6 REFERENCE".to_string()
+    };
+    p.text(
+        rect.left_top() + Vec2::new(8.0, 7.0),
+        Align2::LEFT_TOP,
+        badge,
+        FontId::monospace(10.0),
+        accent_front,
+    );
+    let lfe_energy = live_in_params.map(|m| m[3]).unwrap_or(0.0);
+    let lfe_text = if is_plus {
+        match (cfg.lfe_gain_db.abs() > 0.05, cfg.lfe_lpf) {
+            (true, true) => format!("LFE {:+.1}dB 120Hz", cfg.lfe_gain_db),
+            (true, false) => format!("LFE {:+.1}dB", cfg.lfe_gain_db),
+            (false, true) => "LFE 120Hz".to_string(),
+            (false, false) => "LFE".to_string(),
+        }
+    } else {
+        "LFE".to_string()
+    };
+    p.text(
+        rect.right_bottom() - Vec2::new(8.0, 7.0),
+        Align2::RIGHT_BOTTOM,
+        &lfe_text,
+        FontId::monospace(9.5),
+        if lfe_energy > 0.05 {
+            accent_room
+        } else {
+            muted_col
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1586,5 +1919,38 @@ mod tests {
             b.message.is_some(),
             "the user needs to know why it is empty"
         );
+    }
+
+    #[test]
+    fn clean_pasted_path_strips_quotes_and_whitespace() {
+        assert_eq!(
+            clean_pasted_path("  \"/music/Atmos 7.1/track.mka\"  "),
+            PathBuf::from("/music/Atmos 7.1/track.mka")
+        );
+        assert_eq!(
+            clean_pasted_path("'C:\\Audio\\My Mix.wav'"),
+            PathBuf::from("C:\\Audio\\My Mix.wav")
+        );
+        assert_eq!(
+            clean_pasted_path("/plain/path/file.flac"),
+            PathBuf::from("/plain/path/file.flac")
+        );
+    }
+
+    #[test]
+    fn browser_refresh_does_not_clobber_edited_path_text() {
+        let mut b = Browser {
+            mode: Mode::Dir,
+            filter_audio: false,
+            path: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            ..Default::default()
+        };
+        b.refresh();
+        let pasted = "/custom/pasted/path".to_string();
+        b.path_text = pasted.clone();
+        // Calling refresh on subsequent frames while cached must leave the
+        // user's edited/pasted address bar text untouched.
+        b.refresh();
+        assert_eq!(b.path_text, pasted);
     }
 }

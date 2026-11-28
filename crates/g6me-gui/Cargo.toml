@@ -20,11 +20,11 @@ g6me-core = { workspace = true }
 eframe = "0.31"
 egui = "0.31"
 
-# Native file dialogs need GTK or an XDG portal on Linux, which a minimal
-# Wayland or dwm session may not have. The default build therefore uses a pure
-# egui browser that works wherever eframe does; this feature opts into the
-# platform dialogs for people who want the native look.
-rfd = { version = "0.15", optional = true }
+# Native OS file dialogs: Win32 COM on Windows, Cocoa on macOS, and pure-Rust
+# XDG Desktop Portal (`xdg-portal`) on Linux (works on KDE, GNOME, Hyprland,
+# Sway/Wayland, and X11 with zero GTK C library dependency). Builds with
+# `--no-default-features` fall back cleanly to the built-in egui browser.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"], optional = true }
 
 [dev-dependencies]
 # The meter-history tests decode a real render's report instead of hand-writing thirty
@@ -37,5 +37,5 @@ serde_json.workspace = true
 # No `monitor` feature here on purpose: this app never opens an audio device. The
 # levels come from taps on the render itself, which needs no cpal, no device and
 # no portal — see `g6me_core::meter::MeterTap`.
-default = []
+default = ["native-dialogs"]
 native-dialogs = ["dep:rfd"]

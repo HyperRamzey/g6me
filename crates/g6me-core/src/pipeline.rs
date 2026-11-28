@@ -12,11 +12,12 @@
 //! line and independently checkable with `--dry-run`.
 
 use crate::child::Proc;
-use crate::dsp::{Dsp, SLOTS};
+use crate::dsp::SLOTS;
 use crate::error::{Error, Result};
 use crate::limiter::{Limiter, Report as LimiterReport};
 use crate::mask::{format_order, is_downmixable, mask_of, order_from_layout, Slot};
 use crate::pcm::{Grid24, Sha256};
+use crate::plus::{Renderer, RendererMode};
 use crate::probe::{probe_audio, AudioInfo, Caps, Tools};
 use crate::stages::{
     effective_input_rate, input_args, input_stage, loss_chain, output_args, InputStage, RenderCfg,
@@ -86,6 +87,8 @@ pub struct Report {
     pub source_info: AudioInfo,
     pub order: Vec<Slot>,
     pub mask: u32,
+    #[serde(default)]
+    pub renderer: String,
     pub input_stage: String,
     pub ir: Option<String>,
     pub working_rate: u32,
@@ -760,6 +763,11 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
     cfg.limiter
         .validate()
         .map_err(|e| Error::msg(format!("true-peak limiter: {e}")))?;
+    if cfg.renderer == RendererMode::Plus {
+        cfg.plus
+            .validate()
+            .map_err(|e| Error::msg(format!("plus renderer: {e}")))?;
+    }
 
     // ---- true peak, and the limiter that owns it -----------------------------------
     //
@@ -804,7 +812,7 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         .map_err(Error::Io)?;
 
     // Stage 2 — the downmixer, on the calling thread. Nothing else touches `dsp`.
-    let mut dsp = Dsp::<f64>::new(mask);
+    let mut dsp = Renderer::new(cfg.renderer, cfg.plus, mask, work_rate);
     // Reused across the whole file: one allocation, no per-block allocator churn
     // on a path that is supposed to stay ahead of a live device.
     let mut inter = vec![0f64; block * channels];
@@ -916,12 +924,38 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         }
     }
 
+    // Drain any causal FIR / overlap-add impulse tail held by the renderer (e.g. G6+
+    // early reflections) BEFORE finishing the limiter, so the limiter protects the tail too.
+    let decoded = frames;
+    if decoded > 0 {
+        let (mut rl, mut rr) = dsp.flush();
+        if !rl.is_empty() {
+            if !rl.iter().chain(&rr).all(|v| v.is_finite()) {
+                bail!(Error::NonFinite { frames });
+            }
+            peak.process(&mut rl, &mut rr);
+            if let Some(t) = &opts.tap {
+                let empty_refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+                t.tap(&empty_refs, &rl, &rr, rl.len());
+            }
+            if let Some(g) = grid.as_mut() {
+                g.process(&mut rl, &mut rr);
+            }
+            frames += rl.len() as u64;
+            let mut rb = Vec::with_capacity(rl.len() * 16);
+            interleave_f64(&rl, &rr, &mut rb);
+            let _ = enc_tx.send(Encoded { bytes: rb });
+            if let Some(p) = &opts.progress {
+                p.update(frames, bytes_out.load(Ordering::Relaxed));
+            }
+        }
+    }
+
     // The limiter holds the last `latency` frames of the file back. They are programme,
     // not debris, and they have to reach the encoder before the stream closes: a file
     // that lost its tail would be audibly truncated at exactly the point where the
     // limiter added delay. If the encoder has already died the send fails quietly and the
     // join below reports its error, which is the informative one.
-    let decoded = frames;
     let mut tail = peak.finish_input();
     // No source samples means no programme to hold back: the tail would be `latency`
     // frames of silence, and shipping them turned an empty decode into a "successful"
@@ -1091,6 +1125,10 @@ pub fn render_file(src: &Path, dst: &Path, cfg: &RenderCfg, opts: &RenderOpts) -
         source_info: info,
         order,
         mask,
+        renderer: match cfg.renderer {
+            RendererMode::Reference => "reference".to_string(),
+            RendererMode::Plus => cfg.plus.summary(),
+        },
         input_stage: stage.label().to_string(),
         ir: cfg.ir.enable.then(|| {
             format!(

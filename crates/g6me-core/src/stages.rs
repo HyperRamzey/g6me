@@ -27,6 +27,7 @@ use crate::error::{Error, Result};
 use crate::limiter::Cfg as LimiterCfg;
 use crate::mask::format_mask_hex;
 use crate::pcm::{BitDepth, Dither, Grid24};
+use crate::plus::{PlusCfg, RendererMode};
 use crate::probe::{AudioInfo, Caps};
 use crate::tp::Ratio;
 use serde::{Deserialize, Serialize};
@@ -293,6 +294,12 @@ impl OutCfg {
 /// Everything one render needs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RenderCfg {
+    /// Binaural renderer engine (`Reference` bit-exact G6 vs `Plus` G6+).
+    #[serde(default)]
+    pub renderer: RendererMode,
+    /// Acoustic parameters used when `renderer == RendererMode::Plus`.
+    #[serde(default)]
+    pub plus: PlusCfg,
     pub resample: ResampleCfg,
     pub ir: IrCfg,
     pub out: OutCfg,
@@ -790,11 +797,19 @@ pub fn loss_chain(cfg: &RenderCfg, info: &AudioInfo, mask: u32) -> Vec<String> {
     } else {
         v.push("3. IR convolution: off".into());
     }
-    v.push(format!(
-        "4. downmix mask {mask:#06x} in {} -> stereo (bit-exact port, {})",
-        crate::mask::format_order(&order_for_mask(mask)),
-        f64::PRECISION_NAME
-    ));
+    match cfg.renderer {
+        RendererMode::Reference => v.push(format!(
+            "4. downmix mask {mask:#06x} in {} -> stereo (bit-exact port, {})",
+            crate::mask::format_order(&order_for_mask(mask)),
+            f64::PRECISION_NAME
+        )),
+        RendererMode::Plus => v.push(format!(
+            "4. downmix mask {mask:#06x} in {} -> stereo ({}, {})",
+            crate::mask::format_order(&order_for_mask(mask)),
+            cfg.plus.summary(),
+            f64::PRECISION_NAME
+        )),
+    }
     // 5. the true-peak stage. Printed whether or not it is limiting, because the meter
     // runs either way and a dry run that hides the one stage that measures the file
     // would leave `--dry-run` unable to explain the number in the report.
