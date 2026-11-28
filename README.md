@@ -281,9 +281,12 @@ Four stages, all in memory:
    WarpRectilinear and FixVignetteRadial are applied, and `--dng` prints the
    Honesty Report.
 2. **Metric anchor** — Russian ID-1 card (horizontal or vertical, GOST R ISO/IEC
-   7810-2006), AprilTag3 tag36h11, or ChArUco. The detected anchor fixes metres per
-   pixel, so the reconstruction is metric rather than scale-free.
-3. **2DGS/PGSR → TSDF** — oriented surfels are fused into a TSDF and extracted with
+   7810-2006), or a square fiducial board (AprilTag3 tag36h11 / ChArUco-style outer
+   quad; the detector fits the quad only and decodes no tag ID). The detected anchor
+   fixes metres per pixel, so the reconstruction is metric rather than scale-free.
+3. **Surfel photometric refinement (2DGS/PGSR-inspired) → TSDF** — oriented surfels
+   are refined by coordinate descent on multi-view photometric variance (not the
+   papers' differentiable rasterizer), fused into a TSDF, and extracted with
    crack-free marching tetrahedra; bundle adjustment runs in Ozaki-II FP4→FP64.
 4. **Watertight acoustic conditioning** — generalized winding numbers (Jacobson et
    al., SIGGRAPH 2013) close the surface, isotropic remeshing enforces

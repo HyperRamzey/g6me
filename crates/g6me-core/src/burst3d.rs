@@ -459,6 +459,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ois_interpolation_tracks_the_rolling_shutter_trajectory() {
+        let samples = [
+            OisSample {
+                t_ns: 0,
+                dx_px: 0.0,
+                dy_px: 0.0,
+            },
+            OisSample {
+                t_ns: 10_000_000,
+                dx_px: 10.0,
+                dy_px: -4.0,
+            },
+        ];
+        // Mid-row of a 10 ms frame lies halfway along the trajectory, not frozen at sample 0.
+        let (dx, dy) = interpolate_ois_at_scanline(&samples, 0, 10_000_000, 50.0, 100.0);
+        assert!(
+            (dx - 5.0).abs() < 1e-12,
+            "mid-row dx must interpolate, got {dx}"
+        );
+        assert!(
+            (dy + 2.0).abs() < 1e-12,
+            "mid-row dy must interpolate, got {dy}"
+        );
+        // Top and bottom rows land on the trajectory endpoints.
+        assert_eq!(
+            interpolate_ois_at_scanline(&samples, 0, 10_000_000, 0.0, 100.0),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            interpolate_ois_at_scanline(&samples, 0, 10_000_000, 100.0, 100.0),
+            (10.0, -4.0)
+        );
+        // A frame starting after the last sample holds the last value; empty samples are zero.
+        assert_eq!(
+            interpolate_ois_at_scanline(&samples, 20_000_000, 10_000_000, 0.0, 100.0),
+            (10.0, -4.0)
+        );
+        assert_eq!(
+            interpolate_ois_at_scanline(&[], 0, 10_000_000, 50.0, 100.0),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
     fn forster_so3_imu_preintegration_integrates_exact_rotation() {
         // Constant rotation around Z at 1.0 rad/s for 0.5 s => exact 0.5 rad yaw!
         let mut gyro = Vec::new();

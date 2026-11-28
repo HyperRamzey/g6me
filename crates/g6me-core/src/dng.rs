@@ -10,8 +10,9 @@
 //!    (`FixVignetteRadial`, ID 3, 5-term even-order radial polynomial) directly to unwarped
 //!    radiometric values, while keeping `WarpRectilinear` (ID 1, 3 separate R/G/B 6-coefficient
 //!    `f64` polynomials) strictly **analytical** on continuous `(u, v)` rays — canceling lateral
-//!    chromatic aberration to `< 0.008 px` and feeding the polynomial as a Tikhonov prior for
-//!    per-frame VCM focus-breathing refinement in Bundle Adjustment!
+//!    chromatic aberration to `< 0.008 px` and warping every Bundle-Adjustment projection ray
+//!    analytically. The per-frame VCM focus-breathing prior is a separate unit-scale Tikhonov
+//!    term on the focal scale, not an opcode polynomial.
 //! 3. **Honesty Reporting**: flags `NewSubFileType = 16` (computational multi-frame LinearRaw
 //!    merge) and recommends single-exposure CFA Bayer or unmerged v7.0 `RAW10` burst dumps.
 //! 4. **v7.0 Zero-Copy 50MP MIPI `RAW10` + `meta.json` Sidecar**: unpacks CSI-2 packed 10-bit
@@ -54,10 +55,14 @@ pub const TAG_TILE_LENGTH: u16 = 323;
 pub const TAG_TILE_OFFSETS: u16 = 324;
 pub const TAG_TILE_BYTE_COUNTS: u16 = 325;
 pub const TAG_SUB_IFDS: u16 = 330;
+pub const TAG_SAMPLE_FORMAT: u16 = 339;
 pub const TAG_CFA_REPEAT_PATTERN_DIM: u16 = 33421;
 pub const TAG_CFA_PATTERN: u16 = 33422;
 pub const TAG_DNG_VERSION: u16 = 50706;
+pub const TAG_BLACK_LEVEL_REPEAT_DIM: u16 = 50713;
 pub const TAG_BLACK_LEVEL: u16 = 50714;
+pub const TAG_BLACK_LEVEL_DELTA_H: u16 = 50715;
+pub const TAG_BLACK_LEVEL_DELTA_V: u16 = 50716;
 pub const TAG_WHITE_LEVEL: u16 = 50717;
 pub const TAG_DEFAULT_CROP_ORIGIN: u16 = 50719;
 pub const TAG_DEFAULT_CROP_SIZE: u16 = 50720;
@@ -184,6 +189,83 @@ impl GainMapOpcode {
         let bot = g01 + tx * (g11 - g01);
         top + ty * (bot - top)
     }
+
+    /// Evaluate this `GainMap` opcode exactly as the DNG SDK's `dng_opcode_GainMap::ProcessArea`
+    /// does, honoring `Top/Left/Bottom/Right`, `Plane/Planes`, `RowPitch/ColPitch`, and the
+    /// relative-coordinate `MapOrigin*`/`MapSpacing*` placement.
+    ///
+    /// `x`/`y` are absolute pixel coordinates in the IFD's stored image (the same coordinate
+    /// system as the opcode's area bounds); `bounds` is the ActiveArea rectangle that defines
+    /// the relative coordinate system (`0.0..1.0` across the active image). Pixel centers are
+    /// offset by `+0.5`, matching the SDK. Returns `None` when the pixel is outside the
+    /// opcode's area, off the row/column pitch grid, or outside the `Plane..Plane+Planes`
+    /// range. Inside the map extent, values are bilinearly interpolated; outside the map
+    /// extent, the edge values are replicated.
+    pub fn eval_pixel(&self, x: f64, y: f64, plane: usize, bounds: &DngImageBounds) -> Option<f64> {
+        let pl = plane as u32;
+        if pl < self.plane || pl >= self.plane.saturating_add(self.planes) {
+            return None;
+        }
+        if x < self.left as f64
+            || x >= self.right as f64
+            || y < self.top as f64
+            || y >= self.bottom as f64
+        {
+            return None;
+        }
+        let rp = self.row_pitch.max(1);
+        let cp = self.col_pitch.max(1);
+        let row_off = (y.floor() as i64) - (self.top as i64);
+        let col_off = (x.floor() as i64) - (self.left as i64);
+        if row_off.rem_euclid(rp as i64) != 0 || col_off.rem_euclid(cp as i64) != 0 {
+            return None;
+        }
+
+        let mh = self.map_points_h.max(1) as usize;
+        let mv = self.map_points_v.max(1) as usize;
+        let mp = self.map_planes.max(1) as usize;
+        if self.gains.len() < mh * mv * mp {
+            return None;
+        }
+        let ch = plane.min(mp - 1);
+
+        let spacing_h = if mh == 1 { 1.0 } else { self.map_spacing_h };
+        let spacing_v = if mv == 1 { 1.0 } else { self.map_spacing_v };
+        let origin_h = if mh == 1 { 0.0 } else { self.map_origin_h };
+        let origin_v = if mv == 1 { 0.0 } else { self.map_origin_v };
+        if spacing_h <= 0.0 || spacing_v <= 0.0 || bounds.width <= 0.0 || bounds.height <= 0.0 {
+            return None;
+        }
+
+        let u = (x + 0.5 - bounds.left) / bounds.width;
+        let v = (y + 0.5 - bounds.top) / bounds.height;
+        let fx = ((u - origin_h) / spacing_h).clamp(0.0, (mh - 1) as f64);
+        let fy = ((v - origin_v) / spacing_v).clamp(0.0, (mv - 1) as f64);
+        let x0 = (fx.floor() as usize).min(mh - 1);
+        let y0 = (fy.floor() as usize).min(mv - 1);
+        let x1 = (x0 + 1).min(mh - 1);
+        let y1 = (y0 + 1).min(mv - 1);
+        let tx = fx - (x0 as f64);
+        let ty = fy - (y0 as f64);
+
+        let g = |xi: usize, yi: usize| self.gains[(yi * mh + xi) * mp + ch] as f64;
+        let g00 = g(x0, y0);
+        let g10 = g(x1, y0);
+        let g01 = g(x0, y1);
+        let g11 = g(x1, y1);
+        let top = g00 + tx * (g10 - g00);
+        let bot = g01 + tx * (g11 - g01);
+        Some(top + ty * (bot - top))
+    }
+}
+
+/// ActiveArea rectangle used as the relative-coordinate frame for DNG opcode placement.
+#[derive(Debug, Clone, Copy)]
+pub struct DngImageBounds {
+    pub top: f64,
+    pub left: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// DNG `OpcodeList3` Opcode ID 3 — `FixVignetteRadial`: 5-term even-order radial polynomial
@@ -338,6 +420,79 @@ impl WarpRectilinearOpcode {
     }
 }
 
+/// One parsed DNG opcode, preserving its position in the source `OpcodeList`.
+///
+/// Keeping the opcodes in list order (instead of collapsing each type into a single `Option`)
+/// is required by DNG 1.7.1 Chapter 7: opcodes in a list are applied in the order they appear,
+/// and `OpcodeList1` (raw), `OpcodeList2` (linear, before demosaic), and `OpcodeList3` (after
+/// demosaic) are separate processing stages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DngOpcode {
+    WarpRectilinear(WarpRectilinearOpcode),
+    FixVignetteRadial(FixVignetteRadialOpcode),
+    GainMap(GainMapOpcode),
+    /// Unimplemented/unknown opcode retained so list ordering and byte provenance survive.
+    Unknown {
+        opcode_id: u32,
+        dng_version: u32,
+        flags: u32,
+        parameters: Vec<u8>,
+    },
+}
+
+impl DngOpcode {
+    pub fn opcode_id(&self) -> u32 {
+        match self {
+            Self::WarpRectilinear(_) => OPCODE_WARP_RECTILINEAR,
+            Self::FixVignetteRadial(_) => OPCODE_FIX_VIGNETTE_RADIAL,
+            Self::GainMap(_) => OPCODE_GAIN_MAP,
+            Self::Unknown { opcode_id, .. } => *opcode_id,
+        }
+    }
+
+    pub fn as_gain_map(&self) -> Option<&GainMapOpcode> {
+        match self {
+            Self::GainMap(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    pub fn as_vignette(&self) -> Option<&FixVignetteRadialOpcode> {
+        match self {
+            Self::FixVignetteRadial(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_warp(&self) -> Option<&WarpRectilinearOpcode> {
+        match self {
+            Self::WarpRectilinear(w) => Some(w),
+            _ => None,
+        }
+    }
+}
+
+/// The three DNG opcode lists, each kept in file order and never merged.
+#[derive(Debug, Clone, Default)]
+pub struct DngOpcodeLists {
+    pub list1: Vec<DngOpcode>,
+    pub list2: Vec<DngOpcode>,
+    pub list3: Vec<DngOpcode>,
+}
+
+impl DngOpcodeLists {
+    pub fn all(&self) -> impl Iterator<Item = &DngOpcode> {
+        self.list1
+            .iter()
+            .chain(self.list2.iter())
+            .chain(self.list3.iter())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list1.is_empty() && self.list2.is_empty() && self.list3.is_empty()
+    }
+}
+
 /// Complete optical calibration & IFD provenance extracted from a DNG 1.7 file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DngMetadata {
@@ -461,7 +616,7 @@ impl DngMetadata {
         }
         match vcm_breathing_pct {
             Some(vcm) => s.push_str(&format!(
-                "  VCM Breathing   : OpcodeList3 polynomial used as Tikhonov prior; per-frame focus breathing refined in Ozaki-II FP4->FP64 BA (+-{vcm:.2}% f)\n"
+                "  VCM Breathing   : per-frame focus breathing refined in Ozaki-II FP4->FP64 BA (+-{vcm:.2}% f); the VCM prior is a unit-scale Tikhonov term, not an OpcodeList3 polynomial\n"
             )),
             None => s.push_str(
                 "  VCM Breathing   : N/A (single-file inspect — requires multi-view Bundle Adjustment)\n",
@@ -499,8 +654,19 @@ pub struct DngPixelLayout {
     pub little_endian: bool,
     pub samples_per_pixel: u16,
     pub bits_per_sample_per_ch: Vec<u16>,
+    /// TIFF `SampleFormat` (1 = unsigned integer, 3 = IEEE floating point).
+    pub sample_format: u16,
+    pub sample_formats: Vec<u16>,
+    /// `BlackLevelRepeatDim` as `(rows, cols)`; the pattern origin is the ActiveArea top-left.
+    pub black_level_repeat: (u32, u32),
     pub black_levels: Vec<f64>,
+    pub black_level_delta_h: Vec<f64>,
+    pub black_level_delta_v: Vec<f64>,
     pub white_levels: Vec<f64>,
+    /// Whether `WhiteLevel` (50717) was present. The tag default is `2^BitsPerSample - 1` for
+    /// unsigned integer data and `1.0` for floating point data, so the decoder cannot use the
+    /// placeholder initialized here when the tag is absent.
+    pub white_level_tagged: bool,
     pub rows_per_strip: u32,
     pub strip_offsets: Vec<u32>,
     pub strip_byte_counts: Vec<u32>,
@@ -765,15 +931,13 @@ fn entry_scalar_u32(buf: &[u8], e: &TiffEntry, le: bool) -> Result<u32> {
     Ok(v.first().copied().unwrap_or(0))
 }
 
-/// Parse a DNG `OpcodeList` binary blob (big-endian per DNG 1.7 specification).
-fn parse_opcode_list(
-    blob: &[u8],
-    gain_maps: &mut Vec<GainMapOpcode>,
-    vignette: &mut Option<FixVignetteRadialOpcode>,
-    warp: &mut Option<WarpRectilinearOpcode>,
-) -> Result<()> {
+/// Parse a DNG `OpcodeList` binary blob (big-endian per DNG 1.7 specification) into an
+/// ordered list. Opcodes are never collapsed by type: the caller keeps each source list
+/// (`OpcodeList1/2/3`) distinct and applies entries in file order.
+fn parse_opcode_list(blob: &[u8]) -> Result<Vec<DngOpcode>> {
+    let mut out = Vec::new();
     if blob.len() < 4 {
-        return Ok(());
+        return Ok(out);
     }
     let count = read_be_u32(blob, 0)? as usize;
     let mut off = 4usize;
@@ -782,8 +946,8 @@ fn parse_opcode_list(
             break;
         }
         let op_id = read_be_u32(blob, off)?;
-        let _dng_ver = read_be_u32(blob, off + 4)?;
-        let _flags = read_be_u32(blob, off + 8)?;
+        let dng_version = read_be_u32(blob, off + 4)?;
+        let flags = read_be_u32(blob, off + 8)?;
         let param_len = read_be_u32(blob, off + 12)? as usize;
         off += 16;
         if off + param_len > blob.len() {
@@ -792,7 +956,7 @@ fn parse_opcode_list(
         let p = &blob[off..(off + param_len)];
         off += param_len;
 
-        match op_id {
+        let parsed = match op_id {
             OPCODE_GAIN_MAP if p.len() >= 76 => {
                 let top = read_be_u32(p, 0)?;
                 let left = read_be_u32(p, 4)?;
@@ -821,7 +985,7 @@ fn parse_opcode_list(
                     gains.push(read_be_f32(p, goff)?);
                     goff += 4;
                 }
-                gain_maps.push(GainMapOpcode {
+                Some(DngOpcode::GainMap(GainMapOpcode {
                     top,
                     left,
                     bottom,
@@ -838,10 +1002,10 @@ fn parse_opcode_list(
                     map_origin_h,
                     map_planes,
                     gains,
-                });
+                }))
             }
             OPCODE_FIX_VIGNETTE_RADIAL if p.len() >= 56 => {
-                *vignette = Some(FixVignetteRadialOpcode {
+                Some(DngOpcode::FixVignetteRadial(FixVignetteRadialOpcode {
                     k: [
                         read_be_f64(p, 0)?,
                         read_be_f64(p, 8)?,
@@ -851,7 +1015,7 @@ fn parse_opcode_list(
                     ],
                     cx_hat: read_be_f64(p, 40)?,
                     cy_hat: read_be_f64(p, 48)?,
-                });
+                }))
             }
             OPCODE_WARP_RECTILINEAR if p.len() >= 20 => {
                 let num_planes = read_be_u32(p, 0)? as usize;
@@ -873,23 +1037,41 @@ fn parse_opcode_list(
                     }
                     let cx_hat = read_be_f64(p, poff)?;
                     let cy_hat = read_be_f64(p, poff + 8)?;
-                    *warp = Some(WarpRectilinearOpcode {
+                    Some(DngOpcode::WarpRectilinear(WarpRectilinearOpcode {
                         planes,
                         cx_hat,
                         cy_hat,
-                    });
+                    }))
+                } else {
+                    None
                 }
             }
-            _ => {}
-        }
+            _ => None,
+        };
+        out.push(parsed.unwrap_or_else(|| DngOpcode::Unknown {
+            opcode_id: op_id,
+            dng_version,
+            flags,
+            parameters: p.to_vec(),
+        }));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Parse a binary TIFF/DNG 1.7 file buffer, returning both optical calibration metadata and
 /// physical strip/tile pixel layout. Walks chained IFDs and `SubIFD`s (Tag 330) to bypass
 /// low-resolution `IFD0` thumbnails.
 pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)> {
+    let (meta, layout, _) = parse_dng_document(buf)?;
+    Ok((meta, layout))
+}
+
+/// Parse a DNG while also returning the three opcode lists in source order.
+pub fn parse_dng_with_opcodes(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout, DngOpcodeLists)> {
+    parse_dng_document(buf)
+}
+
+fn parse_dng_document(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout, DngOpcodeLists)> {
     if buf.len() < 8 {
         return Err(Error::msg("DNG buffer too short (< 8 bytes)"));
     }
@@ -1009,6 +1191,8 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
         }
     }
 
+    let mut opcode_lists = DngOpcodeLists::default();
+
     let mut meta = DngMetadata {
         dng_version,
         preview_width: preview_w,
@@ -1032,8 +1216,14 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
         little_endian: le,
         samples_per_pixel: 1,
         bits_per_sample_per_ch: vec![16],
+        sample_format: 1,
+        sample_formats: vec![1],
+        black_level_repeat: (1, 1),
         black_levels: vec![0.0],
+        black_level_delta_h: Vec::new(),
+        black_level_delta_v: Vec::new(),
         white_levels: vec![65535.0],
+        white_level_tagged: false,
         rows_per_strip: 0,
         strip_offsets: Vec::new(),
         strip_byte_counts: Vec::new(),
@@ -1048,25 +1238,46 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
         column_interleave_factor: 1,
     };
 
-    // Inspect both IFD0 and chosen SubIFD for OpcodeList1/2/3 (avoid duplicate parsing if same).
+    // Opcode lists are kept separate and in source order. Inspect both IFD0 and the chosen
+    // SubIFD (some writers put calibration opcodes on IFD0), deduplicating identical blobs.
     let op_entries: Vec<&TiffEntry> = if subifd_routed {
         ifd0.iter().chain(chosen.iter()).collect()
     } else {
         chosen.iter().collect()
     };
+    let mut seen_opcode_blobs: Vec<(u16, u32, u32)> = Vec::new();
     for e in op_entries {
+        if !matches!(
+            e.tag,
+            TAG_OPCODE_LIST_1 | TAG_OPCODE_LIST_2 | TAG_OPCODE_LIST_3
+        ) {
+            continue;
+        }
+        let key = (e.tag, e.value_offset, e.count);
+        if seen_opcode_blobs.contains(&key) {
+            continue;
+        }
+        seen_opcode_blobs.push(key);
+        let Ok(blob) = entry_bytes(buf, e) else {
+            continue;
+        };
+        let parsed = parse_opcode_list(blob)?;
         match e.tag {
-            TAG_OPCODE_LIST_1 | TAG_OPCODE_LIST_2 | TAG_OPCODE_LIST_3 => {
-                if let Ok(blob) = entry_bytes(buf, e) {
-                    parse_opcode_list(
-                        blob,
-                        &mut meta.gain_maps,
-                        &mut meta.vignette,
-                        &mut meta.warp_rectilinear,
-                    )?;
-                }
-            }
-            _ => {}
+            TAG_OPCODE_LIST_1 => opcode_lists.list1.extend(parsed),
+            TAG_OPCODE_LIST_2 => opcode_lists.list2.extend(parsed),
+            TAG_OPCODE_LIST_3 => opcode_lists.list3.extend(parsed),
+            _ => unreachable!(),
+        }
+    }
+
+    // Legacy aggregate views retained for the existing API and the BA warp prior. The decoder
+    // itself always uses `opcode_lists` so multiple opcodes of the same type compose in order.
+    for op in opcode_lists.all() {
+        match op {
+            DngOpcode::GainMap(g) => meta.gain_maps.push(g.clone()),
+            DngOpcode::FixVignetteRadial(v) => meta.vignette = Some(*v),
+            DngOpcode::WarpRectilinear(w) => meta.warp_rectilinear = Some(w.clone()),
+            DngOpcode::Unknown { .. } => {}
         }
     }
 
@@ -1087,8 +1298,29 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
             TAG_SAMPLES_PER_PIXEL => {
                 layout.samples_per_pixel = entry_scalar_u32(buf, e, le)?.max(1) as u16;
             }
+            TAG_SAMPLE_FORMAT => {
+                let vals = entry_u32_vec(buf, e, le)?;
+                if let Some(&first) = vals.first() {
+                    layout.sample_format = first as u16;
+                }
+                if !vals.is_empty() {
+                    layout.sample_formats = vals.into_iter().map(|v| v as u16).collect();
+                }
+            }
             TAG_COMPRESSION => meta.compression = entry_scalar_u32(buf, e, le)? as u16,
             TAG_PHOTOMETRIC => meta.photometric = entry_scalar_u32(buf, e, le)? as u16,
+            TAG_BLACK_LEVEL_REPEAT_DIM => {
+                let vals = entry_u32_vec(buf, e, le)?;
+                if vals.len() >= 2 {
+                    layout.black_level_repeat = (vals[0].max(1), vals[1].max(1));
+                }
+            }
+            TAG_BLACK_LEVEL_DELTA_H => {
+                layout.black_level_delta_h = entry_f64_vec(buf, e, le)?;
+            }
+            TAG_BLACK_LEVEL_DELTA_V => {
+                layout.black_level_delta_v = entry_f64_vec(buf, e, le)?;
+            }
             TAG_BLACK_LEVEL => {
                 let vals = entry_f64_vec(buf, e, le)?;
                 if !vals.is_empty() {
@@ -1101,6 +1333,7 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
                 if !vals.is_empty() {
                     meta.white_level = vals.iter().sum::<f64>() / (vals.len() as f64);
                     layout.white_levels = vals;
+                    layout.white_level_tagged = true;
                 }
             }
             TAG_CFA_PATTERN => {
@@ -1148,7 +1381,7 @@ pub fn parse_dng_with_layout(buf: &[u8]) -> Result<(DngMetadata, DngPixelLayout)
         layout.rows_per_strip = meta.main_height;
     }
 
-    Ok((meta, layout))
+    Ok((meta, layout, opcode_lists))
 }
 
 /// Parse a binary TIFF/DNG 1.7 file buffer, bypassing the IFD0 preview thumbnail trap to
@@ -1694,14 +1927,132 @@ fn unpack_uncompressed_block(raw: &[u8], count: usize, bps: u16, le: bool) -> Re
     Ok(out)
 }
 
+/// Convert a TIFF Technical Note 3 / OpenEXR HALF (IEEE 754 binary16) bit pattern to `f32`.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = (bits >> 15) & 1;
+    let exp = ((bits >> 10) & 0x1F) as i32;
+    let mant = (bits & 0x03FF) as f32;
+    let magnitude = match exp {
+        0 => mant * 2f32.powi(-24),
+        0x1F => {
+            if mant == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + mant / 1024.0) * 2f32.powi(exp - 15),
+    };
+    if sign == 1 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Convert a TIFF Technical Note 3 24-bit float (1 sign, 7 exponent bits biased by 64,
+/// 16 mantissa bits) to `f32`.
+fn float24_to_f32(bits: u32) -> f32 {
+    let sign = (bits >> 23) & 1;
+    let exp = ((bits >> 16) & 0x7F) as i32;
+    let mant = (bits & 0xFFFF) as f32;
+    let magnitude = match exp {
+        0 => mant * 2f32.powi(-79),
+        0x7F => {
+            if mant == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + mant / 65536.0) * 2f32.powi(exp - 64),
+    };
+    if sign == 1 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Unpack uncompressed `SampleFormat = 3` (IEEE floating point) samples. `BitsPerSample` may be
+/// 16 (HALF), 24 (TIFF Technical Note 3) or 32 (binary32); 8/16/32-bit samples use the file byte
+/// order, while 24-bit samples are packed MSB-first regardless of file endianness.
+fn unpack_uncompressed_float_block(
+    raw: &[u8],
+    count: usize,
+    bps: u16,
+    le: bool,
+) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(count);
+    match bps {
+        16 => {
+            if raw.len() < count * 2 {
+                return Err(Error::msg("truncated 16-bit float uncompressed DNG block"));
+            }
+            for i in 0..count {
+                let b = [raw[i * 2], raw[i * 2 + 1]];
+                let bits = if le {
+                    u16::from_le_bytes(b)
+                } else {
+                    u16::from_be_bytes(b)
+                };
+                out.push(half_to_f32(bits));
+            }
+        }
+        24 => {
+            if raw.len() < count * 3 {
+                return Err(Error::msg("truncated 24-bit float uncompressed DNG block"));
+            }
+            for i in 0..count {
+                let bits = ((raw[i * 3] as u32) << 16)
+                    | ((raw[i * 3 + 1] as u32) << 8)
+                    | (raw[i * 3 + 2] as u32);
+                out.push(float24_to_f32(bits));
+            }
+        }
+        32 => {
+            if raw.len() < count * 4 {
+                return Err(Error::msg("truncated 32-bit float uncompressed DNG block"));
+            }
+            for i in 0..count {
+                let b = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]];
+                out.push(f32::from_bits(if le {
+                    u32::from_le_bytes(b)
+                } else {
+                    u32::from_be_bytes(b)
+                }));
+            }
+        }
+        _ => {
+            return Err(Error::msg(format!(
+                "unsupported floating-point DNG BitsPerSample={bps} (supported: 16, 24, 32)"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// One decoded strip or tile: its *actual* sample dimensions (which may be smaller than the
+/// nominal `TileWidth`/`TileLength` at the right/bottom edge) plus its sample buffer.
+struct DecodedBlock {
+    width: usize,
+    height: usize,
+    samples: Vec<f64>,
+}
+
 /// Decode a DNG 1.7 JPEG-XL (`Compression = 52546`) strip or tile codestream via `jxl-oxide`.
+///
+/// The returned block carries the codestream's actual dimensions, not the nominal tile size:
+/// DNG edge tiles may be smaller than `TileWidth`/`TileLength`, and de-interleaving plus the
+/// caller's copy loop must use the real dimensions (not zero-padded nominal tiles).
 fn decode_jpeg_xl_block(
     slice: &[u8],
     bw: usize,
     bh: usize,
     spp: usize,
     bps: u16,
-) -> Result<Vec<u16>> {
+    is_float: bool,
+) -> Result<DecodedBlock> {
     let image = jxl_oxide::JxlImage::builder()
         .read(std::io::Cursor::new(slice))
         .map_err(|e| Error::msg(format!("JPEG-XL DNG header decode failed: {e}")))?;
@@ -1709,40 +2060,48 @@ fn decode_jpeg_xl_block(
         .render_frame(0)
         .map_err(|e| Error::msg(format!("JPEG-XL DNG frame render failed: {e}")))?;
     let fb = render.image_all_channels();
-    let jw = fb.width();
-    let jh = fb.height();
+    let src_w = fb.width();
+    let src_h = fb.height();
     let jc = fb.channels();
     let samples = fb.buf();
 
-    if jw == 0 || jh == 0 || jc == 0 {
+    if src_w == 0 || src_h == 0 || jc == 0 {
         return Err(Error::msg("JPEG-XL DNG decoded empty frame"));
     }
-    let max_code = ((1u32 << bps.clamp(8, 16)) - 1) as f64;
-    let mut out = vec![0u16; bw * bh * spp];
-    let copy_h = bh.min(jh);
-    let copy_w = bw.min(jw);
-    for y in 0..copy_h {
-        for x in 0..copy_w {
+    let jw = src_w.min(bw).max(1);
+    let jh = src_h.min(bh).max(1);
+    let max_code = ((1u32 << bps.clamp(1, 16)) - 1) as f64;
+    let mut out = vec![0.0_f64; jw * jh * spp];
+    for y in 0..jh {
+        for x in 0..jw {
             for c in 0..spp {
                 let sc = c.min(jc - 1);
-                let v = f64::from(samples[(y * jw + x) * jc + sc]).clamp(0.0, 1.0);
-                out[(y * bw + x) * spp + c] = (v * max_code).round_ties_even() as u16;
+                let v = f64::from(samples[(y * src_w + x) * jc + sc]);
+                out[(y * jw + x) * spp + c] = if is_float {
+                    v
+                } else {
+                    (v.clamp(0.0, 1.0) * max_code).round_ties_even()
+                };
             }
         }
     }
-    Ok(out)
+    Ok(DecodedBlock {
+        width: jw,
+        height: jh,
+        samples: out,
+    })
 }
 
 /// Undo DNG 1.7.1 `RowInterleaveFactor` (tag `50975`) and `ColumnInterleaveFactor`
 /// (tag `52547`) planar sub-image interleaving on a decoded `(bw x bh x spp)` block.
-fn deinterleave_block(
-    src: &[u16],
+fn deinterleave_block<T: Copy + Default>(
+    src: &[T],
     bw: usize,
     bh: usize,
     spp: usize,
     row_factor: usize,
     col_factor: usize,
-) -> Vec<u16> {
+) -> Vec<T> {
     let rf = row_factor.max(1);
     let cf = col_factor.max(1);
     if rf == 1 && cf == 1 {
@@ -1761,7 +2120,7 @@ fn deinterleave_block(
         *off = acc_c;
         acc_c += (bw + cf - 1 - p) / cf;
     }
-    let mut dst = vec![0u16; bw * bh * spp];
+    let mut dst = vec![T::default(); bw * bh * spp];
     for y in 0..bh {
         let ey = row_off[y % rf] + (y / rf);
         for x in 0..bw {
@@ -1785,8 +2144,75 @@ fn deinterleave_block(
 ///   `RowInterleaveFactor` 50975 / `ColumnInterleaveFactor` 52547 de-interleaving)
 /// - `Photometric = 32803` (CFA Bayer, demosaiced via Malvar–He–Cutler `f64`) and
 ///   `Photometric = 34892` (LinearRaw 1-ch gray or 3-ch RGB)
+/// Apply one DNG `OpcodeList` to a `width x height x spp` pixel buffer, in file order.
+///
+/// DNG 1.7.1 Chapter 7: opcodes in a list are applied sequentially, and image values are
+/// clipped to the list's logical range after each opcode (`0..2^BitsPerSample-1` for
+/// `OpcodeList1`, `0.0..1.0` for `OpcodeList2/3`). `bounds` is the coordinate frame the
+/// opcode's relative gain-map placement references.
+fn apply_opcode_list(
+    list: &[DngOpcode],
+    pixels: &mut [f64],
+    width: usize,
+    height: usize,
+    spp: usize,
+    bounds: DngImageBounds,
+    clip: Option<(f64, f64)>,
+) -> Result<()> {
+    if list.is_empty() {
+        return Ok(());
+    }
+    let clamp = |v: f64| match clip {
+        Some((lo, hi)) => v.clamp(lo, hi),
+        None => v,
+    };
+    for opcode in list {
+        match opcode {
+            DngOpcode::GainMap(gm) => {
+                for y in 0..height {
+                    for x in 0..width {
+                        for plane in 0..spp {
+                            if let Some(gain) = gm.eval_pixel(x as f64, y as f64, plane, &bounds) {
+                                let idx = (y * width + x) * spp + plane;
+                                pixels[idx] = clamp(pixels[idx] * gain);
+                            }
+                        }
+                    }
+                }
+            }
+            DngOpcode::FixVignetteRadial(vignette) => {
+                for y in 0..height {
+                    for x in 0..width {
+                        let gain =
+                            vignette.eval_gain(x as f64, y as f64, width as f64, height as f64);
+                        for plane in 0..spp {
+                            let idx = (y * width + x) * spp + plane;
+                            pixels[idx] = clamp(pixels[idx] * gain);
+                        }
+                    }
+                }
+            }
+            DngOpcode::WarpRectilinear(_) => {
+                // Geometric warps are evaluated analytically against f64 rays by the scan
+                // pipeline; the decoder deliberately does not resample pixels (0 resampled
+                // pixels), so there is nothing to do here.
+            }
+            DngOpcode::Unknown {
+                opcode_id, flags, ..
+            } => {
+                if flags & 1 == 0 {
+                    return Err(Error::msg(format!(
+                        "DNG opcode list contains unsupported non-optional opcode ID {opcode_id}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
-    let (meta, layout) = parse_dng_with_layout(buf)?;
+    let (meta, layout, opcodes) = parse_dng_with_opcodes(buf)?;
     if meta.main_width == 0 || meta.main_height == 0 {
         return Err(Error::msg("DNG has zero image dimensions"));
     }
@@ -1805,36 +2231,80 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
     let spp = layout.samples_per_pixel.max(1) as usize;
     let row_if = layout.row_interleave_factor.max(1) as usize;
     let col_if = layout.column_interleave_factor.max(1) as usize;
-    let mut raw_u16 = vec![0u16; w * h * spp];
+    let sample_formats = if layout.sample_formats.is_empty() {
+        vec![layout.sample_format.max(1)]
+    } else {
+        layout.sample_formats.clone()
+    };
+    let is_float = sample_formats.iter().all(|&f| f == 3);
+    let is_uint = sample_formats.iter().all(|&f| f == 1);
+    if !is_float && !is_uint {
+        return Err(Error::msg(format!(
+            "unsupported DNG SampleFormat set {sample_formats:?} (supported: 1=unsigned integer, 3=IEEE float)"
+        )));
+    }
+    if is_float && !matches!(meta.bits_per_sample, 16 | 24 | 32) {
+        return Err(Error::msg(format!(
+            "unsupported floating-point DNG BitsPerSample={} (supported: 16, 24, 32)",
+            meta.bits_per_sample
+        )));
+    }
+    if !is_float && meta.bits_per_sample > 16 {
+        return Err(Error::msg(format!(
+            "unsupported integer DNG BitsPerSample={} (supported: 8..=16)",
+            meta.bits_per_sample
+        )));
+    }
 
-    let decode_block_to_u16 = |slice: &[u8], bw: usize, bh: usize| -> Result<Vec<u16>> {
+    // Stage 1: decode the raw IFD exactly as stored. `OpcodeList1` operates in this
+    // full-image coordinate space, before black subtraction and before the ActiveArea crop.
+    let mut raw = vec![0.0_f64; w * h * spp];
+    let decode_block = |slice: &[u8], bw: usize, bh: usize| -> Result<DecodedBlock> {
         let block = if meta.compression == COMPRESSION_UNCOMPRESSED {
-            unpack_uncompressed_block(
-                slice,
-                bw * bh * spp,
-                meta.bits_per_sample,
-                layout.little_endian,
-            )?
+            let samples: Vec<f64> = if is_float {
+                unpack_uncompressed_float_block(
+                    slice,
+                    bw * bh * spp,
+                    meta.bits_per_sample,
+                    layout.little_endian,
+                )?
+                .into_iter()
+                .map(f64::from)
+                .collect()
+            } else {
+                unpack_uncompressed_block(
+                    slice,
+                    bw * bh * spp,
+                    meta.bits_per_sample,
+                    layout.little_endian,
+                )?
+                .into_iter()
+                .map(|v| v as f64)
+                .collect()
+            };
+            DecodedBlock {
+                width: bw,
+                height: bh,
+                samples,
+            }
         } else if meta.compression == COMPRESSION_JPEG_XL {
-            decode_jpeg_xl_block(slice, bw, bh, spp, meta.bits_per_sample)?
+            decode_jpeg_xl_block(slice, bw, bh, spp, meta.bits_per_sample, is_float)?
         } else {
             let (jw, jh, jc, jdata) = decode_lossless_jpeg_sof3(slice)?;
-            let expected = bw * bh * spp;
-            if jdata.len() == expected {
-                jdata
-            } else if jw * jc == bw * spp && jh >= bh {
-                jdata[..expected].to_vec()
-            } else {
+            // Lossless JPEG may declare different internal dimensions, but the decoded row
+            // stride must still equal `bw * spp` for the samples to be in spatial order.
+            if jw * jc != bw * spp || jh < bh {
                 return Err(Error::msg(format!(
-                    "Lossless JPEG block size mismatch: decoded {jw}x{jh}x{jc}, expected {bw}x{bh}x{spp}"
+                    "Lossless JPEG block layout {jw}x{jh}x{jc} is incompatible with DNG block {bw}x{bh}x{spp}"
                 )));
             }
+            DecodedBlock {
+                width: bw,
+                height: bh,
+                samples: jdata[..bw * bh * spp].iter().map(|&v| v as f64).collect(),
+            }
         };
-        if row_if > 1 || col_if > 1 {
-            Ok(deinterleave_block(&block, bw, bh, spp, row_if, col_if))
-        } else {
-            Ok(block)
-        }
+        Ok(block)
     };
 
     if !layout.tile_offsets.is_empty() && layout.tile_width > 0 && layout.tile_length > 0 {
@@ -1853,15 +2323,21 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
                 if off.saturating_add(len) > buf.len() {
                     return Err(Error::msg("DNG tile offset/length exceeds file size"));
                 }
-                let tile_vals = decode_block_to_u16(&buf[off..off + len], tw, th)?;
-                let copy_h = th.min(h.saturating_sub(ty * th));
-                let copy_w = tw.min(w.saturating_sub(tx * tw));
+                let tile = decode_block(&buf[off..off + len], tw, th)?;
+                let copy_w = tw.min(w - tx * tw);
+                let copy_h = th.min(h - ty * th);
+                if tile.width < copy_w || tile.height < copy_h {
+                    return Err(Error::msg(format!(
+                        "DNG tile {tx},{ty} decoded {}x{} but needs {copy_w}x{copy_h}",
+                        tile.width, tile.height
+                    )));
+                }
                 for ry in 0..copy_h {
                     let dst_y = ty * th + ry;
-                    let src_row = ry * tw * spp;
+                    let src_row = ry * tile.width * spp;
                     let dst_row = (dst_y * w + tx * tw) * spp;
-                    raw_u16[dst_row..dst_row + copy_w * spp]
-                        .copy_from_slice(&tile_vals[src_row..src_row + copy_w * spp]);
+                    raw[dst_row..dst_row + copy_w * spp]
+                        .copy_from_slice(&tile.samples[src_row..src_row + copy_w * spp]);
                 }
             }
         }
@@ -1883,9 +2359,15 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
             if off.saturating_add(len) > buf.len() {
                 return Err(Error::msg("DNG strip offset/length exceeds file size"));
             }
-            let strip_vals = decode_block_to_u16(&buf[off..off + len], w, bh)?;
+            let strip = decode_block(&buf[off..off + len], w, bh)?;
+            if strip.width < w || strip.height < bh {
+                return Err(Error::msg(format!(
+                    "DNG strip {si} decoded {}x{} but needs {w}x{bh}",
+                    strip.width, strip.height
+                )));
+            }
             let dst_off = y0 * w * spp;
-            raw_u16[dst_off..dst_off + w * bh * spp].copy_from_slice(&strip_vals);
+            raw[dst_off..dst_off + w * bh * spp].copy_from_slice(&strip.samples[..w * bh * spp]);
         }
     } else {
         return Err(Error::msg(
@@ -1893,95 +2375,177 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
         ));
     }
 
-    // Normalize with per-channel BlackLevel/WhiteLevel + radiometric GainMap & FixVignetteRadial.
-    let mut rgb = if meta.photometric == PHOTOMETRIC_CFA && spp == 1 {
-        let pat = meta.cfa_pattern.unwrap_or(CfaPattern::Gbrg);
-        let mut cfa = vec![0.0_f64; w * h];
-        for y in 0..h {
-            let v_norm = (y as f64 + 0.5) / (h as f64);
-            for x in 0..w {
-                let u_norm = (x as f64 + 0.5) / (w as f64);
-                let bayer_idx = ((y & 1) << 1) | (x & 1);
-                let bl = layout
-                    .black_levels
-                    .get(bayer_idx)
-                    .or_else(|| layout.black_levels.first())
-                    .copied()
-                    .unwrap_or(meta.black_level);
-                let wl = layout
-                    .white_levels
-                    .first()
-                    .copied()
-                    .unwrap_or(meta.white_level);
-                let mut val = (((raw_u16[y * w + x] as f64) - bl) / (wl - bl).max(1.0)).max(0.0);
-                for gm in &meta.gain_maps {
-                    val *= gm.eval(u_norm, v_norm, bayer_idx);
-                }
-                if let Some(vig) = &meta.vignette {
-                    val *= vig.eval_gain(x as f64, y as f64, w as f64, h as f64);
-                }
-                cfa[y * w + x] = val;
-            }
-        }
-        demosaic_malvar_he_cutler(&cfa, w, h, pat)
+    // `RowInterleaveFactor`/`ColumnInterleaveFactor` permute the whole stored image; they do
+    // not decompose across tiles or strips, so undo them only after every block is assembled.
+    if row_if > 1 || col_if > 1 {
+        raw = deinterleave_block(&raw, w, h, spp, row_if, col_if);
+    }
+
+    let raw_bounds = DngImageBounds {
+        top: 0.0,
+        left: 0.0,
+        width: w as f64,
+        height: h as f64,
+    };
+    let list1_clip = if is_float {
+        None
     } else {
-        let mut out_rgb = vec![[0.0_f64; 3]; w * h];
-        for y in 0..h {
-            let v_norm = (y as f64 + 0.5) / (h as f64);
-            for x in 0..w {
-                let u_norm = (x as f64 + 0.5) / (w as f64);
-                let vig_g = meta
-                    .vignette
-                    .as_ref()
-                    .map(|v| v.eval_gain(x as f64, y as f64, w as f64, h as f64))
-                    .unwrap_or(1.0);
-                let mut px = [0.0_f64; 3];
-                for (c, dst) in px.iter_mut().enumerate() {
-                    let sc = c.min(spp - 1);
-                    let bl = layout
-                        .black_levels
-                        .get(sc)
-                        .or_else(|| layout.black_levels.first())
-                        .copied()
-                        .unwrap_or(meta.black_level);
-                    let wl = layout
-                        .white_levels
-                        .get(sc)
-                        .or_else(|| layout.white_levels.first())
-                        .copied()
-                        .unwrap_or(meta.white_level);
-                    let mut val = (((raw_u16[(y * w + x) * spp + sc] as f64) - bl)
-                        / (wl - bl).max(1.0))
-                    .max(0.0);
-                    for gm in &meta.gain_maps {
-                        val *= gm.eval(u_norm, v_norm, sc);
-                    }
-                    *dst = val * vig_g;
+        Some((0.0, ((1u64 << meta.bits_per_sample.min(16)) - 1) as f64))
+    };
+    apply_opcode_list(&opcodes.list1, &mut raw, w, h, spp, raw_bounds, list1_clip)?;
+
+    // Stage 2: black subtraction and rescaling on the ActiveArea-cropped image. DNG 1.7.1
+    // anchors both the CFA pattern and the BlackLevel repeat pattern at the ActiveArea
+    // top-left, and BlackLevelDeltaH/V are indexed by ActiveArea column/row. `OpcodeList2`
+    // applies in this cropped coordinate space, before demosaic; `OpcodeList3` after.
+    let (top, left, bottom, right) = match layout.active_area {
+        Some([t, l, b, r]) => {
+            let (t, l, b, r) = (t as usize, l as usize, b as usize, r as usize);
+            if b <= t || r <= l || b > h || r > w {
+                return Err(Error::msg(format!(
+                    "DNG ActiveArea [{t}, {l}, {b}, {r}] is empty or outside the {w}x{h} image"
+                )));
+            }
+            (t, l, b, r)
+        }
+        None => (0, 0, h, w),
+    };
+    let aw = right - left;
+    let ah = bottom - top;
+    let cfa = meta.photometric == PHOTOMETRIC_CFA && spp == 1;
+    let planes = if cfa { 1 } else { spp };
+    let (repeat_rows, repeat_cols) = (
+        layout.black_level_repeat.0.max(1) as usize,
+        layout.black_level_repeat.1.max(1) as usize,
+    );
+
+    let default_white = if is_float {
+        1.0
+    } else {
+        ((1u64 << meta.bits_per_sample.min(16)) - 1) as f64
+    };
+    let white_level = |plane: usize| -> f64 {
+        if layout.white_level_tagged {
+            layout
+                .white_levels
+                .get(plane)
+                .or_else(|| layout.white_levels.first())
+                .copied()
+                .unwrap_or(default_white)
+        } else {
+            default_white
+        }
+    };
+    let pattern_black = |row: usize, col: usize, plane: usize| -> f64 {
+        let idx =
+            ((row % repeat_rows) * repeat_cols + (col % repeat_cols)) * spp + plane.min(spp - 1);
+        layout
+            .black_levels
+            .get(idx)
+            .or_else(|| layout.black_levels.get(plane))
+            .or_else(|| layout.black_levels.first())
+            .copied()
+            .unwrap_or(meta.black_level)
+    };
+    // DNG 1.7.1 Chapter 5 / SDK `dng_linearization_info::MaxBlackLevel`: the rescale
+    // denominator is `WhiteLevel - max(BlackLevel pattern + per-phase DeltaH/DeltaV)`.
+    let max_black = |plane: usize| -> f64 {
+        let phase_max = |table: &[f64], modulus: usize| -> Vec<f64> {
+            let mut out = vec![0.0_f64; modulus.max(1)];
+            for (i, &v) in table.iter().enumerate() {
+                let slot = &mut out[i % modulus.max(1)];
+                if i < modulus.max(1) {
+                    *slot = v;
+                } else {
+                    *slot = slot.max(v);
                 }
-                out_rgb[y * w + x] = px;
+            }
+            out
+        };
+        let delta_h = phase_max(&layout.black_level_delta_h, repeat_cols);
+        let delta_v = phase_max(&layout.black_level_delta_v, repeat_rows);
+        let mut best = f64::NEG_INFINITY;
+        for row in 0..repeat_rows {
+            for col in 0..repeat_cols {
+                let v = pattern_black(row, col, plane)
+                    + delta_h[col % repeat_cols]
+                    + delta_v[row % repeat_rows];
+                best = best.max(v);
             }
         }
-        out_rgb
+        if best.is_finite() {
+            best
+        } else {
+            0.0
+        }
+    };
+    let white_levels: Vec<f64> = (0..planes).map(white_level).collect();
+    let denoms: Vec<f64> = (0..planes)
+        .map(|plane| (white_levels[plane] - max_black(plane)).max(1.0))
+        .collect();
+
+    let mut stage2 = vec![0.0_f64; aw * ah * planes];
+    for y in 0..ah {
+        for x in 0..aw {
+            for plane in 0..planes {
+                let src_plane = if cfa { 0 } else { plane };
+                let raw_v = raw[((y + top) * w + (x + left)) * spp + src_plane];
+                let black = pattern_black(y, x, plane)
+                    + layout.black_level_delta_h.get(x).copied().unwrap_or(0.0)
+                    + layout.black_level_delta_v.get(y).copied().unwrap_or(0.0);
+                stage2[(y * aw + x) * planes + plane] = ((raw_v - black) / denoms[plane]).max(0.0);
+            }
+        }
+    }
+
+    let active_bounds = DngImageBounds {
+        top: 0.0,
+        left: 0.0,
+        width: aw as f64,
+        height: ah as f64,
+    };
+    apply_opcode_list(
+        &opcodes.list2,
+        &mut stage2,
+        aw,
+        ah,
+        planes,
+        active_bounds,
+        Some((0.0, 1.0)),
+    )?;
+
+    let mut rgb: Vec<[f64; 3]> = if cfa {
+        let pat = meta.cfa_pattern.unwrap_or(CfaPattern::Gbrg);
+        demosaic_malvar_he_cutler(&stage2, aw, ah, pat)
+    } else {
+        let mut out = vec![[0.0_f64; 3]; aw * ah];
+        for (i, px) in out.iter_mut().enumerate() {
+            for (c, dst) in px.iter_mut().enumerate() {
+                *dst = stage2[i * planes + c.min(planes - 1)];
+            }
+        }
+        out
     };
 
-    // Respect ActiveArea crop if strictly inside image bounds.
-    let (out_w, out_h) = if let Some([top, left, bottom, right]) = layout.active_area {
-        let (t, l, b, r) = (top as usize, left as usize, bottom as usize, right as usize);
-        if b > t && r > l && b <= h && r <= w && (t > 0 || l > 0 || b < h || r < w) {
-            let cw = r - l;
-            let ch = b - t;
-            let mut cropped = Vec::with_capacity(cw * ch);
-            for y in t..b {
-                cropped.extend_from_slice(&rgb[(y * w + l)..(y * w + r)]);
-            }
-            rgb = cropped;
-            (cw, ch)
-        } else {
-            (w, h)
+    if !opcodes.list3.is_empty() {
+        let mut flat = vec![0.0_f64; aw * ah * 3];
+        for (i, px) in rgb.iter().enumerate() {
+            flat[i * 3..i * 3 + 3].copy_from_slice(px);
         }
-    } else {
-        (w, h)
-    };
+        apply_opcode_list(
+            &opcodes.list3,
+            &mut flat,
+            aw,
+            ah,
+            3,
+            active_bounds,
+            Some((0.0, 1.0)),
+        )?;
+        for (i, px) in rgb.iter_mut().enumerate() {
+            px.copy_from_slice(&flat[i * 3..i * 3 + 3]);
+        }
+    }
+    let (out_w, out_h) = (aw, ah);
 
     let luma: Vec<f64> = rgb
         .iter()
@@ -3355,5 +3919,793 @@ mod tests {
         assert!((layout.black_levels[1] - 64.25).abs() < 1e-12);
         assert!((meta.black_level - 64.5).abs() < 1e-12);
         assert_eq!(meta.cfa_pattern, Some(CfaPattern::Gbrg));
+    }
+
+    // ------------------------------------------------------------------
+    // Minimal synthetic TIFF/DNG writer + DNG 1.7.1 conformance regressions.
+    // ------------------------------------------------------------------
+
+    struct TinyDng {
+        width: u32,
+        height: u32,
+        bps: u16,
+        sample_format: u16,
+        photometric: u16,
+        spp: u16,
+        compression: u16,
+        cfa: [u8; 4],
+        black: Vec<u32>,
+        black_repeat: (u16, u16),
+        delta_h: Vec<(i32, i32)>,
+        delta_v: Vec<(i32, i32)>,
+        white: Option<u32>,
+        active: Option<[u32; 4]>,
+        row_if: u16,
+        col_if: u16,
+        op1: Vec<u8>,
+        op2: Vec<u8>,
+        op3: Vec<u8>,
+        strip: Option<Vec<u8>>,
+        tiles: Option<(u32, u32, Vec<Vec<u8>>)>,
+    }
+
+    impl TinyDng {
+        fn new(width: u32, height: u32, photometric: u16, spp: u16) -> Self {
+            Self {
+                width,
+                height,
+                bps: 16,
+                sample_format: 1,
+                photometric,
+                spp,
+                compression: COMPRESSION_UNCOMPRESSED,
+                cfa: [0, 1, 1, 2],
+                black: Vec::new(),
+                black_repeat: (1, 1),
+                delta_h: Vec::new(),
+                delta_v: Vec::new(),
+                white: None,
+                active: None,
+                row_if: 1,
+                col_if: 1,
+                op1: Vec::new(),
+                op2: Vec::new(),
+                op3: Vec::new(),
+                strip: None,
+                tiles: None,
+            }
+        }
+    }
+
+    const TINY_EXTRA_OFF: usize = 2048;
+    const TINY_PIX_OFF: usize = 16384;
+
+    fn build_tiny_dng(spec: &TinyDng) -> Vec<u8> {
+        assert!(spec.strip.is_some() ^ spec.tiles.is_some());
+        let mut tags: Vec<(u16, u16, u32, [u8; 4])> = Vec::new();
+        let mut extra: Vec<u8> = Vec::new();
+        fn add(
+            tags: &mut Vec<(u16, u16, u32, [u8; 4])>,
+            extra: &mut Vec<u8>,
+            tag: u16,
+            typ: u16,
+            count: u32,
+            payload: &[u8],
+        ) {
+            let mut inline = [0u8; 4];
+            if payload.len() <= 4 {
+                inline[..payload.len()].copy_from_slice(payload);
+            } else {
+                while extra.len() % 2 != 0 {
+                    extra.push(0);
+                }
+                let off = (TINY_EXTRA_OFF + extra.len()) as u32;
+                inline.copy_from_slice(&off.to_le_bytes());
+                extra.extend_from_slice(payload);
+            }
+            tags.push((tag, typ, count, inline));
+        }
+
+        add(
+            &mut tags,
+            &mut extra,
+            TAG_IMAGE_WIDTH,
+            4,
+            1,
+            &spec.width.to_le_bytes(),
+        );
+        add(
+            &mut tags,
+            &mut extra,
+            TAG_IMAGE_LENGTH,
+            4,
+            1,
+            &spec.height.to_le_bytes(),
+        );
+        add(
+            &mut tags,
+            &mut extra,
+            TAG_BITS_PER_SAMPLE,
+            3,
+            1,
+            &spec.bps.to_le_bytes(),
+        );
+        add(
+            &mut tags,
+            &mut extra,
+            TAG_COMPRESSION,
+            3,
+            1,
+            &spec.compression.to_le_bytes(),
+        );
+        add(
+            &mut tags,
+            &mut extra,
+            TAG_PHOTOMETRIC,
+            3,
+            1,
+            &spec.photometric.to_le_bytes(),
+        );
+        add(
+            &mut tags,
+            &mut extra,
+            TAG_SAMPLES_PER_PIXEL,
+            3,
+            1,
+            &spec.spp.to_le_bytes(),
+        );
+        add(
+            &mut tags,
+            &mut extra,
+            TAG_SAMPLE_FORMAT,
+            3,
+            1,
+            &spec.sample_format.to_le_bytes(),
+        );
+        add(&mut tags, &mut extra, TAG_DNG_VERSION, 1, 4, &[1, 7, 1, 0]);
+        if spec.photometric == PHOTOMETRIC_CFA {
+            add(&mut tags, &mut extra, TAG_CFA_PATTERN, 1, 4, &spec.cfa);
+        }
+        if !spec.black.is_empty() {
+            let mut p = Vec::new();
+            for v in &spec.black {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_BLACK_LEVEL,
+                4,
+                spec.black.len() as u32,
+                &p,
+            );
+            let mut p = Vec::new();
+            p.extend_from_slice(&spec.black_repeat.0.to_le_bytes());
+            p.extend_from_slice(&spec.black_repeat.1.to_le_bytes());
+            add(&mut tags, &mut extra, TAG_BLACK_LEVEL_REPEAT_DIM, 3, 2, &p);
+        }
+        for (tag, table) in [
+            (TAG_BLACK_LEVEL_DELTA_H, &spec.delta_h),
+            (TAG_BLACK_LEVEL_DELTA_V, &spec.delta_v),
+        ] {
+            if !table.is_empty() {
+                let mut p = Vec::new();
+                for &(num, den) in table {
+                    p.extend_from_slice(&num.to_le_bytes());
+                    p.extend_from_slice(&den.to_le_bytes());
+                }
+                add(&mut tags, &mut extra, tag, 10, table.len() as u32, &p);
+            }
+        }
+        if let Some(white) = spec.white {
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_WHITE_LEVEL,
+                4,
+                1,
+                &white.to_le_bytes(),
+            );
+        }
+        if let Some(active) = spec.active {
+            let mut p = Vec::new();
+            for v in active {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            add(&mut tags, &mut extra, TAG_ACTIVE_AREA, 4, 4, &p);
+        }
+        if spec.row_if > 1 {
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_ROW_INTERLEAVE_FACTOR,
+                3,
+                1,
+                &spec.row_if.to_le_bytes(),
+            );
+        }
+        if spec.col_if > 1 {
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_COLUMN_INTERLEAVE_FACTOR,
+                3,
+                1,
+                &spec.col_if.to_le_bytes(),
+            );
+        }
+        for (tag, blob) in [
+            (TAG_OPCODE_LIST_1, &spec.op1),
+            (TAG_OPCODE_LIST_2, &spec.op2),
+            (TAG_OPCODE_LIST_3, &spec.op3),
+        ] {
+            if !blob.is_empty() {
+                add(&mut tags, &mut extra, tag, 7, blob.len() as u32, blob);
+            }
+        }
+
+        let pixel_blob: Vec<u8> = if let Some(strip) = &spec.strip {
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_STRIP_OFFSETS,
+                4,
+                1,
+                &(TINY_PIX_OFF as u32).to_le_bytes(),
+            );
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_ROWS_PER_STRIP,
+                4,
+                1,
+                &spec.height.to_le_bytes(),
+            );
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_STRIP_BYTE_COUNTS,
+                4,
+                1,
+                &(strip.len() as u32).to_le_bytes(),
+            );
+            strip.clone()
+        } else {
+            let (tw, th, tiles) = spec.tiles.as_ref().expect("tiles present");
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_TILE_WIDTH,
+                4,
+                1,
+                &tw.to_le_bytes(),
+            );
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_TILE_LENGTH,
+                4,
+                1,
+                &th.to_le_bytes(),
+            );
+            let mut offsets = Vec::new();
+            let mut counts = Vec::new();
+            let mut cursor = TINY_PIX_OFF;
+            for tile in tiles {
+                offsets.push(cursor as u32);
+                counts.push(tile.len() as u32);
+                cursor += tile.len();
+            }
+            let mut p = Vec::new();
+            for v in &offsets {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_TILE_OFFSETS,
+                4,
+                offsets.len() as u32,
+                &p,
+            );
+            let mut p = Vec::new();
+            for v in &counts {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_TILE_BYTE_COUNTS,
+                4,
+                counts.len() as u32,
+                &p,
+            );
+            tiles.concat()
+        };
+
+        tags.sort_by_key(|t| t.0);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+        for (tag, typ, count, inline) in &tags {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&typ.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(inline);
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        assert!(out.len() <= TINY_EXTRA_OFF);
+        out.resize(TINY_EXTRA_OFF, 0);
+        out.extend_from_slice(&extra);
+        assert!(out.len() <= TINY_PIX_OFF);
+        out.resize(TINY_PIX_OFF, 0);
+        out.extend_from_slice(&pixel_blob);
+        out
+    }
+
+    fn dng_opcode_list(items: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut out = (items.len() as u32).to_be_bytes().to_vec();
+        for (id, params) in items {
+            out.extend_from_slice(&id.to_be_bytes());
+            out.extend_from_slice(&0x0103_0000u32.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&(params.len() as u32).to_be_bytes());
+            out.extend_from_slice(params);
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gain_map_params(
+        top: u32,
+        left: u32,
+        bottom: u32,
+        right: u32,
+        plane: u32,
+        planes: u32,
+        row_pitch: u32,
+        col_pitch: u32,
+        points_v: u32,
+        points_h: u32,
+        spacing_v: f64,
+        spacing_h: f64,
+        origin_v: f64,
+        origin_h: f64,
+        map_planes: u32,
+        gains: &[f32],
+    ) -> Vec<u8> {
+        let mut p = Vec::new();
+        for v in [
+            top, left, bottom, right, plane, planes, row_pitch, col_pitch, points_v, points_h,
+        ] {
+            p.extend_from_slice(&v.to_be_bytes());
+        }
+        for v in [spacing_v, spacing_h, origin_v, origin_h] {
+            p.extend_from_slice(&v.to_be_bytes());
+        }
+        p.extend_from_slice(&map_planes.to_be_bytes());
+        for g in gains {
+            p.extend_from_slice(&g.to_be_bytes());
+        }
+        p
+    }
+
+    fn le_u16(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn le_f32(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn be24_float(bits: &[u32]) -> Vec<u8> {
+        bits.iter()
+            .flat_map(|v| [(v >> 16) as u8, (v >> 8) as u8, *v as u8])
+            .collect()
+    }
+
+    fn assert_rgb_matches(dec: &DecodedDngImage, expected: &[[f64; 3]], tol: f64) {
+        assert_eq!(dec.rgb.len(), expected.len(), "pixel count mismatch");
+        for (i, (got, want)) in dec.rgb.iter().zip(expected.iter()).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (got[c] - want[c]).abs() <= tol,
+                    "px {i} ch {c}: got {} want {} (tol {tol})",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dng_active_area_anchors_cfa_and_black_level_phase() {
+        let mut spec = TinyDng::new(4, 4, PHOTOMETRIC_CFA, 1);
+        spec.active = Some([1, 1, 3, 3]);
+        spec.black_repeat = (2, 2);
+        spec.black = vec![10, 20, 30, 40];
+        spec.white = Some(1009);
+        spec.strip = Some(le_u16(&[110u16; 16]));
+
+        let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode ActiveArea DNG");
+        assert_eq!((dec.width, dec.height), (2, 2));
+
+        // BlackLevel pattern origin is the ActiveArea top-left (DNG 1.7.1 p.28), and the
+        // rescale denominator uses the maximum black level for the plane (SDK MaxBlackLevel).
+        let denom = 1009.0 - 40.0;
+        let expected_cfa = vec![
+            (110.0 - 10.0) / denom,
+            (110.0 - 20.0) / denom,
+            (110.0 - 30.0) / denom,
+            (110.0 - 40.0) / denom,
+        ];
+        let expected = demosaic_malvar_he_cutler(&expected_cfa, 2, 2, CfaPattern::Rggb);
+        assert_rgb_matches(&dec, &expected, 1e-12);
+    }
+
+    #[test]
+    fn dng_black_level_repeat_3x3_and_deltas() {
+        let (w, h) = (6usize, 6usize);
+        let mut spec = TinyDng::new(w as u32, h as u32, PHOTOMETRIC_CFA, 1);
+        spec.black_repeat = (3, 3);
+        spec.black = vec![100, 102, 104, 106, 108, 110, 112, 114, 116];
+        spec.delta_h = vec![(0, 1), (1, 1), (2, 1), (0, 1), (1, 1), (2, 1)];
+        spec.delta_v = vec![(0, 1), (1, 1), (2, 1), (0, 1), (1, 1), (2, 1)];
+        spec.white = Some(4000);
+        spec.strip = Some(le_u16(&vec![1000u16; w * h]));
+
+        let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode 3x3 black pattern");
+        let max_black = 116.0 + 2.0 + 2.0;
+        let mut expected_cfa = vec![0.0_f64; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let black =
+                    f64::from(spec.black[(y % 3) * 3 + (x % 3)]) + (x % 3) as f64 + (y % 3) as f64;
+                expected_cfa[y * w + x] = (1000.0 - black) / (4000.0 - max_black);
+            }
+        }
+        let expected = demosaic_malvar_he_cutler(&expected_cfa, w, h, CfaPattern::Rggb);
+        assert_rgb_matches(&dec, &expected, 1e-12);
+    }
+
+    #[test]
+    fn dng_opcode_order_clipping_and_distinct_lists() {
+        // Two GainMaps in one list are applied in file order, with the 0..1 logical-range
+        // clip between them: 0.6 * 2 -> clip 1.0, then * 0.5 -> 0.5 (not 0.6).
+        let mut spec = TinyDng::new(2, 2, PHOTOMETRIC_LINEAR_RAW, 3);
+        spec.bps = 8;
+        spec.white = Some(200);
+        spec.strip = Some(vec![120u8; 12]);
+        spec.op2 = dng_opcode_list(&[
+            (
+                OPCODE_GAIN_MAP,
+                gain_map_params(
+                    0,
+                    0,
+                    2,
+                    2,
+                    0,
+                    3,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    3,
+                    &[2.0, 2.0, 2.0],
+                ),
+            ),
+            (
+                OPCODE_GAIN_MAP,
+                gain_map_params(
+                    0,
+                    0,
+                    2,
+                    2,
+                    0,
+                    3,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    3,
+                    &[0.5, 0.5, 0.5],
+                ),
+            ),
+        ]);
+        let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode ordered opcode list");
+        for px in &dec.rgb {
+            for c in 0..3 {
+                assert!((px[c] - 0.5).abs() < 1e-12, "expected 0.5, got {}", px[c]);
+            }
+        }
+
+        // OpcodeList1 runs on raw integer data and clips to 0..255 for 8-bit: 200 * 2 -> 255,
+        // then normalization divides by WhiteLevel 200 => 1.275. An implementation that
+        // applies List1 after normalization would produce 2.0 (or 1.0 after a List2 clip).
+        let mut spec1 = TinyDng::new(2, 2, PHOTOMETRIC_LINEAR_RAW, 3);
+        spec1.bps = 8;
+        spec1.white = Some(200);
+        spec1.strip = Some(vec![200u8; 12]);
+        spec1.op1 = dng_opcode_list(&[(
+            OPCODE_GAIN_MAP,
+            gain_map_params(
+                0,
+                0,
+                2,
+                2,
+                0,
+                3,
+                1,
+                1,
+                1,
+                1,
+                1.0,
+                1.0,
+                0.0,
+                0.0,
+                3,
+                &[2.0, 2.0, 2.0],
+            ),
+        )]);
+        let dec1 = decode_dng_bytes(&build_tiny_dng(&spec1)).expect("decode List1 DNG");
+        for px in &dec1.rgb {
+            for c in 0..3 {
+                assert!(
+                    (px[c] - 1.275).abs() < 1e-12,
+                    "List1 must clip raw 8-bit to 255 before normalization, got {}",
+                    px[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dng_gain_map_honors_area_plane_pitch_map_geometry() {
+        let (w, h) = (5u32, 5u32);
+        let mut spec = TinyDng::new(w, h, PHOTOMETRIC_LINEAR_RAW, 3);
+        spec.bps = 8;
+        spec.white = Some(200);
+        let mut pixels = Vec::new();
+        for _ in 0..(w * h) {
+            pixels.extend_from_slice(&[50u8, 100u8, 150u8]);
+        }
+        spec.strip = Some(pixels);
+        // Area [Top=1,Left=1,Bottom=4,Right=4), plane 1 only, every other row/column,
+        // horizontal 2-point map at origin 0.25 with spacing 0.5.
+        spec.op2 = dng_opcode_list(&[(
+            OPCODE_GAIN_MAP,
+            gain_map_params(
+                1,
+                1,
+                4,
+                4,
+                1,
+                1,
+                2,
+                2,
+                1,
+                2,
+                1.0,
+                0.5,
+                0.0,
+                0.25,
+                1,
+                &[1.0, 3.0],
+            ),
+        )]);
+        let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode GainMap geometry");
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let px = dec.rgb[y * w as usize + x];
+                assert!((px[0] - 0.25).abs() < 1e-12, "R modified at ({x},{y})");
+                assert!((px[2] - 0.75).abs() < 1e-12, "B modified at ({x},{y})");
+                let on_grid = (1..4).contains(&x)
+                    && (1..4).contains(&y)
+                    && (x - 1) % 2 == 0
+                    && (y - 1) % 2 == 0;
+                let want_g = if on_grid {
+                    let u = (x as f64 + 0.5) / 5.0;
+                    let fx = ((u - 0.25) / 0.5).clamp(0.0, 1.0);
+                    (0.5 * (1.0 + fx * 2.0)).min(1.0)
+                } else {
+                    0.5
+                };
+                assert!(
+                    (px[1] - want_g).abs() < 1e-12,
+                    "G at ({x},{y}): got {} want {want_g}",
+                    px[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dng_sample_format_float_is_not_integer_scaled() {
+        // A 16-bit IEEE-float JXL DNG: the codestream's normalized samples are already the
+        // floating-point values, and WhiteLevel=1 must not rescale them by 2^16-1.
+        let mut spec = TinyDng::new(4, 4, PHOTOMETRIC_LINEAR_RAW, 1);
+        spec.bps = 16;
+        spec.sample_format = 3;
+        spec.white = Some(1);
+        spec.compression = COMPRESSION_JPEG_XL;
+        spec.strip = Some(TF16.to_vec());
+        let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode float JXL DNG");
+        let want = 16384.0 / 65535.0;
+        for (i, px) in dec.rgb.iter().enumerate() {
+            for (c, v) in px.iter().enumerate() {
+                assert!(
+                    (v - want).abs() < 2e-5,
+                    "float JXL px {i} ch {c}: got {v}, want {want}"
+                );
+                assert!(*v < 1.0, "float JXL must not be scaled by 65535, got {v}");
+            }
+        }
+
+        // Uncompressed 32-bit float samples.
+        let mut fspec = TinyDng::new(2, 2, PHOTOMETRIC_LINEAR_RAW, 3);
+        fspec.bps = 32;
+        fspec.sample_format = 3;
+        fspec.strip = Some(le_f32(&[
+            0.25, 0.5, 0.75, 0.25, 0.5, 0.75, 0.25, 0.5, 0.75, 0.25, 0.5, 0.75,
+        ]));
+        let fdec = decode_dng_bytes(&build_tiny_dng(&fspec)).expect("decode float32 DNG");
+        for px in &fdec.rgb {
+            assert!((px[0] - 0.25).abs() < 1e-12);
+            assert!((px[1] - 0.5).abs() < 1e-12);
+            assert!((px[2] - 0.75).abs() < 1e-12);
+        }
+
+        // Uncompressed 24-bit float (1 sign / 7 exponent biased by 64 / 16 mantissa bits).
+        let mut f24 = TinyDng::new(2, 2, PHOTOMETRIC_LINEAR_RAW, 1);
+        f24.bps = 24;
+        f24.sample_format = 3;
+        f24.strip = Some(be24_float(&[0x40_0000, 0x40_8000, 0x41_0000, 0x40_0000]));
+        let d24 = decode_dng_bytes(&build_tiny_dng(&f24)).expect("decode float24 DNG");
+        assert!((d24.rgb[0][0] - 1.0).abs() < 1e-12);
+        assert!((d24.rgb[1][0] - 1.5).abs() < 1e-12);
+        assert!((d24.rgb[2][0] - 2.0).abs() < 1e-12);
+
+        assert_eq!(half_to_f32(0x3C00), 1.0);
+        assert_eq!(half_to_f32(0x3800), 0.5);
+        assert_eq!(half_to_f32(0xC000), -2.0);
+        assert_eq!(float24_to_f32(0x41_0000), 2.0);
+    }
+
+    // Fixtures generated with libjxl `cjxl -d 0`: 3x2 and 8x2 / 3x8 / 8x8 grayscale tiles
+    // used by the tiled-JXL edge/interleave regression below.
+    const EDGE_T11: &[u8] = &[
+        0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0x00, 0x00, 0x00,
+        0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x78,
+        0x6c, 0x20, 0x00, 0x00, 0x00, 0x09, 0x6a, 0x78, 0x6c, 0x6c, 0x0a, 0x00, 0x00, 0x00, 0xce,
+        0x6a, 0x78, 0x6c, 0x63, 0xff, 0x0a, 0x08, 0x40, 0xfc, 0x00, 0xc5, 0x85, 0x08, 0x02, 0x01,
+        0x00, 0xe0, 0x02, 0x4b, 0x18, 0x9b, 0x9c, 0x71, 0x84, 0x03, 0x38, 0x80, 0x03, 0x38, 0x20,
+        0x4a, 0xc0, 0x39, 0x05, 0x01, 0x00, 0x20, 0x44, 0x80, 0x08, 0x10, 0x01, 0x22, 0x40, 0x84,
+        0xff, 0xff, 0x3f, 0xf8, 0xff, 0xff, 0xa2, 0x3e, 0xc6, 0x18, 0x73, 0xae, 0xb5, 0xf7, 0xde,
+        0xe7, 0x9c, 0x73, 0x0e, 0x01, 0x45, 0x44, 0x44, 0x44, 0x44, 0x64, 0x66, 0x66, 0xde, 0xf7,
+        0x7e, 0x55, 0x55, 0x55, 0x15, 0xfc, 0xff, 0xff, 0xc1, 0xff, 0xff, 0x17, 0xf5, 0x31, 0xc6,
+        0x98, 0x73, 0xad, 0xbd, 0xf7, 0x3e, 0xe7, 0x9c, 0x73, 0x08, 0x28, 0x22, 0x22, 0x22, 0x22,
+        0x22, 0x33, 0x33, 0xf3, 0xbe, 0xf7, 0xab, 0xaa, 0xaa, 0xaa, 0xe0, 0xff, 0xff, 0x0f, 0xfe,
+        0xff, 0xbf, 0xa8, 0x8f, 0x31, 0xc6, 0x9c, 0x6b, 0xed, 0xbd, 0xf7, 0x39, 0xe7, 0x9c, 0x43,
+        0x40, 0x11, 0x11, 0x11, 0x11, 0x11, 0x99, 0x99, 0x99, 0xf7, 0xbd, 0x5f, 0x55, 0x55, 0x55,
+        0x05, 0xff, 0xff, 0x7f, 0xf0, 0xff, 0xff, 0x45, 0x7d, 0x8c, 0x31, 0xe6, 0x5c, 0x6b, 0xef,
+        0xbd, 0xcf, 0x39, 0xe7, 0x1c, 0x02, 0x8a, 0x88, 0x88, 0x88, 0x88, 0xc8, 0xcc, 0xcc, 0xbc,
+        0xef, 0xfd, 0xaa, 0xaa, 0xaa, 0xaa, 0x79, 0x41, 0xff, 0x01, 0xf4, 0x1f, 0x40, 0xff, 0x05,
+        0xdc, 0x7d, 0x00, 0xfd, 0x07, 0xd0, 0x03,
+    ];
+    const EDGE_T10: &[u8] = &[
+        0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0x00, 0x00, 0x00,
+        0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x78,
+        0x6c, 0x20, 0x00, 0x00, 0x00, 0x09, 0x6a, 0x78, 0x6c, 0x6c, 0x0a, 0x00, 0x00, 0x00, 0xc9,
+        0x6a, 0x78, 0x6c, 0x63, 0xff, 0x0a, 0x38, 0x00, 0x04, 0xe0, 0x07, 0x28, 0x2e, 0x04, 0x08,
+        0x02, 0x01, 0x00, 0xc4, 0x02, 0x4b, 0x18, 0x9b, 0x9c, 0x71, 0x84, 0x03, 0x38, 0x80, 0x03,
+        0x38, 0x20, 0x4a, 0xc0, 0x39, 0x05, 0x01, 0x00, 0x20, 0x44, 0x80, 0x08, 0x10, 0x01, 0x22,
+        0x40, 0x84, 0xff, 0xff, 0x3f, 0xf8, 0xff, 0xff, 0xa2, 0x3e, 0xc6, 0x18, 0x73, 0xae, 0xb5,
+        0xf7, 0xde, 0xe7, 0x9c, 0x73, 0x0e, 0x01, 0x45, 0x44, 0x44, 0x44, 0x44, 0x64, 0x66, 0x66,
+        0xde, 0xf7, 0x7e, 0x55, 0x55, 0x55, 0x15, 0xfc, 0xff, 0xff, 0xc1, 0xff, 0xff, 0x17, 0xf5,
+        0x31, 0xc6, 0x98, 0x73, 0xad, 0xbd, 0xf7, 0x3e, 0xe7, 0x9c, 0x73, 0x08, 0x28, 0x22, 0x22,
+        0x22, 0x22, 0x22, 0x33, 0x33, 0xf3, 0xbe, 0xf7, 0xab, 0xaa, 0xaa, 0xaa, 0xe0, 0xff, 0xff,
+        0x0f, 0xfe, 0xff, 0xbf, 0xa8, 0x8f, 0x31, 0xc6, 0x9c, 0x6b, 0xed, 0xbd, 0xf7, 0x39, 0xe7,
+        0x9c, 0x43, 0x40, 0x11, 0x11, 0x11, 0x11, 0x11, 0x99, 0x99, 0x99, 0xf7, 0xbd, 0x5f, 0x55,
+        0x55, 0x55, 0x05, 0xff, 0xff, 0x7f, 0xf0, 0xff, 0xff, 0x45, 0x7d, 0x8c, 0x31, 0xe6, 0x5c,
+        0x6b, 0xef, 0xbd, 0xcf, 0x39, 0xe7, 0x1c, 0x02, 0x8a, 0x88, 0x88, 0x88, 0x88, 0xc8, 0xcc,
+        0xcc, 0xbc, 0xef, 0xfd, 0xaa, 0xaa, 0xaa, 0xaa, 0x79, 0x41, 0x0f, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    const EDGE_T01: &[u8] = &[
+        0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0x00, 0x00, 0x00,
+        0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x78,
+        0x6c, 0x20, 0x00, 0x00, 0x00, 0x09, 0x6a, 0x78, 0x6c, 0x6c, 0x0a, 0x00, 0x00, 0x00, 0xc6,
+        0x6a, 0x78, 0x6c, 0x63, 0xff, 0x0a, 0x08, 0x00, 0x0e, 0xe0, 0x07, 0x28, 0x2e, 0x04, 0x08,
+        0x02, 0x01, 0x00, 0xb8, 0x02, 0x4b, 0x18, 0x9b, 0x9c, 0x71, 0x84, 0x03, 0x38, 0x80, 0x03,
+        0x38, 0x20, 0x4a, 0xc0, 0x39, 0x05, 0x01, 0x00, 0x20, 0x44, 0x80, 0x08, 0x10, 0x01, 0x22,
+        0x40, 0x84, 0xff, 0xff, 0x3f, 0xf8, 0xff, 0xff, 0xa2, 0x3e, 0xc6, 0x18, 0x73, 0xae, 0xb5,
+        0xf7, 0xde, 0xe7, 0x9c, 0x73, 0x0e, 0x01, 0x45, 0x44, 0x44, 0x44, 0x44, 0x64, 0x66, 0x66,
+        0xde, 0xf7, 0x7e, 0x55, 0x55, 0x55, 0x15, 0xfc, 0xff, 0xff, 0xc1, 0xff, 0xff, 0x17, 0xf5,
+        0x31, 0xc6, 0x98, 0x73, 0xad, 0xbd, 0xf7, 0x3e, 0xe7, 0x9c, 0x73, 0x08, 0x28, 0x22, 0x22,
+        0x22, 0x22, 0x22, 0x33, 0x33, 0xf3, 0xbe, 0xf7, 0xab, 0xaa, 0xaa, 0xaa, 0xe0, 0xff, 0xff,
+        0x0f, 0xfe, 0xff, 0xbf, 0xa8, 0x8f, 0x31, 0xc6, 0x9c, 0x6b, 0xed, 0xbd, 0xf7, 0x39, 0xe7,
+        0x9c, 0x43, 0x40, 0x11, 0x11, 0x11, 0x11, 0x11, 0x99, 0x99, 0x99, 0xf7, 0xbd, 0x5f, 0x55,
+        0x55, 0x55, 0x05, 0xff, 0xff, 0x7f, 0xf0, 0xff, 0xff, 0x45, 0x7d, 0x8c, 0x31, 0xe6, 0x5c,
+        0x6b, 0xef, 0xbd, 0xcf, 0x39, 0xe7, 0x1c, 0x02, 0x8a, 0x88, 0x88, 0x88, 0x88, 0xc8, 0xcc,
+        0xcc, 0xbc, 0xef, 0xfd, 0xaa, 0xaa, 0xaa, 0xaa, 0x79, 0x41, 0x0f, 0x00, 0xf0, 0x4f,
+    ];
+    const EDGE_T00: &[u8] = &[
+        0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0x00, 0x00, 0x00,
+        0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x78,
+        0x6c, 0x20, 0x00, 0x00, 0x00, 0x09, 0x6a, 0x78, 0x6c, 0x6c, 0x0a, 0x00, 0x00, 0x00, 0xc5,
+        0x6a, 0x78, 0x6c, 0x63, 0xff, 0x0a, 0x41, 0xf0, 0x03, 0x14, 0x17, 0x02, 0x08, 0x02, 0x01,
+        0x00, 0xbc, 0x02, 0x4b, 0x18, 0x9b, 0x9c, 0x71, 0x84, 0x03, 0x38, 0x80, 0x03, 0x38, 0x20,
+        0x4a, 0xc0, 0x39, 0x05, 0x01, 0x00, 0x20, 0x44, 0x80, 0x08, 0x10, 0x01, 0x22, 0x40, 0x84,
+        0xff, 0xff, 0x3f, 0xf8, 0xff, 0xff, 0xa2, 0x3e, 0xc6, 0x18, 0x73, 0xae, 0xb5, 0xf7, 0xde,
+        0xe7, 0x9c, 0x73, 0x0e, 0x01, 0x45, 0x44, 0x44, 0x44, 0x44, 0x64, 0x66, 0x66, 0xde, 0xf7,
+        0x7e, 0x55, 0x55, 0x55, 0x15, 0xfc, 0xff, 0xff, 0xc1, 0xff, 0xff, 0x17, 0xf5, 0x31, 0xc6,
+        0x98, 0x73, 0xad, 0xbd, 0xf7, 0x3e, 0xe7, 0x9c, 0x73, 0x08, 0x28, 0x22, 0x22, 0x22, 0x22,
+        0x22, 0x33, 0x33, 0xf3, 0xbe, 0xf7, 0xab, 0xaa, 0xaa, 0xaa, 0xe0, 0xff, 0xff, 0x0f, 0xfe,
+        0xff, 0xbf, 0xa8, 0x8f, 0x31, 0xc6, 0x9c, 0x6b, 0xed, 0xbd, 0xf7, 0x39, 0xe7, 0x9c, 0x43,
+        0x40, 0x11, 0x11, 0x11, 0x11, 0x11, 0x99, 0x99, 0x99, 0xf7, 0xbd, 0x5f, 0x55, 0x55, 0x55,
+        0x05, 0xff, 0xff, 0x7f, 0xf0, 0xff, 0xff, 0x45, 0x7d, 0x8c, 0x31, 0xe6, 0x5c, 0x6b, 0xef,
+        0xbd, 0xcf, 0x39, 0xe7, 0x1c, 0x02, 0x8a, 0x88, 0x88, 0x88, 0x88, 0xc8, 0xcc, 0xcc, 0xbc,
+        0xef, 0xfd, 0xaa, 0xaa, 0xaa, 0xaa, 0x79, 0x41, 0x0f, 0x00, 0xf0, 0x17, 0x04,
+    ];
+    const TF16: &[u8] = &[
+        0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0x00, 0x00, 0x00,
+        0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x78,
+        0x6c, 0x20, 0x00, 0x00, 0x00, 0x09, 0x6a, 0x78, 0x6c, 0x6c, 0x0a, 0x00, 0x00, 0x00, 0xc5,
+        0x6a, 0x78, 0x6c, 0x63, 0xff, 0x0a, 0x18, 0x10, 0xfc, 0x00, 0xc5, 0x85, 0x08, 0x02, 0x01,
+        0x00, 0xbc, 0x02, 0x4b, 0x18, 0x9b, 0x9c, 0x71, 0x84, 0x03, 0x38, 0x80, 0x03, 0x38, 0x20,
+        0x4a, 0xc0, 0x39, 0x05, 0x01, 0x00, 0x20, 0x44, 0x80, 0x08, 0x10, 0x01, 0x22, 0x40, 0x84,
+        0xff, 0xff, 0x3f, 0xf8, 0xff, 0xff, 0xa2, 0x3e, 0xc6, 0x18, 0x73, 0xae, 0xb5, 0xf7, 0xde,
+        0xe7, 0x9c, 0x73, 0x0e, 0x01, 0x45, 0x44, 0x44, 0x44, 0x44, 0x64, 0x66, 0x66, 0xde, 0xf7,
+        0x7e, 0x55, 0x55, 0x55, 0x15, 0xfc, 0xff, 0xff, 0xc1, 0xff, 0xff, 0x17, 0xf5, 0x31, 0xc6,
+        0x98, 0x73, 0xad, 0xbd, 0xf7, 0x3e, 0xe7, 0x9c, 0x73, 0x08, 0x28, 0x22, 0x22, 0x22, 0x22,
+        0x22, 0x33, 0x33, 0xf3, 0xbe, 0xf7, 0xab, 0xaa, 0xaa, 0xaa, 0xe0, 0xff, 0xff, 0x0f, 0xfe,
+        0xff, 0xbf, 0xa8, 0x8f, 0x31, 0xc6, 0x9c, 0x6b, 0xed, 0xbd, 0xf7, 0x39, 0xe7, 0x9c, 0x43,
+        0x40, 0x11, 0x11, 0x11, 0x11, 0x11, 0x99, 0x99, 0x99, 0xf7, 0xbd, 0x5f, 0x55, 0x55, 0x55,
+        0x05, 0xff, 0xff, 0x7f, 0xf0, 0xff, 0xff, 0x45, 0x7d, 0x8c, 0x31, 0xe6, 0x5c, 0x6b, 0xef,
+        0xbd, 0xcf, 0x39, 0xe7, 0x1c, 0x02, 0x8a, 0x88, 0x88, 0x88, 0x88, 0xc8, 0xcc, 0xcc, 0xbc,
+        0xef, 0xfd, 0xaa, 0xaa, 0xaa, 0xaa, 0xf9, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn dng_tiled_jxl_edge_tiles_and_global_interleave() {
+        // 11x10 image in 8x8 tiles: 8x8, 3x8, 8x2 and 3x2 codestreams. Stored samples are
+        // globally row/column interleaved (2x2); the 3x2 edge tile holds distinct values so
+        // both actual-edge-tile dimensions and whole-image de-interleaving are exercised.
+        let mut spec = TinyDng::new(11, 10, PHOTOMETRIC_CFA, 1);
+        spec.compression = COMPRESSION_JPEG_XL;
+        spec.white = Some(65535);
+        spec.row_if = 2;
+        spec.col_if = 2;
+        spec.tiles = Some((
+            8,
+            8,
+            vec![
+                EDGE_T00.to_vec(),
+                EDGE_T10.to_vec(),
+                EDGE_T01.to_vec(),
+                EDGE_T11.to_vec(),
+            ],
+        ));
+        let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode tiled JXL DNG");
+        assert_eq!((dec.width, dec.height), (11, 10));
+
+        let mut expected_cfa = vec![1000.0 / 65535.0; 11 * 10];
+        expected_cfa[7 * 11 + 7] = 5000.0 / 65535.0;
+        expected_cfa[7 * 11 + 9] = 9000.0 / 65535.0;
+        expected_cfa[9 * 11 + 5] = 13000.0 / 65535.0;
+        expected_cfa[9 * 11 + 7] = 17000.0 / 65535.0;
+        expected_cfa[9 * 11 + 9] = 21000.0 / 65535.0;
+        let expected = demosaic_malvar_he_cutler(&expected_cfa, 11, 10, CfaPattern::Rggb);
+        assert_rgb_matches(&dec, &expected, 5e-4);
     }
 }
