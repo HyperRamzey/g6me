@@ -916,6 +916,104 @@ fn laplace_dgreen_dny(x: [f64; 3], y: [f64; 3], ny: [f64; 3]) -> f64 {
     -v3_dot(d, ny) / (4.0 * PI * r * r * r)
 }
 
+/// Exact closed-surface static solid-angle diagonal, CPU reference:
+/// `A_ii = 1 + sum_{j != i} K0_ij * A_j` with each row summed over ascending `j`.
+fn solid_angle_diag_cpu(elements: &[BemElement]) -> Vec<f64> {
+    crate::util::par_map_indexed(elements.len(), |i| {
+        let xi = elements[i].centroid;
+        let mut k0_sum = 0.0_f64;
+        for (j, ej) in elements.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            k0_sum += laplace_dgreen_dny(xi, ej.centroid, ej.normal) * ej.area;
+        }
+        1.0 + k0_sum
+    })
+}
+
+/// Zero-FMA GPU assembly of the same diagonal (`g6me_bem_solid_angle_diag`).
+#[cfg(feature = "cuda")]
+fn solid_angle_diag_on_cuda(
+    rt: &g6me_cuda::G6meCudaRuntime,
+    elements: &[BemElement],
+) -> std::result::Result<Vec<f64>, String> {
+    let n = elements.len();
+    let mut cen = Vec::with_capacity(3 * n);
+    let mut nrm = Vec::with_capacity(3 * n);
+    let mut area = Vec::with_capacity(n);
+    for e in elements {
+        cen.extend_from_slice(&e.centroid);
+        nrm.extend_from_slice(&e.normal);
+        area.push(e.area);
+    }
+    rt.bem_solid_angle_diag(&cen, &nrm, &area)
+}
+
+/// One adjoint far-field bucket entry: `(target i, scalar.re, scalar.im, d.x, d.y, d.z)`.
+#[cfg(feature = "cuda")]
+type AdjNodeEntry = (i32, f64, f64, f64, f64, f64);
+
+/// One FMM interaction visit for a single target, in CPU `matvec_fmm` DFS order.
+#[cfg(feature = "cuda")]
+enum FmmInteraction {
+    /// Admissible well-separated cluster: node id, `center - x_target`, distance.
+    Far { node: usize, d: [f64; 3], dist: f64 },
+    /// Leaf source element and the exact CPU double-layer coefficient.
+    Near { j: usize, coeff: Complex },
+}
+
+/// Enumerate one target's FMM interactions in exactly the CPU `matvec_fmm` DFS order:
+/// an admissible node (`dist > 1e-9 && radius/dist < theta && children.len() > 1`) yields
+/// one far visit, a leaf yields near visits over its source indices (skipping the target
+/// itself), anything else is descended with a LIFO stack.
+#[cfg(feature = "cuda")]
+fn walk_fmm_interactions(
+    octree: &FmmOctree,
+    elements: &[BemElement],
+    k: f64,
+    i: usize,
+    xi: [f64; 3],
+    on_visit: &mut impl FnMut(FmmInteraction),
+) {
+    let mut stack = Vec::with_capacity(64);
+    stack.push(0usize);
+    while let Some(nid) = stack.pop() {
+        let node = &octree.nodes[nid];
+        let d = v3_sub(node.center, xi);
+        let dist = v3_norm(d);
+        if dist > 1e-9 && (node.radius / dist) < octree.theta && node.children.len() > 1 {
+            on_visit(FmmInteraction::Far { node: nid, d, dist });
+        } else if node.children.is_empty() {
+            for &j in &node.indices {
+                if i == j {
+                    continue;
+                }
+                let ej = &elements[j];
+                let coeff = helmholtz_dgreen_dny(k, xi, ej.centroid, ej.normal).scale(-ej.area);
+                on_visit(FmmInteraction::Near { j, coeff });
+            }
+        } else {
+            for &ch in &node.children {
+                stack.push(ch);
+            }
+        }
+    }
+}
+
+/// Flatten per-key bucket lists into `(offsets, values)`, preserving bucket order.
+#[cfg(feature = "cuda")]
+fn flatten_indexed<T: Copy>(buckets: &[Vec<T>]) -> (Vec<i32>, Vec<T>) {
+    let mut offsets = Vec::with_capacity(buckets.len() + 1);
+    let mut flat = Vec::new();
+    offsets.push(0i32);
+    for bucket in buckets {
+        flat.extend_from_slice(bucket);
+        offsets.push(flat.len() as i32);
+    }
+    (offsets, flat)
+}
+
 /// Octree node for FMM acceleration of the 3D Helmholtz BEM double-layer operator.
 #[derive(Debug, Clone)]
 struct OctreeNode {
@@ -1022,28 +1120,42 @@ pub struct FmmBemSolver {
 
 impl FmmBemSolver {
     /// Construct an FMM-BEM solver directly from an in-memory watertight `TriangleMesh`
-    /// (zero disk I/O — Stage 4 VRAM/memory handoff!).
+    /// (zero disk I/O — Stage 4 VRAM/memory handoff!). Solid-angle assembly runs on the CPU;
+    /// use [`Self::new_with_cuda`] to opt into the GPU assembly.
     pub fn new(mesh: &TriangleMesh) -> Result<Self> {
+        Self::new_with_cuda(mesh, false)
+    }
+
+    /// Construct an FMM-BEM solver, optionally offloading the O(n²) static solid-angle
+    /// diagonal to the GPU. `use_cuda` is opt-in (the `--cuda` flag); when it is false, or
+    /// when no live CUDA runtime is available, the deterministic CPU assembly runs.
+    pub fn new_with_cuda(mesh: &TriangleMesh, use_cuda: bool) -> Result<Self> {
         let elements = mesh.elements();
         if elements.len() < 4 {
             return Err(Error::msg("BEM mesh has fewer than 4 valid triangles"));
         }
+        #[cfg(feature = "cuda")]
         let n = elements.len();
         // Exact closed-surface static solid-angle diagonal: A_ii = 1 + sum_{j != i} K0_ij * A_j.
-        // Each row is an independent sum over `j` in ascending order, so evaluating the rows
-        // in parallel leaves every row bit-identical to the serial loop while cutting the
-        // O(n^2) assembly to O(n^2 / cores).
-        let solid_angle_diag = crate::util::par_map_indexed(n, |i| {
-            let xi = elements[i].centroid;
-            let mut k0_sum = 0.0_f64;
-            for (j, ej) in elements.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                k0_sum += laplace_dgreen_dny(xi, ej.centroid, ej.normal) * ej.area;
+        // The GPU kernel reproduces the CPU per-row ascending-j sum (zero-FMA ordered
+        // multiply/add) to ~1 ULP; any failure falls back to the CPU `par_map_indexed`
+        // assembly. Only an explicit `use_cuda` opt-in touches the GPU.
+        #[cfg(feature = "cuda")]
+        let solid_angle_diag = if use_cuda {
+            match crate::blackwell::shared_cuda_runtime()
+                .and_then(|rt| solid_angle_diag_on_cuda(&rt, &elements).ok())
+            {
+                Some(diag) if diag.len() == n => diag,
+                _ => solid_angle_diag_cpu(&elements),
             }
-            1.0 + k0_sum
-        });
+        } else {
+            solid_angle_diag_cpu(&elements)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let solid_angle_diag = {
+            let _ = use_cuda;
+            solid_angle_diag_cpu(&elements)
+        };
 
         // Locate anatomical left (+y) and right (-y) ear-canal entrance elements near the
         // horizontal mid-plane (|z| small, slightly posterior x <= 0.02).
@@ -1194,6 +1306,24 @@ impl FmmBemSolver {
         adjoint: bool,
     ) -> std::result::Result<Vec<Complex>, String> {
         let n = self.elements.len();
+        let (mat_re, mat_im) = self.dense_matrix(k, adjoint);
+        let mut op = rt.bem_dense_operator(&mat_re, &mat_im, n)?;
+        let x_re: Vec<f64> = x.iter().map(|c| c.re).collect();
+        let x_im: Vec<f64> = x.iter().map(|c| c.im).collect();
+        let (yr, yi) = op.apply(&x_re, &x_im)?;
+        Ok(yr
+            .into_iter()
+            .zip(yi)
+            .map(|(r, im)| Complex::new(r, im))
+            .collect())
+    }
+
+    /// Assemble the row-major complex dense matrix `A` (or `A^T`) once. This is the
+    /// only `O(n^2)` host work in the explicit CUDA path; it happens at operator
+    /// construction, never per GMRES iteration.
+    #[cfg(feature = "cuda")]
+    fn dense_matrix(&self, k: f64, adjoint: bool) -> (Vec<f64>, Vec<f64>) {
+        let n = self.elements.len();
         let mut mat_re = vec![0.0_f64; n * n];
         let mut mat_im = vec![0.0_f64; n * n];
         for i in 0..n {
@@ -1209,14 +1339,7 @@ impl FmmBemSolver {
                 mat_im[idx] = coeff.im;
             }
         }
-        let x_re: Vec<f64> = x.iter().map(|c| c.re).collect();
-        let x_im: Vec<f64> = x.iter().map(|c| c.im).collect();
-        let (yr, yi) = rt.run_bem_matvec(&mat_re, &mat_im, &x_re, &x_im)?;
-        Ok(yr
-            .into_iter()
-            .zip(yi)
-            .map(|(r, im)| Complex::new(r, im))
-            .collect())
+        (mat_re, mat_im)
     }
 
     /// Exact BEM matrix-vector product with optional CUDA GPU offload (`bem_matvec.cu`),
@@ -1404,6 +1527,179 @@ impl FmmBemSolver {
         y
     }
 
+    /// Build the host-side FMM interaction plan for one `(k, adjoint)` solve.
+    ///
+    /// The octree, admissibility test, leaf rule, dipole moments, near coefficients and
+    /// far cluster scalars are identical to [`Self::matvec_fmm`] / [`Self::matvec_fmm_adjoint`];
+    /// only the per-iteration arithmetic moves to the device. For the adjoint everything is
+    /// bucketed per node / per source in ascending target order, which is the order in which
+    /// the CPU adjoint outer loop accumulates each destination.
+    #[cfg(feature = "cuda")]
+    fn build_cuda_fmm_plan(&self, k: f64, adjoint: bool) -> g6me_cuda::BemFmmPlan {
+        let n = self.elements.len();
+        let nodes = &self.octree.nodes;
+        let node_count = nodes.len();
+
+        // Depth levels (root first). Node ids are pre-order, so every child is deeper.
+        let mut levels: Vec<Vec<i32>> = Vec::new();
+        let mut frontier: Vec<usize> = vec![0];
+        while !frontier.is_empty() {
+            levels.push(frontier.iter().map(|&x| x as i32).collect());
+            let mut next = Vec::new();
+            for &nid in &frontier {
+                next.extend(nodes[nid].children.iter().copied());
+            }
+            frontier = next;
+        }
+        let max_level = levels.len().saturating_sub(1);
+        let mut level_offsets = Vec::with_capacity(levels.len() + 1);
+        let mut level_nodes = Vec::with_capacity(node_count);
+        level_offsets.push(0i32);
+        for level in &levels {
+            level_nodes.extend_from_slice(level);
+            level_offsets.push(level_nodes.len() as i32);
+        }
+
+        // Flattened octree adjacency + leaf source lists (CPU insertion order).
+        let mut child_start = Vec::with_capacity(node_count + 1);
+        let mut children = Vec::new();
+        let mut leaf_start = Vec::with_capacity(node_count + 1);
+        let mut leaf_src = Vec::new();
+        let mut src_leaf = vec![-1i32; n];
+        for (nid, node) in nodes.iter().enumerate() {
+            child_start.push(children.len() as i32);
+            children.extend(node.children.iter().map(|&c| c as i32));
+            leaf_start.push(leaf_src.len() as i32);
+            if node.children.is_empty() {
+                for &j in &node.indices {
+                    leaf_src.push(j as i32);
+                    src_leaf[j] = nid as i32;
+                }
+            }
+        }
+        child_start.push(children.len() as i32);
+        leaf_start.push(leaf_src.len() as i32);
+
+        let mut src_scale = Vec::with_capacity(n);
+        let mut src_nx = Vec::with_capacity(n);
+        let mut src_ny = Vec::with_capacity(n);
+        let mut src_nz = Vec::with_capacity(n);
+        for e in &self.elements {
+            src_scale.push(-e.area);
+            src_nx.push(e.normal[0]);
+            src_ny.push(e.normal[1]);
+            src_nz.push(e.normal[2]);
+        }
+
+        let mut plan = g6me_cuda::BemFmmPlan {
+            n,
+            node_count,
+            max_level,
+            diag: self.solid_angle_diag.clone(),
+            src_scale,
+            src_nx,
+            src_ny,
+            src_nz,
+            src_leaf,
+            child_start,
+            children,
+            leaf_start,
+            leaf_src,
+            level_offsets,
+            level_nodes,
+            ..Default::default()
+        };
+
+        if !adjoint {
+            let mut fwd_start = Vec::with_capacity(n + 1);
+            let mut fwd_kind = Vec::new();
+            let mut fwd_index = Vec::new();
+            let mut fwd_a = Vec::new();
+            let mut fwd_b = Vec::new();
+            let mut fwd_dx = Vec::new();
+            let mut fwd_dy = Vec::new();
+            let mut fwd_dz = Vec::new();
+            fwd_start.push(0i32);
+            for i in 0..n {
+                let xi = self.elements[i].centroid;
+                walk_fmm_interactions(&self.octree, &self.elements, k, i, xi, &mut |visit| {
+                    match visit {
+                        FmmInteraction::Far { node, d, dist } => {
+                            let kr = k * dist;
+                            let e = Complex::new(kr.cos(), -kr.sin());
+                            let scalar = Complex::new(-1.0, -kr)
+                                .mul(e)
+                                .scale(1.0 / (4.0 * PI * dist * dist * dist));
+                            fwd_kind.push(1);
+                            fwd_index.push(node as i32);
+                            fwd_a.push(scalar.re);
+                            fwd_b.push(scalar.im);
+                            fwd_dx.push(d[0]);
+                            fwd_dy.push(d[1]);
+                            fwd_dz.push(d[2]);
+                        }
+                        FmmInteraction::Near { j, coeff } => {
+                            fwd_kind.push(0);
+                            fwd_index.push(j as i32);
+                            fwd_a.push(coeff.re);
+                            fwd_b.push(coeff.im);
+                            fwd_dx.push(0.0);
+                            fwd_dy.push(0.0);
+                            fwd_dz.push(0.0);
+                        }
+                    }
+                });
+                fwd_start.push(fwd_kind.len() as i32);
+            }
+            plan.fwd_start = fwd_start;
+            plan.fwd_kind = fwd_kind;
+            plan.fwd_index = fwd_index;
+            plan.fwd_a = fwd_a;
+            plan.fwd_b = fwd_b;
+            plan.fwd_dx = fwd_dx;
+            plan.fwd_dy = fwd_dy;
+            plan.fwd_dz = fwd_dz;
+        } else {
+            // Adjacent near / far lists bucketed by destination. Targets are visited in
+            // ascending order, so each bucket ends up in the CPU accumulation order.
+            let mut src_buckets: Vec<Vec<(i32, f64, f64)>> = vec![Vec::new(); n];
+            let mut node_buckets: Vec<Vec<AdjNodeEntry>> = vec![Vec::new(); node_count];
+            for i in 0..n {
+                let xi = self.elements[i].centroid;
+                walk_fmm_interactions(&self.octree, &self.elements, k, i, xi, &mut |visit| {
+                    match visit {
+                        FmmInteraction::Far { node, d, dist } => {
+                            let kr = k * dist;
+                            let e = Complex::new(kr.cos(), -kr.sin());
+                            let scalar = Complex::new(-1.0, -kr)
+                                .mul(e)
+                                .scale(1.0 / (4.0 * PI * dist * dist * dist));
+                            node_buckets[node]
+                                .push((i as i32, scalar.re, scalar.im, d[0], d[1], d[2]));
+                        }
+                        FmmInteraction::Near { j, coeff } => {
+                            src_buckets[j].push((i as i32, coeff.re, coeff.im));
+                        }
+                    }
+                });
+            }
+            let (adj_src_start, src_flat) = flatten_indexed(&src_buckets);
+            let (adj_node_start, node_flat) = flatten_indexed(&node_buckets);
+            plan.adj_src_start = adj_src_start;
+            plan.adj_src_i = src_flat.iter().map(|e| e.0).collect();
+            plan.adj_src_cr = src_flat.iter().map(|e| e.1).collect();
+            plan.adj_src_ci = src_flat.iter().map(|e| e.2).collect();
+            plan.adj_node_start = adj_node_start;
+            plan.adj_node_i = node_flat.iter().map(|e| e.0).collect();
+            plan.adj_node_sr = node_flat.iter().map(|e| e.1).collect();
+            plan.adj_node_si = node_flat.iter().map(|e| e.2).collect();
+            plan.adj_node_dx = node_flat.iter().map(|e| e.3).collect();
+            plan.adj_node_dy = node_flat.iter().map(|e| e.4).collect();
+            plan.adj_node_dz = node_flat.iter().map(|e| e.5).collect();
+        }
+        plan
+    }
+
     /// Solve `(0.5 I - K) x = rhs` (or `A^T x = rhs`) using Diagonal-Preconditioned Restarted
     /// Complex GMRES accelerated by the 3D FMM Octree, optionally adding the Hermitian CHIEF
     /// penalty `alpha * C^H C` (forward) or its exact algebraic transpose `alpha * C^T conj(C)`
@@ -1465,11 +1761,55 @@ impl FmmBemSolver {
             .map(|&d| if d.abs() > 1e-9 { 1.0 / d } else { 2.0 })
             .collect();
 
-        let matvec = |v: &[Complex]| -> Vec<Complex> {
-            let mut raw = if use_fmm && n > 192 && !use_cuda {
-                self.matvec_fmm(k, v, adjoint)
-            } else {
-                self.matvec_exact_with_cuda(k, v, adjoint, use_cuda)
+        // Build the cached zero-FMA CUDA operator ONCE for this `(solver, k, adjoint)`
+        // solve: the dense matrix or the full FMM interaction plan is uploaded here and
+        // every GMRES iteration only ships the `2n` vector components. Operator selection
+        // mirrors the CPU choice exactly (`use_fmm && n > 192` => FMM), so `--cuda` no
+        // longer silently downgrades large meshes to the dense exact operator.
+        #[cfg(feature = "cuda")]
+        let mut cuda_op: Option<g6me_cuda::CudaBemOperator> = if use_cuda {
+            crate::blackwell::shared_cuda_runtime().and_then(|rt| {
+                if use_fmm && n > 192 {
+                    let plan = self.build_cuda_fmm_plan(k, adjoint);
+                    rt.bem_fmm_operator(&plan, adjoint).ok()
+                } else {
+                    let (mat_re, mat_im) = self.dense_matrix(k, adjoint);
+                    rt.bem_dense_operator(&mat_re, &mat_im, n).ok()
+                }
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let _ = use_cuda;
+
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut matvec = |v: &[Complex]| -> Vec<Complex> {
+            #[cfg(feature = "cuda")]
+            let gpu_raw: Option<Vec<Complex>> = cuda_op.as_mut().and_then(|op| {
+                let x_re: Vec<f64> = v.iter().map(|c| c.re).collect();
+                let x_im: Vec<f64> = v.iter().map(|c| c.im).collect();
+                op.apply(&x_re, &x_im).ok().map(|(yr, yi)| {
+                    yr.into_iter()
+                        .zip(yi)
+                        .map(|(r, im)| Complex::new(r, im))
+                        .collect()
+                })
+            });
+            #[cfg(not(feature = "cuda"))]
+            let gpu_raw: Option<Vec<Complex>> = None;
+
+            let mut raw = match gpu_raw {
+                Some(y) => y,
+                None => {
+                    // Bit-identical CPU fallback: same operator class the CPU would run
+                    // (FMM for large meshes, exact dense otherwise).
+                    if use_fmm && n > 192 {
+                        self.matvec_fmm(k, v, adjoint)
+                    } else {
+                        self.matvec_exact(k, v, adjoint)
+                    }
+                }
             };
             if chief_alpha > 0.0 && !chief_mat.is_empty() {
                 if !adjoint {
@@ -2174,6 +2514,174 @@ mod tests {
         assert!(
             rel < 1e-11,
             "CHIEF-regularized reciprocity failed at ka=pi: rel={rel:e}"
+        );
+    }
+}
+
+/// Live CPU/GPU parity for the cached zero-FMA BEM operators. Each test skips cleanly
+/// (with a printed reason) when no CUDA GPU / driver / nvcc toolchain is available,
+/// mirroring `blackwell`/`g6me-verify` runtime detection.
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_bem_parity_tests {
+    use super::*;
+    use crate::scattering::sph_to_cart;
+
+    fn runtime() -> Option<std::sync::Arc<g6me_cuda::G6meCudaRuntime>> {
+        if g6me_cuda::cuda_device_info().is_none() {
+            eprintln!("skip: no NVIDIA CUDA device detected");
+            return None;
+        }
+        match crate::blackwell::shared_cuda_runtime() {
+            Some(rt) => Some(rt),
+            None => {
+                eprintln!("skip: CUDA runtime/PTX modules unavailable (no driver or nvcc)");
+                None
+            }
+        }
+    }
+
+    fn max_complex_diff(a: &[Complex], b: &[Complex]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| x.sub(*y).norm())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn probe_vector(n: usize, seed: f64) -> Vec<Complex> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64;
+                Complex::new((t * 0.37 + seed).sin() + 0.1, (t * 0.59 - seed).cos() - 0.2)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cuda_dense_bem_operator_matches_cpu_forward_and_adjoint() {
+        let Some(rt) = runtime() else { return };
+        let solver = FmmBemSolver::new(&TriangleMesh::sphere(0.0875, 2)).expect("BEM solver");
+        let n = solver.elements.len();
+        let k = 2.0 * PI * 1400.0 / 344.0;
+        let x = probe_vector(n, 0.0);
+        for adjoint in [false, true] {
+            let cpu = solver.matvec_exact(k, &x, adjoint);
+            let gpu = solver
+                .matvec_exact_on_cuda(&rt, k, &x, adjoint)
+                .expect("dense CUDA matvec");
+            let err = max_complex_diff(&gpu, &cpu);
+            assert!(
+                err < 1e-13,
+                "dense BEM adjoint={adjoint} n={n}: max |gpu - cpu| = {err:e} >= 1e-13"
+            );
+            eprintln!("dense BEM adjoint={adjoint} n={n}: max |gpu - cpu| = {err:.3e}");
+        }
+    }
+
+    #[test]
+    fn cuda_fmm_bem_operator_matches_cpu_forward_and_adjoint() {
+        let Some(rt) = runtime() else { return };
+        let head = TriangleMesh::procedural_head_with_pinnae(0.0875, 3);
+        let solver = FmmBemSolver::new(&head).expect("FMM-BEM solver");
+        let n = solver.elements.len();
+        assert!(n > 192, "FMM parity test needs FMM-sized mesh, got n={n}");
+        let k = 2.0 * PI * 2500.0 / 344.85;
+        let x1 = probe_vector(n, 0.0);
+        let x2 = probe_vector(n, 1.7);
+        for adjoint in [false, true] {
+            let plan = solver.build_cuda_fmm_plan(k, adjoint);
+            let mut op = rt
+                .bem_fmm_operator(&plan, adjoint)
+                .expect("cached FMM CUDA operator");
+            // Same cached operator applied twice: proves coefficients stay on device.
+            for (round, x) in [x1.clone(), x2.clone()].iter().enumerate() {
+                let cpu = solver.matvec_fmm(k, x, adjoint);
+                let x_re: Vec<f64> = x.iter().map(|c| c.re).collect();
+                let x_im: Vec<f64> = x.iter().map(|c| c.im).collect();
+                let (yr, yi) = op.apply(&x_re, &x_im).expect("FMM CUDA apply");
+                let gpu: Vec<Complex> = yr
+                    .into_iter()
+                    .zip(yi)
+                    .map(|(r, im)| Complex::new(r, im))
+                    .collect();
+                let err = max_complex_diff(&gpu, &cpu);
+                assert!(
+                    err < 1e-12,
+                    "FMM BEM adjoint={adjoint} n={n} round={round}: \
+                     max |gpu - cpu| = {err:e} >= 1e-12"
+                );
+                eprintln!(
+                    "FMM BEM adjoint={adjoint} n={n} round={round} \
+                     ({} nodes, {} levels): max |gpu - cpu| = {err:.3e}",
+                    plan.node_count,
+                    plan.max_level + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_gmres_reciprocal_solve_matches_cpu_fmm() {
+        let Some(_rt) = runtime() else { return };
+        let head = TriangleMesh::procedural_head_with_pinnae(0.0875, 3);
+        let solver = FmmBemSolver::new(&head).expect("FMM-BEM solver");
+        assert!(solver.elements.len() > 192);
+        let c = 344.85;
+        let f_hz = 2500.0;
+        let r_src = sph_to_cart(30.0, 0.0, 2.0);
+        let cpu = solver.solve_reciprocal_hrtfs(f_hz, c, &[r_src], solver.left_ear_elem, true)[0];
+        let gpu = solver.solve_reciprocal_hrtfs_with_cuda(
+            f_hz,
+            c,
+            &[r_src],
+            solver.left_ear_elem,
+            true,
+            true,
+        )[0];
+        let rel = gpu.sub(cpu).norm() / cpu.norm().max(1e-30);
+        assert!(
+            rel < 1e-10,
+            "GMRES reciprocal solve CPU-FMM vs GPU-FMM rel = {rel:e} >= 1e-10 \
+             (cpu={cpu:?}, gpu={gpu:?})"
+        );
+        eprintln!(
+            "GMRES reciprocal solve n={}: rel |gpu - cpu| = {rel:.3e}",
+            solver.elements.len()
+        );
+    }
+
+    #[test]
+    fn cuda_solid_angle_diag_matches_cpu_assembly() {
+        let Some(rt) = runtime() else { return };
+        let mesh = TriangleMesh::sphere(0.0875, 5); // 8192 elements: O(n^2) assembly path
+        let elements = mesh.elements();
+        assert!(elements.len() >= 8192);
+        let cpu = solid_angle_diag_cpu(&elements);
+        let mut cen = Vec::with_capacity(3 * elements.len());
+        let mut nrm = Vec::with_capacity(3 * elements.len());
+        let mut area = Vec::with_capacity(elements.len());
+        for e in &elements {
+            cen.extend_from_slice(&e.centroid);
+            nrm.extend_from_slice(&e.normal);
+            area.push(e.area);
+        }
+        let gpu = rt
+            .bem_solid_angle_diag(&cen, &nrm, &area)
+            .expect("GPU solid-angle diagonal");
+        assert_eq!(gpu.len(), cpu.len());
+        let err = gpu
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            err <= 1e-13,
+            "solid-angle diagonal n={}: max |gpu - cpu| = {err:e} > 1e-13",
+            elements.len()
+        );
+        eprintln!(
+            "solid-angle diagonal n={}: max |gpu - cpu| = {err:.3e}",
+            elements.len()
         );
     }
 }

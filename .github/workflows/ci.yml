@@ -32,6 +32,10 @@ jobs:
             libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev
       - run: cargo fmt --check --all
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Compile/lint the GPU offload surface even though GitHub runners have no
+      # NVIDIA GPU: this catches bit-rot in the cfg(feature = "cuda") code and the
+      # CPU fallback branches. Live GPU parity runs in g6me-verify on real hardware.
+      - run: cargo clippy --locked --workspace --all-targets --features cuda -- -D warnings
       - run: cargo build --locked --release --workspace
       - run: cargo test --locked --workspace
       # The evidence: builds vendor/g6ct in eight configurations and compares.

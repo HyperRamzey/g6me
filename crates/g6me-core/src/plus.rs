@@ -298,7 +298,8 @@ pub struct PlusCfg {
     /// falls back cleanly to deterministic CPU `f64` when no GPU is present).
     pub use_cuda: bool,
     /// Tensor Core precision for Ozaki-II CRT FP64 GEMM when CUDA GPU offload is active
-    /// (`Auto` selects NVFP4 on Blackwell `sm_120a`, FP8 on Hopper/Ada `sm_89+`, INT8 on Ampere/Turing).
+    /// (`Auto` selects single-limb INT8 on `sm_61..sm_120a`; explicit NVFP4 is available only
+    /// on `sm_120a`, and unsupported manual formats downgrade per `resolve_for_arch`).
     pub cuda_tensor_precision: CudaTensorPrecision,
 }
 
@@ -888,7 +889,7 @@ impl KernelBank {
             } else {
                 watertight_winding_repair(raw_mesh, 16)
             };
-            let solver = FmmBemSolver::new(&mesh).ok()?;
+            let solver = FmmBemSolver::new_with_cuda(&mesh, cfg.use_cuda).ok()?;
             let mut srcs = Vec::with_capacity(SLOTS);
             for (ch, &base_az) in SLOT_AZ_DEG.iter().enumerate() {
                 let eff_az = if matches!(ch, SLOT_FL | SLOT_FR | SLOT_FLC | SLOT_FRC) {
@@ -2444,8 +2445,9 @@ impl BinauralPlus {
         #[cfg(feature = "cuda")]
         if use_cuda {
             if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
-                let zeros = vec![0.0_f64; input.len()];
-                if let Ok((re, im)) = rt.run_stockham_fft_f64(input, &zeros, false) {
+                // Real-input FFT: zero imaginary lane is produced on-device (no host zero
+                // upload) and the twiddles are device-resident across blocks.
+                if let Ok((re, im)) = rt.run_stockham_fft_f64_real_input(input, false) {
                     for (k, slot) in out_bins.iter_mut().enumerate() {
                         *slot = Complex::new(re[k], im[k]);
                     }
@@ -2480,7 +2482,7 @@ impl BinauralPlus {
                     re[n - k] = bins[k].re;
                     im[n - k] = -bins[k].im;
                 }
-                if let Ok((out_re, _)) = rt.run_stockham_fft_f64(&re, &im, true) {
+                if let Ok(out_re) = rt.run_stockham_fft_f64_real_output(&re, &im, true) {
                     out_real.copy_from_slice(&out_re);
                     return;
                 }
@@ -3892,5 +3894,197 @@ mod tests {
             max_diff < 3e-6,
             "ControlRoom 16384-tap UPOLA --exact-ntt diverged from f64 FFT: max_diff={max_diff:e}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Live CUDA end-to-end CPU/GPU parity for the BinauralPlus UPOLA
+    // convolution: FP64 Stockham FFT path and exact Goldilocks NTT path.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "cuda")]
+    fn cuda_test_ready(test: &str) -> bool {
+        if crate::blackwell::shared_cuda_runtime().is_some() {
+            true
+        } else {
+            eprintln!("skipping {test}: no live CUDA GPU/runtime (CPU-only host)");
+            false
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn parity_signal(n: usize, sample_rate: u32, phase: f64) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / sample_rate as f64;
+                0.37 * (2.0 * PI * (213.0 * t) + phase).sin()
+                    + 0.19 * (2.0 * PI * 997.0 * t + 0.25).cos()
+                    + 0.07 * (2.0 * PI * 4123.0 * t).sin()
+            })
+            .collect()
+    }
+
+    /// Build a renderer for the parity tests. `synthesize_cuda` selects whether the
+    /// FIR kernel bank is synthesized with GPU FDTD/FMM-BEM offload; `process_cuda`
+    /// selects the convolution-stage offload under test. For the NTT bit-exact test the
+    /// bank is always synthesized on the CPU so that both engines quantize identical
+    /// FIR taps (`use_cuda` also changes FDTD synthesis numerics by ~1e-17).
+    #[cfg(feature = "cuda")]
+    fn parity_render(
+        mut cfg: PlusCfg,
+        sample_rate: u32,
+        synthesize_cuda: bool,
+        process_cuda: bool,
+        chunk: usize,
+        fl: &[f64],
+        fr: &[f64],
+    ) -> (Vec<f64>, Vec<f64>) {
+        cfg.use_cuda = synthesize_cuda;
+        let mut eng = BinauralPlus::new(crate::dsp::MASK_5_1, cfg, sample_rate);
+        // Test-only knob: isolate the convolution-stage offload from the FIR-bank
+        // synthesis path so the rendered kernels are bit-identical across engines.
+        eng.cfg.use_cuda = process_cuda;
+
+        let n = fl.len();
+        let mut out_l = vec![0.0_f64; n];
+        let mut out_r = vec![0.0_f64; n];
+        let mut pos = 0usize;
+        while pos < n {
+            let step = (n - pos).min(chunk);
+            let mut refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+            refs[SLOT_FL] = Some(&fl[pos..pos + step]);
+            refs[SLOT_FR] = Some(&fr[pos..pos + step]);
+            eng.process(
+                &refs,
+                &mut out_l[pos..pos + step],
+                &mut out_r[pos..pos + step],
+                step,
+            );
+            pos += step;
+        }
+        let (tl, tr) = eng.flush();
+        out_l.extend_from_slice(&tl);
+        out_r.extend_from_slice(&tr);
+        assert!(eng.is_finite(), "renderer reported a non-finite state");
+        (out_l, out_r)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn max_abs_pair_diff(a: &[f64], b: &[f64]) -> f64 {
+        assert_eq!(a.len(), b.len(), "renderer output lengths must match");
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// Full BinauralPlus pipeline (kernel synthesis + single-partition OLA and FDL-UPOLA)
+    /// rendered on CPU `f64` vs live CUDA Stockham FFT: max |d| <= 1e-11, no NaN/Inf.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn cuda_plus_stockham_pipeline_matches_cpu_across_rates_and_chunks() {
+        if !cuda_test_ready("cuda_plus_stockham_pipeline_matches_cpu_across_rates_and_chunks") {
+            return;
+        }
+        let anechoic = PlusCfg::from_profile(PlusProfile::Pure);
+        let mut control_room = PlusCfg::from_profile(PlusProfile::Studio);
+        control_room.room_preset = RoomPreset::ControlRoom;
+        control_room.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+
+        // (cfg, sample_rate, chunk, frames, synthesize_with_cuda).
+        //
+        // The anechoic cases construct the GPU engine with `cfg.use_cuda = true` exactly as a
+        // user would; Anechoic/Pure has no FDTD or ray-traced room, so the FIR bank is
+        // bit-identical and the only CPU/GPU difference is the convolution under test.
+        // Room presets also offload FDTD/ray tracing during FIR synthesis, which changes the
+        // synthesized BRIR (different summation order, measured up to 1.4e-4 in the rendered
+        // output) — a property of the synthesis path, not of the UPOLA convolution. Those
+        // cases therefore hold synthesis CPU-identical and toggle only the convolution stage.
+        let cases = [
+            (anechoic, 44_100u32, 1024usize, 2048usize, true),
+            (anechoic, 48_000, 317, 2048, true),
+            (anechoic, 48_000, 1, 384, true),
+            (anechoic, 96_000, 2048, 4096, true),
+            (control_room, 48_000, 317, 2048, false),
+            (control_room, 48_000, 2048, 4096, false),
+        ];
+
+        for (cfg, rate, chunk, frames, synth_cuda) in cases {
+            let fl = parity_signal(frames, rate, 0.0);
+            let fr = parity_signal(frames, rate, 1.3);
+            let (cl, cr) = parity_render(cfg, rate, false, false, chunk, &fl, &fr);
+            let (gl, gr) = parity_render(cfg, rate, synth_cuda, true, chunk, &fl, &fr);
+            let max_diff = max_abs_pair_diff(&cl, &gl).max(max_abs_pair_diff(&cr, &gr));
+            let peak = cl.iter().chain(&cr).fold(0.0_f64, |m, v| m.max(v.abs()));
+            assert!(
+                cl.iter().chain(&cr).all(|v| v.is_finite())
+                    && gl.iter().chain(&gr).all(|v| v.is_finite()),
+                "rate={rate} chunk={chunk}: non-finite renderer output"
+            );
+            assert!(peak > 1e-6, "rate={rate} chunk={chunk}: signal is silent");
+            assert!(
+                max_diff <= 1e-11,
+                "rate={rate} chunk={chunk} synth_cuda={synth_cuda}: CPU/GPU Stockham FFT \
+                 pipeline diverged: max|d|={max_diff:e} (limit 1e-11)"
+            );
+            eprintln!(
+                "cuda stockham parity: rate={rate} chunk={chunk} frames={frames} \
+                 synth_cuda={synth_cuda} max|d|={max_diff:.3e} peak={peak:.3e}"
+            );
+        }
+    }
+
+    /// Full BinauralPlus pipeline through `--exact-ntt`: live CUDA Goldilocks NTT must be
+    /// bit-identical (`to_bits`) to the CPU prime-field transform for every sample.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn cuda_plus_goldilocks_ntt_pipeline_is_bit_identical_to_cpu() {
+        if !cuda_test_ready("cuda_plus_goldilocks_ntt_pipeline_is_bit_identical_to_cpu") {
+            return;
+        }
+        let anechoic = PlusCfg::from_profile(PlusProfile::Pure);
+        let mut control_room = PlusCfg::from_profile(PlusProfile::Studio);
+        control_room.room_preset = RoomPreset::ControlRoom;
+        control_room.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+
+        // (cfg, sample_rate, chunk, frames)
+        let cases = [
+            (anechoic, 48_000u32, 1usize, 384usize),
+            (anechoic, 48_000, 317, 1536),
+            (anechoic, 96_000, 2048, 4096),
+            (control_room, 48_000, 317, 2048),
+            (control_room, 48_000, 2048, 4096),
+        ];
+
+        for (mut cfg, rate, chunk, frames) in cases {
+            cfg.exact_ntt = true;
+            let fl = parity_signal(frames, rate, 0.0);
+            let fr = parity_signal(frames, rate, 1.3);
+            let (cl, cr) = parity_render(cfg, rate, false, false, chunk, &fl, &fr);
+            let (gl, gr) = parity_render(cfg, rate, false, true, chunk, &fl, &fr);
+            assert_eq!(cl.len(), gl.len());
+            assert_eq!(cr.len(), gr.len());
+            let mut mismatches = 0usize;
+            let mut max_diff = 0.0_f64;
+            for (a, b) in cl.iter().zip(&gl).chain(cr.iter().zip(&gr)) {
+                if a.to_bits() != b.to_bits() {
+                    mismatches += 1;
+                    max_diff = max_diff.max((a - b).abs());
+                }
+            }
+            assert!(
+                gl.iter().chain(&gr).all(|v| v.is_finite()),
+                "rate={rate} chunk={chunk}: non-finite Goldilocks NTT output"
+            );
+            assert_eq!(
+                mismatches, 0,
+                "rate={rate} chunk={chunk}: GPU Goldilocks NTT must be bit-identical to CPU, \
+                 {mismatches} sample(s) differ, max|d|={max_diff:e}"
+            );
+            eprintln!(
+                "cuda goldilocks NTT parity: rate={rate} chunk={chunk} frames={frames} \
+                 samples={} all bit-identical",
+                cl.len() + cr.len()
+            );
+        }
     }
 }

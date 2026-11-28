@@ -1098,6 +1098,7 @@ pub struct ScanPipelineOutput {
 /// Run the full 4-stage `g6me-scan` reconstruction pipeline from oriented surfels + calibrated
 /// metric anchor + bundle-adjusted cameras directly into a watertight, isotropically remeshed
 /// (`h <= h_max_m`) in-memory `FmmBemSolver` without touching disk!
+#[allow(clippy::too_many_arguments)]
 pub fn run_stage3_to_stage4_to_fmm_bem(
     anchor: DetectedMetricAnchor,
     ba_report: BundleAdjustmentReport,
@@ -1106,6 +1107,7 @@ pub fn run_stage3_to_stage4_to_fmm_bem(
     winding_res: usize,
     h_max_m: f64,
     c_m_s: f64,
+    use_cuda: bool,
 ) -> Result<ScanPipelineOutput> {
     // Stage 3: 2DGS / PGSR -> TSDF Marching Tetrahedra
     let tsdf_mesh = fuse_surfels_tsdf_to_mesh(surfels, tsdf_res, 0.025)?;
@@ -1119,7 +1121,7 @@ pub fn run_stage3_to_stage4_to_fmm_bem(
     let conditioned = isotropic_acoustic_remesh(&watertight, h_max_m, 3);
     let mesh_stats = conditioned.stats(c_m_s);
     // Stage 4c: Direct in-memory / VRAM handoff into Gumerov FMM-BEM Helmholtz Solver!
-    let solver = FmmBemSolver::new(&conditioned)?;
+    let solver = FmmBemSolver::new_with_cuda(&conditioned, use_cuda)?;
     Ok(ScanPipelineOutput {
         anchor,
         ba_report,
@@ -2842,6 +2844,7 @@ pub fn reconstruct_from_multiview_images(
         cfg.winding_res,
         cfg.max_edge_m,
         cfg.speed_of_sound_m_s,
+        cfg.use_cuda,
     )
 }
 
@@ -3079,8 +3082,9 @@ mod tests {
             iterations: 10,
         };
 
-        let out = run_stage3_to_stage4_to_fmm_bem(anchor, ba, &surfels, 12, 12, 0.06, 344.85)
-            .expect("Stage 3 -> Stage 4 -> FMM-BEM handoff");
+        let out =
+            run_stage3_to_stage4_to_fmm_bem(anchor, ba, &surfels, 12, 12, 0.06, 344.85, false)
+                .expect("Stage 3 -> Stage 4 -> FMM-BEM handoff");
         assert!(out.mesh_stats.is_watertight);
         let h_l = out.solver.solve_reciprocal_hrtfs(
             1000.0,

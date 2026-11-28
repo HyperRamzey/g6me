@@ -197,8 +197,8 @@ pub struct Cli {
     pub cuda: bool,
 
     /// Tensor Core precision for Ozaki-II CRT FP64 GEMM when `--cuda` is active:
-    /// `auto` (NVFP4 on Blackwell sm_120a, FP8 on Hopper/Ada sm_89+, INT8 on Ampere/Turing),
-    /// `nvfp4`, `fp8`, `int8`, or `fp16`.
+    /// `auto` (single-limb INT8 on sm_61..sm_120a), `nvfp4` (explicit, sm_120a only),
+    /// `fp8`, `int8`, or `fp16`; unsupported formats downgrade per `resolve_for_arch`.
     #[arg(long, default_value = "auto", value_parser = parse_cuda_precision)]
     pub cuda_precision: CudaTensorPrecision,
 
@@ -1242,6 +1242,36 @@ fn bar(frac: f32, width: usize) -> String {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.cuda {
+        #[cfg(feature = "cuda")]
+        match g6me_core::blackwell::try_init_cuda_runtime() {
+            Ok(rt) => {
+                let requested = cli.cuda_precision.to_cuda();
+                let active = rt.active_precision(requested);
+                // `Auto` resolving to INT8 is the intended outcome, not a downgrade.
+                if cli.cuda_precision != g6me_core::blackwell::CudaTensorPrecision::Auto
+                    && active != requested
+                {
+                    eprintln!(
+                        "warning: --cuda-precision {} is unavailable on {} ({}); using {}",
+                        requested.short_tag(),
+                        rt.info.name,
+                        rt.compiled_arch,
+                        active.short_tag()
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "warning: --cuda requested but the CUDA runtime could not start ({e}); \
+                 running the CPU pipeline"
+            ),
+        }
+        #[cfg(not(feature = "cuda"))]
+        eprintln!(
+            "warning: --cuda requested but this binary was built without the `cuda` feature; \
+             running the CPU pipeline"
+        );
+    }
     let tools = Tools::discover();
 
     if cli.caps {

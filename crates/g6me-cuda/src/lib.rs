@@ -19,14 +19,15 @@
 //!   kernels AND across all 5 GPU architectures (`sm_120a`, `sm_90`, `sm_89`, `sm_80`, `sm_75`),
 //!   plus a mandatory `--fmad=true` sabotage negative control.
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
-    sys, CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -52,7 +53,10 @@ pub const OZAKI2_NMOD: usize = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CudaTensorPrecision {
     /// Automatically pick the highest-throughput precision supported by the active GPU arch:
-    /// `sm_120a` → `NVFP4 E2M1`, `sm_89+` → `FP8 E4M3`, `sm_75+` → `INT8`.
+    /// every arch from `sm_61` through `sm_120a` → `INT8` (single-limb IMMA/DP4A, faster than
+    /// the 2-limb NVFP4/FP8 paths). NVFP4 is never selected automatically: the
+    /// `mma.sync … kind::mxf4nvf4` path used here exists only on `sm_120a` (consumer Blackwell),
+    /// while B200/B300 (`sm_100a`/`sm_103a`) would need a separate `tcgen05` FP4 kernel.
     #[default]
     Auto,
     /// Blackwell (`sm_120a`) NVFP4 E2M1 Base-13 2-limb (`OMMA.SF.16864` with UE4M3=2.0 → FP32 → `u128` CRT → FP64).
@@ -77,21 +81,19 @@ impl CudaTensorPrecision {
     ///   - RTX 3090 (`sm_86`): `284 TOPS / 1 = 284 eff TOPS` (~14.2 TFLOPS FP64 peak, **4× faster** than FP16-FP32).
     ///   - RTX 2080 Ti (`sm_75`): `215 TOPS / 1 = 215 eff TOPS` (~10.8 TFLOPS FP64 peak, **4× faster** than FP16-FP32).
     ///   - GTX 1080 Ti (`sm_61`): `45.4 TOPS` via `IDP.4A.S8.S8` (`__dp4a`) (~2.27 TFLOPS FP64 peak, **6.5× native FP64**).
-    /// - Blackwell Ultra (`cc == 103`, B300) drops native INT8 TC rate, so `Auto` picks `Nvfp4E2m1` there.
-    /// - Explicit `Nvfp4E2m1` / `Fp8E4m3` / `Fp16` selections remain honored whenever hardware supports them.
+    /// - `Auto` always resolves to `Int8`; NVFP4 is an explicit opt-in on `sm_120a` only.
+    /// - Explicit `Nvfp4E2m1` / `Fp8E4m3` / `Fp16` selections are honored where the deployed
+    ///   kernel actually has a body: NVFP4 requires `cc == 120` **and** an arch-specific (`'a'`)
+    ///   compile target; B200/B300 (`sm_100a`/`sm_103a`) lack that `mma.sync` form and downgrade
+    ///   to FP8. This mirrors the `__CUDA_ARCH__ >= 1200` guards in
+    ///   `ozaki2_blackwell_mma.cu`, so a selection can never resolve to an empty kernel.
     pub fn resolve_for_arch(self, major: i32, minor: i32, compiled_arch: &str) -> Self {
         let cc = major * 10 + minor;
-        let has_nvfp4 = (cc >= 120 || cc == 100 || cc == 103) && compiled_arch.ends_with('a');
+        let has_nvfp4 = cc == 120 && compiled_arch.ends_with('a');
         let has_fp8 = cc >= 89;
         let has_fp16_tc = cc >= 75;
         match self {
-            Self::Auto => {
-                if cc == 103 && has_nvfp4 {
-                    Self::Nvfp4E2m1
-                } else {
-                    Self::Int8
-                }
-            }
+            Self::Auto => Self::Int8,
             Self::Nvfp4E2m1 => {
                 if has_nvfp4 {
                     Self::Nvfp4E2m1
@@ -156,7 +158,7 @@ pub struct CudaArchPlan {
 }
 
 /// Complete capability matrix across supported desktop & datacenter NVIDIA GPU architectures.
-pub const ALL_CUDA_ARCH_PLANS: [CudaArchPlan; 6] = [
+pub const ALL_CUDA_ARCH_PLANS: [CudaArchPlan; 7] = [
     CudaArchPlan {
         arch_name: "Blackwell (RTX 5090 / 5080)",
         sm_target: "sm_120a",
@@ -168,6 +170,19 @@ pub const ALL_CUDA_ARCH_PLANS: [CudaArchPlan; 6] = [
         default_ozaki_precision: CudaTensorPrecision::Int8,
         mma_opcode_summary:
             "IMMA.16832 S8→S32 (838 eff TOPS, ~41.9 TF FP64); opt OMMA.SF NVFP4 (419 eff)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+    CudaArchPlan {
+        arch_name: "Blackwell datacenter (B200 / B300)",
+        sm_target: "sm_100 / sm_103",
+        cc_range: "CC 10.0–10.3",
+        supports_nvfp4: false,
+        supports_fp8: true,
+        supports_int8: true,
+        supports_fp16: true,
+        default_ozaki_precision: CudaTensorPrecision::Int8,
+        mma_opcode_summary:
+            "IMMA.16832 S8→S32 (exact 1-limb); opt FP8 QMMA / FP16 HMMA (FP4 needs tcgen05, not implemented)",
         non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
     },
     CudaArchPlan {
@@ -239,16 +254,18 @@ pub fn arch_capability_plan(major: i32, minor: i32) -> CudaArchPlan {
     let cc = major * 10 + minor;
     if cc >= 120 {
         ALL_CUDA_ARCH_PLANS[0]
-    } else if cc >= 90 {
+    } else if cc >= 100 {
         ALL_CUDA_ARCH_PLANS[1]
-    } else if cc >= 89 {
+    } else if cc >= 90 {
         ALL_CUDA_ARCH_PLANS[2]
-    } else if cc >= 80 {
+    } else if cc >= 89 {
         ALL_CUDA_ARCH_PLANS[3]
-    } else if cc >= 75 {
+    } else if cc >= 80 {
         ALL_CUDA_ARCH_PLANS[4]
-    } else {
+    } else if cc >= 75 {
         ALL_CUDA_ARCH_PLANS[5]
+    } else {
+        ALL_CUDA_ARCH_PLANS[6]
     }
 }
 
@@ -349,9 +366,14 @@ pub fn cuda_device_info() -> Option<CudaDeviceInfo> {
         index: 0,
         name,
         compute_capability: (major, minor),
-        is_blackwell: major >= 12,
+        is_blackwell: major >= 10,
     })
 }
+
+/// Per-stage Stockham twiddles, device-resident (`(tw_re, tw_im)` per radix-2 stage).
+type FftTwiddleStages = Vec<(CudaSlice<f64>, CudaSlice<f64>)>;
+/// Per-stage Goldilocks NTT twiddles, device-resident (one `u64` table per radix-2 stage).
+type NttTwiddleStages = Vec<CudaSlice<u64>>;
 
 /// Live `cudarc` GPU runtime with ALL 6 dynamically compiled zero-FMA PTX modules loaded.
 pub struct G6meCudaRuntime {
@@ -365,6 +387,12 @@ pub struct G6meCudaRuntime {
     raytrace_mod: Arc<CudaModule>,
     fft_mod: Arc<CudaModule>,
     ntt_mod: Arc<CudaModule>,
+    /// Device-resident Stockham twiddle stages keyed by `(n, inverse)`. Uploaded once per
+    /// transform length/direction instead of once per block (the previous per-stage htod
+    /// uploads were the dominant redundant host->device traffic in the streaming UPOLA loop).
+    fft_twiddle_cache: Mutex<HashMap<(usize, bool), FftTwiddleStages>>,
+    /// Device-resident Goldilocks NTT twiddle stages keyed by `(n, inverse, fingerprint)`.
+    ntt_twiddle_cache: Mutex<HashMap<(usize, bool, u64), NttTwiddleStages>>,
 }
 
 #[inline]
@@ -372,8 +400,17 @@ fn align_up(v: usize, align: usize) -> usize {
     v.div_ceil(align) * align
 }
 
+/// Fixed-point scaling exponent for the Ozaki-II Stage-1 limb decomposition.
+///
+/// Full 53-bit `f64` mantissa precision holds for `k_dim <= 131072` (2^17); above that the
+/// exponent shrinks as `(123 - log2(k)) / 2` (52 bits at 2^18, 49 at 2^24, floored at 40) so
+/// the 123-bit CRT product still cannot overflow. Within those bounds the result is exact for
+/// the quantized limbs; the quantization itself, not the CRT, is what limits accuracy.
+///
+/// MUST stay identical to `g6me_core::blackwell::ozaki2_shift_bits`: the CPU reference and
+/// the live GPU stage-1 quantization must produce identical limbs for bit-exact parity.
 #[inline]
-fn ozaki2_shift_bits(k_dim: usize) -> i32 {
+pub fn ozaki2_shift_bits(k_dim: usize) -> i32 {
     if k_dim <= 131_072 {
         53
     } else {
@@ -382,8 +419,184 @@ fn ozaki2_shift_bits(k_dim: usize) -> i32 {
     }
 }
 
+/// Cheap content fingerprint for one direction's Goldilocks NTT twiddle tables.
+///
+/// `NttPlan` tables are deterministic functions of `(n, direction)`, so the fingerprint is a
+/// defensive guard rather than a strict identity: it catches a caller passing a table of the
+/// right length but different values.
+fn ntt_twiddle_key(n: usize, inverse: bool, twiddles: &[Vec<u64>]) -> (usize, bool, u64) {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (n as u64);
+    if inverse {
+        h ^= 0xA5A5_A5A5_A5A5_A5A5;
+    }
+    for stage in twiddles {
+        h = h.rotate_left(7) ^ (stage.len() as u64).wrapping_mul(0x0000_0100_0000_01B3);
+        h = h.rotate_left(7) ^ stage.first().copied().unwrap_or(0);
+        h = h.rotate_left(7) ^ stage.last().copied().unwrap_or(0);
+    }
+    (n, inverse, h)
+}
+
 /// `(ray_delays, ray_energies, ray_dirs)` from [`G6meCudaRuntime::run_raytrace_hoa_pass`].
 pub type RayTraceHoaOutput = (Vec<f64>, Vec<f64>, Vec<f64>);
+
+/// Host-built, x-independent FMM interaction plan for the zero-FMA BEM operator.
+///
+/// The caller (G6ME core) builds this once per `(solver, k, adjoint)` from the same
+/// octree, admissibility test and coefficient formulas used by the CPU FMM matvec.
+/// [`G6meCudaRuntime::bem_fmm_operator`] uploads it to the device exactly once; every
+/// subsequent [`CudaBemOperator::apply`] only ships the `2n` vector components and runs
+/// the kernels. All arrays are flat and C-order so they map directly to device buffers.
+#[derive(Debug, Clone, Default)]
+pub struct BemFmmPlan {
+    /// Number of BEM elements.
+    pub n: usize,
+    /// Number of octree nodes (pre-order ids; every child id > its parent id).
+    pub node_count: usize,
+    /// Deepest octree level index (root level is 0).
+    pub max_level: usize,
+    /// Exact CPU solid-angle diagonal `A_ii`.
+    pub diag: Vec<f64>,
+    /// Per-source `-area` (the CPU `w = x[j] * -area` left factor).
+    pub src_scale: Vec<f64>,
+    /// Per-source outward normal, x components (`[n]`; `src_ny` / `src_nz` likewise).
+    pub src_nx: Vec<f64>,
+    pub src_ny: Vec<f64>,
+    pub src_nz: Vec<f64>,
+    /// Leaf node id containing each source element.
+    pub src_leaf: Vec<i32>,
+    /// Flattened octree child lists (`[node_count + 1]` offsets).
+    pub child_start: Vec<i32>,
+    pub children: Vec<i32>,
+    /// Flattened leaf source lists (`[node_count + 1]` offsets), stored in CPU order.
+    pub leaf_start: Vec<i32>,
+    pub leaf_src: Vec<i32>,
+    /// Node ids grouped by depth (`[max_level + 2]` offsets).
+    pub level_offsets: Vec<i32>,
+    pub level_nodes: Vec<i32>,
+    /// Forward per-target interaction list in CPU DFS order (`[n + 1]` offsets).
+    pub fwd_start: Vec<i32>,
+    /// 0 = near element, 1 = far octree node.
+    pub fwd_kind: Vec<i32>,
+    pub fwd_index: Vec<i32>,
+    /// Near: exact complex coefficient. Far: exact complex cluster scalar.
+    pub fwd_a: Vec<f64>,
+    pub fwd_b: Vec<f64>,
+    /// Far only: `node.center - x_target` components.
+    pub fwd_dx: Vec<f64>,
+    pub fwd_dy: Vec<f64>,
+    pub fwd_dz: Vec<f64>,
+    /// Adjoint near list, bucketed per source in ascending target order (`[n + 1]`).
+    pub adj_src_start: Vec<i32>,
+    pub adj_src_i: Vec<i32>,
+    pub adj_src_cr: Vec<f64>,
+    pub adj_src_ci: Vec<f64>,
+    /// Adjoint far list, bucketed per octree node in ascending target order.
+    pub adj_node_start: Vec<i32>,
+    pub adj_node_i: Vec<i32>,
+    pub adj_node_sr: Vec<f64>,
+    pub adj_node_si: Vec<f64>,
+    pub adj_node_dx: Vec<f64>,
+    pub adj_node_dy: Vec<f64>,
+    pub adj_node_dz: Vec<f64>,
+}
+
+/// Cached zero-FMA BEM operator for one `(solver, k, adjoint)` solve.
+///
+/// Construction uploads the full dense matrix (explicit path) or the FMM interaction
+/// plan once. [`Self::apply`] performs no `n^2` host work and re-uploads no coefficient
+/// data: it ships `x` (`2n` doubles), launches the kernels, and reads back `y`.
+pub struct CudaBemOperator {
+    stream: Arc<CudaStream>,
+    n: usize,
+    d_xr: CudaSlice<f64>,
+    d_xi: CudaSlice<f64>,
+    d_yr: CudaSlice<f64>,
+    d_yi: CudaSlice<f64>,
+    kind: BemOperatorKind,
+}
+
+enum BemOperatorKind {
+    Dense {
+        d_mat_re: CudaSlice<f64>,
+        d_mat_im: CudaSlice<f64>,
+        func: CudaFunction,
+    },
+    FmmForward(Box<BemFmmForwardDevice>),
+    FmmAdjoint(Box<BemFmmAdjointDevice>),
+}
+
+struct BemFmmForwardDevice {
+    /// `(begin, count)` into `d_level_nodes` for each depth, root first.
+    level_ranges: Vec<(i32, i32)>,
+    d_src_scale: CudaSlice<f64>,
+    d_src_nx: CudaSlice<f64>,
+    d_src_ny: CudaSlice<f64>,
+    d_src_nz: CudaSlice<f64>,
+    d_child_start: CudaSlice<i32>,
+    d_children: CudaSlice<i32>,
+    d_leaf_start: CudaSlice<i32>,
+    d_leaf_src: CudaSlice<i32>,
+    d_level_nodes: CudaSlice<i32>,
+    d_diag: CudaSlice<f64>,
+    d_mom: CudaSlice<f64>,
+    d_f_start: CudaSlice<i32>,
+    d_f_kind: CudaSlice<i32>,
+    d_f_index: CudaSlice<i32>,
+    d_f_a: CudaSlice<f64>,
+    d_f_b: CudaSlice<f64>,
+    d_f_dx: CudaSlice<f64>,
+    d_f_dy: CudaSlice<f64>,
+    d_f_dz: CudaSlice<f64>,
+    fn_upward: CudaFunction,
+    fn_forward: CudaFunction,
+}
+
+struct BemFmmAdjointDevice {
+    node_count: usize,
+    level_ranges: Vec<(i32, i32)>,
+    d_src_scale: CudaSlice<f64>,
+    d_src_nx: CudaSlice<f64>,
+    d_src_ny: CudaSlice<f64>,
+    d_src_nz: CudaSlice<f64>,
+    d_src_leaf: CudaSlice<i32>,
+    d_child_start: CudaSlice<i32>,
+    d_children: CudaSlice<i32>,
+    d_level_nodes: CudaSlice<i32>,
+    d_diag: CudaSlice<f64>,
+    d_a_src_start: CudaSlice<i32>,
+    d_a_src_i: CudaSlice<i32>,
+    d_a_src_cr: CudaSlice<f64>,
+    d_a_src_ci: CudaSlice<f64>,
+    d_a_node_start: CudaSlice<i32>,
+    d_a_node_i: CudaSlice<i32>,
+    d_a_node_sr: CudaSlice<f64>,
+    d_a_node_si: CudaSlice<f64>,
+    d_a_node_dx: CudaSlice<f64>,
+    d_a_node_dy: CudaSlice<f64>,
+    d_a_node_dz: CudaSlice<f64>,
+    d_grad: CudaSlice<f64>,
+    fn_nodes: CudaFunction,
+    fn_push: CudaFunction,
+    fn_sources: CudaFunction,
+}
+
+/// `(x_re, x_im, y_re, y_im)` device buffers reused across every [`CudaBemOperator::apply`].
+type BemIoBuffers = (
+    CudaSlice<f64>,
+    CudaSlice<f64>,
+    CudaSlice<f64>,
+    CudaSlice<f64>,
+);
+
+#[inline]
+fn bem_grid(count: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((count.max(1) as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
 
 impl G6meCudaRuntime {
     /// Initialize CUDA device 0 and compile + load all 6 zero-FMA PTX modules via `nvcc --fmad=false`.
@@ -393,6 +606,25 @@ impl G6meCudaRuntime {
             .map_err(|e| format!("failed to create CUDA context: {e}"))?;
         let stream = ctx.default_stream();
         let arch = pick_supported_nvcc_arch(Some(&info.sm_arch()))?;
+        // `pick_supported_nvcc_arch` falls back to whatever the toolkit accepts, which can be
+        // newer than the live device (e.g. CUDA 13 dropping Pascal and selecting sm_120a for a
+        // CC 6.1 card). PTX is forward-compatible only toward newer GPUs, and architecture-
+        // specific `sm_XYa` targets are not forward-compatible at all, so reject a target the
+        // device cannot execute instead of loading it and silently falling back to CPU.
+        let (maj, min) = info.compute_capability;
+        if let Some((amaj, amin)) = parse_sm_arch_cc(&arch) {
+            let runnable = if arch.ends_with('a') {
+                amaj == maj && amin == min
+            } else {
+                amaj < maj || (amaj == maj && amin <= min)
+            };
+            if !runnable {
+                return Err(format!(
+                    "nvcc selected {arch} but the live device is CC {maj}.{min}; \
+                     the installed toolkit cannot target this GPU"
+                ));
+            }
+        }
 
         let load = |name: &str, src: &str| -> Result<Arc<CudaModule>, String> {
             let ptx = compile_cu_to_ptx(name, src, &arch, false)?;
@@ -418,7 +650,80 @@ impl G6meCudaRuntime {
             raytrace_mod,
             fft_mod,
             ntt_mod,
+            fft_twiddle_cache: Mutex::new(HashMap::new()),
+            ntt_twiddle_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Upload the Stockham twiddle stages for `(n, inverse)` exactly once per process.
+    ///
+    /// The host-side twiddle expressions are unchanged from the previous per-call path
+    /// (`ang = sign * 2*pi*q / (2m)`, `cos`/`sin`), so caching cannot change numerics; it only
+    /// removes `2 * log2(n)` redundant htod copies per block.
+    fn ensure_fft_twiddles(&self, n: usize, inverse: bool) -> Result<(), String> {
+        let key = (n, inverse);
+        let mut guard = self
+            .fft_twiddle_cache
+            .lock()
+            .map_err(|_| "fft twiddle cache poisoned".to_string())?;
+        if guard.contains_key(&key) {
+            return Ok(());
+        }
+        let sign = if inverse { 1.0_f64 } else { -1.0_f64 };
+        let half_n = n / 2;
+        let mut stages: FftTwiddleStages = Vec::with_capacity(n.trailing_zeros() as usize);
+        let mut m = half_n;
+        while m >= 1 {
+            let mut tw_re = Vec::with_capacity(m);
+            let mut tw_im = Vec::with_capacity(m);
+            for q in 0..m {
+                let ang = sign * 2.0 * PI * (q as f64) / ((2 * m) as f64);
+                tw_re.push(ang.cos());
+                tw_im.push(ang.sin());
+            }
+            let d_re = self
+                .stream
+                .clone_htod(&tw_re)
+                .map_err(|e| format!("htod fft tw_re: {e}"))?;
+            let d_im = self
+                .stream
+                .clone_htod(&tw_im)
+                .map_err(|e| format!("htod fft tw_im: {e}"))?;
+            stages.push((d_re, d_im));
+            m >>= 1;
+        }
+        guard.insert(key, stages);
+        Ok(())
+    }
+
+    /// Upload the Goldilocks NTT twiddle stages exactly once per `(n, direction, table)`.
+    ///
+    /// The tables come from [`crate::G6meCudaRuntime`]-external `NttPlan`s and are already
+    /// precomputed on the host; the fingerprint guards against silently reusing a cache entry
+    /// for a different table of the same length.
+    fn ensure_ntt_twiddles(
+        &self,
+        n: usize,
+        inverse: bool,
+        twiddles: &[Vec<u64>],
+    ) -> Result<(usize, bool, u64), String> {
+        let key = ntt_twiddle_key(n, inverse, twiddles);
+        let mut guard = self
+            .ntt_twiddle_cache
+            .lock()
+            .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(key) {
+            let mut stages: NttTwiddleStages = Vec::with_capacity(twiddles.len());
+            for tw in twiddles {
+                let d_tw = self
+                    .stream
+                    .clone_htod(tw.as_slice())
+                    .map_err(|e| format!("htod ntt tw: {e}"))?;
+                stages.push(d_tw);
+            }
+            entry.insert(stages);
+        }
+        Ok(key)
     }
 
     /// Resolve which Tensor Core precision will execute on this GPU for a user request.
@@ -559,6 +864,9 @@ impl G6meCudaRuntime {
     }
 
     /// Execute a zero-FMA complex Helmholtz BEM matrix-vector product `y = A * x` on the GPU.
+    ///
+    /// One-shot convenience wrapper around [`Self::bem_dense_operator`]; the cached
+    /// operator path used by GMRES uploads the matrix once for the whole solve.
     pub fn run_bem_matvec(
         &self,
         mat_re: &[f64],
@@ -567,65 +875,255 @@ impl G6meCudaRuntime {
         x_im: &[f64],
     ) -> Result<(Vec<f64>, Vec<f64>), String> {
         let n = x_re.len();
-        if x_im.len() != n || mat_re.len() != n * n || mat_im.len() != n * n {
+        let mut op = self.bem_dense_operator(mat_re, mat_im, n)?;
+        op.apply(x_re, x_im)
+    }
+
+    /// Build a cached dense complex BEM operator: uploads the `n x n` row-major matrix
+    /// exactly once, then [`CudaBemOperator::apply`] only ships/receives `2n` doubles.
+    pub fn bem_dense_operator(
+        &self,
+        mat_re: &[f64],
+        mat_im: &[f64],
+        n: usize,
+    ) -> Result<CudaBemOperator, String> {
+        if n == 0 || mat_re.len() != n * n || mat_im.len() != n * n {
             return Err("BEM matvec dimension mismatch".into());
         }
-        let d_mr = self
-            .stream
-            .clone_htod(mat_re)
-            .map_err(|e| format!("htod mat_re: {e}"))?;
-        let d_mi = self
-            .stream
-            .clone_htod(mat_im)
-            .map_err(|e| format!("htod mat_im: {e}"))?;
-        let d_xr = self
-            .stream
-            .clone_htod(x_re)
-            .map_err(|e| format!("htod x_re: {e}"))?;
-        let d_xi = self
-            .stream
-            .clone_htod(x_im)
-            .map_err(|e| format!("htod x_im: {e}"))?;
-        let mut d_yr = self
-            .stream
-            .alloc_zeros::<f64>(n)
-            .map_err(|e| format!("alloc y_re: {e}"))?;
-        let mut d_yi = self
-            .stream
-            .alloc_zeros::<f64>(n)
-            .map_err(|e| format!("alloc y_im: {e}"))?;
-
-        let func: CudaFunction = self
+        let func = self
             .bem_mod
             .load_function("g6me_bem_complex_matvec")
             .map_err(|e| format!("load g6me_bem_complex_matvec: {e}"))?;
-        let cfg = LaunchConfig {
-            grid_dim: ((n as u32).div_ceil(128), 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
+        let d_mat_re = self
+            .stream
+            .clone_htod(mat_re)
+            .map_err(|e| format!("htod mat_re: {e}"))?;
+        let d_mat_im = self
+            .stream
+            .clone_htod(mat_im)
+            .map_err(|e| format!("htod mat_im: {e}"))?;
+        let (d_xr, d_xi, d_yr, d_yi) = self.bem_io_buffers(n)?;
+        Ok(CudaBemOperator {
+            stream: self.stream.clone(),
+            n,
+            d_xr,
+            d_xi,
+            d_yr,
+            d_yi,
+            kind: BemOperatorKind::Dense {
+                d_mat_re,
+                d_mat_im,
+                func,
+            },
+        })
+    }
+
+    /// Build a cached zero-FMA FMM BEM operator for one `(solver, k, adjoint)` solve.
+    /// All interaction coefficients are uploaded once; `apply` does no host `O(n^2)` work.
+    pub fn bem_fmm_operator(
+        &self,
+        plan: &BemFmmPlan,
+        adjoint: bool,
+    ) -> Result<CudaBemOperator, String> {
+        if plan.n == 0
+            || plan.diag.len() != plan.n
+            || plan.src_scale.len() != plan.n
+            || plan.src_nx.len() != plan.n
+            || plan.src_ny.len() != plan.n
+            || plan.src_nz.len() != plan.n
+            || plan.src_leaf.len() != plan.n
+        {
+            return Err("FMM BEM plan dimension mismatch".into());
+        }
+        if plan.child_start.len() != plan.node_count + 1
+            || plan.leaf_start.len() != plan.node_count + 1
+            || plan.level_offsets.len() != plan.max_level + 2
+        {
+            return Err("FMM BEM plan octree layout mismatch".into());
+        }
+        let (d_xr, d_xi, d_yr, d_yi) = self.bem_io_buffers(plan.n)?;
+        let up = |v: &[f64], what: &str| -> Result<CudaSlice<f64>, String> {
+            self.stream
+                .clone_htod(v)
+                .map_err(|e| format!("htod {what}: {e}"))
         };
+        let upi = |v: &[i32], what: &str| -> Result<CudaSlice<i32>, String> {
+            self.stream
+                .clone_htod(v)
+                .map_err(|e| format!("htod {what}: {e}"))
+        };
+        let level_ranges: Vec<(i32, i32)> = (0..plan.max_level + 1)
+            .map(|l| {
+                (
+                    plan.level_offsets[l],
+                    plan.level_offsets[l + 1] - plan.level_offsets[l],
+                )
+            })
+            .collect();
+
+        let kind = if adjoint {
+            if plan.adj_src_start.len() != plan.n + 1
+                || plan.adj_node_start.len() != plan.node_count + 1
+            {
+                return Err("FMM BEM adjoint plan layout mismatch".into());
+            }
+            let fn_nodes = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_adjoint_nodes")
+                .map_err(|e| format!("load g6me_bem_fmm_adjoint_nodes: {e}"))?;
+            let fn_push = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_adjoint_push")
+                .map_err(|e| format!("load g6me_bem_fmm_adjoint_push: {e}"))?;
+            let fn_sources = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_adjoint_sources")
+                .map_err(|e| format!("load g6me_bem_fmm_adjoint_sources: {e}"))?;
+            BemOperatorKind::FmmAdjoint(Box::new(BemFmmAdjointDevice {
+                node_count: plan.node_count,
+                level_ranges,
+                d_src_scale: up(&plan.src_scale, "src_scale")?,
+                d_src_nx: up(&plan.src_nx, "src_nx")?,
+                d_src_ny: up(&plan.src_ny, "src_ny")?,
+                d_src_nz: up(&plan.src_nz, "src_nz")?,
+                d_src_leaf: upi(&plan.src_leaf, "src_leaf")?,
+                d_child_start: upi(&plan.child_start, "child_start")?,
+                d_children: upi(&plan.children, "children")?,
+                d_level_nodes: upi(&plan.level_nodes, "level_nodes")?,
+                d_diag: up(&plan.diag, "diag")?,
+                d_a_src_start: upi(&plan.adj_src_start, "adj_src_start")?,
+                d_a_src_i: upi(&plan.adj_src_i, "adj_src_i")?,
+                d_a_src_cr: up(&plan.adj_src_cr, "adj_src_cr")?,
+                d_a_src_ci: up(&plan.adj_src_ci, "adj_src_ci")?,
+                d_a_node_start: upi(&plan.adj_node_start, "adj_node_start")?,
+                d_a_node_i: upi(&plan.adj_node_i, "adj_node_i")?,
+                d_a_node_sr: up(&plan.adj_node_sr, "adj_node_sr")?,
+                d_a_node_si: up(&plan.adj_node_si, "adj_node_si")?,
+                d_a_node_dx: up(&plan.adj_node_dx, "adj_node_dx")?,
+                d_a_node_dy: up(&plan.adj_node_dy, "adj_node_dy")?,
+                d_a_node_dz: up(&plan.adj_node_dz, "adj_node_dz")?,
+                d_grad: self
+                    .stream
+                    .alloc_zeros::<f64>(6 * plan.node_count)
+                    .map_err(|e| format!("alloc adjoint grad: {e}"))?,
+                fn_nodes,
+                fn_push,
+                fn_sources,
+            }))
+        } else {
+            if plan.fwd_start.len() != plan.n + 1 {
+                return Err("FMM BEM forward plan layout mismatch".into());
+            }
+            let fn_upward = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_upward")
+                .map_err(|e| format!("load g6me_bem_fmm_upward: {e}"))?;
+            let fn_forward = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_forward")
+                .map_err(|e| format!("load g6me_bem_fmm_forward: {e}"))?;
+            BemOperatorKind::FmmForward(Box::new(BemFmmForwardDevice {
+                level_ranges,
+                d_src_scale: up(&plan.src_scale, "src_scale")?,
+                d_src_nx: up(&plan.src_nx, "src_nx")?,
+                d_src_ny: up(&plan.src_ny, "src_ny")?,
+                d_src_nz: up(&plan.src_nz, "src_nz")?,
+                d_child_start: upi(&plan.child_start, "child_start")?,
+                d_children: upi(&plan.children, "children")?,
+                d_leaf_start: upi(&plan.leaf_start, "leaf_start")?,
+                d_leaf_src: upi(&plan.leaf_src, "leaf_src")?,
+                d_level_nodes: upi(&plan.level_nodes, "level_nodes")?,
+                d_diag: up(&plan.diag, "diag")?,
+                d_mom: self
+                    .stream
+                    .alloc_zeros::<f64>(6 * plan.node_count)
+                    .map_err(|e| format!("alloc fmm moments: {e}"))?,
+                d_f_start: upi(&plan.fwd_start, "fwd_start")?,
+                d_f_kind: upi(&plan.fwd_kind, "fwd_kind")?,
+                d_f_index: upi(&plan.fwd_index, "fwd_index")?,
+                d_f_a: up(&plan.fwd_a, "fwd_a")?,
+                d_f_b: up(&plan.fwd_b, "fwd_b")?,
+                d_f_dx: up(&plan.fwd_dx, "fwd_dx")?,
+                d_f_dy: up(&plan.fwd_dy, "fwd_dy")?,
+                d_f_dz: up(&plan.fwd_dz, "fwd_dz")?,
+                fn_upward,
+                fn_forward,
+            }))
+        };
+
+        Ok(CudaBemOperator {
+            stream: self.stream.clone(),
+            n: plan.n,
+            d_xr,
+            d_xi,
+            d_yr,
+            d_yi,
+            kind,
+        })
+    }
+
+    /// Assemble the exact closed-surface solid-angle diagonal on the GPU with a
+    /// zero-FMA kernel (host precomputes nothing that depends on target/source pairs).
+    /// Returns `None`-style errors so callers can fall back bit-identically to the CPU
+    /// `par_map_indexed` assembly.
+    pub fn bem_solid_angle_diag(
+        &self,
+        centroids: &[f64],
+        normals: &[f64],
+        areas: &[f64],
+    ) -> Result<Vec<f64>, String> {
+        let n = areas.len();
+        if n == 0 || centroids.len() != 3 * n || normals.len() != 3 * n {
+            return Err("BEM solid-angle dimension mismatch".into());
+        }
+        let d_cen = self
+            .stream
+            .clone_htod(centroids)
+            .map_err(|e| format!("htod centroids: {e}"))?;
+        let d_nrm = self
+            .stream
+            .clone_htod(normals)
+            .map_err(|e| format!("htod normals: {e}"))?;
+        let d_area = self
+            .stream
+            .clone_htod(areas)
+            .map_err(|e| format!("htod areas: {e}"))?;
+        let mut d_diag = self
+            .stream
+            .alloc_zeros::<f64>(n)
+            .map_err(|e| format!("alloc solid-angle diag: {e}"))?;
+        let func = self
+            .bem_mod
+            .load_function("g6me_bem_solid_angle_diag")
+            .map_err(|e| format!("load g6me_bem_solid_angle_diag: {e}"))?;
         let n_i = n as i32;
         let mut builder = self.stream.launch_builder(&func);
         builder
-            .arg(&d_mr)
-            .arg(&d_mi)
-            .arg(&d_xr)
-            .arg(&d_xi)
-            .arg(&mut d_yr)
-            .arg(&mut d_yi)
+            .arg(&d_cen)
+            .arg(&d_nrm)
+            .arg(&d_area)
+            .arg(&mut d_diag)
             .arg(&n_i);
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch bem_matvec: {e}"))?;
+        unsafe { builder.launch(bem_grid(n)) }
+            .map_err(|e| format!("launch solid-angle diag: {e}"))?;
+        self.stream
+            .clone_dtoh(&d_diag)
+            .map_err(|e| format!("dtoh solid-angle diag: {e}"))
+    }
 
-        let yr = self
-            .stream
-            .clone_dtoh(&d_yr)
-            .map_err(|e| format!("dtoh y_re: {e}"))?;
-        let yi = self
-            .stream
-            .clone_dtoh(&d_yi)
-            .map_err(|e| format!("dtoh y_im: {e}"))?;
+    fn bem_io_buffers(&self, n: usize) -> Result<BemIoBuffers, String> {
         let _ = &self.ctx;
-        Ok((yr, yi))
+        let alloc = |what: &str| {
+            self.stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|e| format!("alloc {what}: {e}"))
+        };
+        Ok((
+            alloc("bem x_re")?,
+            alloc("bem x_im")?,
+            alloc("bem y_re")?,
+            alloc("bem y_im")?,
+        ))
     }
 
     /// Execute the full 4-stage device-side Ozaki-II CRT FP64-on-Tensor-Core GEMM `C = A * B`
@@ -1107,8 +1605,12 @@ impl G6meCudaRuntime {
         Ok((out, prec))
     }
 
-    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass on the GPU.
-    /// Returns `(ray_delays, ray_energies, ray_dirs)` of lengths `n_rays * max_bounces` (and `* 3`).
+    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass on the GPU,
+    /// specular-only (`wall_scatter` = 0). Prefer [`Self::run_raytrace_hoa_pass_with_scattering`]
+    /// when the room materials carry ISO-17497 scattering.
+    ///
+    /// Returns `(ray_delays, ray_energies, ray_dirs)` of lengths `n_rays * max_bounces`
+    /// (and `* 3`). Wall ordering is `[+x, -x, +y, -y, -z, +z]`, matching `RoomGeometry`.
     #[allow(clippy::too_many_arguments)]
     pub fn run_raytrace_hoa_pass(
         &self,
@@ -1116,6 +1618,46 @@ impl G6meCudaRuntime {
         src_pos: [f64; 3],
         lst_pos: [f64; 3],
         wall_refl: [f64; 6],
+        n_rays: usize,
+        max_bounces: usize,
+        c_air: f64,
+        det_radius: f64,
+        base_seed: u64,
+    ) -> Result<RayTraceHoaOutput, String> {
+        self.run_raytrace_hoa_pass_with_scattering(
+            room_dims,
+            src_pos,
+            lst_pos,
+            wall_refl,
+            [0.0; 6],
+            n_rays,
+            max_bounces,
+            c_air,
+            det_radius,
+            base_seed,
+        )
+    }
+
+    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass with per-wall
+    /// ISO-17497 scattering coefficients.
+    ///
+    /// `wall_refl` is the mid-band energy reflection coefficient `1 - alpha_1k` and
+    /// `wall_scatter` the Lambertian scattering probability, both in `RoomGeometry` wall
+    /// ordering `[+x, -x, +y, -y, -z, +z]`. Each scattered ray samples the cosine-weighted
+    /// hemisphere with a Marsaglia unit-disk rejection (no device `sin`/`cos`), so the
+    /// trajectory stream is bit-identical to the CPU tracer in `g6me-core/src/room.rs`.
+    ///
+    /// Returns `(ray_delays, ray_energies, ray_dirs)` of lengths `n_rays * max_bounces`
+    /// (and `* 3`); `ray_delays == -1.0` / `ray_energies == 0.0` marks a bounce with no
+    /// receiver hit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_raytrace_hoa_pass_with_scattering(
+        &self,
+        room_dims: [f64; 3],
+        src_pos: [f64; 3],
+        lst_pos: [f64; 3],
+        wall_refl: [f64; 6],
+        wall_scatter: [f64; 6],
         n_rays: usize,
         max_bounces: usize,
         c_air: f64,
@@ -1142,6 +1684,10 @@ impl G6meCudaRuntime {
             .stream
             .clone_htod(&wall_refl)
             .map_err(|e| format!("htod wall_refl: {e}"))?;
+        let d_scatter = self
+            .stream
+            .clone_htod(&wall_scatter)
+            .map_err(|e| format!("htod wall_scatter: {e}"))?;
         let mut d_delays = self
             .stream
             .alloc_zeros::<f64>(total)
@@ -1171,6 +1717,7 @@ impl G6meCudaRuntime {
             .arg(&d_src)
             .arg(&d_lst)
             .arg(&d_refl)
+            .arg(&d_scatter)
             .arg(&mut d_delays)
             .arg(&mut d_energies)
             .arg(&mut d_dirs)
@@ -1198,6 +1745,10 @@ impl G6meCudaRuntime {
 
     /// Execute a zero-FMA FP64 Stockham Radix-2 complex FFT (or inverse FFT with `1/N` scaling)
     /// completely on the GPU.
+    ///
+    /// Steady-state transfer pattern: `htod re` + `htod im` + `dtoh re` + `dtoh im`.
+    /// Twiddles are uploaded once per `(n, inverse)` and reused from device memory for every
+    /// subsequent block instead of being recomputed and copied on every call.
     pub fn run_stockham_fft_f64(
         &self,
         re: &[f64],
@@ -1211,14 +1762,99 @@ impl G6meCudaRuntime {
         if n == 1 {
             return Ok((re.to_vec(), im.to_vec()));
         }
+        let (d_re, d_im) = self.run_stockham_core(re, Some(im), inverse)?;
+        let out_re = self
+            .stream
+            .clone_dtoh(&d_re)
+            .map_err(|e| format!("dtoh fft re: {e}"))?;
+        let out_im = self
+            .stream
+            .clone_dtoh(&d_im)
+            .map_err(|e| format!("dtoh fft im: {e}"))?;
+        Ok((out_re, out_im))
+    }
+
+    /// Forward real-input FFT (`im` is implicitly zero): the imaginary input is produced by a
+    /// device `memset`, so only the real block crosses the host->device bus.
+    ///
+    /// Returns the full complex transform (the caller keeps `n/2 + 1` bins).
+    /// Transfer pattern: `htod re` + `dtoh re` + `dtoh im`.
+    pub fn run_stockham_fft_f64_real_input(
+        &self,
+        re: &[f64],
+        inverse: bool,
+    ) -> Result<(Vec<f64>, Vec<f64>), String> {
+        let n = re.len();
+        if !n.is_power_of_two() || n == 0 {
+            return Err("Stockham FFT requires a power-of-two length".into());
+        }
+        if n == 1 {
+            return Ok((re.to_vec(), vec![0.0]));
+        }
+        let (d_re, d_im) = self.run_stockham_core(re, None, inverse)?;
+        let out_re = self
+            .stream
+            .clone_dtoh(&d_re)
+            .map_err(|e| format!("dtoh fft re: {e}"))?;
+        let out_im = self
+            .stream
+            .clone_dtoh(&d_im)
+            .map_err(|e| format!("dtoh fft im: {e}"))?;
+        Ok((out_re, out_im))
+    }
+
+    /// Complex-input FFT returning only the real output. Used by the half-spectrum `irfft`
+    /// reconstruction, which discards the imaginary part; skipping that `dtoh` halves the
+    /// output traffic while leaving the kernel arithmetic identical to
+    /// [`Self::run_stockham_fft_f64`].
+    ///
+    /// Transfer pattern: `htod re` + `htod im` + `dtoh re`.
+    pub fn run_stockham_fft_f64_real_output(
+        &self,
+        re: &[f64],
+        im: &[f64],
+        inverse: bool,
+    ) -> Result<Vec<f64>, String> {
+        let n = re.len();
+        if im.len() != n || !n.is_power_of_two() || n == 0 {
+            return Err("Stockham FFT requires equal power-of-two re/im lengths".into());
+        }
+        if n == 1 {
+            return Ok(re.to_vec());
+        }
+        let (d_re, _d_im) = self.run_stockham_core(re, Some(im), inverse)?;
+        self.stream
+            .clone_dtoh(&d_re)
+            .map_err(|e| format!("dtoh fft re: {e}"))
+    }
+
+    /// Shared Stockham executor: upload the (optional) imaginary input, run `log2(n)` radix-2
+    /// stages with device-cached twiddles, apply the `1/N` inverse scale, and return the
+    /// device-resident result.
+    fn run_stockham_core(
+        &self,
+        re: &[f64],
+        im: Option<&[f64]>,
+        inverse: bool,
+    ) -> Result<(CudaSlice<f64>, CudaSlice<f64>), String> {
+        let n = re.len();
+        debug_assert!(n >= 2 && n.is_power_of_two());
         let mut d_in_re = self
             .stream
             .clone_htod(re)
             .map_err(|e| format!("htod fft re: {e}"))?;
-        let mut d_in_im = self
-            .stream
-            .clone_htod(im)
-            .map_err(|e| format!("htod fft im: {e}"))?;
+        let mut d_in_im = match im {
+            Some(im) => self
+                .stream
+                .clone_htod(im)
+                .map_err(|e| format!("htod fft im: {e}"))?,
+            // Real-input forward transform: zero the imaginary lane on the device instead of
+            // uploading an `n`-element zero vector.
+            None => self
+                .stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|e| format!("alloc fft im zeros: {e}"))?,
+        };
         let mut d_out_re = self
             .stream
             .alloc_zeros::<f64>(n)
@@ -1235,49 +1871,39 @@ impl G6meCudaRuntime {
 
         let half_n = n / 2;
         let half_n_i = half_n as i32;
-        let sign = if inverse { 1.0_f64 } else { -1.0_f64 };
         let cfg = LaunchConfig {
             grid_dim: ((half_n as u32).div_ceil(128), 1, 1),
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
 
-        let mut s = 1usize;
-        let mut m = half_n;
-        while m >= 1 {
-            let mut tw_re = Vec::with_capacity(m);
-            let mut tw_im = Vec::with_capacity(m);
-            for q in 0..m {
-                let ang = sign * 2.0 * PI * (q as f64) / ((2 * m) as f64);
-                tw_re.push(ang.cos());
-                tw_im.push(ang.sin());
-            }
-            let d_tw_re = self
-                .stream
-                .clone_htod(&tw_re)
-                .map_err(|e| format!("htod tw_re: {e}"))?;
-            let d_tw_im = self
-                .stream
-                .clone_htod(&tw_im)
-                .map_err(|e| format!("htod tw_im: {e}"))?;
-            let s_i = s as i32;
-            let m_i = m as i32;
+        self.ensure_fft_twiddles(n, inverse)?;
+        let guard = self
+            .fft_twiddle_cache
+            .lock()
+            .map_err(|_| "fft twiddle cache poisoned".to_string())?;
+        let stages = guard
+            .get(&(n, inverse))
+            .ok_or_else(|| "fft twiddle cache entry missing".to_string())?;
+        for (stage_idx, (tw_re, tw_im)) in stages.iter().enumerate() {
+            let s_i = (1usize << stage_idx) as i32;
+            let m_i = (half_n >> stage_idx) as i32;
             let mut b = self.stream.launch_builder(&fn_stage);
             b.arg(&d_in_re)
                 .arg(&d_in_im)
-                .arg(&d_tw_re)
-                .arg(&d_tw_im)
+                .arg(tw_re)
+                .arg(tw_im)
                 .arg(&mut d_out_re)
                 .arg(&mut d_out_im)
                 .arg(&half_n_i)
                 .arg(&s_i)
                 .arg(&m_i);
-            unsafe { b.launch(cfg) }.map_err(|e| format!("launch stockham s={s}: {e}"))?;
+            unsafe { b.launch(cfg) }
+                .map_err(|e| format!("launch stockham stage {stage_idx}: {e}"))?;
             std::mem::swap(&mut d_in_re, &mut d_out_re);
             std::mem::swap(&mut d_in_im, &mut d_out_im);
-            s <<= 1;
-            m >>= 1;
         }
+        drop(guard);
 
         if inverse {
             let fn_scale = self
@@ -1295,16 +1921,7 @@ impl G6meCudaRuntime {
             b.arg(&mut d_in_re).arg(&mut d_in_im).arg(&inv_n).arg(&n_i);
             unsafe { b.launch(scale_cfg) }.map_err(|e| format!("launch stockham scale: {e}"))?;
         }
-
-        let out_re = self
-            .stream
-            .clone_dtoh(&d_in_re)
-            .map_err(|e| format!("dtoh fft re: {e}"))?;
-        let out_im = self
-            .stream
-            .clone_dtoh(&d_in_im)
-            .map_err(|e| format!("dtoh fft im: {e}"))?;
-        Ok((out_re, out_im))
+        Ok((d_in_re, d_in_im))
     }
 
     /// Execute a zero-FMA complex spectrum multiply-accumulate `acc += a * b` on the GPU.
@@ -1452,16 +2069,23 @@ impl G6meCudaRuntime {
             b.arg(&d_src).arg(&mut d_buf).arg(&n_i).arg(&log_n);
             unsafe { b.launch(cfg_n) }.map_err(|e| format!("launch ntt bitrev fwd: {e}"))?;
         }
-        for (stage_idx, tw) in twiddles_fwd.iter().enumerate() {
-            let half_len = (1usize << stage_idx) as i32;
-            let d_tw = self
-                .stream
-                .clone_htod(tw)
-                .map_err(|e| format!("htod ntt tw_fwd: {e}"))?;
-            let mut b = self.stream.launch_builder(&fn_stage);
-            b.arg(&mut d_buf).arg(&d_tw).arg(&n_i).arg(&half_len);
-            unsafe { b.launch(cfg_half) }
-                .map_err(|e| format!("launch ntt fwd stage {stage_idx}: {e}"))?;
+        // Device-cached forward twiddles: uploaded once per (n, table) instead of per block.
+        self.ensure_ntt_twiddles(n, false, twiddles_fwd)?;
+        {
+            let guard = self
+                .ntt_twiddle_cache
+                .lock()
+                .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+            let stages = guard
+                .get(&ntt_twiddle_key(n, false, twiddles_fwd))
+                .ok_or_else(|| "ntt twiddle cache entry missing".to_string())?;
+            for (stage_idx, d_tw) in stages.iter().enumerate() {
+                let half_len = (1usize << stage_idx) as i32;
+                let mut b = self.stream.launch_builder(&fn_stage);
+                b.arg(&mut d_buf).arg(d_tw).arg(&n_i).arg(&half_len);
+                unsafe { b.launch(cfg_half) }
+                    .map_err(|e| format!("launch ntt fwd stage {stage_idx}: {e}"))?;
+            }
         }
 
         // Pointwise multiply in NTT domain
@@ -1477,16 +2101,23 @@ impl G6meCudaRuntime {
             b.arg(&d_buf).arg(&mut d_tmp).arg(&n_i).arg(&log_n);
             unsafe { b.launch(cfg_n) }.map_err(|e| format!("launch ntt bitrev inv: {e}"))?;
         }
-        for (stage_idx, tw) in twiddles_inv.iter().enumerate() {
-            let half_len = (1usize << stage_idx) as i32;
-            let d_tw = self
-                .stream
-                .clone_htod(tw)
-                .map_err(|e| format!("htod ntt tw_inv: {e}"))?;
-            let mut b = self.stream.launch_builder(&fn_stage);
-            b.arg(&mut d_tmp).arg(&d_tw).arg(&n_i).arg(&half_len);
-            unsafe { b.launch(cfg_half) }
-                .map_err(|e| format!("launch ntt inv stage {stage_idx}: {e}"))?;
+        // Device-cached inverse twiddles: uploaded once per (n, table) instead of per block.
+        self.ensure_ntt_twiddles(n, true, twiddles_inv)?;
+        {
+            let guard = self
+                .ntt_twiddle_cache
+                .lock()
+                .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+            let stages = guard
+                .get(&ntt_twiddle_key(n, true, twiddles_inv))
+                .ok_or_else(|| "ntt twiddle cache entry missing".to_string())?;
+            for (stage_idx, d_tw) in stages.iter().enumerate() {
+                let half_len = (1usize << stage_idx) as i32;
+                let mut b = self.stream.launch_builder(&fn_stage);
+                b.arg(&mut d_tmp).arg(d_tw).arg(&n_i).arg(&half_len);
+                unsafe { b.launch(cfg_half) }
+                    .map_err(|e| format!("launch ntt inv stage {stage_idx}: {e}"))?;
+            }
         }
         {
             let mut b = self.stream.launch_builder(&fn_scale);
@@ -1553,16 +2184,25 @@ impl G6meCudaRuntime {
             b.arg(&d_src).arg(&mut d_buf).arg(&n_i).arg(&log_n);
             unsafe { b.launch(cfg_n) }.map_err(|e| format!("launch ntt bitrev: {e}"))?;
         }
-        for (stage_idx, tw) in twiddles.iter().enumerate() {
-            let half_len = (1usize << stage_idx) as i32;
-            let d_tw = self
-                .stream
-                .clone_htod(tw)
-                .map_err(|e| format!("htod ntt tw: {e}"))?;
-            let mut b = self.stream.launch_builder(&fn_stage);
-            b.arg(&mut d_buf).arg(&d_tw).arg(&n_i).arg(&half_len);
-            unsafe { b.launch(cfg_half) }
-                .map_err(|e| format!("launch ntt stage {stage_idx}: {e}"))?;
+        // Device-cached twiddles (`scale.is_some()` == inverse direction). Steady-state transfer
+        // pattern per call: `htod data` + `dtoh out` only.
+        let inverse = scale.is_some();
+        self.ensure_ntt_twiddles(n, inverse, twiddles)?;
+        {
+            let guard = self
+                .ntt_twiddle_cache
+                .lock()
+                .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+            let stages = guard
+                .get(&ntt_twiddle_key(n, inverse, twiddles))
+                .ok_or_else(|| "ntt twiddle cache entry missing".to_string())?;
+            for (stage_idx, d_tw) in stages.iter().enumerate() {
+                let half_len = (1usize << stage_idx) as i32;
+                let mut b = self.stream.launch_builder(&fn_stage);
+                b.arg(&mut d_buf).arg(d_tw).arg(&n_i).arg(&half_len);
+                unsafe { b.launch(cfg_half) }
+                    .map_err(|e| format!("launch ntt stage {stage_idx}: {e}"))?;
+            }
         }
         if let Some(inv_n) = scale {
             let fn_scale = self
@@ -1577,6 +2217,199 @@ impl G6meCudaRuntime {
         self.stream
             .clone_dtoh(&d_buf)
             .map_err(|e| format!("dtoh ntt out: {e}"))
+    }
+}
+
+impl CudaBemOperator {
+    /// Number of BEM elements this operator acts on.
+    pub fn dim(&self) -> usize {
+        self.n
+    }
+
+    /// Apply the cached zero-FMA BEM operator: `y = A x` (or `A^T x`), where the
+    /// orientation was fixed at construction. Only `x` is uploaded per call; all
+    /// coefficients and interaction lists stay resident on the device.
+    pub fn apply(&mut self, x_re: &[f64], x_im: &[f64]) -> Result<(Vec<f64>, Vec<f64>), String> {
+        if x_re.len() != self.n || x_im.len() != self.n {
+            return Err("BEM operator input dimension mismatch".into());
+        }
+        let stream = self.stream.clone();
+        stream
+            .memcpy_htod(x_re, &mut self.d_xr)
+            .map_err(|e| format!("htod x_re: {e}"))?;
+        stream
+            .memcpy_htod(x_im, &mut self.d_xi)
+            .map_err(|e| format!("htod x_im: {e}"))?;
+
+        match &mut self.kind {
+            BemOperatorKind::Dense {
+                d_mat_re,
+                d_mat_im,
+                func,
+            } => {
+                let n_i = self.n as i32;
+                let mut builder = stream.launch_builder(func);
+                builder
+                    .arg(d_mat_re)
+                    .arg(d_mat_im)
+                    .arg(&self.d_xr)
+                    .arg(&self.d_xi)
+                    .arg(&mut self.d_yr)
+                    .arg(&mut self.d_yi)
+                    .arg(&n_i);
+                unsafe { builder.launch(bem_grid(self.n)) }
+                    .map_err(|e| format!("launch bem_matvec: {e}"))?;
+            }
+            BemOperatorKind::FmmForward(dev) => {
+                dev.apply(
+                    &stream,
+                    &self.d_xr,
+                    &self.d_xi,
+                    &mut self.d_yr,
+                    &mut self.d_yi,
+                    self.n,
+                )?;
+            }
+            BemOperatorKind::FmmAdjoint(dev) => {
+                dev.apply(
+                    &stream,
+                    &self.d_xr,
+                    &self.d_xi,
+                    &mut self.d_yr,
+                    &mut self.d_yi,
+                    self.n,
+                )?;
+            }
+        }
+
+        let yr = stream
+            .clone_dtoh(&self.d_yr)
+            .map_err(|e| format!("dtoh y_re: {e}"))?;
+        let yi = stream
+            .clone_dtoh(&self.d_yi)
+            .map_err(|e| format!("dtoh y_im: {e}"))?;
+        Ok((yr, yi))
+    }
+}
+
+impl BemFmmForwardDevice {
+    fn apply(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        xr: &CudaSlice<f64>,
+        xi: &CudaSlice<f64>,
+        yr: &mut CudaSlice<f64>,
+        yi: &mut CudaSlice<f64>,
+        n: usize,
+    ) -> Result<(), String> {
+        // Upward pass: deepest level first, so every child moment is final before
+        // its parent reads it. One launch per depth level, deterministic per node.
+        for &(begin, count) in self.level_ranges.iter().rev() {
+            let mut b = stream.launch_builder(&self.fn_upward);
+            b.arg(xr)
+                .arg(xi)
+                .arg(&self.d_src_scale)
+                .arg(&self.d_src_nx)
+                .arg(&self.d_src_ny)
+                .arg(&self.d_src_nz)
+                .arg(&self.d_child_start)
+                .arg(&self.d_children)
+                .arg(&self.d_leaf_start)
+                .arg(&self.d_leaf_src)
+                .arg(&self.d_level_nodes)
+                .arg(&begin)
+                .arg(&count)
+                .arg(&mut self.d_mom);
+            unsafe { b.launch(bem_grid(count as usize)) }
+                .map_err(|e| format!("launch fmm upward: {e}"))?;
+        }
+        let n_i = n as i32;
+        let mut b = stream.launch_builder(&self.fn_forward);
+        b.arg(xr)
+            .arg(xi)
+            .arg(&self.d_diag)
+            .arg(&self.d_f_start)
+            .arg(&self.d_f_kind)
+            .arg(&self.d_f_index)
+            .arg(&self.d_f_a)
+            .arg(&self.d_f_b)
+            .arg(&self.d_f_dx)
+            .arg(&self.d_f_dy)
+            .arg(&self.d_f_dz)
+            .arg(&self.d_mom)
+            .arg(yr)
+            .arg(yi)
+            .arg(&n_i);
+        unsafe { b.launch(bem_grid(n)) }
+            .map(|_| ())
+            .map_err(|e| format!("launch fmm forward: {e}"))
+    }
+}
+
+impl BemFmmAdjointDevice {
+    fn apply(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        xr: &CudaSlice<f64>,
+        xi: &CudaSlice<f64>,
+        yr: &mut CudaSlice<f64>,
+        yi: &mut CudaSlice<f64>,
+        n: usize,
+    ) -> Result<(), String> {
+        // Direct far-field adjoint gradients per node (ascending target order).
+        let nc_i = self.node_count as i32;
+        let mut b = stream.launch_builder(&self.fn_nodes);
+        b.arg(xr)
+            .arg(xi)
+            .arg(&self.d_a_node_start)
+            .arg(&self.d_a_node_i)
+            .arg(&self.d_a_node_sr)
+            .arg(&self.d_a_node_si)
+            .arg(&self.d_a_node_dx)
+            .arg(&self.d_a_node_dy)
+            .arg(&self.d_a_node_dz)
+            .arg(&mut self.d_grad)
+            .arg(&nc_i);
+        unsafe { b.launch(bem_grid(self.node_count)) }
+            .map_err(|e| format!("launch fmm adjoint nodes: {e}"))?;
+
+        // Downward push: root level first, then each deeper level. Each child has a
+        // unique parent, so the level-ordered launches are race-free and deterministic.
+        let push_levels = self.level_ranges.len().saturating_sub(1);
+        for &(begin, count) in self.level_ranges.iter().take(push_levels) {
+            let mut b = stream.launch_builder(&self.fn_push);
+            b.arg(&self.d_child_start)
+                .arg(&self.d_children)
+                .arg(&self.d_level_nodes)
+                .arg(&begin)
+                .arg(&count)
+                .arg(&mut self.d_grad);
+            unsafe { b.launch(bem_grid(count as usize)) }
+                .map_err(|e| format!("launch fmm adjoint push: {e}"))?;
+        }
+
+        // Per-source diagonal + near + leaf L2P accumulation.
+        let n_i = n as i32;
+        let mut b = stream.launch_builder(&self.fn_sources);
+        b.arg(xr)
+            .arg(xi)
+            .arg(&self.d_diag)
+            .arg(&self.d_a_src_start)
+            .arg(&self.d_a_src_i)
+            .arg(&self.d_a_src_cr)
+            .arg(&self.d_a_src_ci)
+            .arg(&self.d_src_scale)
+            .arg(&self.d_src_nx)
+            .arg(&self.d_src_ny)
+            .arg(&self.d_src_nz)
+            .arg(&self.d_src_leaf)
+            .arg(&self.d_grad)
+            .arg(yr)
+            .arg(yi)
+            .arg(&n_i);
+        unsafe { b.launch(bem_grid(n)) }
+            .map(|_| ())
+            .map_err(|e| format!("launch fmm adjoint sources: {e}"))
     }
 }
 
@@ -1740,6 +2573,18 @@ pub fn nvcc_toolchain_available() -> bool {
             .unwrap_or(false)
     };
     ok("nvcc") && ok("cuobjdump")
+}
+
+/// Parse the compute capability encoded in an `sm_XY`/`sm_XYZ[a]` target string.
+/// `sm_61` → `(6, 1)`, `sm_90` → `(9, 0)`, `sm_120a` → `(12, 0)`, `sm_103a` → `(10, 3)`.
+pub fn parse_sm_arch_cc(arch: &str) -> Option<(i32, i32)> {
+    let tail = arch.strip_prefix("sm_")?;
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 2 {
+        return None;
+    }
+    let split = digits.len() - 1;
+    Some((digits[..split].parse().ok()?, digits[split..].parse().ok()?))
 }
 
 /// Choose the highest `sm_XX` architecture supported by the installed `nvcc`,
@@ -2174,10 +3019,15 @@ mod tests {
             CudaTensorPrecision::Nvfp4E2m1.resolve_for_arch(12, 0, "sm_120a"),
             CudaTensorPrecision::Nvfp4E2m1
         );
-        // Blackwell Ultra sm_103a (B300): Auto -> NVFP4 OMMA.SF
+        // Blackwell Ultra sm_103a (B300): no sm_120a-style OMMA FP4 body exists, so Auto is
+        // INT8 and an explicit NVFP4 request downgrades to FP8 instead of an empty kernel.
         assert_eq!(
             CudaTensorPrecision::Auto.resolve_for_arch(10, 3, "sm_103a"),
-            CudaTensorPrecision::Nvfp4E2m1
+            CudaTensorPrecision::Int8
+        );
+        assert_eq!(
+            CudaTensorPrecision::Nvfp4E2m1.resolve_for_arch(10, 3, "sm_103a"),
+            CudaTensorPrecision::Fp8E4m3
         );
         // Plain sm_120 (without 'a'): NVFP4 MMA requires sm_120a, gracefully falls back to FP8
         assert_eq!(

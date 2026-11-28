@@ -2861,7 +2861,7 @@ pub fn scan() -> Vec<Check> {
 
     let head = TriangleMesh::procedural_head_with_pinnae(0.0875, 2);
     let surfels = sample_surfels_from_mesh(&head);
-    let pipe = run_stage3_to_stage4_to_fmm_bem(h_anchor, ba, &surfels, 12, 12, 0.06, 344.85)
+    let pipe = run_stage3_to_stage4_to_fmm_bem(h_anchor, ba, &surfels, 12, 12, 0.06, 344.85, false)
         .expect("Stage 3->4->FMM-BEM");
     let h_l = pipe.solver.solve_reciprocal_hrtfs(
         1000.0,
@@ -3573,6 +3573,40 @@ pub fn cuda() -> Vec<Check> {
                     )
                 });
 
+                // 4d2. Direct NTT butterfly parity. `convolve_slice_with_cuda` silently falls
+                // back to the CPU on any GPU error, so on its own it cannot prove the GPU
+                // kernel ran; this check calls `run_goldilocks_ntt_transform` directly and
+                // fails if the returned field elements differ.
+                let ntt_plan = g6me_core::ntt::NttPlan::new(256);
+                let field_in: Vec<u64> = (0..256u64)
+                    .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 0xFFFF_FFFF_0000_0001)
+                    .collect();
+                let mut cpu_field = field_in.clone();
+                ntt_plan.forward(&mut cpu_field);
+                match rt.run_goldilocks_ntt_transform(&field_in, ntt_plan.twiddles_fwd(), None) {
+                    Ok(gpu_field) => {
+                        let exact = cpu_field == gpu_field;
+                        out.push(if exact {
+                            pass(
+                                "cuda",
+                                "Live GPU Goldilocks NTT transform bit-exact parity",
+                                "256-point forward NTT field elements identical to CPU",
+                            )
+                        } else {
+                            fail(
+                                "cuda",
+                                "Live GPU Goldilocks NTT transform bit-exact parity",
+                                "GPU NTT transform field elements differed from CPU",
+                            )
+                        });
+                    }
+                    Err(e) => out.push(fail(
+                        "cuda",
+                        "Live GPU Goldilocks NTT transform bit-exact parity",
+                        e,
+                    )),
+                }
+
                 // 4e. BEM complex matvec live GPU-vs-CPU parity
                 let bem_n = 16usize;
                 let mat_re: Vec<f64> = (0..bem_n * bem_n)
@@ -3621,6 +3655,74 @@ pub fn cuda() -> Vec<Check> {
                     )),
                 }
 
+                // 4e2. Production FMM-BEM reciprocal solve: CPU FMM operator vs cached GPU FMM
+                {
+                    use g6me_core::bem::{FmmBemSolver, TriangleMesh};
+                    let mesh = TriangleMesh::procedural_head_with_pinnae(0.0875, 3);
+                    match FmmBemSolver::new(&mesh) {
+                        Ok(solver) => {
+                            let sources = [
+                                [0.0, 0.0, 1.0],
+                                [0.5, 0.5, 1.0],
+                                [-0.5, 0.0, 1.0],
+                                [0.0, 0.5, 1.0],
+                            ];
+                            let (f_hz, c_air) = (1_000.0_f64, 344.8_f64);
+                            let cpu = solver.solve_reciprocal_hrtfs(
+                                f_hz,
+                                c_air,
+                                &sources,
+                                solver.left_ear_elem,
+                                true,
+                            );
+                            let gpu = solver.solve_reciprocal_hrtfs_with_cuda(
+                                f_hz,
+                                c_air,
+                                &sources,
+                                solver.left_ear_elem,
+                                true,
+                                true,
+                            );
+                            let max_diff = cpu
+                                .iter()
+                                .zip(&gpu)
+                                .map(|(a, b)| (a.re - b.re).hypot(a.im - b.im))
+                                .fold(0.0_f64, f64::max);
+                            out.push(with_metric(
+                                if max_diff < 1e-10 {
+                                    pass(
+                                        "cuda",
+                                        "Live GPU FMM-BEM reciprocal solve parity",
+                                        format!(
+                                            "n={} elements, max |gpu - cpu| = {max_diff:.3e} (< 1e-10)",
+                                            solver.elements.len()
+                                        ),
+                                    )
+                                } else {
+                                    fail(
+                                        "cuda",
+                                        "Live GPU FMM-BEM reciprocal solve parity",
+                                        format!(
+                                            "n={} elements, max |gpu - cpu| = {max_diff:.3e} >= 1e-10",
+                                            solver.elements.len()
+                                        ),
+                                    )
+                                },
+                                json!({
+                                    "elements": solver.elements.len(),
+                                    "max_abs_diff": max_diff,
+                                    "frequency_hz": f_hz,
+                                }),
+                            ));
+                        }
+                        Err(e) => out.push(fail(
+                            "cuda",
+                            "Live GPU FMM-BEM reciprocal solve parity",
+                            e.to_string(),
+                        )),
+                    }
+                }
+
                 // 4f. RayTrace HOA live GPU smoke & finite check
                 match rt.run_raytrace_hoa_pass(
                     geom.dims_m,
@@ -3654,6 +3756,64 @@ pub fn cuda() -> Vec<Check> {
                         });
                     }
                     Err(e) => out.push(fail("cuda", "Live GPU RayTrace HOA zero-FMA kernel", e)),
+                }
+
+                // 4g. CPU-vs-GPU ray-traced HOA histogram, production scattering, bit-exact
+                {
+                    use g6me_core::atmosphere::AtmosphereCfg;
+                    use g6me_core::hoa::HOA_CH;
+                    use g6me_core::room::{
+                        raytrace_hoa_histogram, raytrace_hoa_histogram_with_cuda,
+                    };
+                    let atm = AtmosphereCfg::default();
+                    let src = [1.5, 2.0, 1.2];
+                    let (n_rays, bounces, bins, dt, seed) = (
+                        512usize,
+                        12usize,
+                        128usize,
+                        0.002_f64,
+                        0x6736_4D45_5241_5954u64,
+                    );
+                    let cpu =
+                        raytrace_hoa_histogram(&geom, &atm, src, n_rays, bounces, bins, dt, seed);
+                    let gpu = raytrace_hoa_histogram_with_cuda(
+                        &geom, &atm, src, n_rays, bounces, bins, dt, seed, true,
+                    );
+                    let mut mismatches = 0usize;
+                    let mut max_diff = 0.0_f64;
+                    for (cb, gb) in cpu.iter().zip(&gpu) {
+                        for c in 0..HOA_CH {
+                            if cb[c].to_bits() != gb[c].to_bits() {
+                                mismatches += 1;
+                            }
+                            max_diff = max_diff.max((cb[c] - gb[c]).abs());
+                        }
+                    }
+                    let cells = cpu.len() * HOA_CH;
+                    out.push(with_metric(
+                        if mismatches == 0 {
+                            pass(
+                                "cuda",
+                                "Live CPU/GPU RayTrace HOA histogram bit-exact parity",
+                                format!(
+                                    "{cells} bins bit-identical (Lambertian scattering, max |d| = 0.0)"
+                                ),
+                            )
+                        } else {
+                            fail(
+                                "cuda",
+                                "Live CPU/GPU RayTrace HOA histogram bit-exact parity",
+                                format!("{mismatches}/{cells} bins differ, max |d| = {max_diff:.3e}"),
+                            )
+                        },
+                        json!({
+                            "cells": cells,
+                            "bit_mismatches": mismatches,
+                            "max_abs_diff": max_diff,
+                            "rays": n_rays,
+                            "bounces": bounces,
+                        }),
+                    ));
                 }
             }
             None => {

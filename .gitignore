@@ -7,6 +7,8 @@ dist/
 *.i64
 *.idb
 .g6me-cache/
+# Harness-managed agent worktrees; never part of the tree.
+.claude/
 out/
 .venv/
 __pycache__/

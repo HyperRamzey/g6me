@@ -107,7 +107,8 @@ struct Cli {
     cuda: bool,
 
     /// Tensor Core precision for Ozaki-II CRT FP64 Schur GEMM when `--cuda` is active:
-    /// `auto` (NVFP4 on Blackwell sm_120a, FP8 on Hopper/Ada, INT8 on Ampere/Turing), `nvfp4`, `fp8`, `int8`, `fp16`.
+    /// `auto` (single-limb INT8 on sm_61..sm_120a), `nvfp4` (explicit, sm_120a only),
+    /// `fp8`, `int8`, `fp16`; unsupported formats downgrade per `resolve_for_arch`.
     #[arg(long, default_value = "auto", value_parser = parse_cuda_precision)]
     cuda_precision: CudaTensorPrecision,
 }
@@ -133,6 +134,37 @@ impl From<g6me_core::Error> for ScanError {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.cuda {
+        #[cfg(feature = "cuda")]
+        match g6me_core::blackwell::try_init_cuda_runtime() {
+            Ok(rt) => {
+                let requested = cli.cuda_precision.to_cuda();
+                let active = rt.active_precision(requested);
+                // `Auto` resolving to INT8 is the intended outcome, not a downgrade.
+                if cli.cuda_precision != g6me_core::blackwell::CudaTensorPrecision::Auto
+                    && active != requested
+                {
+                    eprintln!(
+                        "g6me-scan warning: --cuda-precision {} is unavailable on {} ({}); \
+                         using {}",
+                        requested.short_tag(),
+                        rt.info.name,
+                        rt.compiled_arch,
+                        active.short_tag()
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "g6me-scan warning: --cuda requested but the CUDA runtime could not start \
+                 ({e}); running the CPU pipeline"
+            ),
+        }
+        #[cfg(not(feature = "cuda"))]
+        eprintln!(
+            "g6me-scan warning: --cuda requested but this binary was built without the \
+             `cuda` feature; running the CPU pipeline"
+        );
+    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(ScanError::RealInputRefused(msg)) => {

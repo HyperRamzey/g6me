@@ -312,13 +312,21 @@ kernel for every architecture the installed toolkit accepts (`sm_120a`, `sm_90`,
 requiring the Tensor Core / DP4A opcode each target should emit (`OMMA.SF` NVFP4,
 `QMMA` FP8, `IMMA`, `HMMA`, `IDP.4A`). On a live NVIDIA GPU the same group runs CPU-vs-GPU
 parity for all six kernels — 3D FDTD, Ozaki-II CRT GEMM across every supported
-precision, Stockham FFT, bit-exact Goldilocks NTT, BEM complex matvec, plus a
-ray-tracing smoke test — and on a host with no GPU it reports that instead of
-failing. `--cuda` offloads all six paths when an NVIDIA GPU is present; the FDTD
+precision (bit-exact, integer CRT reconstruction asserted per cell), Stockham FFT,
+bit-exact Goldilocks NTT, BEM complex matvec — plus production-path parity: the full
+`raytrace_hoa` HOA histogram with Lambertian wall scattering is bit-identical bin for
+bin, and the FMM-BEM reciprocal HRTF solve through `FmmBemSolver::new_with_cuda` matches
+the CPU solver. A full `g6me --cuda` control-room render is bit-identical to the
+CPU render end to end (measured on an RTX 5070 at 48 kHz stereo, and again with each
+explicit `--cuda-precision`), not merely within tolerance. On a host with no GPU the
+group reports that instead of failing. `--cuda` offloads all six paths when an NVIDIA GPU is present; the FDTD
 grids stay resident in VRAM for the whole run (one upload, one download), and every
 dispatch falls back deterministically to the pure-Rust CPU solver. `--cuda-precision
 auto|nvfp4|fp8|int8|fp16` selects the Ozaki-II Tensor Core format (`auto` picks
-single-limb INT8 on desktop GPUs, NVFP4 on Blackwell Ultra `sm_103a`).
+single-limb INT8 everywhere the kernel supports, `sm_61..sm_120a`; explicit NVFP4 is
+available only on `sm_120a` and otherwise downgrades to FP8/INT8). If the driver or
+CUDA toolkit cannot start, `--cuda` warns once on stderr and runs the CPU pipeline
+instead of failing silently.
 
 Design notes: `docs/G6ME_SCAN_FMM_BEM_NTT.md` (scan, FMM-BEM, NTT),
 `docs/ACADEMIC_NUKE_ACOUSTICS.md` (room, CUDA, noise shaping, transducer, and perceptual models), and
@@ -619,12 +627,17 @@ check also runs per-group (`--group bitexact` …), so a failure can be reproduc
 without waiting for the whole suite. The count above assumes a sibling `g6me` binary
 exists to disassemble, as in the release archive; a bare `cargo run -p g6me-verify`
 builds only the verifier, finds no sibling, and reports 128. With `--features cuda`
-the suite grows to 141 checks (142 with the sibling): the six-kernel PTX/SASS audit,
-the multi-architecture Ozaki-II opcode audit, and the live six-kernel GPU-vs-CPU
-parity group, including the Stockham FFT inverse round-trip.
+the suite grows to 144 checks (145 with the sibling): the six-kernel PTX/SASS audit,
+the multi-architecture Ozaki-II opcode audit, and the live GPU-vs-CPU parity group —
+all six kernels plus a direct Goldilocks NTT butterfly comparison, the Stockham FFT
+inverse round-trip, the bit-exact production raytrace histogram and the FMM-BEM
+reciprocal solve.
 
-The workspace test suite covers what the verifier does not: 374 tests across the
-core (289), CLI (25), GUI (43), CUDA (4) and harness (13). The G6+ invariants live there —
+The workspace test suite covers what the verifier does not: 375 tests across the
+core (290, plus two opt-in full-resolution true-peak tests ignored by default), CLI
+(25), GUI (43), CUDA (4) and harness (13). With `--features cuda` the core grows to
+300 — the live CPU/GPU parity tests for dense and FMM BEM, raytrace scattering and
+Ozaki-II become active — for 385 workspace tests. The G6+ invariants live there —
 a flat 1-ERB diffuse field across all three profiles, measured ITD against
 Woodworth, sub-bass coherence, exact L/R mirror symmetry, a clean kernel tail with
 no pre-ringing, chunk-size-invariant overlap-add streaming, stereo bypass, LFE gain

@@ -24,8 +24,9 @@
 //! 4. **Ozaki Scheme II (Chinese Remainder Theorem, Uchino, Ozaki & Imamura,
 //!    arXiv:2504.08009 / arXiv:2602.02549, 2025–2026)**:
 //!    replaces quadratic `O(S²/2)` slices with linear `O(M)` (`M = 20` pairwise-coprime
-//!    moduli `<= 113`, `log2(∏ m_j) = 124.31 bits`) modular GEMMs + exact double-double
-//!    CRT reconstruction across THREE low-precision Tensor Core backends:
+//!    moduli `<= 113`, `log2(∏ m_j) = 124.31 bits`) modular GEMMs + exact `u128` integer
+//!    CRT reconstruction (bit-identical CPU reference and CUDA Stage 4) across THREE
+//!    low-precision Tensor Core backends:
 //!    - `TensorBackend::Int8` (`INT8` Tensor Cores),
 //!    - `TensorBackend::Fp8E4m3` (`FP8 E4M3` 2-limb exact integer decomposition),
 //!    - `TensorBackend::Fp4E2m1Base13` (**Hayashi, Mukunoki, Hoshino & Katagiri,
@@ -380,33 +381,42 @@ fn sym_mod_i64(x: i64, m: i32) -> i32 {
     r as i32
 }
 
+/// Fixed-point scaling exponent used by the Ozaki-II limb decomposition.
+///
+/// `53` keeps the full IEEE-754 `f64` mantissa for every row/column magnitude when
+/// `k <= 131_072` (worst-case product sum `< 2^123 < M_BIG / 2`). Larger `K` reduces the
+/// per-element bit budget so the CRT reconstruction stays inside `M_BIG / 2`.
+///
+/// This MUST stay identical to `g6me_cuda::ozaki2_shift_bits`: the live GPU stage-1
+/// decomposition and this CPU reference must quantize identical limbs for bit-exact parity.
 #[inline]
-fn two_sum(a: f64, b: f64) -> (f64, f64) {
-    let s = a + b;
-    let v = s - a;
-    let e = (a - (s - v)) + (b - v);
-    (s, e)
+pub fn ozaki2_shift_bits(k_dim: usize) -> i32 {
+    if k_dim <= 131_072 {
+        53
+    } else {
+        let log2_k = (k_dim as f64).log2().ceil() as i32;
+        ((123 - log2_k) / 2).clamp(40, 53)
+    }
 }
 
-#[inline]
-fn dd_add(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    let (s, e) = two_sum(a.0, b.0);
-    two_sum(s, e + a.1 + b.1)
-}
-
-/// Exact Veltkamp-Dekker split multiplication error `(a*b - fl(a*b))` with ZERO FMA!
-#[inline]
-fn two_prod_nofma(a: f64, b: f64) -> (f64, f64) {
-    const SPLIT: f64 = 134_217_729.0; // 2^27 + 1
-    let p = a * b;
-    let ca = SPLIT * a;
-    let ah = ca - (ca - a);
-    let al = a - ah;
-    let cb = SPLIT * b;
-    let bh = cb - (cb - b);
-    let bl = b - bh;
-    let err = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
-    (p, err)
+/// Exact CRT accumulation of one output cell's modular residues into `[0, M_BIG)`.
+///
+/// This is the same arithmetic as `g6me_ozaki2_crt_reconstruct_u128_f64` Stage 4:
+/// canonical residue -> `t = r * (M/m)^-1 mod m` -> `acc += t * (M/m)` folded mod `M`.
+/// Kept separate so tests can assert the reconstructed *integer* limb result directly,
+/// rather than only the final rounded `f64`.
+fn crt_accumulate(residues: &[i32], m_big: u128, invs: &[i32], m_divs: &[u128]) -> u128 {
+    let mut acc = 0u128;
+    for (idx, &m) in OZAKI2_MODULI.iter().enumerate() {
+        let m_u = m as u128;
+        let r = residues[idx].rem_euclid(m) as u128;
+        let t = (r * invs[idx] as u128) % m_u;
+        acc += t * m_divs[idx];
+        if acc >= m_big {
+            acc -= m_big;
+        }
+    }
+    acc
 }
 
 fn mod_inv_u128(a: u128, m: u128) -> i32 {
@@ -433,9 +443,16 @@ fn mod_inv_u128(a: u128, m: u128) -> i32 {
 /// (Uchino, Ozaki & Imamura, arXiv:2504.08009 / arXiv:2602.02549) across `INT8`, `FP8 E4M3`,
 /// or **Blackwell FP4 (E2M1 Base-13)** (Hayashi, Mukunoki, Hoshino & Katagiri, arXiv:2608.06812).
 ///
-/// Uses linear `O(M)` (`M = 20`) modular GEMMs with zero FMA contraction and exact
-/// double-double CRT reconstruction (`INT8`, `FP8`, and `FP4` produce **bit-exact identical**
-/// outputs to `< 1e-14` of native `f64`!).
+/// Uses linear `O(M)` (`M = 20`) modular GEMMs with zero FMA contraction and an **exact
+/// 128-bit integer CRT reconstruction** (`INT8`, `FP8`, and `FP4` produce bit-identical
+/// results to each other and, for identical inputs, bit-identical results to the live
+/// CUDA [`ozaki2_crt_gemm_with_cuda`] Stage-4 reconstruction).
+///
+/// Invariant: with `shift = ozaki2_shift_bits(K)`, every scaled limb is
+/// `q = round(a * 2^(shift - e))` with `|q| <= 2^shift`, so
+/// `|sum_t q_a q_b| <= K * 2^(2*shift) < M_BIG / 2` for the shipped `K` budget. The CRT
+/// therefore recovers the signed integer product exactly, and both the CPU and GPU paths
+/// convert that same `u128` to `f64` with the identical `hi * 2^64 + lo` operation.
 pub fn ozaki2_crt_gemm(a: &[Vec<f64>], b: &[Vec<f64>], backend: TensorBackend) -> Vec<Vec<f64>> {
     let m_rows = a.len();
     let k_dim = a[0].len();
@@ -446,52 +463,43 @@ pub fn ozaki2_crt_gemm(a: &[Vec<f64>], b: &[Vec<f64>], backend: TensorBackend) -
     for &m in &OZAKI2_MODULI {
         m_big *= m as u128;
     }
+    let m_half = m_big / 2;
     let mut invs = [0i32; 20];
-    let mut inv_m_dd = [(0.0_f64, 0.0_f64); 20];
+    let mut m_divs = [0u128; 20];
     for (idx, &m) in OZAKI2_MODULI.iter().enumerate() {
-        invs[idx] = mod_inv_u128(m_big / (m as u128), m as u128);
-        let mf = m as f64;
-        let hi = 1.0 / mf;
-        let (p_hi, p_err) = two_prod_nofma(mf, hi);
-        let lo = ((1.0 - p_hi) - p_err) / mf;
-        inv_m_dd[idx] = (hi, lo);
+        m_divs[idx] = m_big / (m as u128);
+        invs[idx] = mod_inv_u128(m_divs[idx], m as u128);
     }
 
-    // Exact double-double representation of M_big (124 bits -> exact high + mid f64!).
-    let m_hi = m_big as f64;
-    let m_hi_u128 = m_hi as u128;
-    let m_lo = if m_big >= m_hi_u128 {
-        (m_big - m_hi_u128) as f64
-    } else {
-        -((m_hi_u128 - m_big) as f64)
-    };
-
-    // Scale rows of A and columns of B to 53-bit exact integers (preserving every mantissa bit).
-    let mut sa = vec![0.0_f64; m_rows];
+    // Scale rows of A and columns of B to exact `shift`-bit integers (all 53 mantissa bits
+    // when K <= 131072). `i32::MIN` marks an identically-zero row/column.
+    let shift = ozaki2_shift_bits(k_dim);
+    let mut ea = vec![i32::MIN; m_rows];
     let mut a_int = vec![vec![0i64; k_dim]; m_rows];
     for i in 0..m_rows {
         let mx = a[i].iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
         if mx == 0.0 {
             continue;
         }
-        let sc = ldexp_exact(1.0, frexp_exp(mx) - 53);
-        sa[i] = sc;
+        ea[i] = frexp_exp(mx);
+        let sc = ldexp_exact(1.0, ea[i] - shift);
         for t in 0..k_dim {
-            a_int[i][t] = (a[i][t] / sc).round() as i64;
+            // round_ties_even matches the device `llrint` (round-to-nearest-even) exactly.
+            a_int[i][t] = (a[i][t] / sc).round_ties_even() as i64;
         }
     }
 
-    let mut sb = vec![0.0_f64; n_cols];
+    let mut eb = vec![i32::MIN; n_cols];
     let mut b_int = vec![vec![0i64; n_cols]; k_dim];
     for j in 0..n_cols {
         let mx = (0..k_dim).map(|t| b[t][j].abs()).fold(0.0_f64, f64::max);
         if mx == 0.0 {
             continue;
         }
-        let sc = ldexp_exact(1.0, frexp_exp(mx) - 53);
-        sb[j] = sc;
+        eb[j] = frexp_exp(mx);
+        let sc = ldexp_exact(1.0, eb[j] - shift);
         for t in 0..k_dim {
-            b_int[t][j] = (b[t][j] / sc).round() as i64;
+            b_int[t][j] = (b[t][j] / sc).round_ties_even() as i64;
         }
     }
 
@@ -590,31 +598,35 @@ pub fn ozaki2_crt_gemm(a: &[Vec<f64>], b: &[Vec<f64>], backend: TensorBackend) -
         }
     }
 
-    // Exact double-double Chinese Remainder Theorem reconstruction (Uchino–Ozaki–Imamura).
+    // Exact 128-bit integer Chinese Remainder Theorem reconstruction (Uchino–Ozaki–Imamura).
+    //
+    // Identical arithmetic to the live CUDA `g6me_ozaki2_crt_reconstruct_u128_f64` Stage 4:
+    // canonical residues -> `t = r * (M/m)^-1 mod m` -> `acc += t * (M/m)` (all in `u128`,
+    // folded mod `M` each step) -> balanced signed magnitude -> `hi * 2^64 + lo` -> `f64`.
     let mut c = vec![vec![0.0_f64; n_cols]; m_rows];
+    let mut residues = [0i32; 20];
     for i in 0..m_rows {
-        if sa[i] == 0.0 {
+        if ea[i] == i32::MIN {
             continue;
         }
         for j in 0..n_cols {
-            if sb[j] == 0.0 {
+            if eb[j] == i32::MIN {
                 continue;
             }
-            let mut acc = (0.0_f64, 0.0_f64);
-            for (idx, &m) in OZAKI2_MODULI.iter().enumerate() {
-                let y = sym_mod_i64((c_mods[idx][i][j] as i64) * (invs[idx] as i64), m);
-                if y != 0 {
-                    let yf = y as f64;
-                    let (hi, lo) = inv_m_dd[idx];
-                    let (p, p_err) = two_prod_nofma(yf, hi);
-                    let term = two_sum(p, p_err + yf * lo);
-                    acc = dd_add(acc, term);
-                }
+            for (idx, slot) in residues.iter_mut().enumerate() {
+                *slot = c_mods[idx][i][j];
             }
-            let q = acc.0.round();
-            let frac = dd_add(acc, (-q, 0.0));
-            let c_int_est = frac.0 * m_hi + (frac.0 * m_lo + frac.1 * m_hi);
-            c[i][j] = c_int_est * (sa[i] * sb[j]);
+            let acc = crt_accumulate(&residues, m_big, &invs, &m_divs);
+            let neg = acc > m_half;
+            let mag = if neg { m_big - acc } else { acc };
+            let hi = (mag >> 64) as u64;
+            let lo = mag as u64;
+            // Bit-identical to `__dadd_rn(__dmul_rn((double)hi, 2^64), (double)lo)`.
+            let mut val = (hi as f64) * 18_446_744_073_709_551_616.0_f64 + (lo as f64);
+            if neg {
+                val = -val;
+            }
+            c[i][j] = ldexp_exact(val, ea[i] + eb[j] - 2 * shift);
         }
     }
     c
@@ -1345,8 +1357,8 @@ pub fn compile_and_audit_cuda_sass(arch: &str) -> CudaAuditStatus {
 #[serde(rename_all = "kebab-case")]
 pub enum CudaTensorPrecision {
     /// Automatically pick the highest-throughput Tensor Core format for the detected GPU:
-    /// single-limb `INT8` (one MMA per modulus) on desktop Blackwell/Hopper/Ada/Ampere/Turing,
-    /// and `NVFP4 E2M1` only on Blackwell Ultra (`sm_103a`), where INT8 Tensor Core rate drops.
+    /// single-limb `INT8` (one MMA per modulus) on Blackwell/Hopper/Ada/Ampere/Turing.
+    /// `NVFP4 E2M1` is never automatic; it is an explicit `sm_120a` opt-in.
     #[default]
     Auto,
     /// Blackwell (`sm_120a`) NVFP4 E2M1 Base-13 2-limb (`OMMA.SF.16864` with UE4M3=2.0 → FP32 → u128 CRT → FP64).
@@ -1415,20 +1427,16 @@ impl CudaTensorPrecision {
     /// - Single-limb INT8 fits in 1 byte (`1 MMA/mod`, exact S32 accumulation) and delivers the highest
     ///   effective Ozaki-II FP64 throughput on every desktop generation: Blackwell (41.9 TF),
     ///   Ada (33.0 TF), Ampere (14.2 TF), Turing (10.8 TF), and Pascal `__dp4a` (2.27 TF).
-    /// - Blackwell Ultra (`cc == 103`, B300) drops native INT8 TC rate, so `Auto` picks `Nvfp4E2m1`.
+    /// - `Auto` therefore always resolves to `Int8`. NVFP4 is an explicit opt-in available only
+    ///   on `sm_120a`; B200/B300 (`sm_100a`/`sm_103a`) would need a `tcgen05` FP4 kernel that this
+    ///   crate does not implement, so an explicit NVFP4 request there downgrades to FP8.
     pub fn resolve_for_cc(self, major: i32, minor: i32) -> Self {
         let cc = major * 10 + minor;
-        let has_fp4 = cc >= 120 || cc == 100 || cc == 103;
+        let has_fp4 = cc == 120;
         let has_fp8 = cc >= 89;
         let has_fp16_tc = cc >= 75;
         match self {
-            Self::Auto => {
-                if cc == 103 && has_fp4 {
-                    Self::Nvfp4E2m1
-                } else {
-                    Self::Int8
-                }
-            }
+            Self::Auto => Self::Int8,
             Self::Nvfp4E2m1 => {
                 if has_fp4 {
                     Self::Nvfp4E2m1
@@ -1495,7 +1503,7 @@ pub struct CudaArchCapability {
 }
 
 /// Capability matrix across all 6 supported desktop & datacenter NVIDIA GPU generations.
-pub const ALL_CUDA_ARCH_CAPABILITIES: [CudaArchCapability; 6] = [
+pub const ALL_CUDA_ARCH_CAPABILITIES: [CudaArchCapability; 7] = [
     CudaArchCapability {
         arch_name: "Blackwell (RTX 5090 / 5080)",
         sm_target: "sm_120a",
@@ -1506,6 +1514,18 @@ pub const ALL_CUDA_ARCH_CAPABILITIES: [CudaArchCapability; 6] = [
         supports_fp16: true,
         default_precision: CudaTensorPrecision::Int8,
         mma_summary: "IMMA.16832 S8→S32 (838 eff TOPS, ~41.9 TF FP64); opt OMMA.SF NVFP4 (419 eff)",
+        non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
+    },
+    CudaArchCapability {
+        arch_name: "Blackwell datacenter (B200 / B300)",
+        sm_target: "sm_100 / sm_103",
+        cc_range: "CC 10.0–10.3",
+        supports_nvfp4: false,
+        supports_fp8: true,
+        supports_int8: true,
+        supports_fp16: true,
+        default_precision: CudaTensorPrecision::Int8,
+        mma_summary: "IMMA.16832 S8→S32 (exact 1-limb); opt FP8 QMMA / FP16 HMMA (FP4 needs tcgen05, not implemented)",
         non_gemm_summary: "FDTD/BEM/RayTrace/Stockham: Zero-FMA FP64; NTT: Exact u64",
     },
     CudaArchCapability {
@@ -1575,16 +1595,18 @@ pub fn arch_capability_for_cc(major: i32, minor: i32) -> CudaArchCapability {
     let cc = major * 10 + minor;
     if cc >= 120 {
         ALL_CUDA_ARCH_CAPABILITIES[0]
-    } else if cc >= 90 {
+    } else if cc >= 100 {
         ALL_CUDA_ARCH_CAPABILITIES[1]
-    } else if cc >= 89 {
+    } else if cc >= 90 {
         ALL_CUDA_ARCH_CAPABILITIES[2]
-    } else if cc >= 80 {
+    } else if cc >= 89 {
         ALL_CUDA_ARCH_CAPABILITIES[3]
-    } else if cc >= 75 {
+    } else if cc >= 80 {
         ALL_CUDA_ARCH_CAPABILITIES[4]
-    } else {
+    } else if cc >= 75 {
         ALL_CUDA_ARCH_CAPABILITIES[5]
+    } else {
+        ALL_CUDA_ARCH_CAPABILITIES[6]
     }
 }
 
@@ -1641,9 +1663,19 @@ pub fn cuda_hardware_summary() -> Option<String> {
 }
 
 /// Initialize the real zero-FMA CUDA Driver runtime (`g6me-cuda`) on device 0.
+///
+/// The result (success or the init error) is cached process-wide, so calling this from the
+/// CLI to report an unavailable runtime and later from the DSP stages returns the same
+/// instance rather than compiling the six kernels twice.
 #[cfg(feature = "cuda")]
-pub fn try_init_cuda_runtime() -> std::result::Result<g6me_cuda::G6meCudaRuntime, String> {
-    g6me_cuda::G6meCudaRuntime::init()
+pub fn try_init_cuda_runtime(
+) -> std::result::Result<std::sync::Arc<g6me_cuda::G6meCudaRuntime>, String> {
+    use std::sync::{Arc, OnceLock};
+    static RUNTIME: OnceLock<std::result::Result<Arc<g6me_cuda::G6meCudaRuntime>, String>> =
+        OnceLock::new();
+    RUNTIME
+        .get_or_init(|| g6me_cuda::G6meCudaRuntime::init().map(Arc::new))
+        .clone()
 }
 
 /// Process-wide cached CUDA runtime (`OnceLock`) so `nvcc --fmad=false` PTX compilation and
@@ -1651,14 +1683,7 @@ pub fn try_init_cuda_runtime() -> std::result::Result<g6me_cuda::G6meCudaRuntime
 /// Stockham FFT, and Goldilocks NTT.
 #[cfg(feature = "cuda")]
 pub fn shared_cuda_runtime() -> Option<std::sync::Arc<g6me_cuda::G6meCudaRuntime>> {
-    use std::sync::{Arc, OnceLock};
-    static RUNTIME: OnceLock<std::result::Result<Arc<g6me_cuda::G6meCudaRuntime>, String>> =
-        OnceLock::new();
-    RUNTIME
-        .get_or_init(|| g6me_cuda::G6meCudaRuntime::init().map(Arc::new))
-        .as_ref()
-        .ok()
-        .cloned()
+    try_init_cuda_runtime().ok()
 }
 
 #[cfg(test)]
@@ -1867,6 +1892,284 @@ mod tests {
                 assert!(ptx_reference_instructions >= 40);
             }
             CudaAuditStatus::Failed(msg) => panic!("CUDA SASS audit failed: {msg}"),
+        }
+    }
+
+    /// Deterministic Ozaki-II operand generator: wide per-row/column exponent spread plus an
+    /// all-zero final row and column so the `i32::MIN` sentinel path runs on both CPU and GPU.
+    fn ozaki2_test_matrices(m: usize, k: usize, n: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || -> f64 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((seed >> 11) as f64) / ((1u64 << 53) as f64);
+            let exp = ((seed >> 3) % 21) as i32 - 10;
+            (u * 2.0 - 1.0) * 2f64.powi(exp)
+        };
+        let mut a: Vec<Vec<f64>> = (0..m).map(|_| (0..k).map(|_| next()).collect()).collect();
+        let mut b: Vec<Vec<f64>> = (0..k).map(|_| (0..n).map(|_| next()).collect()).collect();
+        if m > 1 {
+            a[m - 1].fill(0.0);
+        }
+        if n > 1 {
+            for row in &mut b {
+                row[n - 1] = 0.0;
+            }
+        }
+        (a, b)
+    }
+
+    /// Production-exact limb scaling: `frexp_exp(max|v|)` then `round_ties_even(v / 2^(e-shift))`,
+    /// mirroring `ozaki2_crt_gemm` and the CUDA Stage-1 kernel.
+    fn ozaki2_test_scaled_limbs(v: &[f64], shift: i32) -> (i32, Vec<i64>) {
+        let mx = v.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+        if mx == 0.0 {
+            return (i32::MIN, vec![0; v.len()]);
+        }
+        let e = frexp_exp(mx);
+        let sc = ldexp_exact(1.0, e - shift);
+        (
+            e,
+            v.iter()
+                .map(|&x| (x / sc).round_ties_even() as i64)
+                .collect(),
+        )
+    }
+
+    /// Independent reference: the exact `i128` limb-product integer per cell (no modular
+    /// arithmetic), plus the documented `hi * 2^64 + lo -> f64` conversion shared by CPU and
+    /// GPU Stage 4. Zero rows/columns produce exact zeros.
+    fn ozaki2_test_exact_limb_product(
+        a: &[Vec<f64>],
+        b: &[Vec<f64>],
+    ) -> (Vec<Vec<i128>>, Vec<Vec<f64>>) {
+        let m_rows = a.len();
+        let k_dim = a[0].len();
+        let n_cols = b[0].len();
+        let shift = ozaki2_shift_bits(k_dim);
+        let scaled_a: Vec<(i32, Vec<i64>)> = a
+            .iter()
+            .map(|row| ozaki2_test_scaled_limbs(row, shift))
+            .collect();
+        let ea: Vec<i32> = scaled_a.iter().map(|(e, _)| *e).collect();
+        let mut eb = vec![i32::MIN; n_cols];
+        let mut b_int = vec![vec![0i64; n_cols]; k_dim];
+        for j in 0..n_cols {
+            let col: Vec<f64> = (0..k_dim).map(|t| b[t][j]).collect();
+            let (e, q) = ozaki2_test_scaled_limbs(&col, shift);
+            eb[j] = e;
+            for t in 0..k_dim {
+                b_int[t][j] = q[t];
+            }
+        }
+        let mut ints = vec![vec![0i128; n_cols]; m_rows];
+        let mut vals = vec![vec![0.0_f64; n_cols]; m_rows];
+        for i in 0..m_rows {
+            for j in 0..n_cols {
+                if ea[i] == i32::MIN || eb[j] == i32::MIN {
+                    continue;
+                }
+                let mut acc = 0i128;
+                for t in 0..k_dim {
+                    acc += scaled_a[i].1[t] as i128 * b_int[t][j] as i128;
+                }
+                ints[i][j] = acc;
+                let mag = acc.unsigned_abs();
+                let hi = (mag >> 64) as u64;
+                let lo = mag as u64;
+                let mut val = (hi as f64) * 18_446_744_073_709_551_616.0_f64 + (lo as f64);
+                if acc < 0 {
+                    val = -val;
+                }
+                vals[i][j] = ldexp_exact(val, ea[i] + eb[j] - 2 * shift);
+            }
+        }
+        (ints, vals)
+    }
+
+    /// `M_BIG`, CRT inverse constants and `M/m` multipliers, identical to `ozaki2_crt_gemm`.
+    fn ozaki2_test_crt_constants() -> (u128, [i32; 20], [u128; 20]) {
+        let mut m_big = 1u128;
+        for &m in &OZAKI2_MODULI {
+            m_big *= m as u128;
+        }
+        let mut invs = [0i32; 20];
+        let mut m_divs = [0u128; 20];
+        for (idx, &m) in OZAKI2_MODULI.iter().enumerate() {
+            m_divs[idx] = m_big / (m as u128);
+            invs[idx] = mod_inv_u128(m_divs[idx], m as u128);
+        }
+        (m_big, invs, m_divs)
+    }
+
+    /// Exactness at the *integer* level: the CRT accumulation must return the balanced residue
+    /// whose signed magnitude equals the direct `i128` limb-product sum `sum_t q_a * q_b`, for
+    /// every backend and every cell (including padded K and zero rows/columns). The final `f64`
+    /// must also be bit-identical to the documented `hi * 2^64 + lo` conversion. This is
+    /// stronger than any backward-error bound: a one-limb CRT/rounding error would show here
+    /// even when the resulting `f64` rounds to the same value.
+    #[test]
+    fn ozaki2_crt_reconstructs_exact_integer_limb_product() {
+        let (m_big, invs, m_divs) = ozaki2_test_crt_constants();
+        let m_half = m_big / 2;
+        for &(m_rows, k_dim, n_cols) in &[(5usize, 17usize, 7usize), (16, 64, 8), (3, 129, 4)] {
+            let (a, b) = ozaki2_test_matrices(m_rows, k_dim, n_cols);
+            let shift = ozaki2_shift_bits(k_dim);
+            let (ints, vals) = ozaki2_test_exact_limb_product(&a, &b);
+
+            let mut ea = vec![i32::MIN; m_rows];
+            let mut a_int = vec![vec![0i64; k_dim]; m_rows];
+            for i in 0..m_rows {
+                let (e, q) = ozaki2_test_scaled_limbs(&a[i], shift);
+                ea[i] = e;
+                a_int[i] = q;
+            }
+            let mut eb = vec![i32::MIN; n_cols];
+            let mut b_int = vec![vec![0i64; n_cols]; k_dim];
+            for j in 0..n_cols {
+                let col: Vec<f64> = (0..k_dim).map(|t| b[t][j]).collect();
+                let (e, q) = ozaki2_test_scaled_limbs(&col, shift);
+                eb[j] = e;
+                for t in 0..k_dim {
+                    b_int[t][j] = q[t];
+                }
+            }
+
+            for backend in [
+                TensorBackend::Int8,
+                TensorBackend::Fp8E4m3,
+                TensorBackend::Fp4E2m1Base13,
+            ] {
+                let c = ozaki2_crt_gemm(&a, &b, backend);
+                for i in 0..m_rows {
+                    for j in 0..n_cols {
+                        if ea[i] == i32::MIN || eb[j] == i32::MIN {
+                            assert_eq!(
+                                c[i][j].to_bits(),
+                                0.0_f64.to_bits(),
+                                "{backend:?} zero row/col ({i},{j}) must be +0.0"
+                            );
+                            continue;
+                        }
+                        // Residues exactly as the production INT8 substrate computes them.
+                        let mut residues = [0i32; 20];
+                        for (idx, &modu) in OZAKI2_MODULI.iter().enumerate() {
+                            let mut acc = 0i64;
+                            for t in 0..k_dim {
+                                acc += sym_mod_i64(a_int[i][t], modu) as i64
+                                    * sym_mod_i64(b_int[t][j], modu) as i64;
+                            }
+                            residues[idx] = sym_mod_i64(acc, modu);
+                        }
+                        let acc = crt_accumulate(&residues, m_big, &invs, &m_divs);
+                        let neg = acc > m_half;
+                        let mag = if neg { m_big - acc } else { acc };
+                        let want = ints[i][j];
+                        assert_eq!(
+                            neg,
+                            want < 0,
+                            "{backend:?} shape {m_rows}x{k_dim}x{n_cols} cell ({i},{j}): \
+                             CRT sign disagrees with exact i128 limb product {want}"
+                        );
+                        assert_eq!(
+                            mag,
+                            want.unsigned_abs(),
+                            "{backend:?} shape {m_rows}x{k_dim}x{n_cols} cell ({i},{j}): \
+                             CRT magnitude {mag} != exact i128 limb product magnitude {}",
+                            want.unsigned_abs()
+                        );
+                        assert_eq!(
+                            c[i][j].to_bits(),
+                            vals[i][j].to_bits(),
+                            "{backend:?} shape {m_rows}x{k_dim}x{n_cols} cell ({i},{j}): \
+                             f64 {} != exact-conversion reference {}",
+                            c[i][j],
+                            vals[i][j]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Live CPU-vs-GPU Ozaki-II parity across every selectable Tensor Core precision and ragged
+    /// shapes: the GPU reconstruction must be bit-identical to the CPU exact-u128 CRT path, and
+    /// both must match the independent exact-integer limb-product reference.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn ozaki2_crt_cpu_gpu_bit_exact_and_integer_exact() {
+        let Some(rt) = shared_cuda_runtime() else {
+            eprintln!("skipping Ozaki-II CPU/GPU parity: no CUDA device/runtime");
+            return;
+        };
+        for &(m_rows, k_dim, n_cols) in &[(2usize, 17usize, 3usize), (16, 64, 8), (5, 129, 4)] {
+            let (a, b) = ozaki2_test_matrices(m_rows, k_dim, n_cols);
+            let a_flat: Vec<f64> = a.iter().flatten().copied().collect();
+            let b_flat: Vec<f64> = b.iter().flatten().copied().collect();
+            let c_cpu = ozaki2_crt_gemm(&a, &b, TensorBackend::Int8);
+            let (_ints, vals) = ozaki2_test_exact_limb_product(&a, &b);
+
+            for precision in CudaTensorPrecision::ALL {
+                let (c_gpu_flat, used) = rt
+                    .run_ozaki2_crt_gemm(
+                        &a_flat,
+                        &b_flat,
+                        m_rows,
+                        k_dim,
+                        n_cols,
+                        precision.to_cuda(),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("GPU Ozaki-II {precision:?} shape {m_rows}x{k_dim}x{n_cols}: {e}")
+                    });
+                assert_eq!(c_gpu_flat.len(), m_rows * n_cols);
+                for i in 0..m_rows {
+                    for j in 0..n_cols {
+                        let gpu = c_gpu_flat[i * n_cols + j];
+                        assert_eq!(
+                            gpu.to_bits(),
+                            c_cpu[i][j].to_bits(),
+                            "GPU {precision:?} (resolved {used:?}) cell ({i},{j}) {} != CPU {}",
+                            gpu,
+                            c_cpu[i][j]
+                        );
+                        assert_eq!(
+                            gpu.to_bits(),
+                            vals[i][j].to_bits(),
+                            "GPU {precision:?} (resolved {used:?}) cell ({i},{j}) {} \
+                             != exact limb-product reference {}",
+                            gpu,
+                            vals[i][j]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// CPU and GPU Stage-1 limb decomposition must agree on the fixed-point exponent for every
+    /// K, including the `K > 131072` branch where the shift is reduced below 53 bits.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn ozaki2_shift_bits_matches_cuda_crate() {
+        for &k in &[
+            1usize,
+            7,
+            64,
+            1024,
+            4096,
+            65_536,
+            131_072,
+            131_073,
+            1 << 18,
+            1 << 20,
+        ] {
+            assert_eq!(
+                ozaki2_shift_bits(k),
+                g6me_cuda::ozaki2_shift_bits(k),
+                "CPU/GPU Ozaki-II fixed-point shift disagrees at k={k}"
+            );
         }
     }
 }
