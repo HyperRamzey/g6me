@@ -2133,17 +2133,6 @@ fn deinterleave_block<T: Copy + Default>(
     dst
 }
 
-/// Decode full linear RGB + luminance pixels directly from a binary DNG file buffer,
-/// applying parsed `OpcodeList2` (`GainMap`) and `OpcodeList3` (`FixVignetteRadial`)
-/// radiometrically while keeping `WarpRectilinear` strictly analytical (zero pixel warping!).
-///
-/// Supports:
-/// - `Compression = 1` (Uncompressed 8/10/12/14/16-bit, strips or tiles)
-/// - `Compression = 7` (Lossless JPEG SOF3 ITU-T T.81, strips or tiles)
-/// - `Compression = 52546` (DNG 1.7 JPEG-XL strips or tiles via `jxl-oxide`, including
-///   `RowInterleaveFactor` 50975 / `ColumnInterleaveFactor` 52547 de-interleaving)
-/// - `Photometric = 32803` (CFA Bayer, demosaiced via Malvar–He–Cutler `f64`) and
-///   `Photometric = 34892` (LinearRaw 1-ch gray or 3-ch RGB)
 /// Apply one DNG `OpcodeList` to a `width x height x spp` pixel buffer, in file order.
 ///
 /// DNG 1.7.1 Chapter 7: opcodes in a list are applied sequentially, and image values are
@@ -2211,6 +2200,17 @@ fn apply_opcode_list(
     Ok(())
 }
 
+/// Decode full linear RGB + luminance pixels directly from a binary DNG file buffer,
+/// applying parsed `OpcodeList2` (`GainMap`) and `OpcodeList3` (`FixVignetteRadial`)
+/// radiometrically while keeping `WarpRectilinear` strictly analytical (zero pixel warping!).
+///
+/// Supports:
+/// - `Compression = 1` (Uncompressed 8/10/12/14/16-bit, strips or tiles)
+/// - `Compression = 7` (Lossless JPEG SOF3 ITU-T T.81, strips or tiles)
+/// - `Compression = 52546` (DNG 1.7 JPEG-XL strips or tiles via `jxl-oxide`, including
+///   `RowInterleaveFactor` 50975 / `ColumnInterleaveFactor` 52547 de-interleaving)
+/// - `Photometric = 32803` (CFA Bayer, demosaiced via Malvar–He–Cutler `f64`) and
+///   `Photometric = 34892` (LinearRaw 1-ch gray or 3-ch RGB)
 pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
     let (meta, layout, opcodes) = parse_dng_with_opcodes(buf)?;
     if meta.main_width == 0 || meta.main_height == 0 {
@@ -3996,7 +3996,7 @@ mod tests {
             if payload.len() <= 4 {
                 inline[..payload.len()].copy_from_slice(payload);
             } else {
-                while extra.len() % 2 != 0 {
+                while !extra.len().is_multiple_of(2) {
                     extra.push(0);
                 }
                 let off = (TINY_EXTRA_OFF + extra.len()) as u32;
@@ -4424,8 +4424,8 @@ mod tests {
         ]);
         let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode ordered opcode list");
         for px in &dec.rgb {
-            for c in 0..3 {
-                assert!((px[c] - 0.5).abs() < 1e-12, "expected 0.5, got {}", px[c]);
+            for &v in px {
+                assert!((v - 0.5).abs() < 1e-12, "expected 0.5, got {v}");
             }
         }
 
@@ -4459,11 +4459,10 @@ mod tests {
         )]);
         let dec1 = decode_dng_bytes(&build_tiny_dng(&spec1)).expect("decode List1 DNG");
         for px in &dec1.rgb {
-            for c in 0..3 {
+            for &v in px {
                 assert!(
-                    (px[c] - 1.275).abs() < 1e-12,
-                    "List1 must clip raw 8-bit to 255 before normalization, got {}",
-                    px[c]
+                    (v - 1.275).abs() < 1e-12,
+                    "List1 must clip raw 8-bit to 255 before normalization, got {v}"
                 );
             }
         }
