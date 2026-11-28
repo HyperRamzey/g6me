@@ -66,6 +66,7 @@ pub mod loudness;
 pub mod mask;
 pub mod meter;
 pub mod ntt;
+pub mod pchip;
 pub mod pcm;
 pub mod pipeline;
 pub mod plus;

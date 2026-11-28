@@ -7,8 +7,9 @@
 //! 2. Dual-resonance nonlinear basilar membrane: a third-order wideband gammatone control
 //!    path drives the OHC Boltzmann nonlinearity (asymmetry 7), a 600 Hz low-pass and the
 //!    `NLafterohc` time-constant law; the signal path is a tenth-order chirp filter (C1)
-//!    whose poles are steered by that control path, in parallel with the unsteered C2
-//!    chirp filter.
+//!    whose poles are steered by that control path, in parallel with the C2 chirp filter,
+//!    whose damping is fixed at the OHC-impaired value `1/bmTaumin` (the reference calls
+//!    `C2ChirpFilt` with `1/ratiobm`).
 //! 3. IHC: `NLogarithm` transduction (slope 0.1, asymmetry 3) for C1, square-law C2
 //!    transduction, a 3 kHz seventh-order membrane low-pass and the cat cochlear delay.
 //! 4. BEZ 2018 synapse: Eq. 1 IHC→PLA mapping with the Eq. 2–6 CF/SR factors and the
@@ -21,17 +22,37 @@
 //! Provenance: the ZBC 2014 JASA paper text could not be retrieved; the middle-ear, BM
 //! and IHC equations and parameters follow the authors' reference implementation
 //! (`BEZ2018a_model/model_IHC_BEZ2018a.c`), which is the normative implementation of that
-//! paper. The synapse follows the published BEZ 2018 equations and Table 1. The
-//! reference's `ffGn_2018a` generator is not part of the archive, so fGn is synthesized
-//! here by FFT with the published Hurst exponent 0.9 and the published per-class standard
-//! deviations (1 /s low, 10 /s medium, SR/2 high). Stimuli are band-limited resampled to
-//! the model's 100 kHz internal rate, as `generate_neurogram_BEZ2018a.m` requires.
+//! paper. The synapse follows the published BEZ 2018 equations and Table 1. The reference
+//! distribution's `ffGn_2018a` generator shapes circulant-embedded fGn and resamples it
+//! from a 0.1 s grid, whereas this port synthesizes full-band fGn by FFT at the synapse
+//! rate with the same Hurst exponent 0.9 and the same per-class standard deviations
+//! (1 /s low, 10 /s medium, SR/2 high); the two are statistically equivalent in mean and
+//! variance but not in bandwidth. Stimuli are band-limited resampled to the model's
+//! 100 kHz internal rate, as `generate_neurogram_BEZ2018a.m` requires.
+//!
+//! Input calibration: the reference model takes a pressure waveform in pascals. This port
+//! keeps that convention explicitly through [`PASCAL_PER_UNIT`]: one input unit is one
+//! pascal, so a full-scale sinusoid (peak amplitude 1.0) is [`FULL_SCALE_PEAK_SPL_DB`]
+//! (93.98 dB SPL peak, 90.97 dB SPL RMS). Attenuate the signal (or scale the units) to
+//! drive the model at lower levels; the IHC asymmetry uses the same 20 µPa reference.
 
 use crate::fft::{i0, Complex, FftPlan};
 use std::f64::consts::{PI, TAU};
 
 /// Internal sampling rate of the reference model (Hz).
 pub const ZBC_INTERNAL_FS: f64 = 100_000.0;
+/// Reference pressure of the dB SPL scale (Pa), as used by the IHC asymmetry.
+const REFERENCE_PRESSURE_PA: f64 = 20e-6;
+/// Sound-pressure calibration of the model input: one input unit is this many
+/// pascals. The reference model is driven by a pressure waveform in Pa, so the
+/// natural convention is one unit per pascal.
+pub const PASCAL_PER_UNIT: f64 = 1.0;
+/// SPL of a full-scale input sample (peak amplitude [`PASCAL_PER_UNIT`]).
+///
+/// `20*log10(1 Pa / 20 uPa) = 93.9794 dB SPL` peak, i.e. `90.9691 dB SPL` RMS
+/// for a sinusoid. The reference's `NLogarithm` uses the same 20 uPa reference,
+/// so no further scaling is applied inside the model.
+pub const FULL_SCALE_PEAK_SPL_DB: f64 = 93.979_400_086_720_37;
 /// Number of synaptic release sites per fiber.
 const N_SITES: usize = 4;
 /// Short-term adaptation time constant of the mean redocking time (s).
@@ -204,10 +225,7 @@ pub fn population_for(cfs: &[f64]) -> Vec<[FiberSpec; 3]> {
                 spont_rate: spont,
                 tabs_s: 0.2085e-3 + u * (0.6915e-3 - 0.2085e-3),
                 trel_s: 0.1310e-3 + u * (0.8940e-3 - 0.1310e-3),
-                seed: 0x9E37_79B9_7F4A_7C15
-                    ^ ((ch as u64) << 32)
-                    ^ ((class as u64) << 8)
-                    ^ 0x5A17,
+                seed: 0x9E37_79B9_7F4A_7C15 ^ ((ch as u64) << 32) ^ ((class as u64) << 8) ^ 0x5A17,
             };
         }
         out.push(fibers);
@@ -358,8 +376,7 @@ impl ChirpFilter {
         ] {
             gain *= (cf_omega - pim).powi(2) + pre * pre;
         }
-        let norm_gain =
-            gain.sqrt() / ((cf_omega * cf_omega + rzero * rzero).sqrt()).powi(5);
+        let norm_gain = gain.sqrt() / ((cf_omega * cf_omega + rzero * rzero).sqrt()).powi(5);
         Self {
             cf_omega,
             fs_bilinear,
@@ -419,7 +436,15 @@ impl WbGammaTone {
         }
     }
 
-    fn step(&mut self, x: f64, tdres: f64, centerfreq: f64, tau: f64, gain: f64, order: usize) -> f64 {
+    fn step(
+        &mut self,
+        x: f64,
+        tdres: f64,
+        centerfreq: f64,
+        tau: f64,
+        gain: f64,
+        order: usize,
+    ) -> f64 {
         self.phase -= TAU * centerfreq * tdres;
         let dtmp = tau * 2.0 / tdres;
         let c1 = (dtmp - 1.0) / (dtmp + 1.0);
@@ -493,7 +518,7 @@ fn n_logarithm(x: f64, slope: f64, asym: f64) -> f64 {
     let strength = 20.0e6 / 10f64.powf(CORNER / 20.0);
     let mut xx = (1.0 + strength * x.abs()).ln() * slope;
     if x < 0.0 {
-        let splx = 20.0 * (-x / 20e-6).log10();
+        let splx = 20.0 * (-x / REFERENCE_PRESSURE_PA).log10();
         let asym_t = asym - (asym - 1.0) / (1.0 + (splx / 5.0).exp());
         xx = -xx / asym_t;
     }
@@ -529,6 +554,9 @@ struct CochlearChannel {
     centerfreq: f64,
     bm_taumax: f64,
     bm_taumin: f64,
+    /// Pole shift of the C2 filter: the reference passes `1/ratiobm` as `fcohc`,
+    /// so C2 runs with the OHC completely impaired (`p1.x = -1/bmTaumin`).
+    c2_rsigma: f64,
     tau_wb_max: f64,
     tau_wb_min: f64,
     wbgain_init: f64,
@@ -570,6 +598,7 @@ impl CochlearChannel {
             centerfreq,
             bm_taumax,
             bm_taumin,
+            c2_rsigma: 1.0 / bm_taumin - 1.0 / bm_taumax,
             tau_wb_max,
             tau_wb_min,
             wbgain_init,
@@ -599,8 +628,7 @@ impl CochlearChannel {
                 self.wbgain,
                 3,
             );
-            let wbout =
-                (self.tauwb / self.tau_wb_max).powi(3) * wbout1 * 10e3 * (cf_max(self.cf));
+            let wbout = (self.tauwb / self.tau_wb_max).powi(3) * wbout1 * 10e3 * (cf_max(self.cf));
             let ohc_nonlin = boltzman(wbout, 7.0, 12.0, 5.0, 5.0);
             let ohcout = self.ohc_lp.step(ohc_nonlin, self.tdres, 600.0, 1.0);
             let tauc1 = nl_after_ohc(ohcout, self.bm_taumin, self.bm_taumax, 7.0);
@@ -621,7 +649,9 @@ impl CochlearChannel {
             self.tauwb = tauwb_new;
 
             let c1 = self.c1.step(meout, rsigma);
-            let c2 = self.c2.step(meout, 0.0);
+            // C2 is the parallel path with the OHC completely impaired (reference
+            // calls C2ChirpFilt with `1/ratiobm`), so its damping is 1/bmTaumin.
+            let c2 = self.c2.step(meout, self.c2_rsigma);
             let c1_v = n_logarithm(c1, 0.1, 3.0);
             let c2_v = -n_logarithm(c2 * c2.abs() * self.cf / 10.0 * self.cf / 2e3, 0.2, 1.0);
             out[k] = self.ihc_lp.step(c1_v + c2_v, self.tdres, 3000.0, 1.0);
@@ -703,14 +733,62 @@ struct PowerLawAdaptation {
 impl PowerLawAdaptation {
     fn new() -> Self {
         Self {
-            n1: Iir2::new(1.0e-3, -0.994466986569624e-3, 2.347e-12, -1.992127932802320, 0.992140616993846),
-            n2: Iir2::new(1.0, -1.997855276593802, 0.997855827934345, -1.999195329360981, 0.999195402928777),
-            n3: Iir2::new(1.0, 0.798261718184977, 0.199131619874064, 0.798261718183851, 0.199131619873480),
-            m1: Iir2::new(0.2, -0.0346984006638638, 3.45967592e-8, -0.491115852967412, 0.055050209956838),
-            m2: Iir2::new(1.0, -0.803462163297112, 0.154962026341513, -1.084520302502860, 0.288760329320566),
-            m3: Iir2::new(1.0, -1.416084732997016, 0.496615555008723, -1.588427084535629, 0.628138993662508),
-            m4: Iir2::new(1.0, -1.830362725074550, 0.836399964176882, -1.886287488516458, 0.888972875389923),
-            m5: Iir2::new(1.0, -1.983165053215032, 0.983193027347456, -1.989549282714008, 0.989558985673023),
+            n1: Iir2::new(
+                1.0e-3,
+                -0.994466986569624e-3,
+                2.347e-12,
+                -1.992127932802320,
+                0.992140616993846,
+            ),
+            n2: Iir2::new(
+                1.0,
+                -1.997855276593802,
+                0.997855827934345,
+                -1.999195329360981,
+                0.999195402928777,
+            ),
+            n3: Iir2::new(
+                1.0,
+                0.798261718184977,
+                0.199131619874064,
+                0.798261718183851,
+                0.199131619873480,
+            ),
+            m1: Iir2::new(
+                0.2,
+                -0.0346984006638638,
+                3.45967592e-8,
+                -0.491115852967412,
+                0.055050209956838,
+            ),
+            m2: Iir2::new(
+                1.0,
+                -0.803462163297112,
+                0.154962026341513,
+                -1.084520302502860,
+                0.288760329320566,
+            ),
+            m3: Iir2::new(
+                1.0,
+                -1.416084732997016,
+                0.496615555008723,
+                -1.588427084535629,
+                0.628138993662508,
+            ),
+            m4: Iir2::new(
+                1.0,
+                -1.830362725074550,
+                0.836399964176882,
+                -1.886287488516458,
+                0.888972875389923,
+            ),
+            m5: Iir2::new(
+                1.0,
+                -1.983165053215032,
+                0.983193027347456,
+                -1.989549282714008,
+                0.989558985673023,
+            ),
             i1: 0.0,
             i2: 0.0,
         }
@@ -722,9 +800,10 @@ impl PowerLawAdaptation {
         let sout1 = (x + noise - 0.15 * self.i1).max(0.0);
         let sout2 = (x - 1000.0 * self.i2).max(0.0);
         self.i2 = self.n3.step(self.n2.step(self.n1.step(sout2)));
-        self.i1 = self
-            .m5
-            .step(self.m4.step(self.m3.step(self.m2.step(self.m1.step(sout1)))));
+        self.i1 = self.m5.step(
+            self.m4
+                .step(self.m3.step(self.m2.step(self.m1.step(sout1)))),
+        );
         sout1 + sout2
     }
 }
@@ -755,10 +834,19 @@ fn map_ihc(v: f64, cf_factor: f64, mult: f64) -> f64 {
     }
 }
 
+/// Taps of the synapse decimation filter (Kaiser-windowed sinc, cutoff 4.5 kHz).
+const DECIMATE_10_TAPS: usize = 63;
+/// Group delay of the symmetric decimation filter, in 100 kHz samples.
+const DECIMATE_10_HALF: usize = DECIMATE_10_TAPS / 2;
+
 /// Anti-aliased 10:1 decimation (Kaiser-windowed sinc, 63 taps, cutoff 4.5 kHz).
+///
+/// Output `j` is the filter centred on input sample `10*j + DECIMATE_10_HALF`,
+/// i.e. it carries a group delay of [`DECIMATE_10_HALF`] input samples that the
+/// caller must compensate ([`upsample_10`] does so).
 fn decimate_10(x: &[f64]) -> Vec<f64> {
-    const N: usize = 63;
-    const HALF: usize = 31;
+    const N: usize = DECIMATE_10_TAPS;
+    const HALF: usize = DECIMATE_10_HALF;
     let fc = 4500.0 / ZBC_INTERNAL_FS;
     let mut h = vec![0.0_f64; N];
     let mut sum = 0.0;
@@ -781,13 +869,41 @@ fn decimate_10(x: &[f64]) -> Vec<f64> {
     for v in h.iter_mut() {
         *v /= sum;
     }
-    let n_out = if x.len() > N { (x.len() - N) / 10 + 1 } else { 0 };
+    let n_out = if x.len() > N {
+        (x.len() - N) / 10 + 1
+    } else {
+        0
+    };
     (0..n_out)
         .map(|j| {
             let c = j * 10 + HALF;
             (0..N).map(|i| h[i] * x[c + i - HALF]).sum()
         })
         .collect()
+}
+
+/// Linear 10 → 100 kHz interpolation of the decimated synapse drive.
+///
+/// `syn10[j]` is centred on input sample `10*j + DECIMATE_10_HALF` (see
+/// [`decimate_10`]), so the read index subtracts that group delay: `out[i]`
+/// interpolates the drive at `pad` sample `i + delaypoint`, matching the
+/// reference's delay-compensated `resample()`.
+fn upsample_10(syn10: &[f64], n: usize, delaypoint: usize) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n];
+    let last = syn10.last().copied().unwrap_or(0.0);
+    for (i, slot) in out.iter_mut().enumerate() {
+        // delaypoint >= 375 for the supported CF range (<= 20 kHz), so the
+        // saturating subtraction only matters for unsupported CFs.
+        let idx = ((i + delaypoint) as isize - DECIMATE_10_HALF as isize).max(0) as usize;
+        let z = idx / 10;
+        let b = idx % 10;
+        *slot = if z + 1 < syn10.len() {
+            syn10[z] + (syn10[z + 1] - syn10[z]) * (b as f64 / 10.0)
+        } else {
+            last
+        };
+    }
+    out
 }
 
 /// Synapse release rate (`Sout`, sp/s) at the internal 100 kHz rate for one fiber.
@@ -802,12 +918,22 @@ fn synapse_output(vihc: &[f64], spec: &FiberSpec, tdres: f64) -> Vec<f64> {
     for &v in vihc {
         mapped.push(map_ihc(v, cf_factor, mult) + 3.0 * spec.spont_rate);
     }
-    // Pre-history and tail padding, exactly as in the reference Synapse().
+    // Pre-history and tail padding as in the reference Synapse(): the first
+    // `delaypoint` samples repeat the mapped drive at the start of the signal.
+    //
+    // The reference's tail loop (`model_Synapse_BEZ2018a.c`, third `powerLawIn`
+    // loop) adds `3*spont` *per sample*, which is a rate ramp, not a resting
+    // value: at CF = 1 kHz with SR = 70 it reaches 3.15e6 sp/s, and the
+    // decimation filter's 31-sample tail sees the first samples of that ramp in
+    // the last output samples. The tail is padding, not physiology, so it holds
+    // the final mapped drive (edge replication) instead; in silence that is the
+    // resting `3*spont` offset.
     let total = n + 3 * delaypoint;
     let mut pad = vec![mapped[0]; total];
     pad[delaypoint..delaypoint + n].copy_from_slice(&mapped);
-    for k in delaypoint + n..total {
-        pad[k] = pad[k - 1] + 3.0 * spec.spont_rate;
+    let tail = pad[delaypoint + n - 1];
+    for slot in &mut pad[delaypoint + n..] {
+        *slot = tail;
     }
     let samp = decimate_10(&pad);
     if samp.is_empty() {
@@ -830,19 +956,43 @@ fn synapse_output(vihc: &[f64], spec: &FiberSpec, tdres: f64) -> Vec<f64> {
     for k in 0..m {
         syn10.push(pla.step(samp[k], noise[k]));
     }
-    // Upsample 10 -> 100 kHz by linear interpolation, then advance past the pre-history.
-    let mut out = vec![0.0_f64; n];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let idx = i + delaypoint;
-        let z = idx / 10;
-        let b = idx % 10;
-        *slot = if z + 1 < syn10.len() {
-            syn10[z] + (syn10[z + 1] - syn10[z]) * (b as f64 / 10.0)
-        } else {
-            *syn10.last().unwrap_or(&0.0)
-        };
+    // Upsample 10 -> 100 kHz by linear interpolation, then advance past the
+    // pre-history. `upsample_10` compensates the decimator's 31-sample group delay.
+    upsample_10(&syn10, n, delaypoint)
+}
+
+/// Sample-index clock for one release site's redocking interval.
+///
+/// The reference compares `floor(one_site_redock/tdres)` with
+/// `floor(elapsed/tdres)`. Accumulating `elapsed` in f64 and re-dividing drifts
+/// across integer boundaries (413 additions of 1e-5 s floor to 412, so the
+/// comparison also holds on the next sample), which delays the `t_rd_jump` and
+/// can fire it twice on consecutive samples. Counting whole samples reproduces
+/// the intended comparison exactly while leaving the RNG draw order untouched.
+#[derive(Clone, Copy, Default)]
+struct RedockClock {
+    /// Redocking interval in whole internal samples.
+    redock_step: i64,
+    /// Whole samples elapsed since the last release.
+    step: i64,
+}
+
+impl RedockClock {
+    /// Arm the clock for a freshly drawn redocking time (s).
+    #[inline]
+    fn arm(&mut self, redock_s: f64, tdres: f64) {
+        self.redock_step = (redock_s / tdres).floor() as i64;
+        self.step = 0;
     }
-    out
+
+    /// Advance one internal sample. Returns true on the single sample at which
+    /// the floored redocking interval is reached.
+    #[inline]
+    fn tick(&mut self) -> bool {
+        let fired = self.step == self.redock_step;
+        self.step += 1;
+        fired
+    }
 }
 
 /// BEZ 2018 spike generator: four release sites, adaptive redocking Eq. 7, absolute and
@@ -855,12 +1005,12 @@ fn generate_spikes(synout: &[f64], spec: &FiberSpec, tdres: f64, rng: &mut Rng) 
     let t_rd_init = T_RD_REST + 0.02e-3 * spec.spont_rate - T_RD_JUMP;
 
     let mut one_site_redock = [0.0_f64; N_SITES];
+    let mut redock = [RedockClock::default(); N_SITES];
     let mut pre_release = [0.0_f64; N_SITES];
     for i in 0..N_SITES {
         one_site_redock[i] = -t_rd_init * rng.uniform().ln();
-        let guess = (N_SITES as f64 / synout[0].max(0.1) + t_rd_init)
-            * rng.uniform().ln()
-            / tdres;
+        redock[i].arm(one_site_redock[i], tdres);
+        let guess = (N_SITES as f64 / synout[0].max(0.1) + t_rd_init) * rng.uniform().ln() / tdres;
         pre_release[i] = (-(n as f64)).max(guess.ceil());
     }
     pre_release.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -886,9 +1036,7 @@ fn generate_spikes(synout: &[f64], spec: &FiberSpec, tdres: f64, rng: &mut Rng) 
         let ki = (k.max(0) as usize).min(last);
         for site in 0..N_SITES {
             if (k as f64) > pre_release[site] {
-                let one_round = (one_site_redock[site] / tdres).floor() as i64;
-                let elapsed_round = (elapsed[site] / tdres).floor() as i64;
-                if one_round == elapsed_round {
+                if redock[site].tick() {
                     current_redocking = previous_redocking + T_RD_JUMP;
                     previous_redocking = current_redocking;
                     t_rd_decay = false;
@@ -901,6 +1049,7 @@ fn generate_spikes(synout: &[f64], spec: &FiberSpec, tdres: f64, rng: &mut Rng) 
             }
             if xsum[site] >= unit_interval[site] as f64 && (k as f64) >= pre_release[site] {
                 one_site_redock[site] = -current_redocking * rng.uniform().ln();
+                redock[site].arm(one_site_redock[site], tdres);
                 let release = previous_release[site] + elapsed[site];
                 elapsed[site] = 0.0;
                 if release >= current_refractory {
@@ -917,8 +1066,8 @@ fn generate_spikes(synout: &[f64], spec: &FiberSpec, tdres: f64, rng: &mut Rng) 
             }
         }
         if t_rd_decay && rd_first {
-            current_redocking = previous_redocking
-                - (tdres / T_RD_TAU) * (previous_redocking - T_RD_REST);
+            current_redocking =
+                previous_redocking - (tdres / T_RD_TAU) * (previous_redocking - T_RD_REST);
             previous_redocking = current_redocking;
         } else {
             t_rd_decay = true;
@@ -937,9 +1086,19 @@ fn fiber_spike_times_100k(x100: &[f64], spec: FiberSpec) -> Vec<f64> {
     generate_spikes(&synout, &spec, tdres, &mut rng)
 }
 
+/// Convert model input samples to pascals ([`PASCAL_PER_UNIT`]).
+#[inline]
+fn to_pascals(x: &[f64]) -> Vec<f64> {
+    x.iter().map(|v| v * PASCAL_PER_UNIT).collect()
+}
+
 /// Spike times (s) of one model fiber in response to `x`.
+///
+/// `x` is the pressure waveform in units of [`PASCAL_PER_UNIT`] (one unit = 1 Pa,
+/// so full scale is 93.98 dB SPL peak).
 pub fn fiber_spike_times(x: &[f64], sample_rate: u32, spec: FiberSpec) -> Vec<f64> {
-    let x100 = resample_to(x, sample_rate.max(8_000) as f64, ZBC_INTERNAL_FS);
+    let x_pa = to_pascals(x);
+    let x100 = resample_to(&x_pa, sample_rate.max(8_000) as f64, ZBC_INTERNAL_FS);
     fiber_spike_times_100k(&x100, spec)
 }
 
@@ -947,13 +1106,9 @@ pub fn fiber_spike_times(x: &[f64], sample_rate: u32, spec: FiberSpec) -> Vec<f6
 ///
 /// Each CF contributes one low-, one medium- and one high-spontaneous-rate fiber; the
 /// binned spike counts of the three fibers are averaged, matching the healthy population
-/// used by `generate_neurogram_BEZ2018a.m`.
-pub fn rate_neurogram(
-    x: &[f64],
-    sample_rate: u32,
-    cfs: &[f64],
-    frame_ms: f64,
-) -> Vec<Vec<f64>> {
+/// used by `generate_neurogram_BEZ2018a.m`. `x` is the pressure waveform in units of
+/// [`PASCAL_PER_UNIT`] (one unit = 1 Pa).
+pub fn rate_neurogram(x: &[f64], sample_rate: u32, cfs: &[f64], frame_ms: f64) -> Vec<Vec<f64>> {
     let fs = sample_rate.max(8_000) as f64;
     let frame_len = ((frame_ms * 1e-3 * fs).round() as usize).max(16);
     let n_frames = x.len() / frame_len;
@@ -962,7 +1117,8 @@ pub fn rate_neurogram(
         return rates;
     }
     let frame_s = frame_len as f64 / fs;
-    let x100 = resample_to(x, fs, ZBC_INTERNAL_FS);
+    let x_pa = to_pascals(x);
+    let x100 = resample_to(&x_pa, fs, ZBC_INTERNAL_FS);
     let population = population_for(cfs);
     let tdres = 1.0 / ZBC_INTERNAL_FS;
     for (ch, fibers) in population.iter().enumerate() {
@@ -982,3 +1138,197 @@ pub fn rate_neurogram(
     rates
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Diagnostic: dump the Rust cochlear output for a 1 kHz, 1 Pa tone so it can
+    /// be compared against the compiled `model_IHC_BEZ2018a.c` reference.
+    #[test]
+    fn dump_ihc_reference_comparison() {
+        let n = 5000;
+        let tdres = 1.0 / ZBC_INTERNAL_FS;
+        let x: Vec<f64> = (0..n)
+            .map(|k| (6.28318530717959 * 1000.0 * k as f64 * tdres).sin())
+            .collect();
+        let mut channel = CochlearChannel::new(1000.0, tdres);
+        let vihc = channel.process(&x);
+        let mut s = String::new();
+        for v in vihc {
+            s.push_str(&format!("{v:.17e}\n"));
+        }
+        std::fs::write("/home/sanjxz/.cache/g6me-papers/zbc/rust_vihc_1k.txt", s)
+            .expect("write diagnostic dump");
+    }
+
+    /// Diagnostic: dump the Rust C1 chirp filter for a unit sine at CF, rsigma = 0.
+    #[test]
+    fn dump_chirp_reference_comparison() {
+        let n = 5000;
+        let tdres: f64 = 1.0 / ZBC_INTERNAL_FS;
+        let cf: f64 = 1000.0;
+        let gain = (26.0 * ((2.2 * (cf / 0.6e3).log10() + 0.15).tanh() + 1.0)).clamp(15.0, 60.0);
+        let q10 = (cf / 1000.0).powf(0.3) * 12.7 * 0.505 + 0.2085;
+        let taumax = 2.0 / (TAU * (cf / q10));
+        let bm_taumax = taumax / 0.7;
+        let mut filter = ChirpFilter::new(cf, tdres, bm_taumax);
+        let mut s = String::new();
+        for k in 0..n {
+            let x = (6.28318530717959 * cf * k as f64 * tdres).sin();
+            let y = filter.step(x, 0.0);
+            s.push_str(&format!("{y:.17e}\n"));
+        }
+        std::fs::write("/home/sanjxz/.cache/g6me-papers/zbc/rust_chirp_1k.txt", s)
+            .expect("write chirp dump");
+        let _ = gain;
+    }
+
+    /// Diagnostic: trace the Rust cochlear loop against the instrumented C.
+    #[test]
+    fn dump_ihc_trace() {
+        let n = 5000;
+        let tdres = 1.0 / ZBC_INTERNAL_FS;
+        let mut ch = CochlearChannel::new(1000.0, tdres);
+        ch.tmpgain = vec![0.0; n];
+        ch.tauwb = ch.tau_wb_max;
+        ch.wbgain = ch.wbgain_init;
+        ch.last_tmpgain = ch.wbgain_init;
+        let mut out = vec![0.0_f64; n];
+        for k in 0..n {
+            let px = (6.28318530717959 * 1000.0 * k as f64 * tdres).sin();
+            let meout = ch.me.step(px);
+            let wbout1 = ch.wb.step(meout, tdres, ch.centerfreq, ch.tauwb, ch.wbgain, 3);
+            let wbout = (ch.tauwb / ch.tau_wb_max).powi(3) * wbout1 * 10e3 * cf_max(ch.cf);
+            let ohc_nonlin = boltzman(wbout, 7.0, 12.0, 5.0, 5.0);
+            let ohcout = ch.ohc_lp.step(ohc_nonlin, tdres, 600.0, 1.0);
+            let tauc1 = nl_after_ohc(ohcout, ch.bm_taumin, ch.bm_taumax, 7.0);
+            let rsigma = 1.0 / tauc1 - 1.0 / ch.bm_taumax;
+            let tauwb_new = ch.tau_wb_max
+                + (tauc1 - ch.bm_taumax) * (ch.tau_wb_max - ch.tau_wb_min)
+                    / (ch.bm_taumax - ch.bm_taumin);
+            let (wb_gain, grd) = gain_groupdelay(tdres, ch.centerfreq, ch.cf, tauwb_new);
+            let idx = k as i64 + grd as i64;
+            if idx >= 0 && (idx as usize) < n {
+                ch.tmpgain[idx as usize] = wb_gain;
+            }
+            if ch.tmpgain[k] == 0.0 {
+                ch.tmpgain[k] = ch.last_tmpgain;
+            }
+            ch.wbgain = ch.tmpgain[k];
+            ch.last_tmpgain = ch.wbgain;
+            ch.tauwb = tauwb_new;
+            let c1 = ch.c1.step(meout, rsigma);
+            let c2 = ch.c2.step(meout, ch.c2_rsigma);
+            let c1_v = n_logarithm(c1, 0.1, 3.0);
+            let c2_v = -n_logarithm(c2 * c2.abs() * ch.cf / 10.0 * ch.cf / 2e3, 0.2, 1.0);
+            out[k] = ch.ihc_lp.step(c1_v + c2_v, tdres, 3000.0, 1.0);
+            if matches!(k, 200 | 201 | 202 | 300 | 301 | 302 | 1000 | 3000 | 4999) {
+                eprintln!(
+                    "RDBG {k} meout={meout:.17e} wbout1={wbout1:.17e} wbout={wbout:.17e} ohcnl={ohc_nonlin:.17e} ohcout={ohcout:.17e} tmptauc1={tauc1:.17e} rsigma={rsigma:.17e} wbgain={wb_gain:.17e} grd={grd} tauwb={tauwb_new:.17e} c1={c1:.17e} c2={c2:.17e} c1v={c1_v:.17e} c2v={c2_v:.17e} vihc={:.17e}",
+                    out[k]
+                );
+            }
+        }
+    }
+
+    /// Diagnostic: measure resting rates, tone-driven rates, latency and chirp gain.
+    #[test]
+    fn diagnostics_measure() {
+        let tdres = 1.0 / ZBC_INTERNAL_FS;
+        let spec = FiberSpec {
+            cf_hz: 1000.0,
+            spont_rate: 70.0,
+            tabs_s: 0.45e-3,
+            trel_s: 0.5e-3,
+            seed: 0x5EED_0001,
+        };
+        // A. Resting synapse drive from silence.
+        let n = 100_000;
+        let vihc = vec![0.0_f64; n];
+        let syn = synapse_output(&vihc, &spec, tdres);
+        let mean_all = syn.iter().sum::<f64>() / n as f64;
+        let tail = &syn[n - 5_000..];
+        let tm = tail.iter().sum::<f64>() / 5_000.0;
+        let ts = (tail.iter().map(|v| (v - tm) * (v - tm)).sum::<f64>() / 5_000.0).sqrt();
+        let max = syn.iter().cloned().fold(f64::MIN, f64::max);
+        eprintln!(
+            "REST mean_all={mean_all:.6} tail_mean={tm:.6} tail_std={ts:.6} max={max:.6}"
+        );
+        // B. Constant-drive discharge rate.
+        for drive in [105.348_363_458_386_9, 210.0, 315.0] {
+            let synout = vec![drive; 200_000];
+            let mut rng = Rng::new(0xABCD_EF01);
+            let spikes = generate_spikes(&synout, &spec, tdres, &mut rng);
+            eprintln!(
+                "DC drive={drive:.3} rate={:.3}",
+                spikes.len() as f64 / 2.0
+            );
+        }
+        // C. Full-scale 1 kHz tone (94 dB SPL peak) rates per SR class.
+        let fs = 100_000.0;
+        let m = 100_000;
+        let tone: Vec<f64> = (0..m)
+            .map(|i| (TAU * 1000.0 * i as f64 / fs).sin())
+            .collect();
+        for sr in [0.1, 4.0, 70.0] {
+            let mut s = spec;
+            s.spont_rate = sr;
+            let spikes = fiber_spike_times(&tone, fs as u32, s);
+            let count = spikes.iter().filter(|&&t| (0.1..0.9).contains(&t)).count();
+            eprintln!("TONE sr={sr} rate={:.2}", count as f64 / 0.8);
+        }
+        // D. Decimator + interpolation latency on a 1 kHz sine.
+        let delaypoint = 7_500;
+        let np = 4_000;
+        let total = np + 3 * delaypoint;
+        let pad: Vec<f64> = (0..total)
+            .map(|k| (TAU * 100.0 * (k as f64 - delaypoint as f64) * tdres).sin())
+            .collect();
+        let syn10 = decimate_10(&pad);
+        let out = upsample_10(&syn10, np, delaypoint);
+        let mut best = (0i32, f64::MIN);
+        let mut corrs = Vec::new();
+        for lag in -50i32..=50 {
+            let mut acc = 0.0;
+            for i in 200..np - 200 {
+                let j = i as i32 - lag;
+                let r = (TAU * 100.0 * j as f64 * tdres).sin();
+                acc += out[i] * r;
+            }
+            corrs.push((lag, acc));
+            if acc > best.1 {
+                best = (lag, acc);
+            }
+        }
+        eprintln!("LAG best={} corr={:.6}", best.0, best.1);
+        for lag in [0, 1, 30, 31, 32] {
+            let c = corrs.iter().find(|(l, _)| *l == lag).unwrap().1;
+            eprintln!("LAGC lag={lag} corr={c:.6}");
+        }
+        let w = TAU * 100.0 * tdres;
+        let (mut sa, mut sb) = (0.0_f64, 0.0_f64);
+        for i in 400..np - 400 {
+            sa += out[i] * (w * i as f64).sin();
+            sb += out[i] * (w * i as f64).cos();
+        }
+        let phase = sb.atan2(sa);
+        eprintln!("PHASE lag_samples={:.6}", -phase / w);
+        // E. Chirp gain at CF.
+        let cf: f64 = 1000.0;
+        let gain = (26.0 * ((2.2 * (cf / 0.6e3).log10() + 0.15).tanh() + 1.0)).clamp(15.0, 60.0);
+        let q10 = (cf / 1000.0).powf(0.3) * 12.7 * 0.505 + 0.2085;
+        let taumax = 2.0 / (TAU * (cf / q10));
+        let bm_taumax = taumax / 0.7;
+        let mut chirp = ChirpFilter::new(cf, tdres, bm_taumax);
+        let mut mn = f64::MAX;
+        let mut mx = f64::MIN;
+        for k in 0..5_000 {
+            let y = chirp.step((TAU * cf * k as f64 * tdres).sin(), 0.0);
+            if k >= 3_000 {
+                mn = mn.min(y);
+                mx = mx.max(y);
+            }
+        }
+        eprintln!("CHIRP gain={:.9} gain_const={gain:.6}", (mx - mn) / 2.0);
+    }
+}

@@ -227,7 +227,9 @@ impl GainMapOpcode {
         if self.gains.len() < mh * mv * mp {
             return None;
         }
-        let ch = plane.min(mp - 1);
+        // `plane` is absolute (`Plane..Plane+Planes` in the opcode); the gain grid's
+        // channel index is its offset from the opcode's first plane.
+        let ch = (plane - self.plane as usize).min(mp - 1);
 
         let spacing_h = if mh == 1 { 1.0 } else { self.map_spacing_h };
         let spacing_v = if mv == 1 { 1.0 } else { self.map_spacing_v };
@@ -2480,8 +2482,12 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
         }
     };
     let white_levels: Vec<f64> = (0..planes).map(white_level).collect();
+    // Integer data needs a denominator of at least one code value; floating-point DNGs are
+    // scene-referred, where `WhiteLevel - BlackLevel` can be a small positive fraction (e.g.
+    // WhiteLevel 1.0, BlackLevel 0.5). Clamping that to 1.0 would halve every float sample.
+    let denom_floor = if is_float { 1e-12 } else { 1.0 };
     let denoms: Vec<f64> = (0..planes)
-        .map(|plane| (white_levels[plane] - max_black(plane)).max(1.0))
+        .map(|plane| (white_levels[plane] - max_black(plane)).max(denom_floor))
         .collect();
 
     let mut stage2 = vec![0.0_f64; aw * ah * planes];
@@ -2504,6 +2510,10 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
         width: aw as f64,
         height: ah as f64,
     };
+    // The DNG 1.7.1 logical range of 0.0..1.0 for OpcodeList2/3 applies to integer images.
+    // Floating-point DNGs are scene-referred and may legitimately carry values above 1.0;
+    // clipping them after each opcode would destroy highlight energy.
+    let list2_3_clip = if is_float { None } else { Some((0.0, 1.0)) };
     apply_opcode_list(
         &opcodes.list2,
         &mut stage2,
@@ -2511,7 +2521,7 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
         ah,
         planes,
         active_bounds,
-        Some((0.0, 1.0)),
+        list2_3_clip,
     )?;
 
     let mut rgb: Vec<[f64; 3]> = if cfa {
@@ -2539,7 +2549,7 @@ pub fn decode_dng_bytes(buf: &[u8]) -> Result<DecodedDngImage> {
             ah,
             3,
             active_bounds,
-            Some((0.0, 1.0)),
+            list2_3_clip,
         )?;
         for (i, px) in rgb.iter_mut().enumerate() {
             px.copy_from_slice(&flat[i * 3..i * 3 + 3]);
@@ -3935,6 +3945,7 @@ mod tests {
         compression: u16,
         cfa: [u8; 4],
         black: Vec<u32>,
+        black_rational: Vec<(u32, u32)>,
         black_repeat: (u16, u16),
         delta_h: Vec<(i32, i32)>,
         delta_v: Vec<(i32, i32)>,
@@ -3961,6 +3972,7 @@ mod tests {
                 compression: COMPRESSION_UNCOMPRESSED,
                 cfa: [0, 1, 1, 2],
                 black: Vec::new(),
+                black_rational: Vec::new(),
                 black_repeat: (1, 1),
                 delta_h: Vec::new(),
                 delta_v: Vec::new(),
@@ -4077,6 +4089,29 @@ mod tests {
                 TAG_BLACK_LEVEL,
                 4,
                 spec.black.len() as u32,
+                &p,
+            );
+            let mut p = Vec::new();
+            p.extend_from_slice(&spec.black_repeat.0.to_le_bytes());
+            p.extend_from_slice(&spec.black_repeat.1.to_le_bytes());
+            add(&mut tags, &mut extra, TAG_BLACK_LEVEL_REPEAT_DIM, 3, 2, &p);
+        }
+        if !spec.black_rational.is_empty() {
+            assert!(
+                spec.black.is_empty(),
+                "TinyDng supports one encoded BlackLevel tag, not both representations"
+            );
+            let mut p = Vec::new();
+            for &(num, den) in &spec.black_rational {
+                p.extend_from_slice(&num.to_le_bytes());
+                p.extend_from_slice(&den.to_le_bytes());
+            }
+            add(
+                &mut tags,
+                &mut extra,
+                TAG_BLACK_LEVEL,
+                5,
+                spec.black_rational.len() as u32,
                 &p,
             );
             let mut p = Vec::new();
@@ -4529,6 +4564,53 @@ mod tests {
     }
 
     #[test]
+    fn dng_gain_map_eval_pixel_indexes_gain_channel_relative_to_plane() {
+        // Opcode Plane=1, Planes=2: absolute planes 1 and 2 address gain-map channels 0 and 1,
+        // not 1 and 1. A one-point map makes interpolation irrelevant, so the sampled gain is
+        // exactly the selected channel.
+        let gm = GainMapOpcode {
+            top: 0,
+            left: 0,
+            bottom: 2,
+            right: 2,
+            plane: 1,
+            planes: 2,
+            row_pitch: 1,
+            col_pitch: 1,
+            map_points_v: 1,
+            map_points_h: 1,
+            map_spacing_v: 1.0,
+            map_spacing_h: 1.0,
+            map_origin_v: 0.0,
+            map_origin_h: 0.0,
+            map_planes: 2,
+            gains: vec![10.0, 20.0],
+        };
+        let bounds = DngImageBounds {
+            top: 0.0,
+            left: 0.0,
+            width: 2.0,
+            height: 2.0,
+        };
+        assert_eq!(gm.eval_pixel(0.0, 0.0, 0, &bounds), None);
+        assert_eq!(gm.eval_pixel(0.0, 0.0, 3, &bounds), None);
+        let ch0 = gm
+            .eval_pixel(0.0, 0.0, 1, &bounds)
+            .expect("plane 1 in range");
+        let ch1 = gm
+            .eval_pixel(1.0, 1.0, 2, &bounds)
+            .expect("plane 2 in range");
+        assert!(
+            (ch0 - 10.0).abs() < 1e-12,
+            "plane 1 must use map channel 0, got {ch0}"
+        );
+        assert!(
+            (ch1 - 20.0).abs() < 1e-12,
+            "plane 2 must use map channel 1, got {ch1}"
+        );
+    }
+
+    #[test]
     fn dng_sample_format_float_is_not_integer_scaled() {
         // A 16-bit IEEE-float JXL DNG: the codestream's normalized samples are already the
         // floating-point values, and WhiteLevel=1 must not rescale them by 2^16-1.
@@ -4578,6 +4660,58 @@ mod tests {
         assert_eq!(half_to_f32(0x3800), 0.5);
         assert_eq!(half_to_f32(0xC000), -2.0);
         assert_eq!(float24_to_f32(0x41_0000), 2.0);
+    }
+
+    #[test]
+    fn dng_float_black_subtraction_uses_scaled_denominator() {
+        // Scene-referred float DNG: WhiteLevel 1.0 and BlackLevel 0.5. The rescale
+        // denominator is WhiteLevel - BlackLevel = 0.5, not the integer minimum of 1.0.
+        let mut spec = TinyDng::new(2, 2, PHOTOMETRIC_LINEAR_RAW, 1);
+        spec.bps = 32;
+        spec.sample_format = 3;
+        spec.white = Some(1);
+        spec.black_rational = vec![(1, 2)];
+        spec.strip = Some(le_f32(&[2.0, 0.5, 1.0, 0.25]));
+        let dec =
+            decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode float DNG with BlackLevel");
+        let want = [3.0, 0.0, 1.0, 0.0];
+        for (i, (px, &w)) in dec.rgb.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (px[0] - w).abs() < 1e-12,
+                "float px {i}: got {} want {w} ((raw - 0.5) / (1.0 - 0.5))",
+                px[0]
+            );
+        }
+    }
+
+    #[test]
+    fn dng_float_opcode_lists_do_not_clip_scene_referred_hdr() {
+        // OpcodeList2/3 clip to 0..1 for integer images only. A scene-referred float pixel of
+        // 2.0 must survive unity-gain opcodes in both lists; the old clip collapsed it to 1.0.
+        // BlackLevel is 0 here so this isolates the opcode clip from the float denominator.
+        let mut spec = TinyDng::new(2, 2, PHOTOMETRIC_LINEAR_RAW, 1);
+        spec.bps = 32;
+        spec.sample_format = 3;
+        spec.white = Some(1);
+        spec.strip = Some(le_f32(&[2.0, 2.0, 2.0, 2.0]));
+        spec.op2 = dng_opcode_list(&[(
+            OPCODE_GAIN_MAP,
+            gain_map_params(0, 0, 2, 2, 0, 1, 1, 1, 1, 1, 1.0, 1.0, 0.0, 0.0, 1, &[1.0]),
+        )]);
+        let mut vignette = Vec::new();
+        // k[0..5] = 0 -> gain 1; centre at (0.5, 0.5).
+        for v in [0.0_f64, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5] {
+            vignette.extend_from_slice(&v.to_be_bytes());
+        }
+        spec.op3 = dng_opcode_list(&[(OPCODE_FIX_VIGNETTE_RADIAL, vignette)]);
+        let dec = decode_dng_bytes(&build_tiny_dng(&spec)).expect("decode float HDR DNG");
+        for (i, px) in dec.rgb.iter().enumerate() {
+            assert!(
+                (px[0] - 2.0).abs() < 1e-12,
+                "float HDR px {i}: got {} want 2.0 — List2/3 must not clip float to 0..1",
+                px[0]
+            );
+        }
     }
 
     // Fixtures generated with libjxl `cjxl -d 0`: 3x2 and 8x2 / 3x8 / 8x8 grayscale tiles

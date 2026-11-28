@@ -2148,6 +2148,45 @@ impl std::fmt::Debug for NttCudaHandle {
     }
 }
 
+// Test-only device-stage failure seam for the device-resident UPOLA path. The alignment
+// path must leave every host streaming field untouched when a device call fails, so a test
+// arms a stage here, calls the hop, and compares the host state to a snapshot.
+//
+// Stage 1 = pre-write tail accumulate, stage 2 = final inverse/D2H. Thread-local so parallel
+// tests cannot interfere; the no-op build is used in every non-test compilation and inlines
+// away.
+#[cfg(all(test, feature = "cuda"))]
+thread_local! {
+    static UPOLA_FAIL_STAGE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static UPOLA_INVERSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn upola_device_failpoint(stage: u8) -> Result<(), String> {
+    #[cfg(all(test, feature = "cuda"))]
+    {
+        let hit = UPOLA_FAIL_STAGE.with(|f| {
+            if f.get() == stage {
+                f.set(0);
+                true
+            } else {
+                false
+            }
+        });
+        if hit {
+            return Err(format!("injected device UPOLA failure at stage {stage}"));
+        }
+    }
+    let _ = stage;
+    Ok(())
+}
+
+#[inline(always)]
+fn upola_note_inverse() {
+    #[cfg(all(test, feature = "cuda"))]
+    UPOLA_INVERSE_CALLS.with(|c| c.set(c.get() + 1));
+}
+
 #[derive(Debug, Clone)]
 pub struct BinauralPlus {
     mask: u32,
@@ -2631,8 +2670,11 @@ impl BinauralPlus {
         plan.irfft(bins, scratch, out_real);
     }
 
-    /// Push the completed `B`-sample `cur_in` block into the UPOLA Frequency-Domain Delay Line
-    /// and accumulate partitions `p = 1..n_parts` directly into `ov_l`/`ov_r` (or `ntt_ov_l`/`ntt_ov_r`).
+    /// Push the completed `B`-sample `cur_in` block into the UPOLA Frequency-Domain Delay Line.
+    ///
+    /// The exact-NTT engine only stores the block's spectrum: its `p >= 1` tail is formed on
+    /// demand at the next partial block's first hop, or folded into the next aligned block's
+    /// single-inverse sum. The float engine retains the tail accumulate into `ov_l`/`ov_r`.
     fn push_completed_upola_block(&mut self) {
         let fdl_len = self.n_parts - 1;
         let head = self.fdl_head;
@@ -2641,51 +2683,23 @@ impl BinauralPlus {
         let use_cuda = self.cfg.use_cuda;
 
         if let Some(ref np) = self.ntt_plan {
-            let n_fft = np.len();
-            // Transform completed B-sample block for each active channel into ntt_fdl[head][ch].
+            // Write the completed block into the delay line. No inverse happens here: a
+            // following partial block inverse-transforms the deferred tail at its first
+            // hop, while a following aligned block folds it into its single U inverse.
             for ch in 0..SLOTS {
                 if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
                     continue;
                 }
-                let dst = &mut self.ntt_fdl[head][ch];
-                dst.fill(0);
+                self.ntt_x.fill(0);
                 let src = &self.cur_in[ch];
                 if src.iter().any(|&v| v != 0.0) {
-                    for (d, &s) in dst.iter_mut().take(b).zip(src.iter()) {
+                    for (d, &s) in self.ntt_x.iter_mut().take(b).zip(src.iter()) {
                         let q = (s * NTT_PCM_SCALE).round().clamp(-8_388_608.0, 8_388_607.0) as i64;
                         *d = i64_to_field(q);
                     }
-                    Self::ntt_forward_buf(use_cuda, np, dst);
+                    Self::ntt_forward_buf(use_cuda, np, &mut self.ntt_x);
                 }
-            }
-
-            // Accumulate all tail partitions p = 1..n_parts with ONE inverse NTT per ear!
-            self.ntt_acc_l.fill(0);
-            self.ntt_acc_r.fill(0);
-            for p in 1..self.n_parts {
-                let slot_idx = (head + fdl_len - (p - 1)) % fdl_len;
-                for ch in 0..SLOTS {
-                    if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
-                        continue;
-                    }
-                    let xf = &self.ntt_fdl[slot_idx][ch];
-                    if !xf.iter().any(|&v| v != 0) {
-                        continue;
-                    }
-                    let kl = &self.ntt_kern_l[p][ch];
-                    let kr = &self.ntt_kern_r[p][ch];
-                    for k in 0..n_fft {
-                        let xv = xf[k];
-                        self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
-                        self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
-                    }
-                }
-            }
-            Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_l);
-            Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_r);
-            for i in 0..ov_len {
-                self.ntt_ov_l[i] += field_to_i128(self.ntt_acc_l[i]);
-                self.ntt_ov_r[i] += field_to_i128(self.ntt_acc_r[i]);
+                self.ntt_fdl[head][ch].copy_from_slice(&self.ntt_x);
             }
         } else {
             let nb = self.plan.len() / 2 + 1;
@@ -2808,7 +2822,16 @@ impl BinauralPlus {
         let ov_len = self.ntt_ov_l.len();
 
         if full_aligned_upola {
-            // ---- completed whole hop: transform directly into the delay line ------------
+            // ---- completed whole hop: one inverse for the whole output block -----------
+            // Standard single-inverse UPOLA: form U_j = sum_{p=0}^{P-1} x_{j-p} h_p in the
+            // NTT domain, inverse once, emits out = U_j + (previous U tail), and keeps the
+            // new overlap tail U_j[B..]. Partitions p >= 1 read the delay line *before*
+            // this block is written, so the row that block j evicts is still available;
+            // partition 0 is folded in from the freshly written row. The old split
+            // (partition-0 inverse for this block + tail inverse for the next block)
+            // launched two inverses and two synchronous D2H copies per aligned hop.
+            upola_device_failpoint(1)?;
+            st.accumulate_fdl_prev(head, mask)?;
             st.zero_fdl_row(head)?;
             for (ch, slot) in inputs.iter().enumerate() {
                 if (mask >> ch) & 1 == 0 {
@@ -2824,16 +2847,18 @@ impl BinauralPlus {
                 st.upload_fdl_row(head, ch, &self.ntt_x)?;
             }
             st.forward_fdl_row(head, mask)?;
-            st.accumulate_fdl(head, 0, 1, mask)?;
-            let acc = st.inverse_acc_to_host()?;
-            let (acc_l, acc_r) = acc.split_at(n_fft);
+            st.accumulate_fdl_add_p0(head, mask)?;
+            upola_note_inverse();
+            upola_device_failpoint(2)?;
+            let u = st.inverse_acc_to_host()?;
+            let (u_l, u_r) = u.split_at(n_fft);
 
             // ---- all device work for the hop is done: commit host state ----------------
             for i in 0..m {
                 let ol = if i < ov_len { self.ntt_ov_l[i] } else { 0 };
                 let or = if i < ov_len { self.ntt_ov_r[i] } else { 0 };
-                let vl = ((field_to_i128(acc_l[i]) + ol) as f64) * inv_scale;
-                let vr = ((field_to_i128(acc_r[i]) + or) as f64) * inv_scale;
+                let vl = ((field_to_i128(u_l[i]) + ol) as f64) * inv_scale;
+                let vr = ((field_to_i128(u_r[i]) + or) as f64) * inv_scale;
                 if !vl.is_finite() || !vr.is_finite() {
                     self.finite = false;
                 }
@@ -2843,29 +2868,16 @@ impl BinauralPlus {
             let y_len = m + self.ola_hop - 1;
             for j in 0..ov_len {
                 let src = m + j;
-                let prev_l = if src < ov_len { self.ntt_ov_l[src] } else { 0 };
-                let prev_r = if src < ov_len { self.ntt_ov_r[src] } else { 0 };
-                let add_l = if src < y_len {
-                    field_to_i128(acc_l[src])
+                self.ntt_ov_l[j] = if src < y_len {
+                    field_to_i128(u_l[src])
                 } else {
                     0
                 };
-                let add_r = if src < y_len {
-                    field_to_i128(acc_r[src])
+                self.ntt_ov_r[j] = if src < y_len {
+                    field_to_i128(u_r[src])
                 } else {
                     0
                 };
-                self.ntt_ov_l[j] = prev_l + add_l;
-                self.ntt_ov_r[j] = prev_r + add_r;
-            }
-
-            // Tail partitions p = 1..n_parts in one accumulate + one batched inverse.
-            st.accumulate_fdl(head, 1, self.n_parts, mask)?;
-            let tail = st.inverse_acc_to_host()?;
-            let (tail_l, tail_r) = tail.split_at(n_fft);
-            for i in 0..ov_len {
-                self.ntt_ov_l[i] += field_to_i128(tail_l[i]);
-                self.ntt_ov_r[i] += field_to_i128(tail_r[i]);
             }
             self.fdl_head = (head + 1) % (self.n_parts - 1);
             crate::cuda_report::record_gpu("ntt", "device-resident UPOLA");
@@ -2873,6 +2885,23 @@ impl BinauralPlus {
         }
 
         // ---- partial hop, or the single-partition anechoic engine -------------------
+        // A partial block emits its samples before the block completes, so the p >= 1
+        // contribution of the *current* block, T_{j-1} = sum_{p=1}^{P-1} x_{j-p} h_p,
+        // is inverse-transformed once at the first hop and added to the overlap buffer.
+        // The aligned path folds the same sum into its single U inverse. At completion
+        // the overlap buffer has advanced to U_j[B..] by construction (the partition-0
+        // slice tails shift it there), so no second inverse is needed at the push.
+        let block_start_partial = use_upola && self.cur_fill == 0 && m < self.ola_hop;
+        let t_vec = if block_start_partial {
+            upola_device_failpoint(1)?;
+            st.accumulate_fdl_prev(head, mask)?;
+            upola_note_inverse();
+            upola_device_failpoint(2)?;
+            Some(st.inverse_acc_to_host()?)
+        } else {
+            None
+        };
+
         let mut contribution_mask = 0u32;
         for (ch, slot) in inputs.iter().enumerate() {
             if (mask >> ch) & 1 == 0 {
@@ -2898,6 +2927,8 @@ impl BinauralPlus {
         let acc = if contribution_mask != 0 {
             st.forward_scratch(contribution_mask)?;
             st.mac_scratch_partition0(contribution_mask)?;
+            upola_note_inverse();
+            upola_device_failpoint(2)?;
             st.inverse_acc_to_host()?
         } else {
             // Zero input transforms and accumulates to the exact zero vector.
@@ -2905,15 +2936,23 @@ impl BinauralPlus {
         };
         let (acc_l, acc_r) = acc.split_at(n_fft);
 
-        // Device push of the just-completed whole block (only when this hop filled it).
+        // Device write of the just-completed block into the delay line (only when this hop
+        // filled it). No inverse here: a following partial block inverse-transforms the
+        // deferred tail at its first hop, and a following aligned block folds it into its
+        // single U inverse.
         let push = use_upola && self.cur_fill + m == self.ola_hop;
-        let push_tail = if push {
-            Some(self.push_completed_upola_block_cuda_work(&mut st, head, n_fft)?)
-        } else {
-            None
-        };
+        if push {
+            self.write_completed_upola_block_cuda(&mut st, head)?;
+        }
 
-        // ---- commit host state (mirrors the CPU branch order) ----------------------
+        // ---- commit host state (all fallible device work is complete) --------------
+        if let Some(t) = t_vec.as_ref() {
+            let (t_l, t_r) = t.split_at(n_fft);
+            for i in 0..ov_len {
+                self.ntt_ov_l[i] += field_to_i128(t_l[i]);
+                self.ntt_ov_r[i] += field_to_i128(t_r[i]);
+            }
+        }
         for i in 0..m {
             let ol = if i < ov_len { self.ntt_ov_l[i] } else { 0 };
             let or = if i < ov_len { self.ntt_ov_r[i] } else { 0 };
@@ -2947,12 +2986,7 @@ impl BinauralPlus {
             self.ntt_ov_l[j] = prev_l + add_l;
             self.ntt_ov_r[j] = prev_r + add_r;
         }
-        if let Some(tail) = push_tail {
-            let (tail_l, tail_r) = tail.split_at(n_fft);
-            for i in 0..ov_len {
-                self.ntt_ov_l[i] += field_to_i128(tail_l[i]);
-                self.ntt_ov_r[i] += field_to_i128(tail_r[i]);
-            }
+        if push {
             self.fdl_head = (head + 1) % (self.n_parts - 1);
             self.cur_fill = 0;
         } else if use_upola {
@@ -2963,15 +2997,16 @@ impl BinauralPlus {
     }
 
     /// Device-side body of [`Self::push_completed_upola_block`]: transform the completed
-    /// `ola_hop`-sample `cur_in` block into the delay line, accumulate every tail partition
-    /// and inverse-transform both ears. Returns the `2 * n` host words of the tail.
+    /// `ola_hop`-sample `cur_in` block into delay-line row `head`. The block's p >= 1
+    /// contributions are not inverse-transformed here; a following partial block forms the
+    /// deferred tail at its first hop, while a following aligned block folds it into its
+    /// single U inverse.
     #[cfg(feature = "cuda")]
-    fn push_completed_upola_block_cuda_work(
+    fn write_completed_upola_block_cuda(
         &mut self,
         st: &mut g6me_cuda::CudaUpolaState,
         head: usize,
-        n_fft: usize,
-    ) -> Result<Vec<u64>, String> {
+    ) -> Result<(), String> {
         let mask = self.ntt_active_mask();
         let b = self.ola_hop;
         st.zero_fdl_row(head)?;
@@ -2990,11 +3025,7 @@ impl BinauralPlus {
             }
             st.upload_fdl_row(head, ch, &self.ntt_x)?;
         }
-        st.forward_fdl_row(head, mask)?;
-        st.accumulate_fdl(head, 1, self.n_parts, mask)?;
-        let tail = st.inverse_acc_to_host()?;
-        debug_assert_eq!(tail.len(), 2 * n_fft);
-        Ok(tail)
+        st.forward_fdl_row(head, mask)
     }
 
     fn process_hop(
@@ -3033,49 +3064,126 @@ impl BinauralPlus {
         if let Some(ref np) = self.ntt_plan {
             let n_fft = np.len();
             let head = self.fdl_head;
+            let fdl_len = self.n_parts.saturating_sub(1);
+
+            // A partial block emits its samples before the block completes, so its p >= 1
+            // contribution T_{j-1} = sum_{p=1}^{P-1} x_{j-p} h_p is inverse-transformed
+            // once at the first hop and added to the overlap buffer. The aligned path folds
+            // the same sum into one U inverse below.
+            if use_upola && !full_aligned_upola && self.cur_fill == 0 {
+                self.ntt_acc_l.fill(0);
+                self.ntt_acc_r.fill(0);
+                for p in 1..self.n_parts {
+                    let slot_idx = (head + fdl_len - p) % fdl_len;
+                    for ch in 0..SLOTS {
+                        if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                            continue;
+                        }
+                        let xf = &self.ntt_fdl[slot_idx][ch];
+                        if !xf.iter().any(|&v| v != 0) {
+                            continue;
+                        }
+                        let kl = &self.ntt_kern_l[p][ch];
+                        let kr = &self.ntt_kern_r[p][ch];
+                        for k in 0..n_fft {
+                            let xv = xf[k];
+                            self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
+                            self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+                        }
+                    }
+                }
+                Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_l);
+                Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_r);
+                let ov_len_t = self.ntt_ov_l.len();
+                for i in 0..ov_len_t {
+                    self.ntt_ov_l[i] += field_to_i128(self.ntt_acc_l[i]);
+                    self.ntt_ov_r[i] += field_to_i128(self.ntt_acc_r[i]);
+                }
+            }
+
             self.ntt_acc_l.fill(0);
             self.ntt_acc_r.fill(0);
-            for (ch, slot) in inputs.iter().enumerate() {
-                if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
-                    continue;
-                }
-                let slice_opt = slot.map(|buf| &buf[offset..offset + m]);
-                if use_upola && !full_aligned_upola {
-                    if let Some(sl) = slice_opt {
-                        self.cur_in[ch][self.cur_fill..self.cur_fill + m].copy_from_slice(sl);
-                    } else {
-                        self.cur_in[ch][self.cur_fill..self.cur_fill + m].fill(0.0);
+            if full_aligned_upola {
+                // Standard single-inverse UPOLA: U_j = sum_{p=0}^{P-1} x_{j-p} h_p in the
+                // NTT domain, one inverse, one overlap update. Partitions p >= 1 read the
+                // delay line before block j overwrites the oldest row; partition 0 comes
+                // from the freshly written row.
+                for p in 1..self.n_parts {
+                    let slot_idx = (head + fdl_len - p) % fdl_len;
+                    for ch in 0..SLOTS {
+                        if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                            continue;
+                        }
+                        let xf = &self.ntt_fdl[slot_idx][ch];
+                        if !xf.iter().any(|&v| v != 0) {
+                            continue;
+                        }
+                        let kl = &self.ntt_kern_l[p][ch];
+                        let kr = &self.ntt_kern_r[p][ch];
+                        for k in 0..n_fft {
+                            let xv = xf[k];
+                            self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
+                            self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+                        }
                     }
                 }
-                let Some(slice) = slice_opt else {
-                    if full_aligned_upola {
-                        self.ntt_fdl[head][ch].fill(0);
+                for (ch, slot) in inputs.iter().enumerate() {
+                    if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                        continue;
                     }
-                    continue;
-                };
-                if !slice.iter().any(|&v| v != 0.0) {
-                    if full_aligned_upola {
-                        self.ntt_fdl[head][ch].fill(0);
+                    self.ntt_x.fill(0);
+                    if let Some(slice) = slot.map(|buf| &buf[offset..offset + m]) {
+                        if slice.iter().any(|&v| v != 0.0) {
+                            for (dst, &sample) in self.ntt_x.iter_mut().take(m).zip(slice) {
+                                let q = (sample * NTT_PCM_SCALE)
+                                    .round()
+                                    .clamp(-8_388_608.0, 8_388_607.0) as i64;
+                                *dst = i64_to_field(q);
+                            }
+                            Self::ntt_forward_buf(use_cuda, np, &mut self.ntt_x);
+                        }
                     }
-                    continue;
-                }
-                self.ntt_x.fill(0);
-                for (dst, &sample) in self.ntt_x.iter_mut().take(m).zip(slice) {
-                    let q = (sample * NTT_PCM_SCALE)
-                        .round()
-                        .clamp(-8_388_608.0, 8_388_607.0) as i64;
-                    *dst = i64_to_field(q);
-                }
-                Self::ntt_forward_buf(use_cuda, np, &mut self.ntt_x);
-                if full_aligned_upola {
+                    let kl = &self.ntt_kern_l[0][ch];
+                    let kr = &self.ntt_kern_r[0][ch];
+                    for k in 0..n_fft {
+                        let xv = self.ntt_x[k];
+                        self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
+                        self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+                    }
                     self.ntt_fdl[head][ch].copy_from_slice(&self.ntt_x);
                 }
-                let kl = &self.ntt_kern_l[0][ch];
-                let kr = &self.ntt_kern_r[0][ch];
-                for k in 0..n_fft {
-                    let xv = self.ntt_x[k];
-                    self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
-                    self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+            } else {
+                for (ch, slot) in inputs.iter().enumerate() {
+                    if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
+                        continue;
+                    }
+                    let slice_opt = slot.map(|buf| &buf[offset..offset + m]);
+                    if use_upola {
+                        if let Some(sl) = slice_opt {
+                            self.cur_in[ch][self.cur_fill..self.cur_fill + m].copy_from_slice(sl);
+                        } else {
+                            self.cur_in[ch][self.cur_fill..self.cur_fill + m].fill(0.0);
+                        }
+                    }
+                    let Some(slice) = slice_opt else { continue };
+                    if !slice.iter().any(|&v| v != 0.0) {
+                        continue;
+                    }
+                    self.ntt_x.fill(0);
+                    for (dst, &sample) in self.ntt_x.iter_mut().take(m).zip(slice) {
+                        let q = (sample * NTT_PCM_SCALE)
+                            .round()
+                            .clamp(-8_388_608.0, 8_388_607.0) as i64;
+                        *dst = i64_to_field(q);
+                    }
+                    Self::ntt_forward_buf(use_cuda, np, &mut self.ntt_x);
+                    let kl = &self.ntt_kern_l[0][ch];
+                    let kr = &self.ntt_kern_r[0][ch];
+                    for k in 0..n_fft {
+                        let xv = self.ntt_x[k];
+                        self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
+                        self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
+                    }
                 }
             }
             Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_l);
@@ -3118,34 +3226,20 @@ impl BinauralPlus {
             }
 
             if full_aligned_upola {
-                // Fast path: ntt_fdl[head] is already transformed — sum p = 1..n_parts in 1 INTT/ear!
-                let fdl_len = self.n_parts - 1;
-                self.ntt_acc_l.fill(0);
-                self.ntt_acc_r.fill(0);
-                for p in 1..self.n_parts {
-                    let slot_idx = (head + fdl_len - (p - 1)) % fdl_len;
-                    for ch in 0..SLOTS {
-                        if ch != SLOT_FL && ch != SLOT_FR && (self.mask & (1u32 << ch)) == 0 {
-                            continue;
-                        }
-                        let xf = &self.ntt_fdl[slot_idx][ch];
-                        if !xf.iter().any(|&v| v != 0) {
-                            continue;
-                        }
-                        let kl = &self.ntt_kern_l[p][ch];
-                        let kr = &self.ntt_kern_r[p][ch];
-                        for k in 0..n_fft {
-                            let xv = xf[k];
-                            self.ntt_acc_l[k] = mod_add(self.ntt_acc_l[k], mod_mul(xv, kl[k]));
-                            self.ntt_acc_r[k] = mod_add(self.ntt_acc_r[k], mod_mul(xv, kr[k]));
-                        }
-                    }
-                }
-                Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_l);
-                Self::ntt_inverse_buf(use_cuda, np, &mut self.ntt_acc_r);
-                for i in 0..ov_len {
-                    self.ntt_ov_l[i] += field_to_i128(self.ntt_acc_l[i]);
-                    self.ntt_ov_r[i] += field_to_i128(self.ntt_acc_r[i]);
+                // The single inverse produced U_j; its second half is the complete overlap
+                // tail for the next block (no separate tail inverse / add).
+                for j in 0..ov_len {
+                    let src = m + j;
+                    self.ntt_ov_l[j] = if src < y_len {
+                        field_to_i128(self.ntt_acc_l[src])
+                    } else {
+                        0
+                    };
+                    self.ntt_ov_r[j] = if src < y_len {
+                        field_to_i128(self.ntt_acc_r[src])
+                    } else {
+                        0
+                    };
                 }
                 self.fdl_head = (head + 1) % fdl_len;
             } else if use_upola {
@@ -4495,6 +4589,121 @@ mod tests {
                  samples={} all bit-identical",
                 cl.len() + cr.len()
             );
+        }
+    }
+
+    /// Build a ControlRoom `--exact-ntt --cuda` engine whose device-resident UPOLA state
+    /// exists, or `None` on a CPU-only host.
+    #[cfg(feature = "cuda")]
+    fn control_room_exact_ntt_cuda_engine() -> Option<BinauralPlus> {
+        let mut cfg = PlusCfg::from_profile(PlusProfile::Studio);
+        cfg.room_preset = RoomPreset::ControlRoom;
+        cfg.physics_engine = PhysicsEngine::HankelSnowmanMagLs;
+        cfg.exact_ntt = true;
+        cfg.use_cuda = true;
+        let eng = BinauralPlus::new(crate::dsp::MASK_5_1, cfg, 48_000);
+        if eng.ntt_cuda.0.is_none() {
+            eprintln!("skipping: device-resident UPOLA state unavailable");
+            return None;
+        }
+        assert!(eng.n_parts > 1, "ControlRoom must use multi-partition UPOLA");
+        Some(eng)
+    }
+
+    /// Aligned device hops must use exactly one inverse NTT launch + one synchronous D2H
+    /// copy per hop (single-inverse UPOLA), not the old partition-0 + tail pair.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn cuda_upola_aligned_hop_uses_one_inverse_and_d2h() {
+        let Some(mut eng) = control_room_exact_ntt_cuda_engine() else {
+            return;
+        };
+        if !cuda_test_ready("cuda_upola_aligned_hop_uses_one_inverse_and_d2h") {
+            return;
+        }
+        let state = eng.ntt_cuda.0.clone().expect("device UPOLA state");
+        let m = eng.ola_hop;
+        let fl = parity_signal(m, 48_000, 0.0);
+        let fr = parity_signal(m, 48_000, 1.1);
+        let mut refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        refs[SLOT_FL] = Some(&fl);
+        refs[SLOT_FR] = Some(&fr);
+        let mut out_l = vec![0.0_f64; m];
+        let mut out_r = vec![0.0_f64; m];
+        UPOLA_INVERSE_CALLS.with(|c| c.set(0));
+        let hops = 4usize;
+        for hop in 0..hops {
+            eng.process_hop_ntt_cuda(&state, &refs, 0, &mut out_l, &mut out_r, m)
+                .unwrap_or_else(|e| panic!("aligned device UPOLA hop {hop}: {e}"));
+        }
+        let calls = UPOLA_INVERSE_CALLS.with(std::cell::Cell::get);
+        assert_eq!(
+            calls, hops,
+            "aligned hops must issue one inverse NTT + one D2H each, got {calls} for {hops} hops"
+        );
+    }
+
+    /// A device failure on the aligned hop must leave every host streaming field untouched:
+    /// out buffers, overlap tails, delay-line head, block fill and the finite flag.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn cuda_upola_device_failure_leaves_host_state_untouched() {
+        let Some(mut eng) = control_room_exact_ntt_cuda_engine() else {
+            return;
+        };
+        if !cuda_test_ready("cuda_upola_device_failure_leaves_host_state_untouched") {
+            return;
+        }
+        let state = eng.ntt_cuda.0.clone().expect("device UPOLA state");
+        let m = eng.ola_hop;
+        let fl = parity_signal(m, 48_000, 2.0);
+        let fr = parity_signal(m, 48_000, 0.7);
+        let mut refs: [Option<&[f64]>; SLOTS] = [None; SLOTS];
+        refs[SLOT_FL] = Some(&fl);
+        refs[SLOT_FR] = Some(&fr);
+        let mut out_l = vec![0.0_f64; m];
+        let mut out_r = vec![0.0_f64; m];
+        // One successful hop so the overlap tail and delay line are non-trivial.
+        eng.process_hop_ntt_cuda(&state, &refs, 0, &mut out_l, &mut out_r, m)
+            .expect("warm-up device UPOLA hop");
+        let ov_l = eng.ntt_ov_l.clone();
+        let ov_r = eng.ntt_ov_r.clone();
+        let head = eng.fdl_head;
+        let fill = eng.cur_fill;
+        let finite = eng.finite;
+
+        for stage in [1u8, 2] {
+            let sentinel_l = vec![123.25_f64; m];
+            let sentinel_r = vec![-77.5_f64; m];
+            out_l.copy_from_slice(&sentinel_l);
+            out_r.copy_from_slice(&sentinel_r);
+            UPOLA_FAIL_STAGE.with(|f| f.set(stage));
+            let err = eng
+                .process_hop_ntt_cuda(&state, &refs, 0, &mut out_l, &mut out_r, m)
+                .expect_err("injected device failure must propagate");
+            assert!(
+                err.contains("injected"),
+                "stage {stage}: unexpected error text: {err}"
+            );
+            assert_eq!(
+                out_l, sentinel_l,
+                "stage {stage}: out_l mutated before the device call failed"
+            );
+            assert_eq!(
+                out_r, sentinel_r,
+                "stage {stage}: out_r mutated before the device call failed"
+            );
+            assert_eq!(
+                eng.ntt_ov_l, ov_l,
+                "stage {stage}: left overlap tail mutated on device failure"
+            );
+            assert_eq!(
+                eng.ntt_ov_r, ov_r,
+                "stage {stage}: right overlap tail mutated on device failure"
+            );
+            assert_eq!(eng.fdl_head, head, "stage {stage}: fdl_head mutated");
+            assert_eq!(eng.cur_fill, fill, "stage {stage}: cur_fill mutated");
+            assert_eq!(eng.finite, finite, "stage {stage}: finite flag mutated");
         }
     }
 }

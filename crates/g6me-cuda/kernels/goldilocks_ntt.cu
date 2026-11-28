@@ -179,8 +179,19 @@ extern "C" __global__ void g6me_goldilocks_ntt_fused_inplace(
 // order; a row of zeros contributes `gl_mul(0, k) = 0` exactly as the CPU's
 // zero-row skip does.
 //
-// Partition 0 is the just-completed row stored at `head`; partitions
-// `p >= 1` walk back in time through `[fdl_slots][slots][n]`.
+// Slot mapping:
+//   * `slot_mode == 0` (post-write): partition 0 is the just-completed row
+//     stored at `head`; partitions `p >= 1` walk back in time and pair block
+//     `j - (p - 1)` with kernel partition `p`.
+//   * `slot_mode == 1` (pre-write): partition `p` reads the row holding block
+//     `j - p`, i.e. `(head + fdl_slots - p) % fdl_slots`. This is the full
+//     current-block sum `sum_{p=1}^{P-1} x_{j-p} h_p` taken before block `j`
+//     overwrites the oldest row, so it can be combined with partition 0 of
+//     block `j` in one NTT-domain accumulator and one inverse transform.
+//
+// `add_to_acc != 0` performs `acc += sum` instead of overwriting `acc`, so a
+// partition-0 launch can be folded into a pre-write launch. The modular sum is
+// exact and associative, so both modes are bit-identical to the CPU loops.
 extern "C" __global__ void g6me_goldilocks_upola_accumulate(
     const uint64_t* __restrict__ fdl,
     const uint64_t* __restrict__ kern_l,
@@ -193,6 +204,8 @@ extern "C" __global__ void g6me_goldilocks_upola_accumulate(
     int p_start,
     int p_end,
     int head,
+    int slot_mode,
+    int add_to_acc,
     unsigned int channel_mask
 ) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -201,7 +214,9 @@ extern "C" __global__ void g6me_goldilocks_upola_accumulate(
     uint64_t al = 0;
     uint64_t ar = 0;
     for (int p = p_start; p < p_end; ++p) {
-        const int slot = (p == 0) ? head : (head + fdl_slots - (p - 1)) % fdl_slots;
+        const int slot = (slot_mode != 0)
+            ? (head + fdl_slots - p) % fdl_slots
+            : ((p == 0) ? head : (head + fdl_slots - (p - 1)) % fdl_slots);
         for (int ch = 0; ch < slots; ++ch) {
             if (((channel_mask >> ch) & 1u) == 0u) continue;
             const size_t xoff = ((size_t)(slot * slots + ch)) * (size_t)n + (size_t)k;
@@ -211,8 +226,13 @@ extern "C" __global__ void g6me_goldilocks_upola_accumulate(
             ar = gl_add(ar, gl_mul(xv, kern_r[koff]));
         }
     }
-    acc[k] = al;
-    acc[n + k] = ar;
+    if (add_to_acc != 0) {
+        acc[k] = gl_add(acc[k], al);
+        acc[n + k] = gl_add(acc[n + k], ar);
+    } else {
+        acc[k] = al;
+        acc[n + k] = ar;
+    }
 }
 
 // Partition-0 accumulation for the sub-block path, where the transform of the

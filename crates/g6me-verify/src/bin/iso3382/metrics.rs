@@ -692,6 +692,40 @@ mod tests {
         assert!(an.bands[9].supported);
     }
 
+    /// Re-measurement fixture for the filter-bank change: prints the broadband
+    /// and selected octave-band values so the before/after deltas are
+    /// reproducible with `cargo test -- --nocapture`.
+    #[test]
+    fn synthetic_case_metrics_snapshot() {
+        let fs = 48_000.0;
+        let (x, _) = geometric_rir(0.5, fs, 1.8);
+        let rir = Rir {
+            sample_rate: 48_000,
+            channels: vec![x.clone(), vec![0.0; x.len()]],
+        };
+        let a = analyze(&rir, true).expect("analysis");
+        let bb = &a.broadband;
+        println!(
+            "snapshot broadband: edt={:?} t30={:?} c80={:?} d50={:?} lf={:?}",
+            bb.edt_s, bb.t30_s, bb.c80_db, bb.d50, bb.lf
+        );
+        for row in &a.bands {
+            if !matches!(row.band_hz, 125.0 | 500.0 | 1000.0 | 2000.0) {
+                continue;
+            }
+            println!(
+                "snapshot band {:>8}: edt={:?} t30={:?} c80={:?} d50={:?} lf={:?}",
+                band_label(row.band_hz),
+                row.metrics.edt_s,
+                row.metrics.t30_s,
+                row.metrics.c80_db,
+                row.metrics.d50,
+                row.metrics.lf
+            );
+        }
+        assert!(bb.c80_db.is_some() && bb.d50.is_some() && bb.edt_s.is_some());
+    }
+
     #[test]
     fn full_pipeline_recovers_the_envelope_decay_in_bands() {
         // Deterministic noise under a known exponential envelope. Unlike the

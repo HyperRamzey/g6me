@@ -2733,6 +2733,35 @@ impl CudaUpolaState {
         p_end: usize,
         channel_mask: u32,
     ) -> Result<(), String> {
+        self.accumulate_fdl_impl(head, p_start, p_end, channel_mask, 0, false)
+    }
+
+    /// Accumulate the deferred tail of the *next* output block from the pre-write delay line:
+    /// `sum_{p=1}^{n_parts-1} x_{j-p} h_p`, where block `j-p` lives in row
+    /// `(head + fdl_slots - p) % fdl_slots`. Overwrites both ear accumulators.
+    ///
+    /// Called by the partial-block path at the first hop of a block, before any hop of block
+    /// `j` has been written into the delay line. An aligned block folds this same sum into
+    /// its partition-0 inverse instead (see [`Self::accumulate_fdl_add_p0`]).
+    pub fn accumulate_fdl_prev(&mut self, head: usize, channel_mask: u32) -> Result<(), String> {
+        self.accumulate_fdl_impl(head, 1, self.n_parts, channel_mask, 1, false)
+    }
+
+    /// Add the partition-0 term of the completed row at `head` to the existing accumulator,
+    /// completing the single-inverse UPOLA sum `U_j = x_j h_0 + sum_{p=1}^{P-1} x_{j-p} h_p`.
+    pub fn accumulate_fdl_add_p0(&mut self, head: usize, channel_mask: u32) -> Result<(), String> {
+        self.accumulate_fdl_impl(head, 0, 1, channel_mask, 0, true)
+    }
+
+    fn accumulate_fdl_impl(
+        &mut self,
+        head: usize,
+        p_start: usize,
+        p_end: usize,
+        channel_mask: u32,
+        slot_mode: i32,
+        add_to_acc: bool,
+    ) -> Result<(), String> {
         self.check_fdl_row(head)?;
         if p_start > p_end || p_end > self.n_parts {
             return Err(format!(
@@ -2747,6 +2776,7 @@ impl CudaUpolaState {
         let ps_i = p_start as i32;
         let pe_i = p_end as i32;
         let head_i = head as i32;
+        let add_i = i32::from(add_to_acc);
         let cfg = LaunchConfig {
             grid_dim: ((self.n as u32).div_ceil(128), 1, 1),
             block_dim: (128, 1, 1),
@@ -2765,6 +2795,8 @@ impl CudaUpolaState {
             .arg(&ps_i)
             .arg(&pe_i)
             .arg(&head_i)
+            .arg(&slot_mode)
+            .arg(&add_i)
             .arg(&channel_mask);
         unsafe { builder.launch(cfg) }.map_err(|e| format!("launch upola accumulate: {e}"))?;
         Ok(())
@@ -4195,6 +4227,48 @@ mod tests {
             assert_eq!(
                 gpu_tail, cpu_tail,
                 "UPOLA tail accumulation differs at block {blk}"
+            );
+
+            // Single-inverse composition: the pre-write tail (block j-p at
+            // `(head + fdl_slots - p) % fdl_slots`) plus partition 0 of the row just
+            // written must equal the CPU `U_j = sum_{p=0}^{n_parts-1} x_{j-p} h_p`.
+            let mut cpu_u = vec![0u64; 2 * n];
+            for p in 1..n_parts {
+                let slot = (head + fdl_slots - p) % fdl_slots;
+                for ch in 0..slots {
+                    if (active_mask >> ch) & 1 == 0 {
+                        continue;
+                    }
+                    for k in 0..n {
+                        let xv = cpu_fdl[(slot * slots + ch) * n + k];
+                        let off = (p * slots + ch) * n + k;
+                        cpu_u[k] = gl_add_ref(cpu_u[k], gl_mul_ref(xv, kern_l[off]));
+                        cpu_u[n + k] = gl_add_ref(cpu_u[n + k], gl_mul_ref(xv, kern_r[off]));
+                    }
+                }
+            }
+            for (ch, x) in transformed.iter().enumerate() {
+                if (active_mask >> ch) & 1 == 0 {
+                    continue;
+                }
+                for k in 0..n {
+                    let off = ch * n + k;
+                    cpu_u[k] = gl_add_ref(cpu_u[k], gl_mul_ref(x[k], kern_l[off]));
+                    cpu_u[n + k] = gl_add_ref(cpu_u[n + k], gl_mul_ref(x[k], kern_r[off]));
+                }
+            }
+            glm_ntt_ref(&mut cpu_u[..n], &inv, Some(inv_n));
+            glm_ntt_ref(&mut cpu_u[n..], &inv, Some(inv_n));
+            state
+                .accumulate_fdl_prev(head, active_mask)
+                .expect("accum pre-write tail");
+            state
+                .accumulate_fdl_add_p0(head, active_mask)
+                .expect("accum partition-0 add");
+            let gpu_u = state.inverse_acc_to_host().expect("inverse U");
+            assert_eq!(
+                gpu_u, cpu_u,
+                "UPOLA single-inverse U composition differs at block {blk}"
             );
         }
 

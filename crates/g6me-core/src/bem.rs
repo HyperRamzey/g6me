@@ -784,6 +784,21 @@ pub fn extract_isosurface_marching_tetrahedra(
     mesh
 }
 
+/// Face budget and outcome of a budgeted isotropic acoustic remesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemeshBudgetReport {
+    /// Face budget the caller requested.
+    pub requested_max_faces: usize,
+    /// Face count actually produced.
+    pub achieved_faces: usize,
+    /// Whether every triangle met the `h_max_m` element bound without exceeding the face
+    /// budget. `false` means the budget (or `max_rounds`) stopped subdivision early.
+    pub target_met: bool,
+}
+
+/// Default conforming-subdivision face budget retained for [`isotropic_acoustic_remesh`].
+pub const DEFAULT_MAX_REMESH_FACES: usize = 16_384;
+
 /// Isotropic Acoustic BEM Remeshing enforcing the strict Helmholtz element bound
 /// `h <= h_max_m` (e.g. `lambda_min / 6 <= 2.5 mm` at `20 kHz`).
 ///
@@ -795,25 +810,44 @@ pub fn isotropic_acoustic_remesh(
     h_max_m: f64,
     max_rounds: usize,
 ) -> TriangleMesh {
+    isotropic_acoustic_remesh_with_budget(mesh, h_max_m, max_rounds, DEFAULT_MAX_REMESH_FACES).0
+}
+
+/// Budgeted [`isotropic_acoustic_remesh`]: returns the remeshed surface plus a
+/// [`RemeshBudgetReport`] stating the requested face budget, the achieved face count, and
+/// whether the `h_max_m` target was met.
+///
+/// Subdivision is conforming and all-or-nothing per round (every face splits, so one round
+/// quadruples the face count). A round that would push the mesh past `max_faces` is not
+/// attempted, and the resulting target miss is reported instead of truncated silently.
+pub fn isotropic_acoustic_remesh_with_budget(
+    mesh: &TriangleMesh,
+    h_max_m: f64,
+    max_rounds: usize,
+    max_faces: usize,
+) -> (TriangleMesh, RemeshBudgetReport) {
     let mut cur = mesh.clone();
     let h_limit = h_max_m.max(1e-4);
+    // The single source of truth for the element bound: any face whose longest edge exceeds
+    // `h_limit` violates it. Used both to drive subdivision and to report the final outcome,
+    // so a mesh that lands exactly on `max_rounds` is judged by its geometry, not by which
+    // branch happened to exit the loop.
+    let violates_bound = |m: &TriangleMesh| -> bool {
+        m.faces.iter().any(|&[a, b, c]| {
+            let l0 = v3_norm(v3_sub(m.vertices[a], m.vertices[b]));
+            let l1 = v3_norm(v3_sub(m.vertices[b], m.vertices[c]));
+            let l2 = v3_norm(v3_sub(m.vertices[c], m.vertices[a]));
+            l0.max(l1).max(l2) > h_limit
+        })
+    };
 
-    const MAX_REMESH_FACES: usize = 16_384;
     for _ in 0..max_rounds {
-        if cur.faces.len().saturating_mul(4) > MAX_REMESH_FACES {
+        if !violates_bound(&cur) {
             break;
         }
-        let mut need_split = false;
-        for &[a, b, c] in &cur.faces {
-            let l0 = v3_norm(v3_sub(cur.vertices[a], cur.vertices[b]));
-            let l1 = v3_norm(v3_sub(cur.vertices[b], cur.vertices[c]));
-            let l2 = v3_norm(v3_sub(cur.vertices[c], cur.vertices[a]));
-            if l0.max(l1).max(l2) > h_limit {
-                need_split = true;
-                break;
-            }
-        }
-        if !need_split {
+        if cur.faces.len().saturating_mul(4) > max_faces {
+            // Refuse the round rather than exceed the budget; the report below records the
+            // requested budget, the achieved count, and `target_met = false`.
             break;
         }
 
@@ -849,7 +883,17 @@ pub fn isotropic_acoustic_remesh(
     }
 
     cur.orient_outward();
-    cur
+    let achieved_faces = cur.faces.len();
+    let report = RemeshBudgetReport {
+        requested_max_faces: max_faces,
+        achieved_faces,
+        // Derived from the final mesh, not from the loop's exit path: a final subdivision that
+        // lands exactly on `max_rounds` can still satisfy the bound. A mesh that entered above
+        // budget is reported as not met even if it already satisfies the edge bound, so the
+        // counts and the flag never disagree.
+        target_met: !violates_bound(&cur) && achieved_faces <= max_faces,
+    };
+    (cur, report)
 }
 
 fn taubin_smooth(mesh: &mut TriangleMesh, lambda: f64, mu: f64) {
@@ -2452,6 +2496,107 @@ mod tests {
             st.max_edge_m,
             h_target
         );
+    }
+
+    #[test]
+    fn isotropic_acoustic_remesh_budget_below_target_reports_miss_with_exact_counts() {
+        let coarse = TriangleMesh::sphere(0.0875, 1);
+        assert_eq!(coarse.faces.len(), 32, "sphere(_, 1) fixture has 32 faces");
+        let h_target = 0.025;
+        // Exactly one conforming round fits: 32 -> 128 faces. The fixture needs more rounds.
+        let budget = coarse.faces.len() * 4;
+        let (remeshed, report) =
+            isotropic_acoustic_remesh_with_budget(&coarse, h_target, 4, budget);
+        assert_eq!(report.requested_max_faces, budget);
+        assert_eq!(report.achieved_faces, remeshed.faces.len());
+        assert_eq!(
+            report.achieved_faces, 128,
+            "one permitted round must have run"
+        );
+        assert!(
+            !report.target_met,
+            "h target {h_target} m cannot be reached under a {budget}-face budget"
+        );
+        let st = remeshed.stats(344.8);
+        assert!(
+            st.max_edge_m > h_target,
+            "fixture must actually miss the target; max edge {:.4} m",
+            st.max_edge_m
+        );
+        assert!(st.is_watertight);
+    }
+
+    #[test]
+    fn isotropic_acoustic_remesh_sufficient_budget_reports_target_met() {
+        let coarse = TriangleMesh::sphere(0.0875, 1);
+        let h_target = 0.025;
+        let budget = DEFAULT_MAX_REMESH_FACES;
+        let (remeshed, report) =
+            isotropic_acoustic_remesh_with_budget(&coarse, h_target, 4, budget);
+        assert!(
+            report.target_met,
+            "default {budget}-face budget must reach h <= {h_target} m"
+        );
+        assert_eq!(report.requested_max_faces, budget);
+        assert_eq!(report.achieved_faces, remeshed.faces.len());
+        assert!(report.achieved_faces <= budget);
+        let st = remeshed.stats(344.8);
+        assert!(st.max_edge_m <= h_target);
+        assert!(st.is_watertight);
+        // The legacy entry point keeps the default budget and produces the same faces.
+        let legacy = isotropic_acoustic_remesh(&coarse, h_target, 4);
+        assert_eq!(legacy.faces, remeshed.faces);
+    }
+
+    #[test]
+    fn isotropic_acoustic_remesh_exact_round_limit_reports_target_met() {
+        let coarse = TriangleMesh::sphere(0.0875, 1);
+        let h_target = 0.025;
+        let budget = DEFAULT_MAX_REMESH_FACES;
+        // Stats-based discovery, independent of the report: the minimum permitted rounds
+        // after which this fixture's geometry satisfies the edge bound.
+        let rounds_needed = (1..=4)
+            .find(|&rounds| {
+                let (candidate, _) =
+                    isotropic_acoustic_remesh_with_budget(&coarse, h_target, rounds, budget);
+                candidate.stats(344.8).max_edge_m <= h_target
+            })
+            .expect("fixture must converge within 4 rounds");
+        // The final subdivision lands exactly on max_rounds and the mesh conforms, so the
+        // report must judge the final geometry rather than the loop's exit path.
+        let (remeshed, report) =
+            isotropic_acoustic_remesh_with_budget(&coarse, h_target, rounds_needed, budget);
+        assert!(
+            report.target_met,
+            "{rounds_needed} rounds suffice for h <= {h_target} m, but the report says miss"
+        );
+        assert_eq!(report.achieved_faces, remeshed.faces.len());
+        assert_eq!(report.requested_max_faces, budget);
+        assert!(remeshed.stats(344.8).max_edge_m <= h_target);
+    }
+
+    #[test]
+    fn isotropic_acoustic_remesh_one_round_short_reports_target_miss() {
+        let coarse = TriangleMesh::sphere(0.0875, 1);
+        let h_target = 0.025;
+        let budget = DEFAULT_MAX_REMESH_FACES;
+        let rounds_needed = (1..=4)
+            .find(|&rounds| {
+                let (candidate, _) =
+                    isotropic_acoustic_remesh_with_budget(&coarse, h_target, rounds, budget);
+                candidate.stats(344.8).max_edge_m <= h_target
+            })
+            .expect("fixture must converge within 4 rounds");
+        assert!(rounds_needed > 1, "fixture must need more than one round");
+        let (short, report) =
+            isotropic_acoustic_remesh_with_budget(&coarse, h_target, rounds_needed - 1, budget);
+        assert!(
+            !report.target_met,
+            "{} rounds are short of h <= {h_target} m, but the report says met",
+            rounds_needed - 1
+        );
+        assert_eq!(report.achieved_faces, short.faces.len());
+        assert!(short.stats(344.8).max_edge_m > h_target);
     }
 
     #[test]

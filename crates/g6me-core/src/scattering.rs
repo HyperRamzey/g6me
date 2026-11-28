@@ -4,10 +4,12 @@
 //! 1. **Duda & Martens (JASA 1998)** — *"Range dependence of the response of a
 //!    spherical head model"*: solves the 3D Helmholtz boundary-value problem outside
 //!    a rigid sphere via Legendre polynomials `P_m(cos θ)` and spherical Hankel
-//!    functions of the second kind `h_m^(2)(kr) = j_m(kr) - i y_m(kr)`. `j_m` uses
-//!    Miller's downward recurrence; the Hankel sequence is evaluated in the scaled
-//!    form `H_m(z) = h_m(z) / A_m(ka)` (`A_m(x) = (2m-1)!!/x^(m+1)`) so the
-//!    evanescent tail does not overflow `f64`. Yields exact near-field acoustic parallax
+//!    functions of the second kind `h_m^(2)(kr) = j_m(kr) - i y_m(kr)`. The Hankel
+//!    sequence is evaluated in the scaled form `H_m(z) = h_m(z) / A_m(ka)`
+//!    (`A_m(x) = (2m-1)!!/x^(m+1)`) so the evanescent tail does not overflow `f64`,
+//!    and the radial products `j_m(k r) A_m(ka)` are built by a scaled downward
+//!    Miller recurrence so the `f64` underflow of `j_m` (`m ≳ 122` at 125 Hz) does
+//!    not truncate the series. Yields exact near-field acoustic parallax
 //!    (e.g., `0.3 m` vs `3.0 m`) and satisfies exact Helmholtz reciprocity
 //!    `|G(r1 -> r2) - G(r2 -> r1)| < 1e-13`.
 //! 2. **Head + torso two-sphere scattering in the snowman geometry of Algazi, Duda,
@@ -140,6 +142,100 @@ fn sph_hankel2_scaled(x0: f64, z: f64, m_max: usize) -> Vec<Complex> {
     h
 }
 
+/// Number of multipole terms required by the exterior rigid-sphere radial series.
+///
+/// `k_r_lo` is `k * r_lo`. Two independent bounds set the count:
+///
+/// * `j_m(k r_lo)` turns from oscillatory to evanescent at `m ~ k r_lo`; past that
+///   point the radial product decays factorially. Summing through the turning point
+///   plus an Airy-transition margin of `12 (k r_lo)^(1/3)` terms (minimum 32) reaches
+///   the `f64` floor. Checked against 50-digit `mpmath` over the audio grid
+///   (`k r_lo <= 440`): when the upper clamp is not binding, the neglected tail is
+///   below `1e-14` relative.
+/// * For `m > k r_hi` both radial functions are evanescent, so the tail decays
+///   geometrically like `(r_lo/r_hi)^m` and `38/ln(r_hi/r_lo)` terms push it below
+///   `1e-16`. This bound governs the near-surface geometry where the two radii are
+///   close; on the surface (`r_lo = a`) it is the only active bound when
+///   `k r_hi < k r_lo + 32`.
+///
+/// The `64..=512` clamp bounds the pathological near-equal-radius geometry, where
+/// the series converges only conditionally and more terms keep improving it.
+fn radial_series_m_max(k_r_lo: f64, r_lo: f64, r_hi: f64) -> usize {
+    let x = k_r_lo.max(0.0);
+    let airy_margin = (12.0 * x.cbrt()).ceil() + 4.0;
+    let turning = (x.ceil() as usize).saturating_add(airy_margin.max(32.0) as usize);
+    let rho = (r_hi / r_lo).max(1.0 + 1e-12);
+    let geometric = ((38.0 / rho.ln().max(1e-6)).ceil() as usize).saturating_add(8);
+    turning.max(geometric).clamp(64, 512)
+}
+
+/// Scaled spherical Bessel product `J_m = j_m(y) * A_m(x)` with
+/// `A_m(x) = (2m-1)!! / x^(m+1)`, evaluated directly by a scaled downward Miller
+/// recurrence and normalized against the exact `J_0 = sin(y) / (x y)`.
+///
+/// For `m > y`, `j_m(y) ~ y^m/(2m+1)!!` underflows `f64` around `m = 122` at
+/// `y = ka = 0.2`, while `A_m(x)` leaves the range far earlier; their product is
+/// `~ 1/((2m+1)x)` when `x = y` and must not be truncated. The product satisfies
+/// `J_{m+1} = ((2m+1)^2/(x y)) J_m - ((2m+1)(2m-1)/x^2) J_{m-1}`, whose minimal
+/// solution is `j_m(y) A_m(x)`. The recurrence is integrated downward from
+/// `m >> max(x, y)`, rescaling the sweep whenever it approaches the `f64` limits,
+/// so neither factor is ever formed on its own.
+fn scaled_j_times_a(x: f64, y: f64, m_max: usize) -> Vec<f64> {
+    let len = m_max + 2;
+    let mut c = vec![0.0_f64; len];
+    if x <= 0.0 || y <= 0.0 || !x.is_finite() || !y.is_finite() {
+        return c;
+    }
+    let m_start = (m_max + 44).max((y as usize).saturating_add(64));
+    let inv_x = 1.0 / x;
+    let inv_xy = 1.0 / (x * y);
+    let mut cm1 = 0.0_f64; // c[m + 1]
+    let mut cm0 = 1e-280_f64; // c[m]
+    for m in (1..=m_start).rev() {
+        let mf = m as f64;
+        let a = (2.0 * mf + 1.0) * (2.0 * mf + 1.0) * inv_xy;
+        let b = (2.0 * mf + 1.0) * (2.0 * mf - 1.0) * inv_x * inv_x;
+        let c_prev = (a * cm0 - cm1) / b;
+        if m - 1 < len {
+            c[m - 1] = c_prev;
+        }
+        cm1 = cm0;
+        cm0 = c_prev;
+        // Going down the minimal solution crosses many decades (it grows like
+        // (y/x)^m); keep the sweep inside f64 and carry the factor into the terms
+        // already stored.
+        let rescale = if cm0.abs() > 1e200 {
+            1e-200
+        } else if cm0 != 0.0 && cm0.abs() < 1e-200 {
+            1e200
+        } else {
+            1.0
+        };
+        if rescale != 1.0 {
+            cm0 *= rescale;
+            cm1 *= rescale;
+            let hi = len.min(m_start);
+            for slot in &mut c[(m - 1).min(hi)..hi] {
+                *slot *= rescale;
+            }
+        }
+    }
+    // Exact anchors: J_0 = j_0(y) A_0(x) = sin(y)/(x y) and
+    // J_1 = j_1(y) A_1(x) = (sin y/y^2 - cos y/y)/x^2.
+    let (anchor, index) = if c[0].abs() > 1e-300 {
+        (y.sin() / (x * y), 0)
+    } else if c[1].abs() > 1e-300 {
+        ((y.sin() / (y * y) - y.cos() / y) / (x * x), 1)
+    } else {
+        return c;
+    };
+    let scale = anchor / c[index];
+    for slot in &mut c {
+        *slot *= scale;
+    }
+    c
+}
+
 /// Exact 3D Helmholtz Green's function `G_sphere(r1, r2)` outside a rigid sphere
 /// of radius `a` centered at the origin, where `r1 = ||p1|| >= a`, `r2 = ||p2|| >= a`,
 /// and `cos_theta = dot(p1, p2) / (r1 * r2)`.
@@ -162,15 +258,12 @@ pub fn rigid_sphere_green(k: f64, a: f64, r1: f64, r2: f64, cos_theta: f64) -> C
     }
 
     let ka = k * a;
-    // The angular series tail decays like (a/r_lo)^m in the near field, so the cutoff
-    // must follow the exterior radius ratio as well as ka. 38/ln(rho) is the number of
-    // terms needed for a 1e-16 relative tail; the hard cap only guards pathological
-    // near-surface points and is never reached at the CLI's 0.25 m minimum range.
-    let rho_lo = (r_lo / a).max(1.0 + 1e-12);
-    let near_field_terms = (38.0 / rho_lo.ln().max(1e-6)).ceil() as usize;
-    let m_max = ((ka as usize) + 32)
-        .max(near_field_terms + 8)
-        .clamp(64, 512);
+    let k_r_lo = k * r_lo;
+    // The cutoff is set by the series' two convergence scales, not by r_lo/a (which
+    // is 1 on the surface and used to clamp every on-surface call to 512 terms):
+    // the j_m(k r_lo) turning point at m ~ k r_lo, and the geometric tail beyond
+    // m > k r_hi. See `radial_series_m_max`.
+    let m_max = radial_series_m_max(k_r_lo, r_lo, r_hi);
     let on_surface = (r_lo - a).abs() <= 1e-13 * a.max(1.0);
 
     // Work with the scaled Hankel sequence (see `sph_hankel2_scaled`). The unscaled
@@ -181,31 +274,20 @@ pub fn rigid_sphere_green(k: f64, a: f64, r1: f64, r2: f64, cos_theta: f64) -> C
     let hlo = if on_surface {
         hx.clone()
     } else {
-        sph_hankel2_scaled(ka, k * r_lo, m_max)
+        sph_hankel2_scaled(ka, k_r_lo, m_max)
     };
 
-    // Unscaled j_m at ka and k r_lo for the off-surface bracket, plus
-    // ln((2m-1)!!) so the product j_m A_m(ka) can be assembled without either
-    // factor leaving the f64 range.
-    let (ja, jlo, ln_odd_prefix) = if on_surface {
-        (Vec::new(), Vec::new(), Vec::new())
+    // Scaled radial products for the off-surface bracket:
+    // jlo_a[m] = j_m(k r_lo) A_m(ka) and ja_a[m] = j_m(ka) A_m(ka).
+    // Forming the products directly keeps them representable where the individual
+    // j_m and A_m factors underflow/overflow f64 (see `scaled_j_times_a`).
+    let (jlo_a, ja_a) = if on_surface {
+        (Vec::new(), Vec::new())
     } else {
-        let (ja, _) = sph_bessel_jy(ka, m_max);
-        let (jlo, _) = sph_bessel_jy(k * r_lo, m_max);
-        let mut prefix = vec![0.0_f64; m_max + 3];
-        for m in 1..prefix.len() {
-            prefix[m] = prefix[m - 1] + (2.0 * m as f64 - 1.0).ln();
-        }
-        (ja, jlo, prefix)
-    };
-    let ln_ka = ka.ln();
-    let j_times_a = |m: usize, jm: f64| -> f64 {
-        if m == 0 {
-            jm / ka
-        } else {
-            let log2_a = (ln_odd_prefix[m] - (m as f64 + 1.0) * ln_ka) / std::f64::consts::LN_2;
-            jm.signum() * (jm.abs().log2() + log2_a).exp2()
-        }
+        (
+            scaled_j_times_a(ka, k_r_lo, m_max),
+            scaled_j_times_a(ka, ka, m_max + 1),
+        )
     };
 
     let mut p_prev = 0.0_f64;
@@ -245,14 +327,8 @@ pub fn rigid_sphere_green(k: f64, a: f64, r1: f64, r2: f64, cos_theta: f64) -> C
             //   (j_m(k r_lo) A_m(ka)) H_m(k r_hi)
             //   - (j_m'(ka) A_m(ka)) H_m(k r_lo) H_m(k r_hi) / D_m,
             // and j_m'(ka) A_m(ka) = (m/ka) j_m A_m(ka) - (ka/(2m+1)) j_{m+1} A_{m+1}(ka).
-            if ja[m] == 0.0 || ja[m + 1] == 0.0 || jlo[m] == 0.0 {
-                break;
-            }
-            let j_a_lo = j_times_a(m, jlo[m]);
-            let j_a_x = j_times_a(m, ja[m]);
-            let j_a_x_next = j_times_a(m + 1, ja[m + 1]);
-            let q = j_a_x * (mf / ka) - j_a_x_next * (ka / (2.0 * mf + 1.0));
-            let t1 = hhi[m].scale(j_a_lo);
+            let q = ja_a[m] * (mf / ka) - ja_a[m + 1] * (ka / (2.0 * mf + 1.0));
+            let t1 = hhi[m].scale(jlo_a[m]);
             let t2 = hlo[m].mul(hhi[m]).div(d).scale(q);
             t1.sub(t2).scale((2.0 * mf + 1.0) * pm)
         };
@@ -262,7 +338,7 @@ pub fn rigid_sphere_green(k: f64, a: f64, r1: f64, r2: f64, cos_theta: f64) -> C
         }
         sum = sum.add(term);
 
-        if mf > ka + 6.0 && term.norm() < 1e-16 * sum.norm().max(1e-300) {
+        if mf > k_r_lo + 6.0 && term.norm() < 1e-16 * sum.norm().max(1e-300) {
             break;
         }
     }
@@ -649,5 +725,230 @@ mod tests {
         );
         // Reference length 25 mm compensation ratio must be exact 1.0 everywhere.
         assert!((ear_canal_compensation_mag(3_600.0, 25.0, c) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn on_surface_term_count_tracks_convergence_not_a_fixed_cap() {
+        // On the surface r_lo = a, so the angular tail decays like (a/r_hi)^m and the
+        // j_m turning point sits at m ~ ka. A 50-digit mpmath evaluation of the same
+        // series converges at m = 12..29 for r_hi = 2..10 m at 125 Hz..4 kHz and at
+        // m = 51 for 12 kHz. The old cutoff used r_lo/a, which is 1 on the surface,
+        // so it always clamped every on-surface call to 512 terms.
+        let a = DEFAULT_HEAD_RADIUS_M;
+        let c = 344.854_f64;
+        for &f in &[125.0_f64, 250.0, 1_000.0, 4_000.0, 12_000.0] {
+            let ka = 2.0 * PI * f / c * a;
+            for &r in &[2.0_f64, 5.0, 10.0] {
+                let m = radial_series_m_max(ka, a, r);
+                assert!(
+                    m <= 64,
+                    "{f} Hz, r = {r} m: m_max = {m}, expected <= 64 (series converges by m <= 51)"
+                );
+                assert!(
+                    m < 512,
+                    "on-surface term count must not hit the old 512 cap"
+                );
+            }
+        }
+        // At 20 kHz ka = 31.9 and the Airy margin needs m = 70 (mpmath).
+        let ka20 = 2.0 * PI * 20_000.0 / c * a;
+        for &r in &[2.0_f64, 5.0, 10.0] {
+            let m = radial_series_m_max(ka20, a, r);
+            assert!(m <= 96, "20 kHz, r = {r} m: m_max = {m}, expected <= 96");
+            assert!(m < 512);
+        }
+    }
+
+    #[test]
+    fn on_surface_green_matches_high_precision_at_2_5_10_m() {
+        // 60-digit mpmath references for h = G(k, a, R, a, cos = -1) / G_ref with
+        // G_ref = exp(-ikR)/(4 pi R). The reduced on-surface term count (64 at 12 kHz
+        // instead of the old 512) must still reproduce the exact series.
+        let c = 344.854_f64;
+        let a = DEFAULT_HEAD_RADIUS_M;
+        for (f, r, re, im) in [
+            (
+                1_000.0_f64,
+                2.0_f64,
+                -0.860_222_333_354_848_5,
+                -0.581_185_213_017_809_9,
+            ),
+            (
+                1_000.0,
+                5.0,
+                -0.878_606_183_258_691_1,
+                -0.626_259_515_404_759_5,
+            ),
+            (
+                1_000.0,
+                10.0,
+                -0.884_771_748_019_710_6,
+                -0.641_832_909_205_254_4,
+            ),
+            (
+                12_000.0,
+                2.0,
+                0.775_704_110_988_236_8,
+                0.061_228_895_176_753_19,
+            ),
+            (
+                12_000.0,
+                5.0,
+                0.771_470_714_070_063_1,
+                0.285_229_114_772_421_24,
+            ),
+            (
+                12_000.0,
+                10.0,
+                0.756_004_431_013_975_2,
+                0.361_363_389_316_898_65,
+            ),
+        ] {
+            let k = 2.0 * PI * f / c;
+            let g = rigid_sphere_green(k, a, r, a, -1.0);
+            let g_ref = Complex::from_polar(1.0 / (4.0 * PI * r), -k * r);
+            let h = g.div(g_ref);
+            let expect = Complex::new(re, im);
+            let rel = h.sub(expect).norm() / expect.norm();
+            assert!(rel < 1e-11, "on-surface {f} Hz / {r} m: rel err = {rel:e}");
+        }
+    }
+
+    #[test]
+    fn scaled_radial_product_matches_high_precision_beyond_underflow() {
+        // j_m(ka) underflows f64 at m = 122 (125 Hz) and m = 170 (1 kHz), yet the
+        // series needs J_m = j_m(y) A_m(ka), which stays O(1e-2 .. 1e165).
+        // 60-digit mpmath references computed at the same f64 arguments.
+        let c = 344.854_f64;
+        let a = DEFAULT_HEAD_RADIUS_M;
+        let f = 125.0_f64;
+        let k = 2.0 * PI * f / c;
+        let (x, y) = (k * a, k * 0.12);
+        let j = scaled_j_times_a(x, y, 256);
+        for (m, expect) in [
+            (122usize, 1.112_846_165_785_190_9e15_f64),
+            (150, 6.279_083_570_643_619e18),
+            (200, 3.404_013_862_133_299e25),
+            (256, 1.278_574_060_856_14e33),
+        ] {
+            let rel = (j[m] - expect).abs() / expect.abs();
+            assert!(rel < 1e-12, "J_{m}(k r_lo) at 125 Hz: rel err = {rel:e}");
+        }
+        // On-axis J_m = j_m(ka) A_m(ka) approaches 1/((2m+1)ka); it is finite and
+        // non-vanishing exactly where sph_bessel_jy returns 0.0.
+        let b = scaled_j_times_a(x, x, 320);
+        for (m, expect) in [
+            (122usize, 0.020_480_301_055_708_826_f64),
+            (256, 0.009_781_449_650_789_74),
+        ] {
+            let rel = (b[m] - expect).abs() / expect;
+            assert!(rel < 1e-12, "J_{m}(ka) at 125 Hz: rel err = {rel:e}");
+        }
+        let f = 1_000.0_f64;
+        let k = 2.0 * PI * f / c;
+        let (x, y) = (k * a, k * 0.32);
+        let j = scaled_j_times_a(x, y, 300);
+        for (m, expect) in [
+            (170usize, 9.490_668_948_778_331e92_f64),
+            (220, 1.065_536_672_550_816_3e121),
+            (256, 1.727_145_679_904_831_5e141),
+            (300, 8.890_140_655_000_878e165),
+        ] {
+            let rel = (j[m] - expect).abs() / expect;
+            assert!(rel < 1e-12, "J_{m}(k r_lo) at 1 kHz: rel err = {rel:e}");
+        }
+        let b = scaled_j_times_a(x, x, 256);
+        for (m, expect) in [
+            (170usize, 0.001_832_668_499_358_581_8_f64),
+            (256, 0.001_219_714_895_554_450_3),
+        ] {
+            let rel = (b[m] - expect).abs() / expect;
+            assert!(rel < 1e-12, "J_{m}(ka) at 1 kHz: rel err = {rel:e}");
+        }
+    }
+
+    #[test]
+    fn off_surface_series_not_truncated_by_bessel_underflow() {
+        // ka = 0.199 (125 Hz): the old j_m(ka) table underflows to 0.0 at m = 122 and
+        // the `ja[m] == 0.0` break truncated the series there, giving 8.8e-7 relative
+        // error against this 60-digit mpmath reference. The true tail (r_lo/r_hi)^m is
+        // still ~1e-7 at m = 122 for r_hi/r_lo = 1.083.
+        let c = 344.854_f64;
+        let a = DEFAULT_HEAD_RADIUS_M;
+        let k = 2.0 * PI * 125.0 / c;
+        let g = rigid_sphere_green(k, a, 0.12, 0.130, 0.5);
+        let expect = Complex::new(0.633_350_135_522_297_5, -0.176_624_808_478_865_33);
+        let rel = g.sub(expect).norm() / expect.norm();
+        assert!(rel < 1e-9, "underflow-truncated tail: rel err = {rel:e}");
+    }
+
+    #[test]
+    fn off_surface_green_matches_high_precision_across_audio_range() {
+        // 60-digit mpmath references. The old `ka + 32` floor truncated at m = 38-51
+        // while the j_m(k r_lo) turning point at k r_lo = 33-98 needs m = 76-130,
+        // giving 1.3e-2 (4 kHz) and 1.0 (12 kHz) relative error before the fix.
+        // The 1 kHz case is well conditioned: old and new agree to ~1 ulp (2.3e-16).
+        let c = 344.854_f64;
+        let a = DEFAULT_HEAD_RADIUS_M;
+        for (f, r1, r2, ct, re, im, tol) in [
+            (
+                1_000.0_f64,
+                0.32_f64,
+                2.40_f64,
+                0.42_f64,
+                -0.027_186_332_267_177_59,
+                0.020_911_099_599_164_61,
+                1e-12_f64,
+            ),
+            (
+                4_000.0,
+                0.45,
+                2.10,
+                0.35,
+                0.040_555_112_122_563_707,
+                -0.011_463_277_787_819_156,
+                1e-12,
+            ),
+            (
+                12_000.0,
+                0.32,
+                2.40,
+                0.42,
+                -0.037_407_002_327_584_32,
+                0.000_144_537_839_732_818_85,
+                1e-11,
+            ),
+        ] {
+            let k = 2.0 * PI * f / c;
+            let g = rigid_sphere_green(k, a, r1, r2, ct);
+            let expect = Complex::new(re, im);
+            let rel = g.sub(expect).norm() / expect.norm();
+            assert!(
+                rel < tol,
+                "{f} Hz, r = {r1}/{r2} m: rel err = {rel:e} (tol {tol:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn green_function_is_finite_across_audio_grid() {
+        // Guard the scaled recurrences against overflow/NaN over the full parameter
+        // space used by the HRTF path and the verifier checks.
+        let c = 344.854_f64;
+        let a = DEFAULT_HEAD_RADIUS_M;
+        for &f in &[20.0_f64, 125.0, 1_000.0, 4_000.0, 12_000.0, 20_000.0] {
+            let k = 2.0 * PI * f / c;
+            for &r1 in &[a, 1.2 * a, 0.12_f64, 0.32, 0.45, 2.4, 10.0] {
+                for &r2 in &[a, 1.2 * a, 0.12_f64, 0.32, 0.45, 2.4, 10.0] {
+                    for &ct in &[-1.0_f64, -0.3, 0.0, 0.7, 1.0] {
+                        let g = rigid_sphere_green(k, a, r1, r2, ct);
+                        assert!(
+                            g.re.is_finite() && g.im.is_finite(),
+                            "non-finite G at f = {f} Hz, r = {r1}/{r2} m, cos = {ct}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

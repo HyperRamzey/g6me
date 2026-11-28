@@ -3601,6 +3601,34 @@ fn read_wav_f32(path: &std::path::Path) -> Result<Vec<f32>, String> {
     Err(format!("{} has no data chunk", path.display()))
 }
 
+/// CUDA stages the `g6me --mode plus --room …` render path records when every
+/// offload stayed on the GPU. These are the exact `cuda_report` stage names for
+/// that path: FDTD (`FdtdSolver3d::simulate_with_cuda`), ten-band ray tracing
+/// (`raytrace_hoa_histogram_per_band_with_cuda` → `"raytrace-hoa-bands"`), and
+/// the device-resident UPOLA FFT (`"fft"`).
+///
+/// The single-band tracer records `"raytrace-hoa"`, a different stage that this
+/// render path never runs; requiring it here made the gate fail on a healthy
+/// all-GPU run.
+#[cfg(feature = "cuda")]
+const CUDA_E2E_REQUIRED_STAGES: [&str; 3] = [
+    "stage fdtd: GPU",
+    "stage raytrace-hoa-bands: GPU",
+    "stage fft: GPU",
+];
+
+/// Required stages absent from the CLI's CUDA report. A stage that fell back to
+/// the CPU appears only as `stage <name>: CPU fallback (…)`, so it is reported
+/// missing here — the gate still fails when the GPU stage did not run.
+#[cfg(feature = "cuda")]
+fn missing_gpu_stages(gpu_err: &str) -> Vec<&'static str> {
+    CUDA_E2E_REQUIRED_STAGES
+        .iter()
+        .copied()
+        .filter(|needle| !gpu_err.contains(needle))
+        .collect()
+}
+
 /// End-to-end CLI render: the same short programme through `g6me --mode plus
 /// --room control-room` with and without `--cuda`. The GPU run must report every
 /// stage on the GPU (no `CPU fallback` line) and the rendered float samples must
@@ -3736,16 +3764,7 @@ fn cuda_cli_end_to_end() -> Check {
     match result {
         Err(e) => fail("cuda", NAME, e),
         Ok((max_diff, peak, rms, gpu_err)) => {
-            let required = [
-                "stage fdtd: GPU",
-                "stage raytrace-hoa: GPU",
-                "stage fft: GPU",
-            ];
-            let missing: Vec<&str> = required
-                .iter()
-                .copied()
-                .filter(|needle| !gpu_err.contains(needle))
-                .collect();
+            let missing = missing_gpu_stages(&gpu_err);
             let fallbacks = gpu_err
                 .lines()
                 .filter(|l| l.contains("[cuda]") && l.contains("CPU fallback"))
@@ -3793,7 +3812,7 @@ fn cuda_cli_end_to_end() -> Check {
                     "peak": peak,
                     "rms_diff": rms,
                     "tolerance": MAX_ABS,
-                    "gpu_stages": required.len(),
+                    "gpu_stages": CUDA_E2E_REQUIRED_STAGES.len(),
                     "fallback_lines": fallbacks,
                 }),
             )
@@ -4681,6 +4700,47 @@ pub fn cuda(require_cuda: bool) -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end-to-end CUDA gate must require the stage names the plus room
+    /// render actually records. Before the fix it required `raytrace-hoa`, which
+    /// only the single-band tracer records, so a healthy all-GPU plus render was
+    /// reported as missing a stage; this test is red on that string and green
+    /// on the ten-band `raytrace-hoa-bands` name.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_e2e_gate_requires_the_stages_the_plus_room_path_records() {
+        let report = "\
+[cuda] stage bem-head-mesh: GPU (1 call(s); mesh 512 triangles)
+[cuda] stage fdtd: GPU (2 call(s); 65x54x32 voxels, 450 steps)
+[cuda] stage raytrace-hoa-bands: GPU (4 call(s); 10 bands x 2048 rays x 48 bounces)
+[cuda] stage fft: GPU (1 call(s))";
+        assert!(
+            missing_gpu_stages(report).is_empty(),
+            "all-GPU plus render reported missing stages: {:?}",
+            missing_gpu_stages(report)
+        );
+
+        // A CPU fallback for one stage must still fail the gate.
+        let fallback = report.replace(
+            "raytrace-hoa-bands: GPU (4 call(s); 10 bands x 2048 rays x 48 bounces)",
+            "raytrace-hoa-bands: CPU fallback (1 call(s); runtime unavailable)",
+        );
+        assert_eq!(
+            missing_gpu_stages(&fallback),
+            vec!["stage raytrace-hoa-bands: GPU"]
+        );
+
+        // The single-band tracer's stage name is a different code path and must
+        // not satisfy the ten-band gate.
+        let single_band = "\
+[cuda] stage fdtd: GPU (2 call(s))
+[cuda] stage raytrace-hoa: GPU (1 call(s))
+[cuda] stage fft: GPU (1 call(s))";
+        assert_eq!(
+            missing_gpu_stages(single_band),
+            vec!["stage raytrace-hoa-bands: GPU"]
+        );
+    }
 
     #[test]
     fn disassembly_lines_are_classified_by_shape_not_by_angle_brackets() {

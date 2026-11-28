@@ -427,21 +427,19 @@ pub fn octave_band_weight(f_hz: f64, band: usize) -> f64 {
     }
 }
 
-/// Piecewise log-frequency interpolation of a ten-band table.
+/// Monotone log-frequency interpolation of a ten-band table.
+///
+/// Uses Fritsch–Carlson PCHIP in `log10(f)` (see [`crate::pchip`]) rather than
+/// piecewise-linear interpolation on the raw `log2(f)` axis. The nominal ISO
+/// centres are only *approximately* octave-spaced: `63 → 125 Hz` spans
+/// `0.9887` octaves, so an `log2(f)`-un-normalised linear segment approaches
+/// `y(63) + 0.9887·(y(125) − y(63))` from the left and restarts at `y(125)` on
+/// the right — a step of ~1.1 % of the 63→125 rise at 125 Hz. PCHIP is C¹ and,
+/// being shape-preserving, keeps absorption inside `[0.01, 0.99]` and
+/// scattering inside `[0, 1]` without overshoot.
 #[inline]
 fn band_value_at(values: &[f64; ROOM_BAND_COUNT], f_hz: f64) -> f64 {
-    if f_hz <= ROOM_BANDS_HZ[0] {
-        return values[0];
-    }
-    if f_hz >= ROOM_BANDS_HZ[ROOM_BAND_COUNT - 1] {
-        return values[ROOM_BAND_COUNT - 1];
-    }
-    let mut idx = 0usize;
-    while idx + 1 < ROOM_BAND_COUNT && f_hz > ROOM_BANDS_HZ[idx + 1] {
-        idx += 1;
-    }
-    let t = (f_hz / ROOM_BANDS_HZ[idx]).log2();
-    values[idx] + t * (values[idx + 1] - values[idx])
+    crate::pchip::pchip_eval_fixed(&ROOM_BANDS_HZ, values, f_hz)
 }
 
 /// Expand a legacy six-band `[125, 250, 500, 1k, 2k, 4k]` table to ten bands by
@@ -3100,6 +3098,70 @@ pub fn raytrace_hoa_histogram_serial(
     reduce_native_arrivals(&per_ray, atm, n_time_bins, bin_dt_s)
 }
 
+/// Per-band W-channel energy envelope `sqrt(sum_i h_i²)` for every 4 ms
+/// histogram bin, plus each band's own maximum.
+///
+/// The envelope modulates the late tail, so normalising each band by its own
+/// maximum preserves that band's decay rate. The pre-fix code divided every band
+/// by one global maximum and floored the result at `0.15` (−16.5 dB), at which
+/// point a strongly absorbing band stopped decaying and its tail inherited
+/// `base_l`/`base_r`'s broadband rate instead of its own RT60.
+fn band_energy_envelopes(
+    hist_bands: &[RoomBandHistogram],
+    n_bins: usize,
+) -> (Vec<Vec<f64>>, [f64; ROOM_BAND_COUNT]) {
+    let mut band_bin_energies = vec![vec![0.0_f64; n_bins]; ROOM_BAND_COUNT];
+    let mut band_max_e = [0.0_f64; ROOM_BAND_COUNT];
+    for (t, row) in hist_bands.iter().take(n_bins).enumerate() {
+        for band in 0..ROOM_BAND_COUNT {
+            let e = row[band].iter().map(|x| x * x).sum::<f64>().sqrt();
+            band_bin_energies[band][t] = e;
+            band_max_e[band] = band_max_e[band].max(e);
+        }
+    }
+    (band_bin_energies, band_max_e)
+}
+
+/// Per-band relative amplitude envelopes in `[0, 1]`, each band divided by its
+/// own maximum, alongside the raw maxima for the "any late energy" gate.
+///
+/// This is the production form of the envelope modulation: a band whose maximum
+/// is at or below the numerical floor (`1e-12`) normalises to all zeros instead
+/// of dividing 0/0, and every other band keeps its own decay slope.
+fn band_relative_envelopes(
+    hist_bands: &[RoomBandHistogram],
+    n_bins: usize,
+) -> (Vec<Vec<f64>>, [f64; ROOM_BAND_COUNT]) {
+    let (energies, maxima) = band_energy_envelopes(hist_bands, n_bins);
+    let relative = energies
+        .iter()
+        .enumerate()
+        .map(|(band, energies)| {
+            let scale = if maxima[band] > 1e-12 {
+                1.0 / maxima[band]
+            } else {
+                0.0
+            };
+            energies.iter().map(|e| (e * scale).sqrt()).collect()
+        })
+        .collect();
+    (relative, maxima)
+}
+
+/// High-pass shading applied to the decoded late-tail spectrum above
+/// `f_xover` (below it the FDTD modal layer owns the response).
+///
+/// Deliberately frequency-only: molecular air absorption is **not** applied
+/// here. The ten-band ray reduction already weights every arrival by
+/// `air_gain_linear(f_band, path_length)²` (ISO 9613-1 at the band centre), so
+/// the extra `air_gain_linear(f, zone_dist_m.min(60))` factor this function
+/// replaced attenuated the late tail twice.
+#[inline]
+fn tail_highpass_shading(f_hz: f64, f_xover: f64) -> f64 {
+    let x_hp = f_hz / f_xover.max(200.0);
+    (x_hp * x_hp) / (1.0 + x_hp * x_hp)
+}
+
 /// Synthesize a complete **Hybrid 3D Room BRIR** (`spec_l_add`, `spec_r_add`) for a virtual
 /// speaker at `(az_deg, el_deg, distance_m)` by fusing:
 /// 1. 3D ISM early reflections (orders 1–2) with wall absorption + molecular `O₂`/`N₂` air,
@@ -3291,17 +3353,11 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
         seed,
         use_cuda,
     );
-    // Per-band W-channel energy envelope and its global maximum (one common
-    // normalisation, so the relative decay of the bands is preserved).
-    let mut band_bin_energies = vec![vec![0.0_f64; n_bins]; ROOM_BAND_COUNT];
-    let mut max_bin_e = 0.0_f64;
-    for (t, row) in hist_bands.iter().enumerate() {
-        for band in 0..ROOM_BAND_COUNT {
-            let e = row[band].iter().map(|x| x * x).sum::<f64>().sqrt();
-            band_bin_energies[band][t] = e;
-            max_bin_e = max_bin_e.max(e);
-        }
-    }
+    // Per-band W-channel relative amplitude envelopes, each band normalised by
+    // its own maximum. A numerical floor only (~1e-12): a band with no late
+    // energy contributes nothing rather than dividing 0/0.
+    let (band_rel_env, band_max_e) = band_relative_envelopes(&hist_bands, n_bins);
+    let max_bin_e = band_max_e.iter().copied().fold(0.0_f64, f64::max);
 
     if max_bin_e > 1e-12 {
         let tail_len = ((tail_dur * fs).round() as usize).min(n_fft.saturating_sub(512));
@@ -3356,22 +3412,19 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
             } else {
                 (z + 1) * bins_per_zone
             };
-            let zone_dist_m = d_dir + (0.5 * ((b0 + b1) as f64) * bin_dt_s) * c;
-            // High-pass (FDTD owns the modal band) and ISO 9613-1 air gain at
-            // this zone's mean travelled distance; band-independent.
-            let hp_air: Vec<f64> = freqs
+            // High-pass only (FDTD owns the modal band). Molecular air
+            // absorption is owned by the ray reduction, which weights every
+            // arrival by `air_gain_linear(f_band, path_length)²`; a second
+            // zone-mean air gain here attenuated the late tail twice.
+            let hp_gain: Vec<f64> = freqs
                 .iter()
-                .map(|&f| {
-                    let x_hp = f / f_xover.max(200.0);
-                    let hp = (x_hp * x_hp) / (1.0 + x_hp * x_hp);
-                    hp * atm.air_gain_linear(f, zone_dist_m.min(60.0))
-                })
+                .map(|&f| tail_highpass_shading(f, f_xover))
                 .collect();
 
             for band in 0..ROOM_BAND_COUNT {
                 // A band with no recorded late energy contributes nothing; skip
                 // its FFT rather than render a silent zone.
-                if band_bin_energies[band].iter().all(|&e| e <= 1e-300) {
+                if band_max_e[band] <= 1e-12 {
                     continue;
                 }
                 let mut sh_zone = [0.0_f64; HOA_CH];
@@ -3400,9 +3453,9 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
                         break;
                     }
                     let bin_idx = (((i as f64) / fs) / bin_dt_s).floor() as usize;
-                    let e_rel = (band_bin_energies[band][bin_idx.min(n_bins - 1)] / max_bin_e)
-                        .sqrt()
-                        .clamp(0.15, 1.0);
+                    // Each band relative to its own peak: the decay rate (and so
+                    // the RT60) of this band's envelope survives into the tail.
+                    let e_rel = band_rel_env[band][bin_idx.min(n_bins - 1)];
                     // Raised-cosine zone edge fade prevents clicks between HOA spatial zones.
                     let mut win = 1.0_f64;
                     if z > 0 && i - s0 < xfade {
@@ -3422,7 +3475,7 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
                     if w <= 0.0 {
                         continue;
                     }
-                    let scale = 0.18 * hp_air[k] * w;
+                    let scale = 0.18 * hp_gain[k] * w;
                     out_l[k] = out_l[k].add(sl_zone[k].mul(hl_hoa[k]).scale(scale));
                     out_r[k] = out_r[k].add(sr_zone[k].mul(hr_hoa[k]).scale(scale));
                 }
@@ -4192,6 +4245,61 @@ mod tests {
         assert_eq!(octave_band_weight(1_000.0, ROOM_BAND_COUNT), 0.0);
     }
 
+    /// The material tables interpolated by `band_value_at` used to step at
+    /// 125 Hz: the un-normalised `log2(f)` segment from 63 Hz approaches
+    /// `y(63) + 0.9887·(y(125) − y(63))`, while the interval above starts at
+    /// `y(125)`. With `dy = 0.45` that is a 5.2e-3 step; PCHIP must hold the
+    /// left and right limits to `y(125)` within 1e-9.
+    #[test]
+    fn band_value_interpolation_is_continuous_at_nominal_band_edges() {
+        let values = [0.10, 0.15, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60];
+        for &edge in &ROOM_BANDS_HZ[1..ROOM_BAND_COUNT - 1] {
+            let left = band_value_at(&values, edge * (1.0 - 1e-12));
+            let right = band_value_at(&values, edge * (1.0 + 1e-12));
+            let at = band_value_at(&values, edge);
+            assert!(
+                (left - at).abs() < 1e-9,
+                "left limit at {edge} Hz is {left}, knot is {at}"
+            );
+            assert!(
+                (right - at).abs() < 1e-9,
+                "right limit at {edge} Hz is {right}, knot is {at}"
+            );
+        }
+        // The old piecewise-linear form differed from the knot by 5.19e-3 here.
+        let at_125 = band_value_at(&values, 125.0);
+        assert!((at_125 - values[2]).abs() < 1e-12);
+    }
+
+    /// PCHIP is shape-preserving: a monotone table stays monotone, and a table
+    /// inside the physical ranges cannot overshoot them.
+    #[test]
+    fn band_value_interpolation_is_monotone_without_overshoot() {
+        let absorption = [0.05, 0.07, 0.10, 0.13, 0.20, 0.30, 0.42, 0.55, 0.66, 0.75];
+        // Non-monotone table with a sharp 125 Hz peak: no ringing past 0.90.
+        let scattering = [0.10, 0.20, 0.90, 0.50, 0.30, 0.25, 0.20, 0.15, 0.10, 0.05];
+        let mut f = ROOM_BANDS_HZ[0];
+        let mut prev = band_value_at(&absorption, f);
+        while f <= ROOM_BANDS_HZ[ROOM_BAND_COUNT - 1] {
+            let a = band_value_at(&absorption, f);
+            assert!(
+                a >= prev - 1e-12,
+                "absorption interpolation dipped at {f} Hz: {prev} -> {a}"
+            );
+            assert!(
+                (0.01..=0.99).contains(&a),
+                "absorption left [0.01, 0.99] at {f} Hz: {a}"
+            );
+            let s = band_value_at(&scattering, f);
+            assert!(
+                (0.0..=1.0).contains(&s),
+                "scattering left [0, 1] at {f} Hz: {s}"
+            );
+            prev = a;
+            f *= 1.003;
+        }
+    }
+
     #[test]
     fn legacy_six_band_room_json_expands_to_ten_bands() {
         // Pre-ten-band `--room-json` schema: six-band absorption and a scalar
@@ -4592,11 +4700,11 @@ mod tests {
             }
         }
 
-        // Band isolation: perturbing the ceiling's 8 kHz alpha must change only
-        // band 7, and only on taps that actually hit the ceiling.
+        // Band isolation: perturbing the ceiling's 8 kHz alpha (ROOM_BANDS_HZ[8])
+        // must change only band 8, and only on taps that actually hit the ceiling.
         let mut sabotaged = geom.clone();
-        let alpha = sabotaged.walls[5].absorption[7];
-        sabotaged.walls[5].absorption[7] = (alpha * 1.10).min(0.99);
+        let alpha = sabotaged.walls[5].absorption[8];
+        sabotaged.walls[5].absorption[8] = (alpha * 1.10).min(0.99);
         let sab_taps = image_sources_3d(&sabotaged, src, c, 2);
         assert_eq!(taps.len(), sab_taps.len());
         let mut ceiling_taps = 0usize;
@@ -4614,11 +4722,11 @@ mod tests {
             } else {
                 ceiling_taps += 1;
                 assert!(
-                    (a.band_reflection_energy[7] - b.band_reflection_energy[7]).abs() > 1e-6,
+                    (a.band_reflection_energy[8] - b.band_reflection_energy[8]).abs() > 1e-6,
                     "ceiling tap's 8 kHz energy did not respond to a ceiling alpha change"
                 );
                 for band in 0..ROOM_BAND_COUNT {
-                    if band != 7 {
+                    if band != 8 {
                         assert_eq!(
                             a.band_reflection_energy[band].to_bits(),
                             b.band_reflection_energy[band].to_bits(),
@@ -4675,10 +4783,11 @@ mod tests {
             }
         }
 
-        // Band isolation: only band 7 (8 kHz) may see the ceiling change.
+        // Band isolation: only band 8 (8 kHz, ROOM_BANDS_HZ[8]) may see the
+        // ceiling change.
         let mut sabotaged = geom.clone();
-        let alpha = sabotaged.walls[5].absorption[7];
-        sabotaged.walls[5].absorption[7] = (alpha * 1.10).min(0.99);
+        let alpha = sabotaged.walls[5].absorption[8];
+        sabotaged.walls[5].absorption[8] = (alpha * 1.10).min(0.99);
         let pert = raytrace_hoa_histogram_per_band(
             &sabotaged,
             &atm,
@@ -4689,16 +4798,16 @@ mod tests {
             bin_dt_s,
             seed,
         );
-        let mut band7_changed = false;
+        let mut band8_changed = false;
         for (bin, (a, b)) in base.iter().zip(&pert).enumerate() {
             for band in 0..ROOM_BAND_COUNT {
-                if band == 7 {
+                if band == 8 {
                     if a[band]
                         .iter()
                         .zip(b[band].iter())
                         .any(|(&x, &y)| x.to_bits() != y.to_bits())
                     {
-                        band7_changed = true;
+                        band8_changed = true;
                     }
                 } else {
                     for (ch, (&x, &y)) in a[band].iter().zip(b[band].iter()).enumerate() {
@@ -4712,7 +4821,7 @@ mod tests {
             }
         }
         assert!(
-            band7_changed,
+            band8_changed,
             "ceiling 8 kHz alpha change did not alter the 8 kHz per-band histogram"
         );
     }
@@ -4754,6 +4863,369 @@ mod tests {
             ratio < 0.75,
             "16 kHz late energy is not attenuated relative to 31.5 Hz (ratio {ratio:.4}); \
              the per-band air reference is not wired"
+        );
+    }
+
+    /// T30 from a per-band relative amplitude envelope: least-squares slope of
+    /// `20·log10(e_rel)` over the −5 … −35 dB portion of the decay after the
+    /// envelope's peak, scaled to a 60 dB decay time. `None` when the envelope
+    /// does not cover 30 dB (which is exactly what the old `0.15` floor caused).
+    fn t30_from_amplitude_envelope(e_rel: &[f64], bin_dt_s: f64) -> Option<f64> {
+        let peak = e_rel.iter().copied().fold(0.0_f64, f64::max);
+        if peak <= 0.0 {
+            return None;
+        }
+        let peak_idx = e_rel.iter().position(|&e| e == peak)?;
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for (i, &e) in e_rel.iter().enumerate().skip(peak_idx) {
+            if e <= 0.0 {
+                continue;
+            }
+            let level = 20.0 * (e / peak).log10();
+            if (-35.0..=-5.0).contains(&level) {
+                xs.push((i - peak_idx) as f64 * bin_dt_s);
+                ys.push(level);
+            }
+        }
+        if xs.len() < 8 {
+            return None;
+        }
+        let n = xs.len() as f64;
+        let mx = xs.iter().sum::<f64>() / n;
+        let my = ys.iter().sum::<f64>() / n;
+        let sxx: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
+        let sxy: f64 = xs.iter().zip(&ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+        let slope = sxy / sxx;
+        (slope < 0.0).then(|| -60.0 / slope)
+    }
+
+    /// The envelope of a strongly absorbing band must keep its own decay: the
+    /// pre-fix code divided every band by one global maximum and clamped the
+    /// relative amplitude at `0.15` (−16.48 dB), at which point that band
+    /// flat-lined and inherited `base_l`/`base_r`'s broadband rate.
+    #[test]
+    fn per_band_envelope_keeps_absorbing_band_decay_below_minus_16_5_db() {
+        const BAND: usize = 5; // 1 kHz: wall absorption dominates, air is negligible.
+        let mut walls = [WallMaterial::uniform(0.05, 0.50); 6];
+        for w in &mut walls {
+            w.absorption[BAND] = 0.30;
+        }
+        let geom = RoomGeometry {
+            name: "One Absorbing Band".to_string(),
+            dims_m: [6.0, 5.0, 3.0],
+            listener_m: [2.6, 2.5, 1.25],
+            walls,
+            bass_trap_admittance: 0.16,
+            target_rt60_s: 0.25,
+            targets: None,
+            edges: Vec::new(),
+        };
+        geom.validate()
+            .expect("one-absorbing-band room must validate");
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.3];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (8_192usize, 128usize, 200usize, 0.004_f64, 0x0BA5_E5EDu64);
+        let hist = raytrace_hoa_histogram_per_band(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        let (envelopes, maxima) = band_relative_envelopes(&hist, n_bins);
+        assert!(maxima[BAND] > 0.0, "absorbing band recorded no late energy");
+        let e_rel = &envelopes[BAND];
+        // Last non-zero sample, so a tail that simply ran out of rays cannot
+        // masquerade as a deep decay.
+        let min_positive = e_rel
+            .iter()
+            .copied()
+            .filter(|&e| e > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        let min_db = 20.0 * min_positive.log10();
+        assert!(
+            min_positive < 0.10,
+            "band {BAND} envelope bottomed at {min_positive:.4} ({min_db:.1} dB); \
+             the old global clamp pinned it at 0.15 (−16.48 dB)"
+        );
+        let target = geom.eyring_rt60_band(&atm, BAND);
+        let t30 = t30_from_amplitude_envelope(e_rel, bin_dt_s).unwrap_or_else(|| {
+            panic!(
+                "band {BAND} envelope does not span the −5…−35 dB T30 window \
+                 (min {min_positive:.4}); the decay floor is back"
+            )
+        });
+        eprintln!(
+            "absorbing band {} Hz: T30 = {t30:.4} s, Eyring target = {target:.4} s, \
+             envelope min = {min_positive:.3e} ({min_db:.1} dB)",
+            ROOM_BANDS_HZ[BAND]
+        );
+        assert!(
+            (t30 / target - 1.0).abs() < 0.20,
+            "absorbing band T30 = {t30:.4} s vs Eyring target {target:.4} s \
+             (ratio {:.3})",
+            t30 / target
+        );
+    }
+
+    /// A band with no recorded energy must normalise to all zeros (0/0 handled
+    /// by the `1e-12` numerical floor), and a single non-zero bin must
+    /// normalise to exactly 1.0 with no NaN anywhere.
+    #[test]
+    fn band_envelope_normalises_empty_bands_to_zero_without_nan() {
+        let empty = vec![[[0.0_f64; HOA_CH]; ROOM_BAND_COUNT]; 4];
+        let (env, maxima) = band_relative_envelopes(&empty, 4);
+        assert_eq!(maxima, [0.0_f64; ROOM_BAND_COUNT]);
+        for band in &env {
+            assert!(band.iter().all(|&e| e == 0.0), "empty band is not zero");
+        }
+
+        let mut one = vec![[[0.0_f64; HOA_CH]; ROOM_BAND_COUNT]; 4];
+        one[2][3][0] = 5.0;
+        let (env, maxima) = band_relative_envelopes(&one, 4);
+        assert_eq!(maxima[3], 5.0);
+        assert_eq!(env[3][2], 1.0);
+        assert_eq!(env[3][0], 0.0);
+        for band in &env {
+            assert!(band.iter().all(|e| e.is_finite()), "NaN in envelope");
+        }
+    }
+
+    /// Per-path air attenuation is owned by the ray reduction: one synthetic
+    /// arrival at each of two distances must carry exactly the ISO 9613-1
+    /// energy attenuation `10^(−α(f)·d/10)` at the band centre.
+    #[test]
+    fn ray_reduction_applies_iso9613_air_once_at_two_distances() {
+        let atm = AtmosphereCfg::default();
+        let c = atm.speed_of_sound_m_s();
+        let band = 8; // 8 kHz: air absorption is large enough to measure.
+        let f = ROOM_BANDS_HZ[band];
+        let alpha = atm.alpha_db_per_m(f);
+        let bin_dt_s = 0.01;
+        let n_bins = 64usize;
+        let mut w = Vec::new();
+        for &d in &[5.0_f64, 40.0] {
+            let per_ray = vec![vec![NativeArrival {
+                delay_s: d / c,
+                energy: 1.0,
+                dir: [0.0, 0.0, 1.0],
+            }]];
+            let hist = reduce_native_arrivals_at(&per_ray, &atm, n_bins, bin_dt_s, f);
+            let bin = (d / c / bin_dt_s) as usize;
+            w.push(hist[bin][0]);
+            let sh = eval_sh_order7(0.0, std::f64::consts::FRAC_PI_2);
+            let want = sh[0] * 10.0_f64.powf(-alpha * d / 10.0);
+            assert!(
+                (hist[bin][0] / want - 1.0).abs() < 1e-12,
+                "ISO 9613-1 at {d} m, band {band}: W = {:e}, analytic = {want:e} \
+                 (α = {alpha:.6e} dB/m)",
+                hist[bin][0]
+            );
+        }
+        let want_ratio = 10.0_f64.powf(alpha * 35.0 / 10.0);
+        let got_ratio = w[0] / w[1];
+        eprintln!(
+            "8 kHz ISO 9613-1 α = {alpha:.5e} dB/m: W(5 m)/W(40 m) = {got_ratio:.4} \
+             (analytic {want_ratio:.4})"
+        );
+        assert!((got_ratio / want_ratio - 1.0).abs() < 1e-12);
+    }
+
+    /// The late-tail spectral shading must be high-pass only. The old
+    /// `hp_air` vector multiplied it by a second ISO 9613-1 air gain over the
+    /// zone mean distance (capped at 60 m), so every late arrival was attenuated
+    /// twice. At 16 kHz / 60 m that omitted factor is large.
+    #[test]
+    fn late_tail_shading_has_no_second_air_factor() {
+        let atm = AtmosphereCfg::default();
+        let f_xover = 500.0;
+        for f in [1_000.0_f64, 8_000.0, 16_000.0] {
+            let x = f / f_xover;
+            let want = x * x / (1.0 + x * x);
+            let got = tail_highpass_shading(f, f_xover);
+            assert!(
+                (got - want).abs() < 1e-15,
+                "shading at {f} Hz = {got}, high-pass = {want}"
+            );
+        }
+        let air_60m = atm.air_gain_linear(16_000.0, 60.0);
+        eprintln!(
+            "16 kHz ISO 9613-1 air gain over 60 m = {air_60m:.4} (double-counted before the fix)"
+        );
+        assert!(
+            air_60m < 0.75,
+            "test premise: 16 kHz / 60 m air gain {air_60m:.4} must be a measurable factor"
+        );
+        let hp = tail_highpass_shading(16_000.0, f_xover);
+        assert!(
+            (hp - hp * air_60m).abs() > 1e-3,
+            "re-adding the zone air factor must be detectable at 16 kHz"
+        );
+    }
+
+    /// CPU ↔ CUDA ten-band envelope parity. The two Monte Carlo streams differ,
+    /// so the envelopes agree statistically; the integer-indexed bin/band
+    /// normalisation itself is exact and deterministic for identical input
+    /// (checked first). The float tolerance is the smallest bound that covers
+    /// the measured difference on this host (0.0287).
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn per_band_cuda_envelope_parity_matches_native_at_measured_tolerance() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP per_band_cuda_envelope_parity_matches_native_at_measured_tolerance: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        // Measured worst over the ten bands on this host: 0.0287 (band 7).
+        const MAX_NORMALIZED_ENVELOPE_L1: f64 = 0.05;
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.25];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (16_384usize, 24usize, 128usize, 0.002_f64, 0xE17E_10BEu64);
+
+        let cpu = raytrace_hoa_histogram_per_band(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        let gpu = raytrace_hoa_histogram_per_band_on_cuda(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        )
+        .unwrap_or_else(|e| panic!("per-band CUDA raytrace failed: {e}"));
+
+        let (cpu_env, cpu_max) = band_relative_envelopes(&cpu, n_bins);
+        let (gpu_env, gpu_max) = band_relative_envelopes(&gpu, n_bins);
+        // Deterministic integer-indexed stages: identical input must reproduce
+        // the envelopes and maxima bit-for-bit.
+        let (again_env, again_max) = band_relative_envelopes(&cpu, n_bins);
+        assert_eq!(cpu_max, again_max, "band maxima are not deterministic");
+        assert_eq!(cpu_env, again_env, "envelopes are not deterministic");
+
+        let mut worst_l1 = 0.0_f64;
+        for band in 0..ROOM_BAND_COUNT {
+            assert!(
+                cpu_max[band] > 0.0 && gpu_max[band] > 0.0,
+                "band {band} ({:.0} Hz) has no late W energy: cpu={:e}, gpu={:e}",
+                ROOM_BANDS_HZ[band],
+                cpu_max[band],
+                gpu_max[band]
+            );
+            let l1: f64 = cpu_env[band]
+                .iter()
+                .zip(gpu_env[band].iter())
+                .map(|(&a, &b)| (a - b).abs())
+                .sum::<f64>()
+                / n_bins as f64;
+            eprintln!(
+                "band {band:2} ({:5.0} Hz): normalized-envelope L1 = {l1:.4}",
+                ROOM_BANDS_HZ[band]
+            );
+            worst_l1 = worst_l1.max(l1);
+        }
+        eprintln!(
+            "worst normalized-envelope L1 = {worst_l1:.4} (tol {MAX_NORMALIZED_ENVELOPE_L1})"
+        );
+        assert!(
+            worst_l1 < MAX_NORMALIZED_ENVELOPE_L1,
+            "native CPU vs GPU normalized band-envelope L1 = {worst_l1:.4} >= \
+             {MAX_NORMALIZED_ENVELOPE_L1}"
+        );
+    }
+
+    /// The per-band GPU stage must be genuinely GPU-resident: the
+    /// `_with_cuda` wrapper dispatches the GPU-only kernel path, records
+    /// `stage raytrace-hoa-bands: GPU` with no `CPU fallback`, and returns
+    /// bit-identically what the direct GPU entry point returns. A host fallback
+    /// would both record a fallback line and produce a statistically different
+    /// native histogram, so neither can pass.
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn per_band_gpu_stage_is_gpu_resident_and_records_no_fallback() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP per_band_gpu_stage_is_gpu_resident_and_records_no_fallback: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.25];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (4_096usize, 16usize, 32usize, 0.004_f64, 0x6D0B_11E5u64);
+
+        let via_wrapper = raytrace_hoa_histogram_per_band_with_cuda(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+            true,
+        );
+
+        let report = crate::cuda_report::summary();
+        let line = report
+            .lines
+            .iter()
+            .find(|l| l.contains("stage raytrace-hoa-bands:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "per-band GPU stage was not recorded at all: {:?}",
+                    report.lines
+                )
+            });
+        assert!(
+            line.contains(": GPU ("),
+            "per-band raytrace did not run on the GPU: {line}"
+        );
+        assert!(
+            !line.contains("CPU fallback"),
+            "per-band raytrace fell back to the CPU: {line}"
+        );
+
+        let direct = raytrace_hoa_histogram_per_band_on_cuda(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        )
+        .unwrap_or_else(|e| panic!("direct per-band CUDA raytrace failed: {e}"));
+        assert_eq!(
+            via_wrapper, direct,
+            "wrapper output is not bit-identical to the GPU-only entry point"
+        );
+        assert!(
+            via_wrapper
+                .iter()
+                .any(|row| row.iter().any(|band| band.iter().any(|&x| x != 0.0))),
+            "GPU per-band trace recorded no energy"
         );
     }
 
@@ -4894,8 +5366,8 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("base per-band CUDA raytrace failed: {e}"));
         let mut sabotaged = geom.clone();
-        let alpha = sabotaged.walls[5].absorption[7];
-        sabotaged.walls[5].absorption[7] = (alpha * 1.10).min(0.99);
+        let alpha = sabotaged.walls[5].absorption[8];
+        sabotaged.walls[5].absorption[8] = (alpha * 1.10).min(0.99);
         let pert = raytrace_hoa_histogram_per_band_on_cuda(
             &sabotaged,
             &atm,
@@ -4908,16 +5380,16 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("perturbed per-band CUDA raytrace failed: {e}"));
 
-        let mut band7_changed = false;
+        let mut band8_changed = false;
         for (bin, (a, b)) in base.iter().zip(&pert).enumerate() {
             for band in 0..ROOM_BAND_COUNT {
-                if band == 7 {
+                if band == 8 {
                     if a[band]
                         .iter()
                         .zip(b[band].iter())
                         .any(|(&x, &y)| x.to_bits() != y.to_bits())
                     {
-                        band7_changed = true;
+                        band8_changed = true;
                     }
                 } else {
                     for (ch, (&x, &y)) in a[band].iter().zip(b[band].iter()).enumerate() {
@@ -4931,7 +5403,7 @@ mod tests {
             }
         }
         assert!(
-            band7_changed,
+            band8_changed,
             "GPU ceiling 8 kHz alpha change did not alter the 8 kHz per-band histogram"
         );
     }

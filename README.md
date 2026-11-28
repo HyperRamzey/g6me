@@ -23,6 +23,49 @@ multichannel file ──ffmpeg decode──► f64 samples ──► renderer (f
                                                          Plus: G6+ binaural   and reported)       in WAV)
 ```
 
+## Roadmap — 2026-11-28 (in progress)
+
+A verification-first program toward full CPU/GPU feature parity and paper-literal
+conformance. Every item lands with a sabotage test that fails on the unfixed or wrong
+implementation. The working checklist is `docs/handoffs/roadmap-temp-2026-11-28.md`.
+
+**Doctrine.** Production CPU and GPU implement the same feature natively on different
+hardware: same algorithm and operation order, strict IEEE, zero FMA. Integer stages are
+bit-identical; float stages are gated at the smallest measured difference. A CUDA stage is
+never "missing" and never satisfied by a silent host fallback; a GPU-only feature gets a
+bit-exact CPU counterpart. A paper's name appears only on an implementation of that paper.
+
+**Wave 1 — correctness (in progress).** Room late-tail per-band RT60 (envelope floor,
+double ISO 9613-1 air absorption, 125 Hz interpolation step), Bruce–Erfani–Zilany (BEZ2018a)
+auditory periphery (tail padding, decimator phase, PLA/chirp gains, SPL calibration, integer
+step counter), ISO 3382-1 LF denominator + IEC 61260 class-1 filterbank, Baumgartner–Majdak
+7-cue externalization (true Butterworth, pinna template), DNG float/GainMap edge cases and
+remesh budget reporting, spherical near-field HRTF series (r_hi cutoff, scaled Miller J_m),
+UPOLA single-inverse and rollback atomicity, and the CUDA E2E stage gate.
+
+**Wave 2 — measured room validation.** Lundeby cross-point truncation and noise handling,
+Tier-A shoebox presets in CLI/GUI, OpenAIR/dEchorate gates, passive frequency-dependent FDTD
+boundaries (Kowalczyk–van Walstijn; Bilbao–Hamilton), colorless FDN matrices (Dal Santo et
+al.) and per-band GFDN absorption (Das et al. 2025).
+
+**Wave 3 — binaural and personalisation.** MagLS phase continuation (Hold, Meyer-Kahlen &
+Pulkki 2023), bilateral MagLS, diffuse-field equalisation with regularised complex inversion,
+reverberant externalisation (Li et al. 2020) and full-sphere localisation (Barumerli et al.
+2023), SOFA AES69 I/O with Mesh2HRTF/NumCalc interop, minimum-phase HRIR synthesis from
+HyprEQ's Hilbert-cepstral generator, and Møller et al. (2007) phase-matched stereo for
+per-ear HPEQ.
+
+**Wave 4 — compute.** ETH Zürich optimal-Q Ozaki-II modulus schemes (FP4 59 / FP8 30 GEMMs,
+INT8 moduli ≤ 239), CUDA perf plan §§2–5 (batched FFT + CUDA Graph, FDTD temporal blocking,
+GPU-resident GMRES).
+
+**Wave 5 — scan completeness.** Tiled 12–50 MP depth, configurable remesh budget, optional
+AprilTag3 (tag36h11) payload decoding.
+
+No new equalisation features are introduced: HyprEQ primitives (PCHIP, complex inversion,
+IEC 61260, Neumaier summation, minimum-phase FIR) are ported only where a paper's algorithm
+requires them.
+
 ## Two engines, one pipeline
 
 | | **Reference** (default) | **Plus** (`--mode plus`) |
