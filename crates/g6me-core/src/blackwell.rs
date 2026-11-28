@@ -643,8 +643,23 @@ pub fn ozaki2_crt_gemm_with_cuda(
     use_cuda: bool,
     precision: CudaTensorPrecision,
 ) -> Vec<Vec<f64>> {
+    ozaki2_crt_gemm_with_cuda_precision(a, b, backend, use_cuda, precision).0
+}
+
+/// Same as [`ozaki2_crt_gemm_with_cuda`], but also reports the precision the runtime actually
+/// selected. `Some(p)` means the product really ran on the GPU at precision `p`, which can
+/// differ from `precision` after `Auto` resolution or an unsupported-format downgrade for the
+/// detected compute capability; `None` means the CPU [`ozaki2_crt_gemm`] reference produced
+/// the result. Callers that display which arithmetic ran must use this, not the request.
+pub fn ozaki2_crt_gemm_with_cuda_precision(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    backend: TensorBackend,
+    use_cuda: bool,
+    precision: CudaTensorPrecision,
+) -> (Vec<Vec<f64>>, Option<CudaTensorPrecision>) {
     if a.is_empty() || b.is_empty() || a[0].is_empty() || b[0].is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     #[cfg(feature = "cuda")]
     if use_cuda {
@@ -660,20 +675,20 @@ pub fn ozaki2_crt_gemm_with_cuda(
             for row in b {
                 b_flat.extend_from_slice(row);
             }
-            if let Ok((c_flat, _actual_prec)) =
+            if let Ok((c_flat, actual_prec)) =
                 rt.run_ozaki2_crt_gemm(&a_flat, &b_flat, m, k, n, precision.to_cuda())
             {
                 let mut out = vec![vec![0.0_f64; n]; m];
                 for i in 0..m {
                     out[i].copy_from_slice(&c_flat[i * n..(i + 1) * n]);
                 }
-                return out;
+                return (out, Some(CudaTensorPrecision::from_cuda(actual_prec)));
             }
         }
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (use_cuda, precision);
-    ozaki2_crt_gemm(a, b, backend)
+    (ozaki2_crt_gemm(a, b, backend), None)
 }
 
 /// Complex matrix multiply `C = A * B` executed strictly via real Ozaki-II CRT GEMMs
