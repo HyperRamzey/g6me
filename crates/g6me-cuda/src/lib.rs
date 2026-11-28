@@ -19,14 +19,15 @@
 //!   kernels AND across all 5 GPU architectures (`sm_120a`, `sm_90`, `sm_89`, `sm_80`, `sm_75`),
 //!   plus a mandatory `--fmad=true` sabotage negative control.
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
-    sys, CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -353,6 +354,11 @@ pub fn cuda_device_info() -> Option<CudaDeviceInfo> {
     })
 }
 
+/// Per-stage Stockham twiddles, device-resident (`(tw_re, tw_im)` per radix-2 stage).
+type FftTwiddleStages = Vec<(CudaSlice<f64>, CudaSlice<f64>)>;
+/// Per-stage Goldilocks NTT twiddles, device-resident (one `u64` table per radix-2 stage).
+type NttTwiddleStages = Vec<CudaSlice<u64>>;
+
 /// Live `cudarc` GPU runtime with ALL 6 dynamically compiled zero-FMA PTX modules loaded.
 pub struct G6meCudaRuntime {
     pub info: CudaDeviceInfo,
@@ -365,6 +371,12 @@ pub struct G6meCudaRuntime {
     raytrace_mod: Arc<CudaModule>,
     fft_mod: Arc<CudaModule>,
     ntt_mod: Arc<CudaModule>,
+    /// Device-resident Stockham twiddle stages keyed by `(n, inverse)`. Uploaded once per
+    /// transform length/direction instead of once per block (the previous per-stage htod
+    /// uploads were the dominant redundant host->device traffic in the streaming UPOLA loop).
+    fft_twiddle_cache: Mutex<HashMap<(usize, bool), FftTwiddleStages>>,
+    /// Device-resident Goldilocks NTT twiddle stages keyed by `(n, inverse, fingerprint)`.
+    ntt_twiddle_cache: Mutex<HashMap<(usize, bool, u64), NttTwiddleStages>>,
 }
 
 #[inline]
@@ -372,14 +384,36 @@ fn align_up(v: usize, align: usize) -> usize {
     v.div_ceil(align) * align
 }
 
+/// Fixed-point scaling exponent for the Ozaki-II Stage-1 limb decomposition.
+///
+/// MUST stay identical to `g6me_core::blackwell::ozaki2_shift_bits`: the CPU reference and
+/// the live GPU stage-1 quantization must produce identical limbs for bit-exact parity.
 #[inline]
-fn ozaki2_shift_bits(k_dim: usize) -> i32 {
+pub fn ozaki2_shift_bits(k_dim: usize) -> i32 {
     if k_dim <= 131_072 {
         53
     } else {
         let log2_k = (k_dim as f64).log2().ceil() as i32;
         ((123 - log2_k) / 2).clamp(40, 53)
     }
+}
+
+/// Cheap content fingerprint for one direction's Goldilocks NTT twiddle tables.
+///
+/// `NttPlan` tables are deterministic functions of `(n, direction)`, so the fingerprint is a
+/// defensive guard rather than a strict identity: it catches a caller passing a table of the
+/// right length but different values.
+fn ntt_twiddle_key(n: usize, inverse: bool, twiddles: &[Vec<u64>]) -> (usize, bool, u64) {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (n as u64);
+    if inverse {
+        h ^= 0xA5A5_A5A5_A5A5_A5A5;
+    }
+    for stage in twiddles {
+        h = h.rotate_left(7) ^ (stage.len() as u64).wrapping_mul(0x0000_0100_0000_01B3);
+        h = h.rotate_left(7) ^ stage.first().copied().unwrap_or(0);
+        h = h.rotate_left(7) ^ stage.last().copied().unwrap_or(0);
+    }
+    (n, inverse, h)
 }
 
 /// `(ray_delays, ray_energies, ray_dirs)` from [`G6meCudaRuntime::run_raytrace_hoa_pass`].
@@ -418,7 +452,80 @@ impl G6meCudaRuntime {
             raytrace_mod,
             fft_mod,
             ntt_mod,
+            fft_twiddle_cache: Mutex::new(HashMap::new()),
+            ntt_twiddle_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Upload the Stockham twiddle stages for `(n, inverse)` exactly once per process.
+    ///
+    /// The host-side twiddle expressions are unchanged from the previous per-call path
+    /// (`ang = sign * 2*pi*q / (2m)`, `cos`/`sin`), so caching cannot change numerics; it only
+    /// removes `2 * log2(n)` redundant htod copies per block.
+    fn ensure_fft_twiddles(&self, n: usize, inverse: bool) -> Result<(), String> {
+        let key = (n, inverse);
+        let mut guard = self
+            .fft_twiddle_cache
+            .lock()
+            .map_err(|_| "fft twiddle cache poisoned".to_string())?;
+        if guard.contains_key(&key) {
+            return Ok(());
+        }
+        let sign = if inverse { 1.0_f64 } else { -1.0_f64 };
+        let half_n = n / 2;
+        let mut stages: FftTwiddleStages = Vec::with_capacity(n.trailing_zeros() as usize);
+        let mut m = half_n;
+        while m >= 1 {
+            let mut tw_re = Vec::with_capacity(m);
+            let mut tw_im = Vec::with_capacity(m);
+            for q in 0..m {
+                let ang = sign * 2.0 * PI * (q as f64) / ((2 * m) as f64);
+                tw_re.push(ang.cos());
+                tw_im.push(ang.sin());
+            }
+            let d_re = self
+                .stream
+                .clone_htod(&tw_re)
+                .map_err(|e| format!("htod fft tw_re: {e}"))?;
+            let d_im = self
+                .stream
+                .clone_htod(&tw_im)
+                .map_err(|e| format!("htod fft tw_im: {e}"))?;
+            stages.push((d_re, d_im));
+            m >>= 1;
+        }
+        guard.insert(key, stages);
+        Ok(())
+    }
+
+    /// Upload the Goldilocks NTT twiddle stages exactly once per `(n, direction, table)`.
+    ///
+    /// The tables come from [`crate::G6meCudaRuntime`]-external `NttPlan`s and are already
+    /// precomputed on the host; the fingerprint guards against silently reusing a cache entry
+    /// for a different table of the same length.
+    fn ensure_ntt_twiddles(
+        &self,
+        n: usize,
+        inverse: bool,
+        twiddles: &[Vec<u64>],
+    ) -> Result<(usize, bool, u64), String> {
+        let key = ntt_twiddle_key(n, inverse, twiddles);
+        let mut guard = self
+            .ntt_twiddle_cache
+            .lock()
+            .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(key) {
+            let mut stages: NttTwiddleStages = Vec::with_capacity(twiddles.len());
+            for tw in twiddles {
+                let d_tw = self
+                    .stream
+                    .clone_htod(tw.as_slice())
+                    .map_err(|e| format!("htod ntt tw: {e}"))?;
+                stages.push(d_tw);
+            }
+            entry.insert(stages);
+        }
+        Ok(key)
     }
 
     /// Resolve which Tensor Core precision will execute on this GPU for a user request.
@@ -1198,6 +1305,10 @@ impl G6meCudaRuntime {
 
     /// Execute a zero-FMA FP64 Stockham Radix-2 complex FFT (or inverse FFT with `1/N` scaling)
     /// completely on the GPU.
+    ///
+    /// Steady-state transfer pattern: `htod re` + `htod im` + `dtoh re` + `dtoh im`.
+    /// Twiddles are uploaded once per `(n, inverse)` and reused from device memory for every
+    /// subsequent block instead of being recomputed and copied on every call.
     pub fn run_stockham_fft_f64(
         &self,
         re: &[f64],
@@ -1211,14 +1322,99 @@ impl G6meCudaRuntime {
         if n == 1 {
             return Ok((re.to_vec(), im.to_vec()));
         }
+        let (d_re, d_im) = self.run_stockham_core(re, Some(im), inverse)?;
+        let out_re = self
+            .stream
+            .clone_dtoh(&d_re)
+            .map_err(|e| format!("dtoh fft re: {e}"))?;
+        let out_im = self
+            .stream
+            .clone_dtoh(&d_im)
+            .map_err(|e| format!("dtoh fft im: {e}"))?;
+        Ok((out_re, out_im))
+    }
+
+    /// Forward real-input FFT (`im` is implicitly zero): the imaginary input is produced by a
+    /// device `memset`, so only the real block crosses the host->device bus.
+    ///
+    /// Returns the full complex transform (the caller keeps `n/2 + 1` bins).
+    /// Transfer pattern: `htod re` + `dtoh re` + `dtoh im`.
+    pub fn run_stockham_fft_f64_real_input(
+        &self,
+        re: &[f64],
+        inverse: bool,
+    ) -> Result<(Vec<f64>, Vec<f64>), String> {
+        let n = re.len();
+        if !n.is_power_of_two() || n == 0 {
+            return Err("Stockham FFT requires a power-of-two length".into());
+        }
+        if n == 1 {
+            return Ok((re.to_vec(), vec![0.0]));
+        }
+        let (d_re, d_im) = self.run_stockham_core(re, None, inverse)?;
+        let out_re = self
+            .stream
+            .clone_dtoh(&d_re)
+            .map_err(|e| format!("dtoh fft re: {e}"))?;
+        let out_im = self
+            .stream
+            .clone_dtoh(&d_im)
+            .map_err(|e| format!("dtoh fft im: {e}"))?;
+        Ok((out_re, out_im))
+    }
+
+    /// Complex-input FFT returning only the real output. Used by the half-spectrum `irfft`
+    /// reconstruction, which discards the imaginary part; skipping that `dtoh` halves the
+    /// output traffic while leaving the kernel arithmetic identical to
+    /// [`Self::run_stockham_fft_f64`].
+    ///
+    /// Transfer pattern: `htod re` + `htod im` + `dtoh re`.
+    pub fn run_stockham_fft_f64_real_output(
+        &self,
+        re: &[f64],
+        im: &[f64],
+        inverse: bool,
+    ) -> Result<Vec<f64>, String> {
+        let n = re.len();
+        if im.len() != n || !n.is_power_of_two() || n == 0 {
+            return Err("Stockham FFT requires equal power-of-two re/im lengths".into());
+        }
+        if n == 1 {
+            return Ok(re.to_vec());
+        }
+        let (d_re, _d_im) = self.run_stockham_core(re, Some(im), inverse)?;
+        self.stream
+            .clone_dtoh(&d_re)
+            .map_err(|e| format!("dtoh fft re: {e}"))
+    }
+
+    /// Shared Stockham executor: upload the (optional) imaginary input, run `log2(n)` radix-2
+    /// stages with device-cached twiddles, apply the `1/N` inverse scale, and return the
+    /// device-resident result.
+    fn run_stockham_core(
+        &self,
+        re: &[f64],
+        im: Option<&[f64]>,
+        inverse: bool,
+    ) -> Result<(CudaSlice<f64>, CudaSlice<f64>), String> {
+        let n = re.len();
+        debug_assert!(n >= 2 && n.is_power_of_two());
         let mut d_in_re = self
             .stream
             .clone_htod(re)
             .map_err(|e| format!("htod fft re: {e}"))?;
-        let mut d_in_im = self
-            .stream
-            .clone_htod(im)
-            .map_err(|e| format!("htod fft im: {e}"))?;
+        let mut d_in_im = match im {
+            Some(im) => self
+                .stream
+                .clone_htod(im)
+                .map_err(|e| format!("htod fft im: {e}"))?,
+            // Real-input forward transform: zero the imaginary lane on the device instead of
+            // uploading an `n`-element zero vector.
+            None => self
+                .stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|e| format!("alloc fft im zeros: {e}"))?,
+        };
         let mut d_out_re = self
             .stream
             .alloc_zeros::<f64>(n)
@@ -1235,49 +1431,39 @@ impl G6meCudaRuntime {
 
         let half_n = n / 2;
         let half_n_i = half_n as i32;
-        let sign = if inverse { 1.0_f64 } else { -1.0_f64 };
         let cfg = LaunchConfig {
             grid_dim: ((half_n as u32).div_ceil(128), 1, 1),
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
 
-        let mut s = 1usize;
-        let mut m = half_n;
-        while m >= 1 {
-            let mut tw_re = Vec::with_capacity(m);
-            let mut tw_im = Vec::with_capacity(m);
-            for q in 0..m {
-                let ang = sign * 2.0 * PI * (q as f64) / ((2 * m) as f64);
-                tw_re.push(ang.cos());
-                tw_im.push(ang.sin());
-            }
-            let d_tw_re = self
-                .stream
-                .clone_htod(&tw_re)
-                .map_err(|e| format!("htod tw_re: {e}"))?;
-            let d_tw_im = self
-                .stream
-                .clone_htod(&tw_im)
-                .map_err(|e| format!("htod tw_im: {e}"))?;
-            let s_i = s as i32;
-            let m_i = m as i32;
+        self.ensure_fft_twiddles(n, inverse)?;
+        let guard = self
+            .fft_twiddle_cache
+            .lock()
+            .map_err(|_| "fft twiddle cache poisoned".to_string())?;
+        let stages = guard
+            .get(&(n, inverse))
+            .ok_or_else(|| "fft twiddle cache entry missing".to_string())?;
+        for (stage_idx, (tw_re, tw_im)) in stages.iter().enumerate() {
+            let s_i = (1usize << stage_idx) as i32;
+            let m_i = (half_n >> stage_idx) as i32;
             let mut b = self.stream.launch_builder(&fn_stage);
             b.arg(&d_in_re)
                 .arg(&d_in_im)
-                .arg(&d_tw_re)
-                .arg(&d_tw_im)
+                .arg(tw_re)
+                .arg(tw_im)
                 .arg(&mut d_out_re)
                 .arg(&mut d_out_im)
                 .arg(&half_n_i)
                 .arg(&s_i)
                 .arg(&m_i);
-            unsafe { b.launch(cfg) }.map_err(|e| format!("launch stockham s={s}: {e}"))?;
+            unsafe { b.launch(cfg) }
+                .map_err(|e| format!("launch stockham stage {stage_idx}: {e}"))?;
             std::mem::swap(&mut d_in_re, &mut d_out_re);
             std::mem::swap(&mut d_in_im, &mut d_out_im);
-            s <<= 1;
-            m >>= 1;
         }
+        drop(guard);
 
         if inverse {
             let fn_scale = self
@@ -1295,16 +1481,7 @@ impl G6meCudaRuntime {
             b.arg(&mut d_in_re).arg(&mut d_in_im).arg(&inv_n).arg(&n_i);
             unsafe { b.launch(scale_cfg) }.map_err(|e| format!("launch stockham scale: {e}"))?;
         }
-
-        let out_re = self
-            .stream
-            .clone_dtoh(&d_in_re)
-            .map_err(|e| format!("dtoh fft re: {e}"))?;
-        let out_im = self
-            .stream
-            .clone_dtoh(&d_in_im)
-            .map_err(|e| format!("dtoh fft im: {e}"))?;
-        Ok((out_re, out_im))
+        Ok((d_in_re, d_in_im))
     }
 
     /// Execute a zero-FMA complex spectrum multiply-accumulate `acc += a * b` on the GPU.
@@ -1452,16 +1629,23 @@ impl G6meCudaRuntime {
             b.arg(&d_src).arg(&mut d_buf).arg(&n_i).arg(&log_n);
             unsafe { b.launch(cfg_n) }.map_err(|e| format!("launch ntt bitrev fwd: {e}"))?;
         }
-        for (stage_idx, tw) in twiddles_fwd.iter().enumerate() {
-            let half_len = (1usize << stage_idx) as i32;
-            let d_tw = self
-                .stream
-                .clone_htod(tw)
-                .map_err(|e| format!("htod ntt tw_fwd: {e}"))?;
-            let mut b = self.stream.launch_builder(&fn_stage);
-            b.arg(&mut d_buf).arg(&d_tw).arg(&n_i).arg(&half_len);
-            unsafe { b.launch(cfg_half) }
-                .map_err(|e| format!("launch ntt fwd stage {stage_idx}: {e}"))?;
+        // Device-cached forward twiddles: uploaded once per (n, table) instead of per block.
+        self.ensure_ntt_twiddles(n, false, twiddles_fwd)?;
+        {
+            let guard = self
+                .ntt_twiddle_cache
+                .lock()
+                .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+            let stages = guard
+                .get(&ntt_twiddle_key(n, false, twiddles_fwd))
+                .ok_or_else(|| "ntt twiddle cache entry missing".to_string())?;
+            for (stage_idx, d_tw) in stages.iter().enumerate() {
+                let half_len = (1usize << stage_idx) as i32;
+                let mut b = self.stream.launch_builder(&fn_stage);
+                b.arg(&mut d_buf).arg(d_tw).arg(&n_i).arg(&half_len);
+                unsafe { b.launch(cfg_half) }
+                    .map_err(|e| format!("launch ntt fwd stage {stage_idx}: {e}"))?;
+            }
         }
 
         // Pointwise multiply in NTT domain
@@ -1477,16 +1661,23 @@ impl G6meCudaRuntime {
             b.arg(&d_buf).arg(&mut d_tmp).arg(&n_i).arg(&log_n);
             unsafe { b.launch(cfg_n) }.map_err(|e| format!("launch ntt bitrev inv: {e}"))?;
         }
-        for (stage_idx, tw) in twiddles_inv.iter().enumerate() {
-            let half_len = (1usize << stage_idx) as i32;
-            let d_tw = self
-                .stream
-                .clone_htod(tw)
-                .map_err(|e| format!("htod ntt tw_inv: {e}"))?;
-            let mut b = self.stream.launch_builder(&fn_stage);
-            b.arg(&mut d_tmp).arg(&d_tw).arg(&n_i).arg(&half_len);
-            unsafe { b.launch(cfg_half) }
-                .map_err(|e| format!("launch ntt inv stage {stage_idx}: {e}"))?;
+        // Device-cached inverse twiddles: uploaded once per (n, table) instead of per block.
+        self.ensure_ntt_twiddles(n, true, twiddles_inv)?;
+        {
+            let guard = self
+                .ntt_twiddle_cache
+                .lock()
+                .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+            let stages = guard
+                .get(&ntt_twiddle_key(n, true, twiddles_inv))
+                .ok_or_else(|| "ntt twiddle cache entry missing".to_string())?;
+            for (stage_idx, d_tw) in stages.iter().enumerate() {
+                let half_len = (1usize << stage_idx) as i32;
+                let mut b = self.stream.launch_builder(&fn_stage);
+                b.arg(&mut d_tmp).arg(d_tw).arg(&n_i).arg(&half_len);
+                unsafe { b.launch(cfg_half) }
+                    .map_err(|e| format!("launch ntt inv stage {stage_idx}: {e}"))?;
+            }
         }
         {
             let mut b = self.stream.launch_builder(&fn_scale);
@@ -1553,16 +1744,25 @@ impl G6meCudaRuntime {
             b.arg(&d_src).arg(&mut d_buf).arg(&n_i).arg(&log_n);
             unsafe { b.launch(cfg_n) }.map_err(|e| format!("launch ntt bitrev: {e}"))?;
         }
-        for (stage_idx, tw) in twiddles.iter().enumerate() {
-            let half_len = (1usize << stage_idx) as i32;
-            let d_tw = self
-                .stream
-                .clone_htod(tw)
-                .map_err(|e| format!("htod ntt tw: {e}"))?;
-            let mut b = self.stream.launch_builder(&fn_stage);
-            b.arg(&mut d_buf).arg(&d_tw).arg(&n_i).arg(&half_len);
-            unsafe { b.launch(cfg_half) }
-                .map_err(|e| format!("launch ntt stage {stage_idx}: {e}"))?;
+        // Device-cached twiddles (`scale.is_some()` == inverse direction). Steady-state transfer
+        // pattern per call: `htod data` + `dtoh out` only.
+        let inverse = scale.is_some();
+        self.ensure_ntt_twiddles(n, inverse, twiddles)?;
+        {
+            let guard = self
+                .ntt_twiddle_cache
+                .lock()
+                .map_err(|_| "ntt twiddle cache poisoned".to_string())?;
+            let stages = guard
+                .get(&ntt_twiddle_key(n, inverse, twiddles))
+                .ok_or_else(|| "ntt twiddle cache entry missing".to_string())?;
+            for (stage_idx, d_tw) in stages.iter().enumerate() {
+                let half_len = (1usize << stage_idx) as i32;
+                let mut b = self.stream.launch_builder(&fn_stage);
+                b.arg(&mut d_buf).arg(d_tw).arg(&n_i).arg(&half_len);
+                unsafe { b.launch(cfg_half) }
+                    .map_err(|e| format!("launch ntt stage {stage_idx}: {e}"))?;
+            }
         }
         if let Some(inv_n) = scale {
             let fn_scale = self
