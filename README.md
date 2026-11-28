@@ -103,7 +103,7 @@ rather than sampled from a head:
     MagLS, alongside the fast Brown–Duda default. Head radius, torso spacing, pinna
     shelf and Webster ear-canal length are explicit controls.
 12. **Hybrid 3D room** (`--room anechoic|control-room|theater`, `--room-quality preview|production`, `--room-json`, `--cuda`, `--cuda-precision`) —
-    FDTD + image-source + boundary-transmission + parallel deterministic PCG64 ray-traced late field,
+    FDTD + image-source + boundary-transmission + parallel deterministic PCG32 ray-traced late field,
     convolved via zero-latency UPOLA (341.3 ms Control Room, 682.7 ms Theater Stage at 48 kHz) with
     SHA-256 kernel caching, and temperature, humidity, CO₂ and pressure driving Cramer (1993) speed of
     sound and ISO 9613-1 air absorption. A JSON room file sets dimensions, wall absorption, listener
@@ -126,8 +126,9 @@ rather than sampled from a head:
     ADAA2 C² soft clipper, while `transparent` remains the bit-exact default.
 
 Three further toggles replace the default DSP primitives: `--plus-slepian` (exact
-Slepian DPSS Heisenberg-optimal tail window), `--plus-fdn` (paraunitary scattering
-FDN + ternary velvet-noise late externalization tail) and `--plus-warped-decorr`
+Slepian DPSS Heisenberg-optimal tail window), `--plus-fdn` (orthogonal-scattering
+FDN after the Schlecht–Habets lossless prototype + ternary velvet-noise late
+externalization tail) and `--plus-warped-decorr`
 (Kermit–Canfield & Abel Bark-warped all-pass surround decorrelation).
 
 ### Profiles
@@ -257,7 +258,7 @@ than folded.
 | `--detail`, `--detail-intensity`, `--detail-bias`, `--detail-transients`, `--detail-tilt` | Sines+Transients micro-detail and presence enhancement. |
 | `--unmask`, `--unmask-recover`, `--unmask-tame`, `--unmask-max-db`, `--unmask-bias`, `--unmask-brighten` | Moore 2016 / ISO 532-2 perceptual unmasking dynamic EQ. |
 | `--plus-physics`, `--plus-distance`, `--plus-head-radius`, `--plus-torso-height`, `--plus-pinna-shelf`, `--ear-canal-mm` | Physical head/torso scattering model and near-field parallax. |
-| `--room`, `--room-quality`, `--room-json`, `--room-temp-c`, `--room-rh`, `--co2-ppm`, `--room-pressure-kpa`, `--cuda`, `--cuda-precision` | Hybrid 3D room (`preview` or `production` 670 Hz FDTD + 50k rays), ISO 9613-1/Cramer air absorption, and optional `--features cuda` offload of FDTD, ray tracing, BEM matvec, Stockham FFT, Goldilocks NTT and Ozaki-II CRT GEMM (`auto|nvfp4|fp8|int8|fp16`). |
+| `--room`, `--room-quality`, `--room-json`, `--room-temp-c`, `--room-rh`, `--co2-ppm`, `--room-pressure-kpa`, `--cuda`, `--cuda-precision` | Hybrid 3D room (`preview`: 500 Hz control-room / 275 Hz theater FDTD + 2,048 rays; `production`: 670 Hz control-room / 437 Hz theater FDTD + 50k rays), ISO 9613-1/Cramer air absorption, and optional `--features cuda` offload of FDTD, ray tracing, BEM matvec, Stockham FFT, Goldilocks NTT and Ozaki-II CRT GEMM (`auto|nvfp4|fp8|int8|fp16`). |
 | `--head-mesh` | OBJ head/pinna scan for CHIEF-regularized FMM-BEM personalised HRTF synthesis. |
 | `--exact-ntt` | Goldilocks-field NTT convolution with zero intermediate rounding. |
 | `--plus-slepian`, `--plus-fdn`, `--plus-warped-decorr` | Exact Slepian window, scattering FDN late tail, Bark-warped surround decorrelation. |
@@ -311,14 +312,27 @@ kernel for every architecture the installed toolkit accepts (`sm_120a`, `sm_90`,
 `sm_89`, `sm_80`, `sm_75` here, plus `sm_61` where nvcc still targets Pascal),
 requiring the Tensor Core / DP4A opcode each target should emit (`OMMA.SF` NVFP4,
 `QMMA` FP8, `IMMA`, `HMMA`, `IDP.4A`). On a live NVIDIA GPU the same group runs CPU-vs-GPU
-parity for all six kernels — 3D FDTD, Ozaki-II CRT GEMM across every supported
-precision (bit-exact, integer CRT reconstruction asserted per cell), Stockham FFT,
-bit-exact Goldilocks NTT, BEM complex matvec — plus production-path parity: the full
-`raytrace_hoa` HOA histogram with Lambertian wall scattering is bit-identical bin for
-bin, and the FMM-BEM reciprocal HRTF solve through `FmmBemSolver::new_with_cuda` matches
-the CPU solver. A full `g6me --cuda` control-room render is bit-identical to the
-CPU render end to end (measured on an RTX 5070 at 48 kHz stereo, and again with each
-explicit `--cuda-precision`), not merely within tolerance. On a host with no GPU the
+parity for all six kernels — 3D FDTD at toy and production grid sizes, Ozaki-II CRT
+GEMM across every supported precision (bit-exact, integer CRT reconstruction asserted
+per cell), Stockham FFT, bit-exact Goldilocks NTT, BEM complex matvec — plus
+production-path parity: the full `raytrace_hoa` HOA histogram with Lambertian wall
+scattering is bit-identical bin for bin through the direct kernel entry point (not the
+fallback wrapper), and the FMM-BEM reciprocal HRTF solve through
+`FmmBemSolver::new_with_cuda(_, true)` uses the GPU solid-angle diagonal and matches the
+CPU solver within 1e-10. A full `g6me --mode plus --room control-room --cuda` render is
+**tolerance-level, not bit-identical**: GPU room synthesis changes the BRIR (measured up
+to 1.4e-4 in the rendered output, from the different FDTD summation order), while the
+UPOLA Stockham FFT stage agrees to ~2e-14 and the exact-NTT convolution path is
+bit-identical. Each stage has two native implementations — a Rust CPU algorithm and a
+standalone CUDA kernel written for the device — rather than one emulating the other, so
+float parity is gated at tolerance (FDTD `max |Δp|` 1e-13, BEM matvec 1e-13, FMM-BEM
+1e-10, Stockham FFT 1e-11, end-to-end render 1e-3) and bit-exact gates are kept only for
+the integer-exact Goldilocks NTT and Ozaki-II CRT paths. The raytrace histogram is the
+current exception: its CPU fallback is a line-for-line mirror of the kernel, so the
+bin-for-bin equality is by construction, not independent agreement; reclassification to
+a native CPU tracer (whose gate then becomes tolerance-level) is pending. Every run now
+prints one `[cuda] stage …` line per stage, so a CPU fallback cannot hide behind the
+CUDA banner. On a host with no GPU the
 group reports that instead of failing. `--cuda` offloads all six paths when an NVIDIA GPU is present; the FDTD
 grids stay resident in VRAM for the whole run (one upload, one download), and every
 dispatch falls back deterministically to the pure-Rust CPU solver. `--cuda-precision
@@ -326,7 +340,9 @@ auto|nvfp4|fp8|int8|fp16` selects the Ozaki-II Tensor Core format (`auto` picks
 single-limb INT8 everywhere the kernel supports, `sm_61..sm_120a`; explicit NVFP4 is
 available only on `sm_120a` and otherwise downgrades to FP8/INT8). If the driver or
 CUDA toolkit cannot start, `--cuda` warns once on stderr and runs the CPU pipeline
-instead of failing silently.
+instead of failing silently. In the default `reference` mode there are no GPU stages at
+all: `--cuda` now says so explicitly, and the run ends with `[cuda] GPU stages run: 0`
+rather than leaving a CUDA banner to imply an offload that never happened.
 
 Design notes: `docs/G6ME_SCAN_FMM_BEM_NTT.md` (scan, FMM-BEM, NTT),
 `docs/ACADEMIC_NUKE_ACOUSTICS.md` (room, CUDA, noise shaping, transducer, and perceptual models), and
@@ -627,11 +643,13 @@ check also runs per-group (`--group bitexact` …), so a failure can be reproduc
 without waiting for the whole suite. The count above assumes a sibling `g6me` binary
 exists to disassemble, as in the release archive; a bare `cargo run -p g6me-verify`
 builds only the verifier, finds no sibling, and reports 128. With `--features cuda`
-the suite grows to 144 checks (145 with the sibling): the six-kernel PTX/SASS audit,
-the multi-architecture Ozaki-II opcode audit, and the live GPU-vs-CPU parity group —
-all six kernels plus a direct Goldilocks NTT butterfly comparison, the Stockham FFT
-inverse round-trip, the bit-exact production raytrace histogram and the FMM-BEM
-reciprocal solve.
+the suite grows to 159 checks: the six-kernel PTX/SASS audit,
+the multi-architecture Ozaki-II opcode audit, and the live GPU-vs-CPU parity group
+(20 checks) — all six kernels plus a direct Goldilocks NTT butterfly comparison, the
+Stockham FFT inverse round-trip, a 65,610-voxel × 128-step production FDTD grid, the
+bit-exact raytrace histogram through the direct kernel entry point, the FMM-BEM
+reciprocal solve with the GPU solid-angle diagonal asserted, and an end-to-end
+`g6me --mode plus --room control-room --cuda` render with zero CPU-fallback stages.
 
 The workspace test suite covers what the verifier does not: 375 tests across the
 core (290, plus two opt-in full-resolution true-peak tests ignored by default), CLI

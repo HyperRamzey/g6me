@@ -53,10 +53,12 @@ pub mod blackwell;
 pub mod burst3d;
 pub mod child;
 pub mod cochlea;
+pub mod cuda_report;
 pub mod dng;
 pub mod dsp;
 pub mod enhance;
 pub mod error;
+pub mod externalization;
 pub mod fft;
 pub mod hoa;
 pub mod limiter;
@@ -80,6 +82,7 @@ pub mod unmask;
 pub mod upmix;
 pub mod util;
 pub mod wav;
+pub mod zbc;
 
 #[cfg(feature = "monitor")]
 pub mod monitor;

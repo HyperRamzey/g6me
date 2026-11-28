@@ -643,37 +643,62 @@ pub fn ozaki2_crt_gemm_with_cuda(
     use_cuda: bool,
     precision: CudaTensorPrecision,
 ) -> Vec<Vec<f64>> {
+    ozaki2_crt_gemm_with_cuda_precision(a, b, backend, use_cuda, precision).0
+}
+
+/// [`ozaki2_crt_gemm_with_cuda`], additionally reporting the Tensor Core precision the device
+/// actually executed. The runtime resolves [`CudaTensorPrecision::Auto`] against the live
+/// architecture and may downgrade an unsupported explicit format, so the executed format is
+/// not always the requested one. Returns `None` when the multiply ran on the CPU reference
+/// path (no GPU present, runtime init failed, or the device call failed), where no Tensor Core
+/// precision exists.
+pub fn ozaki2_crt_gemm_with_cuda_precision(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    backend: TensorBackend,
+    use_cuda: bool,
+    precision: CudaTensorPrecision,
+) -> (Vec<Vec<f64>>, Option<CudaTensorPrecision>) {
     if a.is_empty() || b.is_empty() || a[0].is_empty() || b[0].is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     #[cfg(feature = "cuda")]
     if use_cuda {
-        if let Some(rt) = shared_cuda_runtime() {
-            let m = a.len();
-            let k = a[0].len();
-            let n = b[0].len();
-            let mut a_flat = Vec::with_capacity(m * k);
-            for row in a {
-                a_flat.extend_from_slice(row);
-            }
-            let mut b_flat = Vec::with_capacity(k * n);
-            for row in b {
-                b_flat.extend_from_slice(row);
-            }
-            if let Ok((c_flat, _actual_prec)) =
-                rt.run_ozaki2_crt_gemm(&a_flat, &b_flat, m, k, n, precision.to_cuda())
-            {
-                let mut out = vec![vec![0.0_f64; n]; m];
-                for i in 0..m {
-                    out[i].copy_from_slice(&c_flat[i * n..(i + 1) * n]);
+        match shared_cuda_runtime() {
+            Some(rt) => {
+                let m = a.len();
+                let k = a[0].len();
+                let n = b[0].len();
+                let mut a_flat = Vec::with_capacity(m * k);
+                for row in a {
+                    a_flat.extend_from_slice(row);
                 }
-                return out;
+                let mut b_flat = Vec::with_capacity(k * n);
+                for row in b {
+                    b_flat.extend_from_slice(row);
+                }
+                match rt.run_ozaki2_crt_gemm(&a_flat, &b_flat, m, k, n, precision.to_cuda()) {
+                    Ok((c_flat, actual_prec)) => {
+                        let actual = CudaTensorPrecision::from_cuda(actual_prec);
+                        crate::cuda_report::record_gpu(
+                            "ozaki2",
+                            format!("precision {}", actual.short_tag()),
+                        );
+                        let mut out = vec![vec![0.0_f64; n]; m];
+                        for i in 0..m {
+                            out[i].copy_from_slice(&c_flat[i * n..(i + 1) * n]);
+                        }
+                        return (out, Some(actual));
+                    }
+                    Err(e) => crate::cuda_report::record_cpu_fallback("ozaki2", e),
+                }
             }
+            None => crate::cuda_report::record_cpu_fallback("ozaki2", "CUDA runtime unavailable"),
         }
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (use_cuda, precision);
-    ozaki2_crt_gemm(a, b, backend)
+    (ozaki2_crt_gemm(a, b, backend), None)
 }
 
 /// Complex matrix multiply `C = A * B` executed strictly via real Ozaki-II CRT GEMMs
@@ -954,7 +979,7 @@ impl BiquadCoeffs {
 /// Zero-FMA (`--fmad=false`) Blackwell `sm_120` CUDA C++ kernel source covering:
 /// 1. Stockham Radix-4 `f64` FFT (`__dmul_rn` / `__dadd_rn` intrinsics, zero FMA),
 /// 2. 3D Wave-Equation FDTD PDE stencil,
-/// 3. Deterministic PCG64 Monte Carlo Acoustic Ray Tracer.
+/// 3. Deterministic PCG32 Monte Carlo Acoustic Ray Tracer.
 pub const BLACKWELL_CUDA_KERNELS: &str = r#"// g6me Blackwell (sm_120) Zero-FMA Acoustic Physics Kernels
 // Compile with: nvcc -std=c++23 -arch=sm_120 --fmad=false -Xcompiler -ffp-contract=off -O3 -ptx
 #include <stdint.h>
@@ -1683,7 +1708,15 @@ pub fn try_init_cuda_runtime(
 /// Stockham FFT, and Goldilocks NTT.
 #[cfg(feature = "cuda")]
 pub fn shared_cuda_runtime() -> Option<std::sync::Arc<g6me_cuda::G6meCudaRuntime>> {
-    try_init_cuda_runtime().ok()
+    match try_init_cuda_runtime() {
+        Ok(rt) => Some(rt),
+        Err(e) => {
+            // The result is cached, so every later stage sees `None`; record the
+            // reason once instead of letting each one fail silently.
+            crate::cuda_report::record_init_failure(&e);
+            None
+        }
+    }
 }
 
 #[cfg(test)]

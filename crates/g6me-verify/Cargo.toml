@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Bit-exactness, phase and drift verification of the G6ME downmixer against the reference C port"
+# `cargo run -p g6me-verify` must keep selecting the verifier now that the
+# FMA sabotage control lives in `src/bin/`.
+default-run = "g6me-verify"
 
 [features]
 cuda = ["g6me-core/cuda", "dep:g6me-cuda"]

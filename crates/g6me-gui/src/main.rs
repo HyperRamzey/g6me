@@ -1507,9 +1507,10 @@ impl App {
                                      Kulkarni excess Woodworth ITD (lowest CPU cost, universal timbre)."
                                 }
                                 PhysicsEngine::HankelSnowmanMagLs => {
-                                    "Exact multipole Rayleigh spherical-Hankel head + Snowman torso \
-                                     diffraction + Order-7 HOA MagLS decoding (true near-field ILD/ITD \
-                                     and shoulder bounce)."
+                                    "Exact Rayleigh spherical-Hankel head diffraction + coupled \
+                                     two-sphere Snowman torso (single-scattering approximation) + \
+                                     Order-7 HOA MagLS decoding (true near-field ILD/ITD and \
+                                     shoulder bounce)."
                                 }
                             };
                             if ui
@@ -1538,14 +1539,14 @@ impl App {
                                     "Control Room (3D FDTD+ISM+RT)",
                                     "ITU-R BS.1116 mastering control room (6×5×3 m, RT60 0.25 s): \
                                      reciprocal 3D FDTD modal bass + Order-3 ISM + Svensson BTM \
-                                     desk diffraction + parallel PCG64 HOA raytracing, zero-latency \
+                                     desk diffraction + parallel PCG32 HOA raytracing, zero-latency \
                                      UPOLA 341.3 ms BRIR with SHA-256 kernel cache.",
                                 ),
                                 RoomPreset::TheaterStage => (
                                     "Theater Stage (3D FDTD+ISM+RT)",
                                     "Reference theatrical mixing stage (12×9.5×5.2 m, RT60 0.42 s): \
                                      reciprocal 3D FDTD modal bass + Order-3 ISM + BTM console edge \
-                                     + parallel PCG64 HOA raytracing, zero-latency UPOLA 682.7 ms \
+                                     + parallel PCG32 HOA raytracing, zero-latency UPOLA 682.7 ms \
                                      BRIR with SHA-256 kernel cache.",
                                 ),
                             };
@@ -1564,13 +1565,14 @@ impl App {
                             for q in RoomQuality::ALL {
                                 let tip = match q {
                                     RoomQuality::Preview => {
-                                        "Fast interactive tier: 500 Hz 6-PPW 3D FDTD (65k voxels, \
-                                         165 ms) + 2,048 parallel rays / 48 bounces."
+                                        "Fast interactive tier: 65k-voxel 6-PPW 3D FDTD (500 Hz in \
+                                         the control room, 275 Hz in the theater) + 2,048 parallel \
+                                         rays / 48 bounces."
                                     }
                                     RoomQuality::Production => {
-                                        "Archival mastering tier: 670 Hz 6-PPW 3D FDTD (dx ≤ 8.5 cm, \
-                                         260k voxels, 350 ms) + 50,000 parallel rays / 72 bounces \
-                                         (cached by SHA-256 across tracks)."
+                                        "Archival mastering tier: 260k-voxel 6-PPW 3D FDTD (670 Hz in \
+                                         the control room, 437 Hz in the theater) + 50,000 parallel \
+                                         rays / 72 bounces (cached by SHA-256 across tracks)."
                                     }
                                 };
                                 if ui
@@ -1652,8 +1654,8 @@ impl App {
                                     .suffix(" mm"),
                             )
                             .on_hover_text(
-                                "Head-center to torso-center vertical spacing for the Snowman \
-                                 multipole solver (default 315 mm). Governs the 700 Hz–2.5 kHz \
+                                "Head-center to torso-center vertical spacing for the coupled \
+                                 Snowman torso solver (default 315 mm). Governs the 700 Hz–2.5 kHz \
                                  shoulder reflection elevation cue.",
                             )
                             .changed()
@@ -1770,7 +1772,7 @@ impl App {
                             };
                             let cuda_tip = match &hw_clone {
                                 Some(d) => format!(
-                                    "Offloads zero-FMA 3D FDTD, stochastic PCG64 ray tracing, \
+                                    "Offloads zero-FMA 3D FDTD, stochastic PCG32 ray tracing, \
                                      Helmholtz BEM matvec, Stockham FFT, Goldilocks NTT, and \
                                      Ozaki-II CRT Tensor Core GEMM to {} ({}).",
                                     d.name, d.sm_arch

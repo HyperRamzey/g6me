@@ -286,7 +286,8 @@ pub struct PlusCfg {
     pub room_quality: RoomQuality,
     /// Replace Half-Kaiser tail taper with exact Slepian DPSS eigenvector window (`Slepian 1961`).
     pub use_slepian_tail: bool,
-    /// Engage Paraunitary Scattering FDN (Schlecht & Habets) + Velvet Noise late externalization.
+    /// Engage orthogonal-scattering FDN (lossless Schlecht-Habets prototype) + Velvet Noise
+    /// late externalization.
     pub use_fdn_velvet: bool,
     /// Engage Kermit-Canfield & Abel (DAFx 2016) Bark-warped all-pass rear decorrelation.
     pub use_warped_decorr: bool,
@@ -889,7 +890,41 @@ impl KernelBank {
             } else {
                 watertight_winding_repair(raw_mesh, 16)
             };
-            let solver = FmmBemSolver::new_with_cuda(&mesh, cfg.use_cuda).ok()?;
+            let solver = match FmmBemSolver::new_with_cuda(&mesh, cfg.use_cuda) {
+                Ok(solver) => solver,
+                Err(gpu_err) if cfg.use_cuda => match FmmBemSolver::new_with_cuda(&mesh, false) {
+                    Ok(solver) => {
+                        eprintln!(
+                            "warning: head-mesh BEM GPU construction failed ({gpu_err}); \
+                             using the CPU BEM solver instead"
+                        );
+                        crate::cuda_report::record_cpu_fallback(
+                            "bem-head-mesh",
+                            gpu_err.to_string(),
+                        );
+                        solver
+                    }
+                    Err(cpu_err) => {
+                        eprintln!(
+                            "warning: head-mesh personalization disabled: BEM mesh rejected \
+                             ({cpu_err})"
+                        );
+                        crate::cuda_report::record_cpu_fallback(
+                            "bem-head-mesh",
+                            cpu_err.to_string(),
+                        );
+                        return None;
+                    }
+                },
+                Err(cpu_err) => {
+                    eprintln!(
+                        "warning: head-mesh personalization disabled: BEM mesh rejected \
+                         ({cpu_err})"
+                    );
+                    crate::cuda_report::record_cpu_fallback("bem-head-mesh", cpu_err.to_string());
+                    return None;
+                }
+            };
             let mut srcs = Vec::with_capacity(SLOTS);
             for (ch, &base_az) in SLOT_AZ_DEG.iter().enumerate() {
                 let eff_az = if matches!(ch, SLOT_FL | SLOT_FR | SLOT_FLC | SLOT_FRC) {
@@ -999,7 +1034,7 @@ impl KernelBank {
         // 3. Room / externalization reflections:
         //    - If a 3D Hybrid Room (`ControlRoom`, `TheaterStage`, or `--room-json`) is active:
         //      run 2 reciprocal 3D FDTD PDE simulations (Left ear & Right ear -> all 12 speakers!)
-        //      + 3D ISM + BTM desk edge diffraction + PCG64 Monte Carlo Ray Tracing -> Order-7 MagLS
+        //      + 3D ISM + BTM desk edge diffraction + PCG32 Monte Carlo Ray Tracing -> Order-7 MagLS
         //      (+ Paraunitary Scattering FDN & Velvet Noise).
         //    - Otherwise, when `externalize > 0`, add dry ITU-R BS.1116 lateral early reflections.
         if let (Some(room_geom), Some(decoder)) = (&active_room, &magls) {
@@ -2087,6 +2122,32 @@ fn itu_bs1116_reflections(ch: usize) -> [ReflectionTap; 6] {
 /// (`B = 2048`, `N_FFT = 4096`, `P = 8..16` partitions covering `341..683 ms` at 48 kHz)
 /// for 3D Hybrid Room BRIRs — supporting BOTH FP64 Stockham FFT and 64-bit Goldilocks
 /// `--exact-ntt` with strict 1:1 immediate frame emission and arbitrary chunk-size invariance.
+/// Optional device-resident exact-NTT UPOLA state (`docs/CUDA_PERF_PLAN.md` section 1).
+///
+/// The delay line belongs to one stream, so `Clone` deliberately starts the copy without
+/// device state: the stateless per-call integer NTT path is bit-identical and does not
+/// silently share one FDL between two independently advancing streams.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct NttCudaHandle(Option<std::sync::Arc<std::sync::Mutex<g6me_cuda::CudaUpolaState>>>);
+
+#[cfg(feature = "cuda")]
+impl Clone for NttCudaHandle {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for NttCudaHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(_) => f.write_str("NttCudaHandle(device-resident)"),
+            None => f.write_str("NttCudaHandle(none)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BinauralPlus {
     mask: u32,
@@ -2131,6 +2192,10 @@ pub struct BinauralPlus {
     ntt_acc_l: Vec<u64>,
     ntt_acc_r: Vec<u64>,
     ntt_kernel_scale: f64,
+    /// VRAM-resident FDL-UPOLA state (`None` on CPU-only hosts or when the device path was
+    /// declined); the per-call integer NTT path below stays the bit-identical fallback.
+    #[cfg(feature = "cuda")]
+    ntt_cuda: NttCudaHandle,
     finite: bool,
 }
 
@@ -2289,6 +2354,53 @@ impl BinauralPlus {
             )
         };
 
+        // Device-resident FDL-UPOLA state (docs/CUDA_PERF_PLAN.md section 1): the NTT-domain
+        // kernels, twiddle stages, delay line and both ear accumulators are uploaded once per
+        // preset, so a streaming block no longer ships every 8192-word buffer down and back.
+        #[cfg(feature = "cuda")]
+        let ntt_cuda = {
+            let mut handle = NttCudaHandle::default();
+            if cfg.use_cuda {
+                if let Some(np) = ntt_plan.as_ref() {
+                    if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
+                        let mut flat_l = Vec::with_capacity(ntt_kern_l.len() * SLOTS * n_fft);
+                        let mut flat_r = Vec::with_capacity(flat_l.capacity());
+                        for parts in &ntt_kern_l {
+                            for ch in parts {
+                                flat_l.extend_from_slice(ch);
+                            }
+                        }
+                        for parts in &ntt_kern_r {
+                            for ch in parts {
+                                flat_r.extend_from_slice(ch);
+                            }
+                        }
+                        match rt.create_upola_state(
+                            n_fft,
+                            SLOTS,
+                            n_parts,
+                            np.inv_n(),
+                            &flat_l,
+                            &flat_r,
+                            np.twiddles_fwd(),
+                            np.twiddles_inv(),
+                        ) {
+                            Ok(state) => {
+                                handle = NttCudaHandle(Some(std::sync::Arc::new(
+                                    std::sync::Mutex::new(state),
+                                )));
+                            }
+                            Err(e) => crate::cuda_report::record_cpu_fallback(
+                                "ntt",
+                                format!("device-resident UPOLA unavailable: {e}"),
+                            ),
+                        }
+                    }
+                }
+            }
+            handle
+        };
+
         Self {
             mask,
             sample_rate,
@@ -2323,6 +2435,8 @@ impl BinauralPlus {
             ntt_acc_l,
             ntt_acc_r,
             ntt_kernel_scale,
+            #[cfg(feature = "cuda")]
+            ntt_cuda,
             finite: true,
         }
     }
@@ -2406,11 +2520,16 @@ impl BinauralPlus {
     fn ntt_forward_buf(use_cuda: bool, np: &NttPlan, buf: &mut [u64]) {
         #[cfg(feature = "cuda")]
         if use_cuda {
-            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
-                if let Ok(out) = rt.run_goldilocks_ntt_transform(buf, np.twiddles_fwd(), None) {
-                    buf.copy_from_slice(&out);
-                    return;
-                }
+            match crate::blackwell::shared_cuda_runtime() {
+                Some(rt) => match rt.run_goldilocks_ntt_transform(buf, np.twiddles_fwd(), None) {
+                    Ok(out) => {
+                        buf.copy_from_slice(&out);
+                        crate::cuda_report::record_gpu("ntt", "");
+                        return;
+                    }
+                    Err(e) => crate::cuda_report::record_cpu_fallback("ntt", e),
+                },
+                None => crate::cuda_report::record_cpu_fallback("ntt", "CUDA runtime unavailable"),
             }
         }
         let _ = use_cuda;
@@ -2421,13 +2540,19 @@ impl BinauralPlus {
     fn ntt_inverse_buf(use_cuda: bool, np: &NttPlan, buf: &mut [u64]) {
         #[cfg(feature = "cuda")]
         if use_cuda {
-            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
-                if let Ok(out) =
-                    rt.run_goldilocks_ntt_transform(buf, np.twiddles_inv(), Some(np.inv_n()))
-                {
-                    buf.copy_from_slice(&out);
-                    return;
+            match crate::blackwell::shared_cuda_runtime() {
+                Some(rt) => {
+                    match rt.run_goldilocks_ntt_transform(buf, np.twiddles_inv(), Some(np.inv_n()))
+                    {
+                        Ok(out) => {
+                            buf.copy_from_slice(&out);
+                            crate::cuda_report::record_gpu("ntt", "");
+                            return;
+                        }
+                        Err(e) => crate::cuda_report::record_cpu_fallback("ntt", e),
+                    }
                 }
+                None => crate::cuda_report::record_cpu_fallback("ntt", "CUDA runtime unavailable"),
             }
         }
         let _ = use_cuda;
@@ -2444,15 +2569,22 @@ impl BinauralPlus {
     ) {
         #[cfg(feature = "cuda")]
         if use_cuda {
-            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
-                // Real-input FFT: zero imaginary lane is produced on-device (no host zero
-                // upload) and the twiddles are device-resident across blocks.
-                if let Ok((re, im)) = rt.run_stockham_fft_f64_real_input(input, false) {
-                    for (k, slot) in out_bins.iter_mut().enumerate() {
-                        *slot = Complex::new(re[k], im[k]);
+            match crate::blackwell::shared_cuda_runtime() {
+                Some(rt) => {
+                    // Real-input FFT: zero imaginary lane is produced on-device (no host zero
+                    // upload) and the twiddles are device-resident across blocks.
+                    match rt.run_stockham_fft_f64_real_input(input, false) {
+                        Ok((re, im)) => {
+                            for (k, slot) in out_bins.iter_mut().enumerate() {
+                                *slot = Complex::new(re[k], im[k]);
+                            }
+                            crate::cuda_report::record_gpu("fft", "");
+                            return;
+                        }
+                        Err(e) => crate::cuda_report::record_cpu_fallback("fft", e),
                     }
-                    return;
                 }
+                None => crate::cuda_report::record_cpu_fallback("fft", "CUDA runtime unavailable"),
             }
         }
         let _ = use_cuda;
@@ -2469,23 +2601,30 @@ impl BinauralPlus {
     ) {
         #[cfg(feature = "cuda")]
         if use_cuda {
-            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
-                let n = plan.len();
-                let nb = bins.len();
-                let mut re = vec![0.0_f64; n];
-                let mut im = vec![0.0_f64; n];
-                for k in 0..nb {
-                    re[k] = bins[k].re;
-                    im[k] = bins[k].im;
+            match crate::blackwell::shared_cuda_runtime() {
+                Some(rt) => {
+                    let n = plan.len();
+                    let nb = bins.len();
+                    let mut re = vec![0.0_f64; n];
+                    let mut im = vec![0.0_f64; n];
+                    for k in 0..nb {
+                        re[k] = bins[k].re;
+                        im[k] = bins[k].im;
+                    }
+                    for k in 1..(n / 2) {
+                        re[n - k] = bins[k].re;
+                        im[n - k] = -bins[k].im;
+                    }
+                    match rt.run_stockham_fft_f64_real_output(&re, &im, true) {
+                        Ok(out_re) => {
+                            out_real.copy_from_slice(&out_re);
+                            crate::cuda_report::record_gpu("fft", "");
+                            return;
+                        }
+                        Err(e) => crate::cuda_report::record_cpu_fallback("fft", e),
+                    }
                 }
-                for k in 1..(n / 2) {
-                    re[n - k] = bins[k].re;
-                    im[n - k] = -bins[k].im;
-                }
-                if let Ok(out_re) = rt.run_stockham_fft_f64_real_output(&re, &im, true) {
-                    out_real.copy_from_slice(&out_re);
-                    return;
-                }
+                None => crate::cuda_report::record_cpu_fallback("fft", "CUDA runtime unavailable"),
             }
         }
         let _ = use_cuda;
@@ -2613,6 +2752,251 @@ impl BinauralPlus {
         self.cur_fill = 0;
     }
 
+    /// Effective channel mask for the NTT accumulation loops: `SLOT_FL`/`SLOT_FR` are always
+    /// included regardless of the speaker mask, exactly like the CPU loops' condition.
+    #[cfg(feature = "cuda")]
+    fn ntt_active_mask(&self) -> u32 {
+        self.mask | (1u32 << SLOT_FL) | (1u32 << SLOT_FR)
+    }
+
+    /// Quantize one `f64` hop into the exact 24-bit PCM field elements used by the NTT
+    /// (identical expression to the stateless path), zero-padding to `ntt_x.len()`.
+    #[cfg(feature = "cuda")]
+    fn ntt_quantize_hop(&mut self, slice: &[f64]) {
+        self.ntt_x.fill(0);
+        for (dst, &sample) in self.ntt_x.iter_mut().zip(slice.iter()) {
+            let q = (sample * NTT_PCM_SCALE)
+                .round()
+                .clamp(-8_388_608.0, 8_388_607.0) as i64;
+            *dst = i64_to_field(q);
+        }
+    }
+
+    /// Device-resident NTT hop (`docs/CUDA_PERF_PLAN.md` section 1).
+    ///
+    /// Mirrors the integer branch of [`Self::process_hop`] operation-for-operation:
+    /// forward transforms per active channel, exact pointwise accumulation, one batched
+    /// inverse per ear, then the same overlap-add bookkeeping. All device work for the hop
+    /// completes before any host streaming state changes, so an `Err` return leaves the
+    /// caller free to fall back for this call.
+    ///
+    /// This method is only reachable when `self.ntt_plan.is_some()`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn process_hop_ntt_cuda(
+        &mut self,
+        state: &std::sync::Arc<std::sync::Mutex<g6me_cuda::CudaUpolaState>>,
+        inputs: &[Option<&[f64]>; SLOTS],
+        offset: usize,
+        out_l: &mut [f64],
+        out_r: &mut [f64],
+        m: usize,
+    ) -> Result<(), String> {
+        let n_fft = self
+            .ntt_plan
+            .as_ref()
+            .map(|p| p.len())
+            .ok_or_else(|| "device UPOLA hop without an NTT plan".to_string())?;
+        let use_upola = self.n_parts > 1;
+        let full_aligned_upola = use_upola && self.cur_fill == 0 && m == self.ola_hop;
+        let mask = self.ntt_active_mask();
+        let head = self.fdl_head;
+        let mut st = state
+            .lock()
+            .map_err(|_| "ntt cuda state poisoned".to_string())?;
+        let inv_scale = 1.0 / (NTT_PCM_SCALE * self.ntt_kernel_scale);
+        let ov_len = self.ntt_ov_l.len();
+
+        if full_aligned_upola {
+            // ---- completed whole hop: transform directly into the delay line ------------
+            st.zero_fdl_row(head)?;
+            for (ch, slot) in inputs.iter().enumerate() {
+                if (mask >> ch) & 1 == 0 {
+                    continue;
+                }
+                let Some(slice) = slot.map(|buf| &buf[offset..offset + m]) else {
+                    continue;
+                };
+                if !slice.iter().any(|&v| v != 0.0) {
+                    continue;
+                }
+                self.ntt_quantize_hop(slice);
+                st.upload_fdl_row(head, ch, &self.ntt_x)?;
+            }
+            st.forward_fdl_row(head, mask)?;
+            st.accumulate_fdl(head, 0, 1, mask)?;
+            let acc = st.inverse_acc_to_host()?;
+            let (acc_l, acc_r) = acc.split_at(n_fft);
+
+            // ---- all device work for the hop is done: commit host state ----------------
+            for i in 0..m {
+                let ol = if i < ov_len { self.ntt_ov_l[i] } else { 0 };
+                let or = if i < ov_len { self.ntt_ov_r[i] } else { 0 };
+                let vl = ((field_to_i128(acc_l[i]) + ol) as f64) * inv_scale;
+                let vr = ((field_to_i128(acc_r[i]) + or) as f64) * inv_scale;
+                if !vl.is_finite() || !vr.is_finite() {
+                    self.finite = false;
+                }
+                out_l[i] = vl;
+                out_r[i] = vr;
+            }
+            let y_len = m + self.ola_hop - 1;
+            for j in 0..ov_len {
+                let src = m + j;
+                let prev_l = if src < ov_len { self.ntt_ov_l[src] } else { 0 };
+                let prev_r = if src < ov_len { self.ntt_ov_r[src] } else { 0 };
+                let add_l = if src < y_len {
+                    field_to_i128(acc_l[src])
+                } else {
+                    0
+                };
+                let add_r = if src < y_len {
+                    field_to_i128(acc_r[src])
+                } else {
+                    0
+                };
+                self.ntt_ov_l[j] = prev_l + add_l;
+                self.ntt_ov_r[j] = prev_r + add_r;
+            }
+
+            // Tail partitions p = 1..n_parts in one accumulate + one batched inverse.
+            st.accumulate_fdl(head, 1, self.n_parts, mask)?;
+            let tail = st.inverse_acc_to_host()?;
+            let (tail_l, tail_r) = tail.split_at(n_fft);
+            for i in 0..ov_len {
+                self.ntt_ov_l[i] += field_to_i128(tail_l[i]);
+                self.ntt_ov_r[i] += field_to_i128(tail_r[i]);
+            }
+            self.fdl_head = (head + 1) % (self.n_parts - 1);
+            crate::cuda_report::record_gpu("ntt", "device-resident UPOLA");
+            return Ok(());
+        }
+
+        // ---- partial hop, or the single-partition anechoic engine -------------------
+        let mut contribution_mask = 0u32;
+        for (ch, slot) in inputs.iter().enumerate() {
+            if (mask >> ch) & 1 == 0 {
+                continue;
+            }
+            let slice_opt = slot.map(|buf| &buf[offset..offset + m]);
+            if use_upola {
+                // Idempotent on retry: the same samples land at the same `cur_fill`.
+                if let Some(sl) = slice_opt {
+                    self.cur_in[ch][self.cur_fill..self.cur_fill + m].copy_from_slice(sl);
+                } else {
+                    self.cur_in[ch][self.cur_fill..self.cur_fill + m].fill(0.0);
+                }
+            }
+            let Some(slice) = slice_opt else { continue };
+            if !slice.iter().any(|&v| v != 0.0) {
+                continue;
+            }
+            self.ntt_quantize_hop(slice);
+            st.upload_scratch_row(ch, &self.ntt_x)?;
+            contribution_mask |= 1u32 << ch;
+        }
+        let acc = if contribution_mask != 0 {
+            st.forward_scratch(contribution_mask)?;
+            st.mac_scratch_partition0(contribution_mask)?;
+            st.inverse_acc_to_host()?
+        } else {
+            // Zero input transforms and accumulates to the exact zero vector.
+            vec![0u64; 2 * n_fft]
+        };
+        let (acc_l, acc_r) = acc.split_at(n_fft);
+
+        // Device push of the just-completed whole block (only when this hop filled it).
+        let push = use_upola && self.cur_fill + m == self.ola_hop;
+        let push_tail = if push {
+            Some(self.push_completed_upola_block_cuda_work(&mut st, head, n_fft)?)
+        } else {
+            None
+        };
+
+        // ---- commit host state (mirrors the CPU branch order) ----------------------
+        for i in 0..m {
+            let ol = if i < ov_len { self.ntt_ov_l[i] } else { 0 };
+            let or = if i < ov_len { self.ntt_ov_r[i] } else { 0 };
+            let vl = ((field_to_i128(acc_l[i]) + ol) as f64) * inv_scale;
+            let vr = ((field_to_i128(acc_r[i]) + or) as f64) * inv_scale;
+            if !vl.is_finite() || !vr.is_finite() {
+                self.finite = false;
+            }
+            out_l[i] = vl;
+            out_r[i] = vr;
+        }
+        let y_len = if use_upola {
+            m + self.ola_hop - 1
+        } else {
+            n_fft
+        };
+        for j in 0..ov_len {
+            let src = m + j;
+            let prev_l = if src < ov_len { self.ntt_ov_l[src] } else { 0 };
+            let prev_r = if src < ov_len { self.ntt_ov_r[src] } else { 0 };
+            let add_l = if src < y_len {
+                field_to_i128(acc_l[src])
+            } else {
+                0
+            };
+            let add_r = if src < y_len {
+                field_to_i128(acc_r[src])
+            } else {
+                0
+            };
+            self.ntt_ov_l[j] = prev_l + add_l;
+            self.ntt_ov_r[j] = prev_r + add_r;
+        }
+        if let Some(tail) = push_tail {
+            let (tail_l, tail_r) = tail.split_at(n_fft);
+            for i in 0..ov_len {
+                self.ntt_ov_l[i] += field_to_i128(tail_l[i]);
+                self.ntt_ov_r[i] += field_to_i128(tail_r[i]);
+            }
+            self.fdl_head = (head + 1) % (self.n_parts - 1);
+            self.cur_fill = 0;
+        } else if use_upola {
+            self.cur_fill += m;
+        }
+        crate::cuda_report::record_gpu("ntt", "device-resident UPOLA");
+        Ok(())
+    }
+
+    /// Device-side body of [`Self::push_completed_upola_block`]: transform the completed
+    /// `ola_hop`-sample `cur_in` block into the delay line, accumulate every tail partition
+    /// and inverse-transform both ears. Returns the `2 * n` host words of the tail.
+    #[cfg(feature = "cuda")]
+    fn push_completed_upola_block_cuda_work(
+        &mut self,
+        st: &mut g6me_cuda::CudaUpolaState,
+        head: usize,
+        n_fft: usize,
+    ) -> Result<Vec<u64>, String> {
+        let mask = self.ntt_active_mask();
+        let b = self.ola_hop;
+        st.zero_fdl_row(head)?;
+        for ch in 0..SLOTS {
+            if (mask >> ch) & 1 == 0 {
+                continue;
+            }
+            let src = &self.cur_in[ch];
+            if !src.iter().any(|&v| v != 0.0) {
+                continue;
+            }
+            self.ntt_x.fill(0);
+            for (d, &s) in self.ntt_x.iter_mut().take(b).zip(src.iter()) {
+                let q = (s * NTT_PCM_SCALE).round().clamp(-8_388_608.0, 8_388_607.0) as i64;
+                *d = i64_to_field(q);
+            }
+            st.upload_fdl_row(head, ch, &self.ntt_x)?;
+        }
+        st.forward_fdl_row(head, mask)?;
+        st.accumulate_fdl(head, 1, self.n_parts, mask)?;
+        let tail = st.inverse_acc_to_host()?;
+        debug_assert_eq!(tail.len(), 2 * n_fft);
+        Ok(tail)
+    }
+
     fn process_hop(
         &mut self,
         inputs: &[Option<&[f64]>; SLOTS],
@@ -2625,6 +3009,26 @@ impl BinauralPlus {
         let use_upola = self.n_parts > 1;
         let full_aligned_upola = use_upola && self.cur_fill == 0 && m == self.ola_hop;
         let use_cuda = self.cfg.use_cuda;
+
+        // Device-resident FDL-UPOLA path. It mirrors the integer NTT branch below exactly and
+        // returns without touching host streaming state on error, so a failed device hop can
+        // fall back to the stateless path for this call.
+        #[cfg(feature = "cuda")]
+        if use_cuda && self.ntt_plan.is_some() {
+            if let Some(state) = self.ntt_cuda.0.clone() {
+                match self.process_hop_ntt_cuda(&state, inputs, offset, out_l, out_r, m) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        crate::cuda_report::record_cpu_fallback("ntt", e);
+                        self.ntt_cuda = NttCudaHandle::default();
+                        // The host delay line was not maintained while the device owned it;
+                        // zero the decay tails so the fallback cannot replay stale history.
+                        self.ntt_ov_l.fill(0);
+                        self.ntt_ov_r.fill(0);
+                    }
+                }
+            }
+        }
 
         if let Some(ref np) = self.ntt_plan {
             let n_fft = np.len();
@@ -2922,6 +3326,12 @@ impl BinauralPlus {
             for s in &mut self.ntt_fdl {
                 for c in s {
                     c.fill(0);
+                }
+            }
+            #[cfg(feature = "cuda")]
+            if let Some(state) = self.ntt_cuda.0.as_ref() {
+                if let Ok(mut st) = state.lock() {
+                    let _ = st.reset();
                 }
             }
             for c in &mut self.cur_in {
@@ -3699,7 +4109,7 @@ mod tests {
 
     /// End-to-end integration of the full acoustic-physics stack:
     /// Spherical-Hankel + Snowman torso + Order-7 MagLS + Hybrid 3D ControlRoom
-    /// (2-run reciprocal 3D FDTD + ISM + BTM + PCG64 Ray Tracing) + Slepian DPSS tail
+    /// (2-run reciprocal 3D FDTD + ISM + BTM + PCG32 Ray Tracing) + Slepian DPSS tail
     /// + Paraunitary Scattering FDN/Velvet + Webster 1D Ear-Canal impedance.
     #[test]
     fn academic_nuke_hankel_room_slepian_externalization_integration() {

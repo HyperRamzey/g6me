@@ -1,31 +1,35 @@
-//! Phenomenological Human Cochlea, Auditory Nerve Neurogram (NSIM), Bayesian Auditory
-//! Externalization, and Bayesian Active Personalization Loop.
+//! Cochlea, Auditory Nerve Neurogram (NSIM), Bayesian Auditory Externalization, and
+//! Bayesian Active Personalization Loop.
 //!
-//! 1. **Phenomenological Cochlea & Auditory Nerve Model** (inspired by Zilany, Bruce &
-//!    Carney, JASA 2014; Bruce, Erfani & Zilany, Hearing Research 2018):
-//!    - Deterministic continuous-rate approximation (not a full stochastic IHC/AN
-//!      synapse pool simulator): 28-channel ERB-spaced 4th-order gammatone basilar-membrane
-//!      filterbank with OHC compressive nonlinearity (`~0.35` slope above knee),
-//!    - Asymmetric Boltzmann Inner Hair Cell (IHC) mechano-transduction + `3.0 kHz`
-//!      membrane low-pass (phase-locking rolloff),
-//!    - Dual-time-constant exponential + power-law adaptation producing deterministic
-//!      auditory-nerve discharge-rate neurograms (`sp/s`),
+//! 1. **Zilany–Bruce–Carney auditory periphery** (Zilany, Bruce & Carney, JASA 2014;
+//!    Bruce, Erfani & Zilany, Hearing Research 2018), implemented in [`crate::zbc`]:
+//!    - human middle ear (three biquad sections),
+//!    - dual-resonance nonlinear basilar membrane (C1/C2 tenth-order chirp filters with
+//!      the wideband control path and OHC Boltzmann nonlinearity),
+//!    - IHC `NLogarithm` transduction, `3 kHz` seventh-order membrane low-pass and the cat
+//!      cochlear delay,
+//!    - BEZ 2018 synapse: Eq. 1 IHC→PLA mapping, fractional Gaussian noise, two power-law
+//!      adaptation paths, adaptive redocking, four release sites and stochastic spike
+//!      generation with absolute plus relative refractoriness,
+//!    - three fibers per CF (low/medium/high spontaneous rate from BEZ 2018 Table 1),
+//!      24 ERB-spaced CFs from `120 Hz` to `12 kHz`, binned spike-rate neurogram.
 //!    - **Neurogram Similarity Index (NSIM)** (Hines & Harte 2010 / Bruce et al. 2018):
 //!      mean luminance × structural similarity `NSIM in [0, 1]` between reference and
-//!      processed auditory-nerve neurograms.
+//!      processed auditory-nerve neurograms over `3×3` Gaussian windows (radius 0.5).
 //! 2. **Baumgartner & Majdak (2021)** — **Bayesian Auditory Externalization Model**:
-//!    combines monaural spectral-shape fidelity (ERB spectral gradient similarity) with
-//!    binaural interaural coherence (`IACC` decorrelation) and early-to-direct acoustic
-//!    cues to predict perceived out-of-head externalization probability `E in [0, 1]`.
-//! 3. **Hear-to-Hear Bayesian Active Personalization (ACM UIST 2026)**:
+//!    eight expectation-error cues (`MSS`, `ISS`, `MSSD`, `ISSD`, `ITIT`, `IC`, `MI`,
+//!    `ITSD`) mapped through Eq. 10 and combined by the published weighted-sum decision
+//!    stage (0.6 `MSS` / 0.4 `ISS`) or the LTA/MTA/WTA selection strategies. The
+//!    listener-specific DTF template is substituted by our own snowman HRTF model at a
+//!    fixed `30°` lateral angle and `2 m` distance (see `externalization.rs`).
+//! 3. **Bayesian Active Personalization over Three Anatomy Scalars (BALD)**:
 //!    10–15 click uncertainty-aware Bayesian active-learning A/B loop over anatomical
 //!    parameters `(head_radius_m, torso_height_m, pinna_shelf_db)` choosing each A/B
 //!    pair by maximizing expected Shannon entropy reduction (BALD / mutual information).
+//!    This is a three-scalar anatomy search, not a Hear-to-Hear HRTF posterior.
 
-use crate::fft::{erb_hz, Complex, FftPlan};
-use std::f64::consts::PI;
 
-/// 28 ERB-spaced cochlear characteristic frequencies (Hz) spanning `120 Hz .. 12 kHz`.
+/// 24 ERB-spaced cochlear characteristic frequencies (Hz) spanning `120 Hz .. 12 kHz`.
 pub fn cochlea_cf_hz(n_ch: usize) -> Vec<f64> {
     let f_min = 120.0_f64;
     let f_max = 12_000.0_f64;
@@ -53,97 +57,16 @@ pub struct Neurogram {
     pub rates: Vec<Vec<f64>>,
 }
 
-/// Compute a biophysical auditory-nerve neurogram (Zilany–Bruce–Carney 2014 / Bruce et al. 2018)
-/// for a mono signal `x` at `sample_rate`.
+/// Compute the auditory-nerve neurogram of a mono signal `x` at `sample_rate`.
 ///
-/// Pipeline per CF channel:
-/// 1. 4th-order all-pole gammatone basilar-membrane filterbank (ERB bandwidth `1.019 * ERB(CF)`),
-/// 2. Outer Hair Cell (OHC) level-dependent compression (`y = sign(v) * |v|^0.35` above knee),
-/// 3. Asymmetric Boltzmann IHC receptor potential + 2nd-order `3.0 kHz` IHC low-pass,
-/// 4. Exponential + power-law ribbon-synapse adaptation (`tau_fast = 5 ms`, `tau_slow = 40 ms`),
-/// 5. Frame-averaged discharge rate (`sp/s`) in `5 ms` neurogram bins.
+/// Runs the Zilany–Bruce–Carney periphery (`crate::zbc`) for one low-, one medium- and one
+/// high-spontaneous-rate fiber at each of `n_ch` ERB-spaced CFs, then bins the generated
+/// spike times into `5 ms` frames (`sp/s`). The model runs at its native `100 kHz` internal
+/// rate; `x` is band-limited resampled on entry.
 pub fn compute_neurogram(x: &[f64], sample_rate: u32, n_ch: usize) -> Neurogram {
-    let fs = (sample_rate.max(8_000)) as f64;
-    let cfs = cochlea_cf_hz(n_ch);
     let frame_ms = 5.0_f64;
-    let frame_len = ((frame_ms * 1e-3 * fs).round() as usize).max(16);
-    let n_frames = x.len() / frame_len;
-    let mut rates = vec![vec![0.0_f64; n_frames]; n_ch];
-    if n_frames == 0 {
-        return Neurogram {
-            cfs_hz: cfs,
-            frame_ms,
-            rates,
-        };
-    }
-
-    // 1-pole IHC membrane low-pass at 3000 Hz (captures human phase-locking rolloff).
-    let a_ihc = (-2.0 * PI * 3_000.0_f64.min(0.45 * fs) / fs).exp();
-    // Ribbon-synapse fast & slow adaptation decay constants.
-    let a_fast = (-1.0 / (0.005 * fs)).exp();
-    let a_slow = (-1.0 / (0.040 * fs)).exp();
-    const SPONT_RATE: f64 = 50.0; // High-SR auditory nerve fiber spontaneous rate (sp/s)
-    const MAX_RATE: f64 = 280.0; // Saturated discharge rate (sp/s)
-
-    for (ch, &cf) in cfs.iter().enumerate() {
-        if cf >= 0.46 * fs {
-            continue;
-        }
-        // 4-stage cascaded complex 1-pole gammatone resonator at CF with ERB bandwidth.
-        let bw = 1.019 * erb_hz(cf);
-        let r = (-2.0 * PI * bw / fs).exp();
-        let w = 2.0 * PI * cf / fs;
-        let pole = Complex::new(r * w.cos(), r * w.sin());
-        // Peak gain normalization at CF: |(1 - r)|^4
-        let norm_gain = (1.0 - r).powi(4);
-
-        let mut s = [Complex::ZERO; 4];
-        let mut ihc_lp = 0.0_f64;
-        let mut adapt_fast = 0.0_f64;
-        let mut adapt_slow = 0.0_f64;
-
-        for (f_idx, rate_slot) in rates[ch].iter_mut().enumerate() {
-            let start = f_idx * frame_len;
-            let mut sum_rate = 0.0_f64;
-            for &sample in &x[start..(start + frame_len)] {
-                // 4th-order complex gammatone filter (zero FMA).
-                let mut cur = Complex::new(sample * norm_gain, 0.0);
-                for st in &mut s {
-                    let next = cur.add(st.mul(pole));
-                    *st = next;
-                    cur = next;
-                }
-                let bm = cur.re;
-
-                // OHC nonlinear compressive basilar membrane gain (~0.35 slope above knee 0.02).
-                let mag = bm.abs();
-                let knee = 0.02;
-                let comp = if mag > knee {
-                    bm.signum() * knee * (mag / knee).powf(0.35)
-                } else {
-                    bm
-                };
-
-                // Asymmetric Boltzmann Inner Hair Cell (IHC) mechano-transduction.
-                let v_ihc = if comp >= 0.0 {
-                    comp / (comp + 0.04)
-                } else {
-                    0.3 * comp / (-comp + 0.04)
-                };
-                ihc_lp = (1.0 - a_ihc) * v_ihc + a_ihc * ihc_lp;
-                let drive = ihc_lp.max(0.0);
-
-                // Power-law-approximated 2-time-constant ribbon-synapse adaptation.
-                adapt_fast = a_fast * adapt_fast + (1.0 - a_fast) * drive;
-                adapt_slow = a_slow * adapt_slow + (1.0 - a_slow) * drive;
-                let adapted = (drive - 0.35 * adapt_fast - 0.25 * adapt_slow).max(0.0);
-                let rate = SPONT_RATE + (MAX_RATE - SPONT_RATE) * (adapted / (adapted + 0.12));
-                sum_rate += rate;
-            }
-            *rate_slot = sum_rate / (frame_len as f64);
-        }
-    }
-
+    let cfs = cochlea_cf_hz(n_ch);
+    let rates = crate::zbc::rate_neurogram(x, sample_rate, &cfs, frame_ms);
     Neurogram {
         cfs_hz: cfs,
         frame_ms,
@@ -172,45 +95,49 @@ pub fn nsim(a: &Neurogram, b: &Neurogram) -> f64 {
     const C1: f64 = (0.01 * L_DYN) * (0.01 * L_DYN);
     const C2: f64 = (0.03 * L_DYN) * (0.03 * L_DYN);
 
+    // Hines & Harte (2010) use a 3 x 3 Gaussian window; radius 0.5 samples.
+    const W_SIGMA: f64 = 0.5;
+    let weight =
+        |dc: isize, dt: isize| (-((dc * dc + dt * dt) as f64) / (2.0 * W_SIGMA * W_SIGMA)).exp();
     let mut total = 0.0_f64;
     let mut count = 0usize;
 
     for ch in 0..n_ch {
-        let ch_lo = ch.saturating_sub(1);
-        let ch_hi = (ch + 1).min(n_ch - 1);
         for fr in 0..n_fr {
-            let fr_lo = fr.saturating_sub(1);
-            let fr_hi = (fr + 1).min(n_fr - 1);
-
+            let mut sum_w = 0.0_f64;
             let mut sum_a = 0.0_f64;
             let mut sum_b = 0.0_f64;
-            let mut k = 0usize;
-            for c in ch_lo..=ch_hi {
-                for t in fr_lo..=fr_hi {
-                    sum_a += a.rates[c][t];
-                    sum_b += b.rates[c][t];
-                    k += 1;
+            for dc in -1isize..=1 {
+                let c = (ch as isize + dc).clamp(0, n_ch as isize - 1) as usize;
+                for dt in -1isize..=1 {
+                    let t = (fr as isize + dt).clamp(0, n_fr as isize - 1) as usize;
+                    let w = weight(dc, dt);
+                    sum_w += w;
+                    sum_a += w * a.rates[c][t];
+                    sum_b += w * b.rates[c][t];
                 }
             }
-            let kf = k as f64;
-            let mu_a = sum_a / kf;
-            let mu_b = sum_b / kf;
+            let mu_a = sum_a / sum_w;
+            let mu_b = sum_b / sum_w;
 
             let mut var_a = 0.0_f64;
             let mut var_b = 0.0_f64;
             let mut cov = 0.0_f64;
-            for c in ch_lo..=ch_hi {
-                for t in fr_lo..=fr_hi {
+            for dc in -1isize..=1 {
+                let c = (ch as isize + dc).clamp(0, n_ch as isize - 1) as usize;
+                for dt in -1isize..=1 {
+                    let t = (fr as isize + dt).clamp(0, n_fr as isize - 1) as usize;
+                    let w = weight(dc, dt);
                     let da = a.rates[c][t] - mu_a;
                     let db = b.rates[c][t] - mu_b;
-                    var_a += da * da;
-                    var_b += db * db;
-                    cov += da * db;
+                    var_a += w * da * da;
+                    var_b += w * db * db;
+                    cov += w * da * db;
                 }
             }
-            let sig_a = (var_a / kf).max(0.0).sqrt();
-            let sig_b = (var_b / kf).max(0.0).sqrt();
-            let cov_ab = cov / kf;
+            let sig_a = (var_a / sum_w).max(0.0).sqrt();
+            let sig_b = (var_b / sum_w).max(0.0).sqrt();
+            let cov_ab = cov / sum_w;
 
             let lum = (2.0 * mu_a * mu_b + C1) / (mu_a * mu_a + mu_b * mu_b + C1);
             let struc = (cov_ab + 0.5 * C2) / (sig_a * sig_b + 0.5 * C2);
@@ -225,162 +152,13 @@ pub fn nsim(a: &Neurogram, b: &Neurogram) -> f64 {
     }
 }
 
-/// Output of the **Baumgartner & Majdak (2021)** Bayesian Auditory Externalization Model.
-#[derive(Debug, Clone, Copy)]
-pub struct ExternalizationReport {
-    /// Predicted out-of-head externalization score `E in [0.0, 1.0]`
-    /// (`0.0` = inside-head lateralized, `1.0` = fully externalized room image).
-    pub score: f64,
-    /// Monaural spectral-cue likelihood `L_mon in [0.0, 1.0]`.
-    pub monaural_cue: f64,
-    /// Binaural interaural coherence / reverberation decorrelation cue `L_bin in [0.0, 1.0]`.
-    pub binaural_cue: f64,
-    /// Measured broadband interaural cross-correlation `IACC in [0.0, 1.0]`.
-    pub iacc: f64,
-    /// Early-to-direct reflection energy ratio (dB).
-    pub early_refl_db: f64,
-}
-
-/// Evaluate the **Baumgartner & Majdak (2021)** Bayesian Auditory Externalization Model
-/// on a binaural stereo impulse response `(ir_l, ir_r)` at `sample_rate`.
-///
-/// Combines:
-/// - **Monaural spectral-shape cue**: smoothness & pinna-band spectral richness in `1–14 kHz`
-///   versus a flat inside-head headphone spectrum (Gaussian likelihood in spectral gradient space),
-/// - **Binaural IACC decorrelation cue**: early-reflection (`>= 4 ms` after peak) + broadband
-///   IACC drop from `1.0` (in-head mono) toward `0.55–0.85` (natural externalized control room),
-/// - **Direct-to-early reverberant cue**: presence of physical room reflections (`5..65 ms`)
-///   in the optimal externalization zone (`-18 dB .. -3 dB` relative to direct).
-pub fn baumgartner_majdak_externalization(
-    ir_l: &[f64],
-    ir_r: &[f64],
-    sample_rate: u32,
-) -> ExternalizationReport {
-    let n = ir_l.len().min(ir_r.len());
-    if n < 32 {
-        return ExternalizationReport {
-            score: 0.0,
-            monaural_cue: 0.0,
-            binaural_cue: 0.0,
-            iacc: 1.0,
-            early_refl_db: -120.0,
-        };
-    }
-    let fs = sample_rate as f64;
-
-    // 1. Broadband IACC over ±1.0 ms lag window (standard ISO 3382 definition).
-    let max_lag = ((0.001 * fs).round() as usize).clamp(1, n / 4);
-    let el: f64 = ir_l[..n].iter().map(|x| x * x).sum();
-    let er: f64 = ir_r[..n].iter().map(|x| x * x).sum();
-    let denom = (el * er).sqrt().max(1e-30);
-    let mut iacc = 0.0_f64;
-    for lag in -(max_lag as isize)..=(max_lag as isize) {
-        let mut acc = 0.0_f64;
-        for (i, &l_val) in ir_l.iter().enumerate().take(n) {
-            let j = i as isize + lag;
-            if j >= 0 && (j as usize) < n {
-                acc += l_val * ir_r[j as usize];
-            }
-        }
-        iacc = iacc.max(acc.abs() / denom);
-    }
-    iacc = iacc.clamp(0.0, 1.0);
-
-    // 2. Locate direct sound peak and compute early-reflection energy (5 ms .. 80 ms post-peak).
-    let peak_idx = (0..n)
-        .max_by(|&a, &b| {
-            let ea = ir_l[a] * ir_l[a] + ir_r[a] * ir_r[a];
-            let eb = ir_l[b] * ir_l[b] + ir_r[b] * ir_r[b];
-            ea.total_cmp(&eb)
-        })
-        .unwrap_or(0);
-    let dir_lo = peak_idx.saturating_sub((0.001 * fs) as usize);
-    let dir_hi = (peak_idx + (0.004 * fs) as usize).min(n);
-    let refl_lo = (peak_idx + (0.005 * fs) as usize).min(n);
-    let refl_hi = (peak_idx + (0.080 * fs) as usize).min(n);
-
-    let e_dir: f64 = (dir_lo..dir_hi)
-        .map(|i| ir_l[i] * ir_l[i] + ir_r[i] * ir_r[i])
-        .sum::<f64>()
-        .max(1e-30);
-    let e_refl: f64 = (refl_lo..refl_hi)
-        .map(|i| ir_l[i] * ir_l[i] + ir_r[i] * ir_r[i])
-        .sum();
-    let early_refl_db = 10.0 * (e_refl.max(1e-18) / e_dir).log10();
-
-    // 3. Monaural spectral-shape cue: ERB-band spectral contrast in 1–14 kHz.
-    let n_fft = n.next_power_of_two().clamp(512, 8192);
-    let plan = FftPlan::new(n_fft);
-    let mut buf_l = vec![0.0_f64; n_fft];
-    let mut buf_r = vec![0.0_f64; n_fft];
-    let copy_n = n.min(n_fft);
-    buf_l[..copy_n].copy_from_slice(&ir_l[..copy_n]);
-    buf_r[..copy_n].copy_from_slice(&ir_r[..copy_n]);
-    let mut scratch = vec![Complex::ZERO; n_fft];
-    let mut sl = vec![Complex::ZERO; n_fft / 2 + 1];
-    let mut sr = vec![Complex::ZERO; n_fft / 2 + 1];
-    plan.rfft(&buf_l, &mut scratch, &mut sl);
-    plan.rfft(&buf_r, &mut scratch, &mut sr);
-
-    let cfs = cochlea_cf_hz(16);
-    let mut erb_db = Vec::with_capacity(cfs.len());
-    for &cf in &cfs {
-        if !(800.0..=14_000.0).contains(&cf) || cf >= 0.48 * fs {
-            continue;
-        }
-        let bw = 0.5 * erb_hz(cf);
-        let k0 = (((cf - bw).max(0.0) * (n_fft as f64) / fs).floor() as usize).min(sl.len() - 1);
-        let k1 = (((cf + bw) * (n_fft as f64) / fs).ceil() as usize).min(sl.len() - 1);
-        let mut p = 0.0_f64;
-        let mut cnt = 0usize;
-        for k in k0..=k1 {
-            p += 0.5 * (sl[k].norm_sq() + sr[k].norm_sq());
-            cnt += 1;
-        }
-        erb_db.push(10.0 * (p / (cnt.max(1) as f64)).max(1e-18).log10());
-    }
-    // Spectral gradient RMS across ERB bands (flat headphone = 0 dB; natural HRTF/pinna ~ 1.5–4 dB).
-    let mut grad_sq = 0.0_f64;
-    for w in erb_db.windows(2) {
-        let d = w[1] - w[0];
-        grad_sq += d * d;
-    }
-    let grad_rms = if erb_db.len() > 1 {
-        (grad_sq / ((erb_db.len() - 1) as f64)).sqrt()
-    } else {
-        0.0
-    };
-    // Monaural externalization likelihood rises smoothly with natural spectral cues (peaking ~2.5 dB/ERB)
-    // and decays if extreme comb filtering (> 9 dB/ERB) degrades timbral realism.
-    let monaural_cue =
-        (1.0 - (-grad_rms / 1.8).exp()) * (-(grad_rms - 3.0).max(0.0).powi(2) / 36.0).exp();
-
-    // 4. Binaural externalization cue (Baumgartner & Majdak 2021):
-    //    combines IACC decorrelation (1 - IACC) and physical room-reflection energy (-25..-4 dB).
-    let decorr_cue = (1.0 - (-((1.0 - iacc) / 0.14)).exp()).clamp(0.0, 1.0);
-    let refl_cue = if early_refl_db <= -45.0 {
-        0.0
-    } else {
-        // Sigmoid around -18 dB early-to-direct reflection level (Hassager–Gran–Dau 2016).
-        1.0 / (1.0 + (-(early_refl_db + 18.0) / 4.5).exp())
-    };
-    let binaural_cue = (0.55 * decorr_cue + 0.45 * refl_cue).clamp(0.0, 1.0);
-
-    // Bayesian weighted cue integration (Baumgartner & Majdak 2021 Eq. 8):
-    // Binaural reverberant/IACC cues carry ~70% weight and monaural spectral cues ~30%.
-    let score = (0.30 * monaural_cue + 0.70 * binaural_cue).clamp(0.0, 1.0);
-
-    ExternalizationReport {
-        score,
-        monaural_cue,
-        binaural_cue,
-        iacc,
-        early_refl_db,
-    }
-}
+pub use crate::externalization::{
+    baumgartner_majdak_externalization, externalization_with_strategy, CueErrors, DecisionStrategy,
+    ExternalizationReport,
+};
 
 // ============================================================================
-// 3. Hear-to-Hear Bayesian Active Personalization Loop (ACM UIST 2026)
+// 3. Bayesian Active Personalization over Three Anatomy Scalars (BALD)
 // ============================================================================
 
 /// Personalized anthropomorphic binaural parameters optimized via A/B active learning.
@@ -604,6 +382,7 @@ impl PersonalizationSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
 
     #[test]
     fn cochlea_nsim_is_unity_for_identical_and_detects_degradation() {
@@ -637,43 +416,35 @@ mod tests {
     }
 
     #[test]
-    fn baumgartner_majdak_externalization_ranks_room_above_dry_in_head() {
+    fn externalization_ranks_template_above_in_head_delta() {
         let fs = 48_000u32;
-        // Dry inside-head mono impulse (IACC = 1.0, flat spectrum, zero reflections).
+        // The model's own externalized template (30-degree source, 2 m): the reference
+        // condition that must receive the maximum Eq. 10 rating.
+        let (tpl_l, tpl_r) =
+            crate::externalization::externalization_template_ir(4096, fs as f64, 30.0);
+        let e_tpl = baumgartner_majdak_externalization(&tpl_l, &tpl_r, fs);
+
+        // Dry inside-head diotic impulse: flat spectrum, zero IID, zero reflections.
         let mut dry_l = vec![0.0_f64; 4096];
         let mut dry_r = vec![0.0_f64; 4096];
         dry_l[240] = 1.0;
         dry_r[240] = 1.0;
-
-        // Externalized studio BRIR with lateral early reflections + gentle pinna shading.
-        let mut room_l = vec![0.0_f64; 4096];
-        let mut room_r = vec![0.0_f64; 4096];
-        room_l[240] = 0.85;
-        room_l[242] = -0.18;
-        room_r[252] = 0.72;
-        room_r[254] = -0.14;
-        // Decorrelated lateral reflections at 11 ms, 18 ms, 27 ms, 39 ms
-        room_l[240 + 528] = 0.26;
-        room_r[240 + 545] = -0.22;
-        room_l[240 + 864] = -0.20;
-        room_r[240 + 890] = 0.24;
-        room_l[240 + 1300] = 0.16;
-        room_r[240 + 1320] = -0.17;
-        room_l[240 + 1870] = -0.12;
-        room_r[240 + 1895] = 0.13;
-
         let e_dry = baumgartner_majdak_externalization(&dry_l, &dry_r, fs);
-        let e_room = baumgartner_majdak_externalization(&room_l, &room_r, fs);
 
         assert!(
-            e_dry.score < 0.20,
-            "dry mono impulse should score low externalization (<0.20), got {:.3}",
+            e_tpl.score > 0.90,
+            "externalized template must score > 0.90, got {:.3}",
+            e_tpl.score
+        );
+        assert!(
+            e_dry.score < 0.60,
+            "dry mono impulse should score low externalization (<0.60), got {:.3}",
             e_dry.score
         );
         assert!(
-            e_room.score > e_dry.score + 0.45 && e_room.score <= 1.0,
-            "room BRIR ({:.3}) must strongly beat dry ({:.3})",
-            e_room.score,
+            e_tpl.score > e_dry.score + 0.30,
+            "template ({:.3}) must beat dry in-head ({:.3})",
+            e_tpl.score,
             e_dry.score
         );
     }
@@ -689,10 +460,14 @@ mod tests {
         let h0 = sess.entropy_bits();
         for _ in 0..12 {
             let (a, b) = sess.pair_params();
-            // Oracle picks whichever candidate is closer to ground truth.
-            let da = PersonalizationSession::dist_sq(truth, a);
-            let db = PersonalizationSession::dist_sq(truth, b);
-            sess.record_choice(da < db);
+            // Independent L1 oracle: deliberately does not call PersonalizationSession::dist_sq,
+            // so the test cannot pass by sharing the model's own likelihood geometry.
+            let err = |x: AnatomyParams| -> f64 {
+                (x.head_radius_m - truth.head_radius_m).abs() / 0.010
+                    + (x.torso_height_m - truth.torso_height_m).abs() / 0.045
+                    + 0.5 * (x.pinna_shelf_db - truth.pinna_shelf_db).abs() / 1.8
+            };
+            sess.record_choice(err(a) < err(b));
         }
         let h12 = sess.entropy_bits();
         let est = sess.posterior_mean();

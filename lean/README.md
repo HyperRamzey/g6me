@@ -3,7 +3,9 @@
 A core-Lean-4 formalization of the exact integer and rational mathematics in
 `crates/g6me-core/`.  No Mathlib, no axioms, no `sorry`.
 
-- Toolchain: Lean 4.27.0 and Lake 5.0.0 (already installed at `/usr/bin`).
+- Toolchain: pinned in `lean-toolchain` (Lean 4.27.0 / Lake 5.0.0). The CI
+  `lean` job installs exactly that toolchain with elan and runs the gate, so
+  the claims on this page are what CI enforces, not local observations.
 - Build: `cd lean && lake build`
 - Purity gate: `./check_axioms.sh` (forbidden-token scan, full build, theorem
   coverage against the EXPECTED registry, and `#print axioms` for every

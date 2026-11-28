@@ -5,7 +5,7 @@
 //!   built with `--features cuda` still run cleanly on CPU-only machines and fall back gracefully.
 //! - Embeds and loads ALL 6 real CUDA C++ kernels into [`G6meCudaRuntime`]:
 //!   1. `fdtd_3d.cu` — zero-FMA 3D SRL FDTD acoustic wave solver (`f64`),
-//!   2. `raytrace_hoa.cu` — zero-FMA deterministic PCG64 stochastic ray tracer (`f64`),
+//!   2. `raytrace_hoa.cu` — zero-FMA deterministic PCG32 stochastic ray tracer (`f64`),
 //!   3. `stockham_fft_f64.cu` — zero-FMA Stockham radix-2 complex FFT + MAC (`f64`),
 //!   4. `goldilocks_ntt.cu` — exact 64-bit Goldilocks prime NTT convolution (pure integer, 0 ULP),
 //!   5. `bem_matvec.cu` — zero-FMA complex Helmholtz BEM matvec (`f64`),
@@ -393,7 +393,18 @@ pub struct G6meCudaRuntime {
     fft_twiddle_cache: Mutex<HashMap<(usize, bool), FftTwiddleStages>>,
     /// Device-resident Goldilocks NTT twiddle stages keyed by `(n, inverse, fingerprint)`.
     ntt_twiddle_cache: Mutex<HashMap<(usize, bool, u64), NttTwiddleStages>>,
+    /// Concatenated per-stage twiddle tables for the fused single-launch transform,
+    /// keyed like `ntt_twiddle_cache`. Stage `s` starts at element `(1 << s) - 1`.
+    ntt_fused_twiddle_cache: Mutex<HashMap<(usize, bool, u64), CudaSlice<u64>>>,
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` for this device. The fused
+    /// NTT needs `n * 8` dynamic shared bytes, which exceeds the 48 KiB default on every
+    /// target that can hold a 4096/8192-point transform.
+    max_dynamic_shared: usize,
 }
+
+/// Threads per block for the fused single-block Goldilocks NTT. One block owns the whole
+/// transform, so this only trades per-stage loop trips against `__syncthreads` overhead.
+const NTT_FUSED_THREADS: u32 = 1024;
 
 #[inline]
 fn align_up(v: usize, align: usize) -> usize {
@@ -638,6 +649,14 @@ impl G6meCudaRuntime {
         let raytrace_mod = load("raytrace_hoa", KERNEL_RAYTRACE_HOA_CU)?;
         let fft_mod = load("stockham_fft_f64", KERNEL_STOCKHAM_FFT_CU)?;
         let ntt_mod = load("goldilocks_ntt", KERNEL_GOLDILOCKS_NTT_CU)?;
+        // Dynamic shared-memory opt-in is a per-device hard limit (99 KiB on cc 12.0,
+        // 64 KiB on sm_75). Query it instead of assuming the 48 KiB default.
+        let max_dynamic_shared = ctx
+            .attribute(
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )
+            .map(|v| v.max(0) as usize)
+            .unwrap_or(48 * 1024);
 
         Ok(Self {
             info,
@@ -652,6 +671,8 @@ impl G6meCudaRuntime {
             ntt_mod,
             fft_twiddle_cache: Mutex::new(HashMap::new()),
             ntt_twiddle_cache: Mutex::new(HashMap::new()),
+            ntt_fused_twiddle_cache: Mutex::new(HashMap::new()),
+            max_dynamic_shared,
         })
     }
 
@@ -722,6 +743,55 @@ impl G6meCudaRuntime {
                 stages.push(d_tw);
             }
             entry.insert(stages);
+        }
+        Ok(key)
+    }
+
+    /// Concatenate one direction's per-stage twiddle tables into the single device buffer the
+    /// fused kernel indexes (`stage s` at offset `(1 << s) - 1`), uploaded once per key.
+    ///
+    /// The concatenation is a pure layout change: every `u64` is copied verbatim from the
+    /// `NttPlan` tables the multi-launch path uses, so the fused kernel reads exactly the
+    /// same twiddle values.
+    fn ensure_fused_ntt_twiddles(
+        &self,
+        n: usize,
+        inverse: bool,
+        twiddles: &[Vec<u64>],
+    ) -> Result<(usize, bool, u64), String> {
+        let log_n = n.trailing_zeros() as usize;
+        if twiddles.len() != log_n {
+            return Err("Goldilocks NTT twiddle stage count mismatch".into());
+        }
+        let mut flat = Vec::with_capacity(n.saturating_sub(1));
+        for (stage, tw) in twiddles.iter().enumerate() {
+            if tw.len() != (1usize << stage) {
+                return Err(format!(
+                    "Goldilocks NTT stage {stage} twiddle length {} != {}",
+                    tw.len(),
+                    1usize << stage
+                ));
+            }
+            flat.extend_from_slice(tw);
+        }
+        if flat.len() != n - 1 {
+            return Err(format!(
+                "Goldilocks NTT twiddle concatenation length {} != {}",
+                flat.len(),
+                n - 1
+            ));
+        }
+        let key = ntt_twiddle_key(n, inverse, twiddles);
+        let mut guard = self
+            .ntt_fused_twiddle_cache
+            .lock()
+            .map_err(|_| "ntt fused twiddle cache poisoned".to_string())?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(key) {
+            let d_tw = self
+                .stream
+                .clone_htod(&flat)
+                .map_err(|e| format!("htod fused ntt tw: {e}"))?;
+            entry.insert(d_tw);
         }
         Ok(key)
     }
@@ -1605,7 +1675,7 @@ impl G6meCudaRuntime {
         Ok((out, prec))
     }
 
-    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass on the GPU,
+    /// Execute the zero-FMA stochastic PCG32 acoustic ray-tracing pass on the GPU,
     /// specular-only (`wall_scatter` = 0). Prefer [`Self::run_raytrace_hoa_pass_with_scattering`]
     /// when the room materials carry ISO-17497 scattering.
     ///
@@ -1638,7 +1708,7 @@ impl G6meCudaRuntime {
         )
     }
 
-    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass with per-wall
+    /// Execute the zero-FMA stochastic PCG32 acoustic ray-tracing pass with per-wall
     /// ISO-17497 scattering coefficients.
     ///
     /// `wall_refl` is the mid-band energy reflection coefficient `1 - alpha_1k` and
@@ -2132,7 +2202,114 @@ impl G6meCudaRuntime {
 
     /// Execute a single forward or inverse 64-bit Goldilocks prime NTT on the GPU
     /// (passing `scale = Some(inv_n)` for inverse NTT), strictly 0 FP operations (0 ULP).
+    ///
+    /// This is the fused single-launch path from `docs/CUDA_PERF_PLAN.md` section 1: when
+    /// the whole transform fits one block's opt-in dynamic shared memory, the bit reversal,
+    /// all `log2(n)` butterfly stages and the inverse scale run in one kernel launch with one
+    /// H2D and one D2H. Above the shared-memory limit (or if the driver rejects the opt-in)
+    /// it falls back to the same batched multi-launch sequence as before; both paths compute
+    /// the identical canonical field elements.
     pub fn run_goldilocks_ntt_transform(
+        &self,
+        data: &[u64],
+        twiddles: &[Vec<u64>],
+        scale: Option<u64>,
+    ) -> Result<Vec<u64>, String> {
+        let n = data.len();
+        if !n.is_power_of_two() || n == 0 {
+            return Err("Goldilocks NTT requires power-of-two length".into());
+        }
+        if n == 1 {
+            return Ok(data.to_vec());
+        }
+        if n.saturating_mul(std::mem::size_of::<u64>()) <= self.max_dynamic_shared {
+            match self.run_goldilocks_ntt_transform_fused(data, twiddles, scale) {
+                Ok(out) => return Ok(out),
+                Err(fused_err) => {
+                    // The plan's documented fallback: if the driver refuses the dynamic
+                    // shared-memory opt-in or the launch, use the multi-launch sequence.
+                    return self
+                        .run_goldilocks_ntt_transform_legacy(data, twiddles, scale)
+                        .map_err(|legacy_err| {
+                            format!(
+                                "fused NTT failed ({fused_err}); legacy NTT failed ({legacy_err})"
+                            )
+                        });
+                }
+            }
+        }
+        self.run_goldilocks_ntt_transform_legacy(data, twiddles, scale)
+    }
+
+    /// One-launch forward/inverse NTT: bit reversal, all stages and the optional inverse
+    /// scale inside a single block's dynamic shared memory (`n * 8` bytes).
+    fn run_goldilocks_ntt_transform_fused(
+        &self,
+        data: &[u64],
+        twiddles: &[Vec<u64>],
+        scale: Option<u64>,
+    ) -> Result<Vec<u64>, String> {
+        let n = data.len();
+        let log_n = n.trailing_zeros() as i32;
+        if twiddles.len() != log_n as usize {
+            return Err("Goldilocks NTT twiddle stage count mismatch".into());
+        }
+        let shared_mem_bytes = std::mem::size_of_val(data) as u32;
+        if shared_mem_bytes as usize > self.max_dynamic_shared {
+            return Err(format!(
+                "fused NTT needs {shared_mem_bytes} B dynamic shared memory, device allows {} B",
+                self.max_dynamic_shared
+            ));
+        }
+        let inverse = scale.is_some();
+        let key = self.ensure_fused_ntt_twiddles(n, inverse, twiddles)?;
+        let mut d_data = self
+            .stream
+            .clone_htod(data)
+            .map_err(|e| format!("htod fused ntt data: {e}"))?;
+        let func = self
+            .ntt_mod
+            .load_function("g6me_goldilocks_ntt_fused_inplace")
+            .map_err(|e| format!("load goldilocks_ntt_fused_inplace: {e}"))?;
+        func.set_attribute(
+            sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared_mem_bytes as i32,
+        )
+        .map_err(|e| format!("set fused ntt max dynamic shared ({shared_mem_bytes} B): {e}"))?;
+        let inv_n = scale.unwrap_or(0);
+        let has_scale: i32 = i32::from(scale.is_some());
+        let all_channels: u32 = u32::MAX;
+        {
+            let guard = self
+                .ntt_fused_twiddle_cache
+                .lock()
+                .map_err(|_| "ntt fused twiddle cache poisoned".to_string())?;
+            let d_tw = guard
+                .get(&key)
+                .ok_or_else(|| "fused ntt twiddle cache entry missing".to_string())?;
+            let mut b = self.stream.launch_builder(&func);
+            b.arg(&mut d_data)
+                .arg(d_tw)
+                .arg(&log_n)
+                .arg(&inv_n)
+                .arg(&has_scale)
+                .arg(&all_channels);
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (NTT_FUSED_THREADS, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe { b.launch(cfg) }.map_err(|e| format!("launch fused ntt: {e}"))?;
+        }
+        self.stream
+            .clone_dtoh(&d_data)
+            .map_err(|e| format!("dtoh fused ntt out: {e}"))
+    }
+
+    /// Original multi-launch transform (bit-reversal kernel, one launch per butterfly stage,
+    /// optional scale kernel). Kept as the above-limit fallback and as the before/after
+    /// measurement reference for the fused path.
+    fn run_goldilocks_ntt_transform_legacy(
         &self,
         data: &[u64],
         twiddles: &[Vec<u64>],
@@ -2217,6 +2394,429 @@ impl G6meCudaRuntime {
         self.stream
             .clone_dtoh(&d_buf)
             .map_err(|e| format!("dtoh ntt out: {e}"))
+    }
+
+    /// Build the device-resident FDL-UPOLA state of `docs/CUDA_PERF_PLAN.md` section 1.
+    ///
+    /// Everything that is a pure function of the preset is uploaded exactly once:
+    /// * `kern_l` / `kern_r` — flat `[n_parts][slots][n]` NTT-domain kernels,
+    /// * the concatenated forward/inverse twiddle stages,
+    /// * the frequency-domain delay line `[n_parts - 1][slots][n]`,
+    /// * both ear accumulators (`[2][n]`) and the per-channel hop scratch (`[slots][n]`).
+    ///
+    /// A streaming block then runs forward transforms, pointwise accumulation and both
+    /// inverse transforms entirely on the device; only the inverse-NTT result is read back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_upola_state(
+        &self,
+        n: usize,
+        slots: usize,
+        n_parts: usize,
+        inv_n: u64,
+        kern_l: &[u64],
+        kern_r: &[u64],
+        twiddles_fwd: &[Vec<u64>],
+        twiddles_inv: &[Vec<u64>],
+    ) -> Result<CudaUpolaState, String> {
+        if !n.is_power_of_two() || n < 2 {
+            return Err(format!("UPOLA NTT length {n} is not a power of two >= 2"));
+        }
+        if slots == 0 || n_parts == 0 {
+            return Err("UPOLA state requires slots > 0 and n_parts > 0".into());
+        }
+        let log_n = n.trailing_zeros() as i32;
+        let shared_mem_bytes = (n * std::mem::size_of::<u64>()) as u32;
+        if shared_mem_bytes as usize > self.max_dynamic_shared {
+            return Err(format!(
+                "UPOLA NTT N={n} needs {shared_mem_bytes} B dynamic shared memory, device allows {} B",
+                self.max_dynamic_shared
+            ));
+        }
+        let elem = n_parts
+            .checked_mul(slots)
+            .and_then(|v| v.checked_mul(n))
+            .ok_or_else(|| "UPOLA kernel table length overflow".to_string())?;
+        if kern_l.len() != elem || kern_r.len() != elem {
+            return Err(format!(
+                "UPOLA kernel tables must be {elem} words ([{n_parts}][{slots}][{n}]), got {} and {}",
+                kern_l.len(),
+                kern_r.len()
+            ));
+        }
+        let fdl_slots = n_parts - 1;
+        let fdl_alloc = (fdl_slots * slots * n).max(1);
+        let acc_alloc = 2 * n;
+
+        // Concatenate and upload the twiddle stages (the same bytes the legacy path reads).
+        let mut tw_fwd_host = Vec::with_capacity(n - 1);
+        let mut tw_inv_host = Vec::with_capacity(n - 1);
+        for (stage, (fwd, inv)) in twiddles_fwd.iter().zip(twiddles_inv).enumerate() {
+            let want = 1usize << stage;
+            if fwd.len() != want || inv.len() != want {
+                return Err(format!(
+                    "UPOLA twiddle stage {stage} length ({}, {}) != {want}",
+                    fwd.len(),
+                    inv.len()
+                ));
+            }
+            tw_fwd_host.extend_from_slice(fwd);
+            tw_inv_host.extend_from_slice(inv);
+        }
+        if twiddles_fwd.len() != log_n as usize
+            || twiddles_inv.len() != log_n as usize
+            || tw_fwd_host.len() != n - 1
+            || tw_inv_host.len() != n - 1
+        {
+            return Err("UPOLA twiddle stage count/length mismatch".into());
+        }
+
+        let d_fdl = self
+            .stream
+            .alloc_zeros::<u64>(fdl_alloc)
+            .map_err(|e| format!("alloc upola fdl: {e}"))?;
+        let d_kern_l = self
+            .stream
+            .clone_htod(kern_l)
+            .map_err(|e| format!("htod upola kern_l: {e}"))?;
+        let d_kern_r = self
+            .stream
+            .clone_htod(kern_r)
+            .map_err(|e| format!("htod upola kern_r: {e}"))?;
+        let d_acc = self
+            .stream
+            .alloc_zeros::<u64>(acc_alloc)
+            .map_err(|e| format!("alloc upola acc: {e}"))?;
+        let d_scratch = self
+            .stream
+            .alloc_zeros::<u64>(slots * n)
+            .map_err(|e| format!("alloc upola scratch: {e}"))?;
+        let d_tw_fwd = self
+            .stream
+            .clone_htod(&tw_fwd_host)
+            .map_err(|e| format!("htod upola tw_fwd: {e}"))?;
+        let d_tw_inv = self
+            .stream
+            .clone_htod(&tw_inv_host)
+            .map_err(|e| format!("htod upola tw_inv: {e}"))?;
+
+        let fn_fused = self
+            .ntt_mod
+            .load_function("g6me_goldilocks_ntt_fused_inplace")
+            .map_err(|e| format!("load goldilocks_ntt_fused_inplace: {e}"))?;
+        fn_fused
+            .set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_mem_bytes as i32,
+            )
+            .map_err(|e| {
+                format!("set upola fused max dynamic shared ({shared_mem_bytes} B): {e}")
+            })?;
+        let fn_accum = self
+            .ntt_mod
+            .load_function("g6me_goldilocks_upola_accumulate")
+            .map_err(|e| format!("load goldilocks_upola_accumulate: {e}"))?;
+        let fn_mac_row = self
+            .ntt_mod
+            .load_function("g6me_goldilocks_upola_mac_scratch")
+            .map_err(|e| format!("load goldilocks_upola_mac_scratch: {e}"))?;
+
+        Ok(CudaUpolaState {
+            stream: self.stream.clone(),
+            n,
+            log_n,
+            slots,
+            n_parts,
+            fdl_slots,
+            inv_n,
+            d_fdl,
+            d_kern_l,
+            d_kern_r,
+            d_acc,
+            d_scratch,
+            d_tw_fwd,
+            d_tw_inv,
+            fn_fused,
+            fn_accum,
+            fn_mac_row,
+        })
+    }
+}
+
+/// Device-resident FDL-UPOLA state for the exact Goldilocks NTT engine.
+///
+/// The delay line, NTT-domain kernels, both ear accumulators, the per-hop scratch row and
+/// the twiddle stages all live in VRAM, so a streaming block costs only one H2D per active
+/// channel and one D2H for the final inverse transform, instead of the per-transform host
+/// round trip of [`G6meCudaRuntime::run_goldilocks_ntt_transform`]. Every operation is exact
+/// integer modular arithmetic in arrival order, so results are bit-identical to the CPU
+/// `BinauralPlus` UPOLA loops.
+pub struct CudaUpolaState {
+    stream: Arc<CudaStream>,
+    n: usize,
+    log_n: i32,
+    slots: usize,
+    n_parts: usize,
+    fdl_slots: usize,
+    inv_n: u64,
+    /// `[fdl_slots][slots][n]` frequency-domain delay line.
+    d_fdl: CudaSlice<u64>,
+    /// `[n_parts][slots][n]` NTT-domain left/right kernels.
+    d_kern_l: CudaSlice<u64>,
+    d_kern_r: CudaSlice<u64>,
+    /// `[2][n]` — left ear at `0..n`, right ear at `n..2n`.
+    d_acc: CudaSlice<u64>,
+    /// `[slots][n]` transform scratch for sub-block / single-partition hops.
+    d_scratch: CudaSlice<u64>,
+    d_tw_fwd: CudaSlice<u64>,
+    d_tw_inv: CudaSlice<u64>,
+    fn_fused: CudaFunction,
+    fn_accum: CudaFunction,
+    fn_mac_row: CudaFunction,
+}
+
+impl std::fmt::Debug for CudaUpolaState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaUpolaState")
+            .field("n", &self.n)
+            .field("slots", &self.slots)
+            .field("n_parts", &self.n_parts)
+            .field("fdl_slots", &self.fdl_slots)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CudaUpolaState {
+    /// Transform length (`N_FFT`).
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Number of uniform partitions.
+    pub fn n_parts(&self) -> usize {
+        self.n_parts
+    }
+
+    /// Number of channel slots.
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    /// Zero the whole delay line and accumulator bank (stream reset / preset reload).
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.stream
+            .memset_zeros(&mut self.d_fdl)
+            .map_err(|e| format!("memset upola fdl: {e}"))?;
+        self.stream
+            .memset_zeros(&mut self.d_acc)
+            .map_err(|e| format!("memset upola acc: {e}"))
+    }
+
+    fn check_fdl_row(&self, head: usize) -> Result<(), String> {
+        if self.fdl_slots == 0 || head >= self.fdl_slots {
+            return Err(format!(
+                "UPOLA head {head} out of range for {} delay-line slots",
+                self.fdl_slots
+            ));
+        }
+        Ok(())
+    }
+
+    /// Zero one delay-line row (`[slots][n]`), the exact analogue of the CPU
+    /// `ntt_fdl[head][ch].fill(0)` for silent or absent channels.
+    pub fn zero_fdl_row(&mut self, head: usize) -> Result<(), String> {
+        self.check_fdl_row(head)?;
+        let begin = head * self.slots * self.n;
+        let end = begin + self.slots * self.n;
+        let mut row = self.d_fdl.slice_mut(begin..end);
+        self.stream
+            .memset_zeros(&mut row)
+            .map_err(|e| format!("memset upola fdl row: {e}"))
+    }
+
+    /// Upload one quantized time-domain block (exactly `n` words, zero padded) into the
+    /// delay line row for channel `ch`.
+    pub fn upload_fdl_row(&mut self, head: usize, ch: usize, data: &[u64]) -> Result<(), String> {
+        self.check_fdl_row(head)?;
+        if ch >= self.slots || data.len() != self.n {
+            return Err(format!(
+                "UPOLA fdl upload ch={ch} len={} (slots={}, n={})",
+                data.len(),
+                self.slots,
+                self.n
+            ));
+        }
+        let begin = (head * self.slots + ch) * self.n;
+        let mut dst = self.d_fdl.slice_mut(begin..begin + self.n);
+        self.stream
+            .memcpy_htod(data, &mut dst)
+            .map_err(|e| format!("htod upola fdl row: {e}"))
+    }
+
+    /// Upload one quantized hop into the per-channel scratch row (sub-block path).
+    pub fn upload_scratch_row(&mut self, ch: usize, data: &[u64]) -> Result<(), String> {
+        if ch >= self.slots || data.len() != self.n {
+            return Err(format!(
+                "UPOLA scratch upload ch={ch} len={} (slots={}, n={})",
+                data.len(),
+                self.slots,
+                self.n
+            ));
+        }
+        let begin = ch * self.n;
+        let mut dst = self.d_scratch.slice_mut(begin..begin + self.n);
+        self.stream
+            .memcpy_htod(data, &mut dst)
+            .map_err(|e| format!("htod upola scratch row: {e}"))
+    }
+
+    /// Forward-transform every channel row of the scratch bank whose mask bit is set.
+    pub fn forward_scratch(&mut self, channel_mask: u32) -> Result<(), String> {
+        let log_n = self.log_n;
+        let shared_mem_bytes = (self.n * std::mem::size_of::<u64>()) as u32;
+        let zero_scale = 0u64;
+        let no_scale = 0i32;
+        let batch = self.slots.max(1) as u32;
+        let mut builder = self.stream.launch_builder(&self.fn_fused);
+        builder
+            .arg(&mut self.d_scratch)
+            .arg(&self.d_tw_fwd)
+            .arg(&log_n)
+            .arg(&zero_scale)
+            .arg(&no_scale)
+            .arg(&channel_mask);
+        let cfg = LaunchConfig {
+            grid_dim: (batch, 1, 1),
+            block_dim: (NTT_FUSED_THREADS, 1, 1),
+            shared_mem_bytes,
+        };
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch upola forward scratch: {e}"))?;
+        Ok(())
+    }
+
+    /// Forward-transform every channel row of delay-line row `head` whose mask bit is set.
+    pub fn forward_fdl_row(&mut self, head: usize, channel_mask: u32) -> Result<(), String> {
+        self.check_fdl_row(head)?;
+        let log_n = self.log_n;
+        let shared_mem_bytes = (self.n * std::mem::size_of::<u64>()) as u32;
+        let zero_scale = 0u64;
+        let no_scale = 0i32;
+        let begin = head * self.slots * self.n;
+        let end = begin + self.slots * self.n;
+        let batch = self.slots.max(1) as u32;
+        let mut row = self.d_fdl.slice_mut(begin..end);
+        let mut builder = self.stream.launch_builder(&self.fn_fused);
+        builder
+            .arg(&mut row)
+            .arg(&self.d_tw_fwd)
+            .arg(&log_n)
+            .arg(&zero_scale)
+            .arg(&no_scale)
+            .arg(&channel_mask);
+        let cfg = LaunchConfig {
+            grid_dim: (batch, 1, 1),
+            block_dim: (NTT_FUSED_THREADS, 1, 1),
+            shared_mem_bytes,
+        };
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch upola forward fdl: {e}"))?;
+        Ok(())
+    }
+
+    /// Exact tail accumulation from the delay line into both ear accumulators.
+    ///
+    /// `p_start = 0, p_end = 1` reproduces the CPU partition-0 accumulate from the completed
+    /// row at `head`; `p_start = 1, p_end = n_parts` reproduces the tail sum over the
+    /// `n_parts - 1` stored rows, walking back in time exactly as the CPU loop does.
+    pub fn accumulate_fdl(
+        &mut self,
+        head: usize,
+        p_start: usize,
+        p_end: usize,
+        channel_mask: u32,
+    ) -> Result<(), String> {
+        self.check_fdl_row(head)?;
+        if p_start > p_end || p_end > self.n_parts {
+            return Err(format!(
+                "UPOLA accumulate range {p_start}..{p_end} outside 0..{}",
+                self.n_parts
+            ));
+        }
+        let n_i = self.n as i32;
+        let slots_i = self.slots as i32;
+        let fdl_i = self.fdl_slots as i32;
+        let n_parts_i = self.n_parts as i32;
+        let ps_i = p_start as i32;
+        let pe_i = p_end as i32;
+        let head_i = head as i32;
+        let cfg = LaunchConfig {
+            grid_dim: ((self.n as u32).div_ceil(128), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = self.stream.launch_builder(&self.fn_accum);
+        builder
+            .arg(&self.d_fdl)
+            .arg(&self.d_kern_l)
+            .arg(&self.d_kern_r)
+            .arg(&mut self.d_acc)
+            .arg(&n_i)
+            .arg(&slots_i)
+            .arg(&fdl_i)
+            .arg(&n_parts_i)
+            .arg(&ps_i)
+            .arg(&pe_i)
+            .arg(&head_i)
+            .arg(&channel_mask);
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch upola accumulate: {e}"))?;
+        Ok(())
+    }
+
+    /// Partition-0 accumulation from the scratch bank (sub-block and single-partition hops).
+    pub fn mac_scratch_partition0(&mut self, channel_mask: u32) -> Result<(), String> {
+        let n_i = self.n as i32;
+        let slots_i = self.slots as i32;
+        let cfg = LaunchConfig {
+            grid_dim: ((self.n as u32).div_ceil(128), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = self.stream.launch_builder(&self.fn_mac_row);
+        builder
+            .arg(&self.d_scratch)
+            .arg(&self.d_kern_l)
+            .arg(&self.d_kern_r)
+            .arg(&mut self.d_acc)
+            .arg(&n_i)
+            .arg(&slots_i)
+            .arg(&channel_mask);
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch upola mac scratch: {e}"))?;
+        Ok(())
+    }
+
+    /// Inverse-transform both ear accumulators in one launch (one block per ear) and return
+    /// `2 * n` host words: left ear at `0..n`, right ear at `n..2n`.
+    pub fn inverse_acc_to_host(&mut self) -> Result<Vec<u64>, String> {
+        let log_n = self.log_n;
+        let inv_n = self.inv_n;
+        let has_scale = 1i32;
+        let all_channels = u32::MAX;
+        let shared_mem_bytes = (self.n * std::mem::size_of::<u64>()) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (2, 1, 1),
+            block_dim: (NTT_FUSED_THREADS, 1, 1),
+            shared_mem_bytes,
+        };
+        let mut builder = self.stream.launch_builder(&self.fn_fused);
+        builder
+            .arg(&mut self.d_acc)
+            .arg(&self.d_tw_inv)
+            .arg(&log_n)
+            .arg(&inv_n)
+            .arg(&has_scale)
+            .arg(&all_channels);
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch upola inverse: {e}"))?;
+        self.stream
+            .clone_dtoh(&self.d_acc)
+            .map_err(|e| format!("dtoh upola inverse: {e}"))
     }
 }
 
@@ -3334,5 +3934,467 @@ mod tests {
             err_sabotaged > 0.05,
             "Sabotage check: wrong UE4M3 scale factor MUST fail parity (got {err_sabotaged:e})"
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Fused single-launch NTT + device-resident UPOLA (docs/CUDA_PERF_PLAN.md section 1).
+    // These are test-only CPU references: they exist to prove the live GPU integer path
+    // is bit-exact, not to run in production.
+    // ---------------------------------------------------------------------------------
+
+    const GL_P: u64 = 0xFFFF_FFFF_0000_0001;
+
+    fn gl_add_ref(a: u64, b: u64) -> u64 {
+        ((a as u128 + b as u128) % GL_P as u128) as u64
+    }
+
+    fn gl_sub_ref(a: u64, b: u64) -> u64 {
+        if a >= b {
+            a - b
+        } else {
+            GL_P - (b - a)
+        }
+    }
+
+    fn gl_mul_ref(a: u64, b: u64) -> u64 {
+        ((a as u128 * b as u128) % GL_P as u128) as u64
+    }
+
+    fn gl_pow_ref(mut base: u64, mut exp: u64) -> u64 {
+        let mut acc = 1u64;
+        base %= GL_P;
+        while exp > 0 {
+            if exp & 1 == 1 {
+                acc = gl_mul_ref(acc, base);
+            }
+            base = gl_mul_ref(base, base);
+            exp >>= 1;
+        }
+        acc
+    }
+
+    /// Test-only replica of `g6me_core::ntt::NttPlan` tables (`W32 = 7^((p-1)/2^32)`).
+    fn glm_plan(n: usize) -> (Vec<Vec<u64>>, Vec<Vec<u64>>, u64) {
+        let log_n = n.trailing_zeros();
+        let w32 = 1_753_635_133_440_165_772u64;
+        let w_n = gl_pow_ref(w32, 1u64 << (32 - log_n));
+        let w_n_inv = gl_pow_ref(w_n, GL_P - 2);
+        let mut fwd = Vec::new();
+        let mut inv = Vec::new();
+        let mut len = 2usize;
+        while len <= n {
+            let half = len / 2;
+            let step_f = gl_pow_ref(w_n, (n / len) as u64);
+            let step_i = gl_pow_ref(w_n_inv, (n / len) as u64);
+            let mut tf = Vec::with_capacity(half);
+            let mut ti = Vec::with_capacity(half);
+            let (mut wf, mut wi) = (1u64, 1u64);
+            for _ in 0..half {
+                tf.push(wf);
+                ti.push(wi);
+                wf = gl_mul_ref(wf, step_f);
+                wi = gl_mul_ref(wi, step_i);
+            }
+            fwd.push(tf);
+            inv.push(ti);
+            len <<= 1;
+        }
+        (fwd, inv, gl_pow_ref(n as u64, GL_P - 2))
+    }
+
+    /// Test-only CPU reference transform with the same operation order as `NttPlan`.
+    fn glm_ntt_ref(buf: &mut [u64], twiddles: &[Vec<u64>], scale: Option<u64>) {
+        let n = buf.len();
+        let log_n = n.trailing_zeros();
+        if log_n > 0 {
+            for i in 0..n {
+                let j = i.reverse_bits() >> (usize::BITS - log_n);
+                if i < j {
+                    buf.swap(i, j);
+                }
+            }
+        }
+        for (stage, tw) in twiddles.iter().enumerate() {
+            let half = 1usize << stage;
+            let len = half << 1;
+            let mut start = 0usize;
+            while start < n {
+                for (k, &w) in tw.iter().enumerate() {
+                    let u = buf[start + k];
+                    let v = gl_mul_ref(buf[start + k + half], w);
+                    buf[start + k] = gl_add_ref(u, v);
+                    buf[start + k + half] = gl_sub_ref(u, v);
+                }
+                start += len;
+            }
+        }
+        if let Some(inv) = scale {
+            for v in buf.iter_mut() {
+                *v = gl_mul_ref(*v, inv);
+            }
+        }
+    }
+
+    fn test_field_vec(seed: u64, len: usize) -> Vec<u64> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                s % GL_P
+            })
+            .collect()
+    }
+
+    /// Live gate: the fused single-launch transform must equal both the multi-launch path
+    /// and the CPU reference bit-for-bit (forward and inverse), and the device-resident
+    /// UPOLA state must reproduce a scalar CPU simulation of the same FDL-UPOLA loop.
+    #[test]
+    fn fused_ntt_and_device_upola_are_bit_exact_against_cpu_reference() {
+        let Ok(rt) = G6meCudaRuntime::init() else {
+            // No CUDA GPU / driver / nvcc on this host: the parity gate cannot run here.
+            return;
+        };
+
+        // ---- fused transform vs multi-launch vs CPU, both directions --------------
+        for n in [256usize, 4096, 8192] {
+            let (fwd, inv, inv_n) = glm_plan(n);
+            let input = test_field_vec(0x1234_5678_9ABC_DEF0 ^ n as u64, n);
+
+            let mut cpu_f = input.clone();
+            glm_ntt_ref(&mut cpu_f, &fwd, None);
+            let legacy_f = rt
+                .run_goldilocks_ntt_transform_legacy(&input, &fwd, None)
+                .expect("legacy forward NTT");
+            let fused_f = rt
+                .run_goldilocks_ntt_transform(&input, &fwd, None)
+                .expect("fused forward NTT");
+            assert_eq!(
+                legacy_f, cpu_f,
+                "legacy forward NTT differs from CPU at n={n}"
+            );
+            assert_eq!(
+                fused_f, cpu_f,
+                "fused forward NTT differs from CPU at n={n}"
+            );
+
+            let mut cpu_i = cpu_f.clone();
+            glm_ntt_ref(&mut cpu_i, &inv, Some(inv_n));
+            let fused_i = rt
+                .run_goldilocks_ntt_transform(&cpu_f, &inv, Some(inv_n))
+                .expect("fused inverse NTT");
+            assert_eq!(
+                fused_i, cpu_i,
+                "fused inverse NTT differs from CPU at n={n}"
+            );
+            assert_eq!(
+                fused_i, input,
+                "inverse(forward(x)) must return x bit-for-bit at n={n}"
+            );
+        }
+
+        // ---- device-resident UPOLA vs a scalar CPU simulation ---------------------
+        let n = 512usize;
+        let slots = 4usize;
+        let n_parts = 3usize;
+        let fdl_slots = n_parts - 1;
+        let (fwd, inv, inv_n) = glm_plan(n);
+        let kern_l = test_field_vec(0xDEAD_BEEF_CAFE_0001, n_parts * slots * n);
+        let kern_r = test_field_vec(0xDEAD_BEEF_CAFE_0002, n_parts * slots * n);
+        let mut state = rt
+            .create_upola_state(n, slots, n_parts, inv_n, &kern_l, &kern_r, &fwd, &inv)
+            .expect("create CudaUpolaState");
+        assert_eq!(state.n(), n);
+        assert_eq!(state.n_parts(), n_parts);
+
+        // CPU simulation mirrors `BinauralPlus`: FDL row per head, partition-0 from the
+        // just-completed row, partitions 1..n_parts walking back in time.
+        let mut cpu_fdl = vec![0u64; fdl_slots * slots * n];
+        let active_mask: u32 = (1 << 0) | (1 << 1) | (1 << 3); // ch 2 inactive
+        let mut inputs: Vec<Vec<u64>> = Vec::new();
+        for blk in 0..5u64 {
+            inputs.push(test_field_vec(0xB10C_0000 + blk, n));
+        }
+
+        for (blk, input) in inputs.iter().enumerate() {
+            let head = blk % fdl_slots;
+            // CPU side: zero row, transform active channels into it.
+            let row = &mut cpu_fdl[head * slots * n..(head + 1) * slots * n];
+            row.fill(0);
+            let mut transformed = vec![vec![0u64; n]; slots];
+            for ch in 0..slots {
+                if (active_mask >> ch) & 1 == 0 {
+                    continue;
+                }
+                let mut x = input.clone();
+                glm_ntt_ref(&mut x, &fwd, None);
+                transformed[ch].copy_from_slice(&x);
+                row[ch * n..(ch + 1) * n].copy_from_slice(&x);
+            }
+
+            // Device side: the same upload + one batched fused forward.
+            state.zero_fdl_row(head).expect("zero fdl row");
+            for ch in 0..slots {
+                if (active_mask >> ch) & 1 == 0 {
+                    continue;
+                }
+                state
+                    .upload_fdl_row(head, ch, input)
+                    .expect("upload fdl row");
+            }
+            state
+                .forward_fdl_row(head, active_mask)
+                .expect("fused fdl forward");
+
+            // Partition 0 (completed row) → both ears.
+            let mut cpu_acc = vec![0u64; 2 * n];
+            for (ch, x) in transformed.iter().enumerate() {
+                if (active_mask >> ch) & 1 == 0 {
+                    continue;
+                }
+                for k in 0..n {
+                    let off = ch * n + k;
+                    cpu_acc[k] = gl_add_ref(cpu_acc[k], gl_mul_ref(x[k], kern_l[off]));
+                    cpu_acc[n + k] = gl_add_ref(cpu_acc[n + k], gl_mul_ref(x[k], kern_r[off]));
+                }
+            }
+            glm_ntt_ref(&mut cpu_acc[..n], &inv, Some(inv_n));
+            glm_ntt_ref(&mut cpu_acc[n..], &inv, Some(inv_n));
+            state
+                .accumulate_fdl(head, 0, 1, active_mask)
+                .expect("accum p0");
+            let gpu_acc = state.inverse_acc_to_host().expect("inverse acc");
+            assert_eq!(
+                gpu_acc, cpu_acc,
+                "UPOLA partition-0 accumulation differs at block {blk}"
+            );
+
+            // Tail partitions p = 1..n_parts from the stored rows.
+            let mut cpu_tail = vec![0u64; 2 * n];
+            for p in 1..n_parts {
+                let slot = (head + fdl_slots - (p - 1)) % fdl_slots;
+                for ch in 0..slots {
+                    if (active_mask >> ch) & 1 == 0 {
+                        continue;
+                    }
+                    for k in 0..n {
+                        let xv = cpu_fdl[(slot * slots + ch) * n + k];
+                        let off = (p * slots + ch) * n + k;
+                        cpu_tail[k] = gl_add_ref(cpu_tail[k], gl_mul_ref(xv, kern_l[off]));
+                        cpu_tail[n + k] = gl_add_ref(cpu_tail[n + k], gl_mul_ref(xv, kern_r[off]));
+                    }
+                }
+            }
+            glm_ntt_ref(&mut cpu_tail[..n], &inv, Some(inv_n));
+            glm_ntt_ref(&mut cpu_tail[n..], &inv, Some(inv_n));
+            state
+                .accumulate_fdl(head, 1, n_parts, active_mask)
+                .expect("accum tail");
+            let gpu_tail = state.inverse_acc_to_host().expect("inverse tail");
+            assert_eq!(
+                gpu_tail, cpu_tail,
+                "UPOLA tail accumulation differs at block {blk}"
+            );
+        }
+
+        // Scratch (sub-block / single-partition) path: partition-0 from [slots][n] scratch.
+        let mut scratch_ref = vec![vec![0u64; n]; slots];
+        for (ch, slot_ref) in scratch_ref.iter_mut().enumerate() {
+            if (active_mask >> ch) & 1 == 0 {
+                continue;
+            }
+            let mut x = inputs[0].clone();
+            glm_ntt_ref(&mut x, &fwd, None);
+            slot_ref.copy_from_slice(&x);
+            state
+                .upload_scratch_row(ch, &inputs[0])
+                .expect("upload scratch row");
+        }
+        state
+            .forward_scratch(active_mask)
+            .expect("fused scratch forward");
+        let mut cpu_scratch = vec![0u64; 2 * n];
+        for (ch, x) in scratch_ref.iter().enumerate() {
+            if (active_mask >> ch) & 1 == 0 {
+                continue;
+            }
+            for k in 0..n {
+                let off = ch * n + k;
+                cpu_scratch[k] = gl_add_ref(cpu_scratch[k], gl_mul_ref(x[k], kern_l[off]));
+                cpu_scratch[n + k] = gl_add_ref(cpu_scratch[n + k], gl_mul_ref(x[k], kern_r[off]));
+            }
+        }
+        glm_ntt_ref(&mut cpu_scratch[..n], &inv, Some(inv_n));
+        glm_ntt_ref(&mut cpu_scratch[n..], &inv, Some(inv_n));
+        state
+            .mac_scratch_partition0(active_mask)
+            .expect("scratch partition-0 mac");
+        let gpu_scratch = state.inverse_acc_to_host().expect("inverse scratch");
+        assert_eq!(
+            gpu_scratch, cpu_scratch,
+            "UPOLA scratch partition-0 differs from CPU"
+        );
+
+        state.reset().expect("reset upola state");
+    }
+
+    /// Before/after measurement on the same host (run with `--ignored --nocapture`).
+    /// Prints the per-transform wall time for the multi-launch path vs the fused path and
+    /// the per-block time for the stateless UPOLA loop vs the VRAM-resident state.
+    #[test]
+    #[ignore = "live GPU benchmark; run with --ignored --nocapture"]
+    fn bench_fused_ntt_and_upola_residency() {
+        let Ok(rt) = G6meCudaRuntime::init() else {
+            eprintln!("bench skipped: no CUDA GPU/driver/nvcc on this host");
+            return;
+        };
+        use std::time::Instant;
+
+        let n = 8192usize;
+        let (fwd, inv, inv_n) = glm_plan(n);
+        let input = test_field_vec(0x5EED_0000_0000_0001, n);
+        let iters = 50usize;
+
+        // Warm-up + correctness sanity.
+        let expect = rt
+            .run_goldilocks_ntt_transform(&input, &fwd, None)
+            .expect("fused forward");
+        assert_eq!(
+            rt.run_goldilocks_ntt_transform_legacy(&input, &fwd, None)
+                .expect("legacy forward"),
+            expect
+        );
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let out = rt
+                .run_goldilocks_ntt_transform_legacy(&input, &fwd, None)
+                .expect("legacy forward");
+            std::hint::black_box(out);
+        }
+        let legacy_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let out = rt
+                .run_goldilocks_ntt_transform(&input, &fwd, None)
+                .expect("fused forward");
+            std::hint::black_box(out);
+        }
+        let fused_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        // Device-resident UPOLA block vs the stateless per-buffer loop.
+        let slots = 6usize;
+        let n_parts = 8usize;
+        let fdl_slots = n_parts - 1;
+        let kern_l = test_field_vec(0xA5A5_0001, n_parts * slots * n);
+        let kern_r = test_field_vec(0xA5A5_0002, n_parts * slots * n);
+        let mut state = rt
+            .create_upola_state(n, slots, n_parts, inv_n, &kern_l, &kern_r, &fwd, &inv)
+            .expect("create CudaUpolaState");
+        let mask: u32 = 0b11_1111; // six active channels
+        let blocks = 20usize;
+
+        // Legacy block: per-channel forward, host pointwise accumulation, two inverses.
+        let host_in: Vec<Vec<u64>> = (0..slots)
+            .map(|ch| test_field_vec(0xBEEF_0000 + ch as u64, n))
+            .collect();
+        let t0 = Instant::now();
+        for _ in 0..blocks {
+            let mut acc = vec![0u64; 2 * n];
+            for (ch, input) in host_in.iter().enumerate() {
+                let x = rt
+                    .run_goldilocks_ntt_transform_legacy(input, &fwd, None)
+                    .expect("legacy forward");
+                for k in 0..n {
+                    let off = ch * n + k;
+                    acc[k] = gl_add_ref(acc[k], gl_mul_ref(x[k], kern_l[off]));
+                    acc[n + k] = gl_add_ref(acc[n + k], gl_mul_ref(x[k], kern_r[off]));
+                }
+            }
+            let l = rt
+                .run_goldilocks_ntt_transform_legacy(&acc[..n], &inv, Some(inv_n))
+                .expect("legacy inverse l");
+            let r = rt
+                .run_goldilocks_ntt_transform_legacy(&acc[n..], &inv, Some(inv_n))
+                .expect("legacy inverse r");
+            std::hint::black_box((l, r));
+        }
+        let legacy_block_us = t0.elapsed().as_secs_f64() * 1e6 / blocks as f64;
+
+        // Device-resident block: uploads + fused forwards + accumulate + batched inverse.
+        let t0 = Instant::now();
+        for blk in 0..blocks {
+            let head = blk % fdl_slots;
+            state.zero_fdl_row(head).expect("zero row");
+            for (ch, input) in host_in.iter().enumerate() {
+                state.upload_fdl_row(head, ch, input).expect("upload row");
+            }
+            state.forward_fdl_row(head, mask).expect("forward row");
+            state.accumulate_fdl(head, 0, 1, mask).expect("accum p0");
+            let _ = state.inverse_acc_to_host().expect("inverse p0");
+            state
+                .accumulate_fdl(head, 1, n_parts, mask)
+                .expect("accum tail");
+            let _ = state.inverse_acc_to_host().expect("inverse tail");
+        }
+        let resident_block_us = t0.elapsed().as_secs_f64() * 1e6 / blocks as f64;
+
+        eprintln!(
+            "[bench] N={n} forward transform: multi-launch {legacy_us:.1} us, fused {fused_us:.1} us, \
+             speedup {:.2}x",
+            legacy_us / fused_us
+        );
+        eprintln!(
+            "[bench] one {slots}-channel {n_parts}-partition UPOLA block: stateless {legacy_block_us:.1} us, \
+             VRAM-resident {resident_block_us:.1} us, speedup {:.2}x",
+            legacy_block_us / resident_block_us
+        );
+        eprintln!(
+            "[bench] kernel launches per block: stateless ~{} ({} transforms x 14-15 stages), \
+             resident 4 (+{} htod +1 memset)",
+            (slots + 2) * 14 + 2,
+            slots + 2,
+            slots
+        );
+
+        // Small-N sweep: a single 8192-point transform is the fused kernel's worst case
+        // (one block, 2^13 butterflies per stage); smaller transforms trade launch count
+        // against block occupancy differently.
+        for &sn in &[256usize, 1024, 2048, 4096] {
+            let (sfwd, _, _) = glm_plan(sn);
+            let sinput = test_field_vec(0x5EED_0000_0000_0001, sn);
+            let s_expect = rt
+                .run_goldilocks_ntt_transform_legacy(&sinput, &sfwd, None)
+                .expect("legacy sweep");
+            assert_eq!(
+                rt.run_goldilocks_ntt_transform(&sinput, &sfwd, None)
+                    .expect("fused sweep"),
+                s_expect
+            );
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(
+                    rt.run_goldilocks_ntt_transform_legacy(&sinput, &sfwd, None)
+                        .expect("legacy sweep"),
+                );
+            }
+            let l_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(
+                    rt.run_goldilocks_ntt_transform(&sinput, &sfwd, None)
+                        .expect("fused sweep"),
+                );
+            }
+            let f_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            eprintln!(
+                "[bench] N={sn} forward transform: multi-launch {l_us:.1} us, fused {f_us:.1} us, \
+                 speedup {:.2}x",
+                l_us / f_us
+            );
+        }
+        assert!(fused_us.is_finite() && resident_block_us.is_finite());
     }
 }

@@ -1,7 +1,7 @@
 //! Hybrid 3D Room Acoustics Engine:
 //! - **Layer 1 (> 500 Hz)**: Allen & Berkley (JASA 1979) / Savioja & Svensson (JASA 2015)
 //!   3D Image-Source Method (orders 1–3) with octave-band wall absorption & `AtmosphereCfg`
-//!   molecular `O₂`/`N₂` air absorption, plus deterministic **PCG64** Monte Carlo Acoustic
+//!   molecular `O₂`/`N₂` air absorption, plus deterministic native Monte Carlo Acoustic
 //!   Ray Tracing (orders 4–50, Lambertian / ISO-17497 scattering -> Order-7 HOA -> MagLS).
 //! - **Layer 2 (Analytic Edge Diffraction)**: Svensson, Fred & Vanderkooy (JASA 1999)
 //!   Biot–Tolstoy–Medwin (BTM) secondary-source edge diffraction + Kirsch & Ewert
@@ -69,15 +69,226 @@ impl RoomPreset {
     }
 }
 
+/// Tier-A shoebox preset library (`docs/ROOM_PRESETS_RESEARCH.md` §4).
+///
+/// The three legacy [`RoomPreset`] rooms are included so one enum addresses the
+/// whole library; the five additional rooms are the measured/shoebox halls and
+/// the standard design rooms. Every preset fits the engine's six-plane shoebox
+/// geometry and the `1.5..=60 m` dimension validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShoeboxPreset {
+    /// ITU-R BS.1116 mastering control room (legacy [`RoomPreset::ControlRoom`]).
+    ControlRoom,
+    /// Theatrical reference mixing stage (legacy [`RoomPreset::TheaterStage`]).
+    TheaterStage,
+    /// Small studio live room, `8.0 × 6.0 × 4.0 m`, design RT `0.45 s`.
+    StudioLiveRoom,
+    /// Lecture theatre, `15.0 × 10.0 × 6.0 m`, design RT `0.8 s`.
+    LectureTheatre,
+    /// Cinema dubbing stage, `20.0 × 12.0 × 8.0 m`, design RT `0.5 s`.
+    Cinema,
+    /// Vienna Musikverein Grosser Saal, shoebox `48.8 × 19.1 × 17.75 m`.
+    Musikverein,
+    /// Boston Symphony Hall, shoebox `38.1 × 22.9 × 18.6 m`.
+    BostonSymphonyHall,
+    /// Amsterdam Concertgebouw Grote Zaal, shoebox `44 × 28 × 17 m`.
+    Concertgebouw,
+}
+
+impl ShoeboxPreset {
+    pub const ALL: [ShoeboxPreset; 8] = [
+        Self::ControlRoom,
+        Self::TheaterStage,
+        Self::StudioLiveRoom,
+        Self::LectureTheatre,
+        Self::Cinema,
+        Self::Musikverein,
+        Self::BostonSymphonyHall,
+        Self::Concertgebouw,
+    ];
+
+    pub const HALLS: [ShoeboxPreset; 3] = [
+        Self::Musikverein,
+        Self::BostonSymphonyHall,
+        Self::Concertgebouw,
+    ];
+
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "control-room" | "control" | "bs1116" => Ok(Self::ControlRoom),
+            "theater" | "theatre" | "theater-stage" | "stage" => Ok(Self::TheaterStage),
+            "studio" | "studio-live-room" | "live-room" => Ok(Self::StudioLiveRoom),
+            "lecture" | "lecture-theatre" | "lecture-theater" => Ok(Self::LectureTheatre),
+            "cinema" | "cinema-dubbing-stage" | "dubbing-stage" => Ok(Self::Cinema),
+            "musikverein" | "vienna" | "grosser-saal" => Ok(Self::Musikverein),
+            "boston" | "symphony-hall" | "boston-symphony-hall" => Ok(Self::BostonSymphonyHall),
+            "concertgebouw" | "amsterdam" | "grote-zaal" => Ok(Self::Concertgebouw),
+            other => Err(format!(
+                "unknown shoebox preset `{other}` (expected: control-room, theater, studio, \
+                 lecture, cinema, musikverein, boston, concertgebouw)"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ControlRoom => "control-room",
+            Self::TheaterStage => "theater",
+            Self::StudioLiveRoom => "studio",
+            Self::LectureTheatre => "lecture",
+            Self::Cinema => "cinema",
+            Self::Musikverein => "musikverein",
+            Self::BostonSymphonyHall => "boston",
+            Self::Concertgebouw => "concertgebouw",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ControlRoom => "Control Room (BS.1116)",
+            Self::TheaterStage => "Theater Stage",
+            Self::StudioLiveRoom => "Studio Live Room",
+            Self::LectureTheatre => "Lecture Theatre",
+            Self::Cinema => "Cinema Dubbing Stage",
+            Self::Musikverein => "Vienna Musikverein, Grosser Saal",
+            Self::BostonSymphonyHall => "Boston Symphony Hall",
+            Self::Concertgebouw => "Amsterdam Concertgebouw, Grote Zaal",
+        }
+    }
+
+    /// The legacy three-way preset, when one exists.
+    pub fn legacy_room_preset(self) -> Option<RoomPreset> {
+        match self {
+            Self::ControlRoom => Some(RoomPreset::ControlRoom),
+            Self::TheaterStage => Some(RoomPreset::TheaterStage),
+            _ => None,
+        }
+    }
+
+    /// Bridge from the legacy UI/CLI enum.
+    pub fn from_room_preset(preset: RoomPreset) -> Option<Self> {
+        match preset {
+            RoomPreset::Anechoic => None,
+            RoomPreset::ControlRoom => Some(Self::ControlRoom),
+            RoomPreset::TheaterStage => Some(Self::TheaterStage),
+        }
+    }
+}
+
+/// Provenance of a preset's per-band `RT60` target curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Rt60Model {
+    /// No per-band curve; only a mid-frequency target (or standard allowance)
+    /// is asserted. Used by the legacy control-room and theater-stage presets,
+    /// whose bass is owned by the FDTD boundary model.
+    #[default]
+    MidBandOnly,
+    /// Per-band statistical (Eyring) design curve computed from the preset's
+    /// material table; the mid-band value is calibrated to the measured or
+    /// standard target. Bands below `geometric_bands_from_hz` are `None`
+    /// because the FDTD wave solver owns them (research doc §2 method table).
+    EyringDesign,
+}
+
+/// Documented acoustic targets and preset metadata (research doc §4/§6).
+///
+/// Values in `rt60_bands_s`, `mid_rt60_s`, `mid_rt60_alt_s`, `mid_edt_s`,
+/// `strength_g_db`, `clarity_c80_db`, `bass_lf`, `one_minus_iacc` and
+/// `itdg_ms` are transcribed from `docs/ROOM_PRESETS_RESEARCH.md` (Beranek
+/// 2004 via akuTEK Table 2) where the doc gives them; the doc is the source of
+/// truth and the preset tests compare against those exact numbers.
+///
+/// `rt60_bands_s[i] == None` means the band is not a geometric target: the
+/// FDTD wave model owns it below `geometric_bands_from_hz`, and a per-band
+/// statistical value would be an unmeasured extrapolation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoomAcousticTargets {
+    /// Band centres for every per-band array in this struct.
+    pub bands_hz: [f64; ROOM_BAND_COUNT],
+    /// Per-band geometric RT60 design target (s); `None` below the FDTD handoff.
+    pub rt60_bands_s: [Option<f64>; ROOM_BAND_COUNT],
+    /// Per-band measured EDT (s), where a source gives it. The research doc
+    /// tabulates only the mid-frequency EDT for the three halls.
+    pub edt_bands_s: [Option<f64>; ROOM_BAND_COUNT],
+    /// Occupied mid-frequency reverberation time `T` (s), the measured target.
+    pub mid_rt60_s: f64,
+    /// Documented design range `[lo, hi]` (s) when the source gives a range
+    /// rather than a measured single value (studio/lecture/cinema).
+    pub mid_rt60_range_s: Option<[f64; 2]>,
+    /// Alternate documented mid-band RT (e.g. Concertgebouw `2.2 s` occupied
+    /// according to the hall, vs Beranek's `2.0 s`).
+    pub mid_rt60_alt_s: Option<f64>,
+    /// Mid-frequency early decay time `EDT` (s).
+    pub mid_edt_s: Option<f64>,
+    /// Strength `G` (dB).
+    pub strength_g_db: Option<f64>,
+    /// Clarity `C80` (dB) at mid frequencies.
+    pub clarity_c80_db: Option<f64>,
+    /// Beranek bass ratio / low-frequency factor `LF`.
+    pub bass_lf: Option<f64>,
+    /// Binaural inter-aural cross-correlation complement `1 - IACC`.
+    pub one_minus_iacc: Option<f64>,
+    /// Initial time-delay gap (ms).
+    pub itdg_ms: Option<f64>,
+    /// Acoustic volume (m³) quoted by the source. For the halls this differs
+    /// from `L × W × H`; it is metadata, not the geometric volume.
+    pub acoustic_volume_m3: Option<f64>,
+    /// Lowest octave band whose target is the geometric (ray/ISM) model. The
+    /// FDTD wave solver owns the bands below it.
+    pub geometric_bands_from_hz: f64,
+    /// Explanation of what the per-band curve is (and is not).
+    pub model: Rt60Model,
+    /// Reference source position `(x, y, z)` for the ISO 3382 geometric checks
+    /// (ITDG). Chosen to reproduce the documented ITDG in the shoebox, not a
+    /// surveyed stage coordinate.
+    pub reference_source_m: Option<[f64; 3]>,
+    /// Eyring mid-band fit residual `rt60(1 kHz) - mid_rt60_s` (s), when the
+    /// material table was fitted to the mid target (research doc §5 B4).
+    pub fit_residual_s: Option<f64>,
+    /// Data provenance string.
+    pub source: String,
+}
+
+impl Default for RoomAcousticTargets {
+    fn default() -> Self {
+        Self {
+            bands_hz: ROOM_BANDS_HZ,
+            rt60_bands_s: [None; ROOM_BAND_COUNT],
+            edt_bands_s: [None; ROOM_BAND_COUNT],
+            mid_rt60_s: 0.25,
+            mid_rt60_range_s: None,
+            mid_rt60_alt_s: None,
+            mid_edt_s: None,
+            strength_g_db: None,
+            clarity_c80_db: None,
+            bass_lf: None,
+            one_minus_iacc: None,
+            itdg_ms: None,
+            acoustic_volume_m3: None,
+            geometric_bands_from_hz: 500.0,
+            model: Rt60Model::MidBandOnly,
+            reference_source_m: None,
+            fit_residual_s: None,
+            source: String::new(),
+        }
+    }
+}
+
 /// Physical simulation fidelity for the 3D Hybrid Room solver (FDTD + Ray Tracing + UPOLA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RoomQuality {
-    /// Fast interactive/CI fidelity: 500 Hz FDTD (65k voxels, 0.165 s) + 2,048 parallel PCG64 rays.
+    /// Fast interactive/CI fidelity: 65k-voxel FDTD (500 Hz at 6 PPW in the 6x5x3 m
+    /// control room, 275 Hz in the 12x9.5x5.2 m theater) + 2,048 parallel native-tracer rays.
     #[default]
     Preview,
-    /// Full mastering production fidelity: >= 670 Hz FDTD (`dx <= 0.085 m`, 0.35 s decay) +
-    /// 50,000 parallel deterministic PCG64 Monte Carlo rays across all CPU cores.
+    /// Full mastering production fidelity: 260k-voxel FDTD (670 Hz at 6 PPW in the
+    /// control room, 437 Hz in the theater) + 50,000 parallel deterministic native
+    /// Monte Carlo rays across all CPU cores. The IR length is set by the room preset's
+    /// RT60, not by the quality tier.
     Production,
 }
 
@@ -103,14 +314,16 @@ impl RoomQuality {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Preview => "Preview (Fast, 2k rays / 500 Hz FDTD)",
-            Self::Production => "Production (50k rays / 670 Hz FDTD)",
+            Self::Preview => "Preview (Fast, 2k rays / 65k-voxel FDTD)",
+            Self::Production => "Production (50k rays / 260k-voxel FDTD)",
         }
     }
 }
 
-/// Deterministic PCG64 (64-bit Permuted Congruential Generator, XSL-RR) PRNG
-/// for bit-exact reproducible Monte Carlo ray tracing & Velvet Noise sequences.
+/// Deterministic PCG64 (128-bit LCG, XSL-RR 128/64 output) PRNG for bit-exact
+/// reproducible Velvet Noise sequences and for the native CPU stochastic ray tracer.
+/// (The test-only `RayPcg32` oracle separately mirrors the PCG stream in
+/// `raytrace_hoa.cu`; it is not used by the production CPU path.)
 #[derive(Debug, Clone, Copy)]
 pub struct Pcg64 {
     state: u128,
@@ -163,32 +376,224 @@ pub struct DiffractionEdge {
     pub face0_dir: Option<[f64; 3]>,
 }
 
-/// 6-band octave wall acoustic material (`125, 250, 500, 1k, 2k, 4k Hz`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Number of octave bands in the ten-band room model (`31.5 Hz` .. `16 kHz`).
+pub const ROOM_BAND_COUNT: usize = 10;
+/// ISO 266 preferred octave-band centres used by the ten-band room model: the
+/// OpenAIR reverberation-time band set (`31.25 Hz` is represented by the ISO
+/// octave centre `31.5 Hz`).
+pub const ROOM_BANDS_HZ: [f64; ROOM_BAND_COUNT] = [
+    31.5, 63.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0,
+];
+/// Index of the `1 kHz` octave band. The pre-ten-band single-band room paths
+/// (`absorption[3]`) evaluate exactly this band.
+pub const ROOM_BAND_MID: usize = 5;
+
+/// Log-frequency (octave) interpolation weight of `band` at `f_hz`.
+///
+/// This is the piecewise-linear partition basis on the ten-band
+/// `log2(f)` grid (the same grid [`band_value_at`] interpolates on): inside the
+/// interval between two adjacent band centres, the two bracketing weights sum
+/// to exactly `1.0`, and the two edge bands hold full weight outside the covered
+/// range. Normalising each interval by its actual width matters because the ISO
+/// preferred centres are nominal octaves: `31.5 → 63` is exactly one octave but
+/// `63 → 125` is `0.9887` octaves, so unnormalised triangles would sum to
+/// `1.007` near 63 Hz and boost that region of the late-tail spectrum.
+pub fn octave_band_weight(f_hz: f64, band: usize) -> f64 {
+    if band >= ROOM_BAND_COUNT || !f_hz.is_finite() || f_hz <= 0.0 {
+        return 0.0;
+    }
+    if f_hz <= ROOM_BANDS_HZ[0] {
+        return if band == 0 { 1.0 } else { 0.0 };
+    }
+    if f_hz >= ROOM_BANDS_HZ[ROOM_BAND_COUNT - 1] {
+        return if band == ROOM_BAND_COUNT - 1 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let mut idx = 0usize;
+    while idx + 1 < ROOM_BAND_COUNT && f_hz > ROOM_BANDS_HZ[idx + 1] {
+        idx += 1;
+    }
+    let t =
+        (f_hz / ROOM_BANDS_HZ[idx]).log2() / (ROOM_BANDS_HZ[idx + 1] / ROOM_BANDS_HZ[idx]).log2();
+    if band == idx {
+        1.0 - t
+    } else if band == idx + 1 {
+        t
+    } else {
+        0.0
+    }
+}
+
+/// Piecewise log-frequency interpolation of a ten-band table.
+#[inline]
+fn band_value_at(values: &[f64; ROOM_BAND_COUNT], f_hz: f64) -> f64 {
+    if f_hz <= ROOM_BANDS_HZ[0] {
+        return values[0];
+    }
+    if f_hz >= ROOM_BANDS_HZ[ROOM_BAND_COUNT - 1] {
+        return values[ROOM_BAND_COUNT - 1];
+    }
+    let mut idx = 0usize;
+    while idx + 1 < ROOM_BAND_COUNT && f_hz > ROOM_BANDS_HZ[idx + 1] {
+        idx += 1;
+    }
+    let t = (f_hz / ROOM_BANDS_HZ[idx]).log2();
+    values[idx] + t * (values[idx + 1] - values[idx])
+}
+
+/// Expand a legacy six-band `[125, 250, 500, 1k, 2k, 4k]` table to ten bands by
+/// log-frequency interpolation, holding the 125 Hz value at 31.5/63 Hz and the
+/// 4 kHz value at 8/16 kHz. This is the backward-compatibility mapping for
+/// `--room-json` files written before the ten-band model.
+pub fn bands_six_to_ten(six: &[f64; 6]) -> [f64; ROOM_BAND_COUNT] {
+    const SIX_BANDS: [f64; 6] = [125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0];
+    std::array::from_fn(|i| {
+        let f = ROOM_BANDS_HZ[i];
+        if f <= SIX_BANDS[0] {
+            six[0]
+        } else if f >= SIX_BANDS[5] {
+            six[5]
+        } else {
+            let mut idx = 0usize;
+            while idx + 1 < 6 && f > SIX_BANDS[idx + 1] {
+                idx += 1;
+            }
+            let t = (f / SIX_BANDS[idx]).log2();
+            six[idx] + t * (six[idx + 1] - six[idx])
+        }
+    })
+}
+
+/// Ten-band octave wall acoustic material (`31.5 Hz` .. `16 kHz`).
+///
+/// `absorption` is the energy absorption coefficient per octave band and
+/// `scattering` the ISO-17497 diffuse-scattering coefficient per band. Both are
+/// interpolated in `log2(f)` when a continuously frequency-dependent value is
+/// required (image-source taps, per-bin synthesis weights).
+///
+/// Deserialization accepts the pre-B0 six-band `absorption` array and scalar
+/// `scattering` so existing room JSON keeps loading unchanged.
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct WallMaterial {
-    /// Energy absorption coefficients `alpha in [0.01, 0.99]` at `[125, 250, 500, 1k, 2k, 4k] Hz`.
-    pub absorption: [f64; 6],
-    /// ISO-17497 diffuse scattering coefficient `s in [0.0, 1.0]`.
-    pub scattering: f64,
+    /// Energy absorption coefficients `alpha in [0.01, 0.99]` at
+    /// `[31.5, 63, 125, 250, 500, 1k, 2k, 4k, 8k, 16k] Hz`.
+    pub absorption: [f64; ROOM_BAND_COUNT],
+    /// ISO-17497 diffuse scattering coefficient `s in [0.0, 1.0]` per band.
+    pub scattering: [f64; ROOM_BAND_COUNT],
+}
+
+/// Untagged band-table decoder: ten bands (current) or six bands (legacy).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BandArrayDe {
+    Ten([f64; ROOM_BAND_COUNT]),
+    Six([f64; 6]),
+}
+
+impl BandArrayDe {
+    fn into_ten(self) -> [f64; ROOM_BAND_COUNT] {
+        match self {
+            Self::Ten(v) => v,
+            Self::Six(v) => bands_six_to_ten(&v),
+        }
+    }
+}
+
+/// Untagged scattering decoder: ten bands, six bands, or a legacy scalar.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BandSpectrumDe {
+    Ten([f64; ROOM_BAND_COUNT]),
+    Six([f64; 6]),
+    One(f64),
+}
+
+impl BandSpectrumDe {
+    fn into_ten(self) -> [f64; ROOM_BAND_COUNT] {
+        match self {
+            Self::Ten(v) => v,
+            Self::Six(v) => bands_six_to_ten(&v),
+            Self::One(v) => [v; ROOM_BAND_COUNT],
+        }
+    }
+}
+
+fn de_absorption<'de, D>(de: D) -> std::result::Result<[f64; ROOM_BAND_COUNT], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(BandArrayDe::deserialize(de)?.into_ten())
+}
+
+fn de_scattering<'de, D>(de: D) -> std::result::Result<[f64; ROOM_BAND_COUNT], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(BandSpectrumDe::deserialize(de)?.into_ten())
+}
+
+#[derive(Deserialize)]
+struct WallMaterialDe {
+    #[serde(deserialize_with = "de_absorption")]
+    absorption: [f64; ROOM_BAND_COUNT],
+    #[serde(default, deserialize_with = "de_scattering")]
+    scattering: [f64; ROOM_BAND_COUNT],
+}
+
+impl<'de> Deserialize<'de> for WallMaterial {
+    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = WallMaterialDe::deserialize(de)?;
+        Ok(Self {
+            absorption: raw.absorption,
+            scattering: raw.scattering,
+        })
+    }
 }
 
 impl WallMaterial {
-    /// Amplitude reflection coefficient `sqrt(1 - alpha(f))` log-interpolated across octave bands.
+    /// Uniform material across all ten bands (used by the anechoic preset).
+    pub const fn uniform(absorption: f64, scattering: f64) -> Self {
+        Self {
+            absorption: [absorption; ROOM_BAND_COUNT],
+            scattering: [scattering; ROOM_BAND_COUNT],
+        }
+    }
+
+    /// Clamped band absorption `alpha_b in [0.01, 0.99]`.
+    #[inline]
+    pub fn alpha(&self, band: usize) -> f64 {
+        self.absorption[band.min(ROOM_BAND_COUNT - 1)].clamp(0.01, 0.99)
+    }
+
+    /// Band energy reflection coefficient `1 - alpha_b`.
+    #[inline]
+    pub fn refl_energy(&self, band: usize) -> f64 {
+        1.0 - self.alpha(band)
+    }
+
+    /// Clamped band ISO-17497 scattering coefficient.
+    #[inline]
+    pub fn scatter(&self, band: usize) -> f64 {
+        self.scattering[band.min(ROOM_BAND_COUNT - 1)].clamp(0.0, 1.0)
+    }
+
+    /// Amplitude reflection coefficient `sqrt(1 - alpha(f))` log-interpolated
+    /// between the ten octave-band absorption values.
     pub fn refl_amp(&self, f_hz: f64) -> f64 {
-        const BANDS: [f64; 6] = [125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0];
-        let alpha = if f_hz <= BANDS[0] {
-            self.absorption[0]
-        } else if f_hz >= BANDS[5] {
-            self.absorption[5]
-        } else {
-            let mut idx = 0usize;
-            while idx + 1 < 6 && f_hz > BANDS[idx + 1] {
-                idx += 1;
-            }
-            let t = (f_hz / BANDS[idx]).log2();
-            self.absorption[idx] + t * (self.absorption[idx + 1] - self.absorption[idx])
-        };
-        (1.0 - alpha.clamp(0.01, 0.99)).sqrt()
+        (1.0 - band_value_at(&self.absorption, f_hz).clamp(0.01, 0.99)).sqrt()
+    }
+
+    /// Diffuse-scattering coefficient interpolated to `f_hz`.
+    pub fn scatter_at(&self, f_hz: f64) -> f64 {
+        band_value_at(&self.scattering, f_hz).clamp(0.0, 1.0)
     }
 }
 
@@ -206,9 +611,106 @@ pub struct RoomGeometry {
     pub bass_trap_admittance: f64,
     /// Target reverberation time `RT60` (seconds) at mid frequencies.
     pub target_rt60_s: f64,
+    /// Documented per-band / ISO 3382 targets and provenance (research doc §4/§6).
+    #[serde(default)]
+    pub targets: Option<RoomAcousticTargets>,
     /// Optional finite diffracting edges (mixing console front lip, monitor baffle).
     #[serde(default)]
     pub edges: Vec<DiffractionEdge>,
+}
+
+// ---------------------------------------------------------------------------
+// Tier-A shoebox material library (design values; research doc §4).
+//
+// These are *design* octave-band tables, not measured material samples. The
+// per-band RT target of every calibrated preset is the Eyring value these
+// tables produce, with the mid-band value gated against the measured/standard
+// target in the tests. The eight tables cover the surface classes used by the
+// Tier-A rooms: plaster, wood panelling, coffered ceiling, occupied seats,
+// porous panel, QRD diffuser, wood floor, ceiling cloud, carpet and cinema
+// fabric.
+// ---------------------------------------------------------------------------
+
+/// Rigid plaster / masonry wall with mild low-frequency panel absorption.
+fn mat_plaster() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.06, 0.06, 0.05, 0.05, 0.05, 0.06, 0.06, 0.05, 0.05, 0.05],
+        scattering: [0.05, 0.05, 0.05, 0.05, 0.06, 0.06, 0.07, 0.07, 0.08, 0.08],
+    }
+}
+
+/// Wood-panelled hall wall.
+fn mat_wood_panel() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.12, 0.11, 0.10, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.14],
+        scattering: [0.10, 0.12, 0.15, 0.18, 0.20, 0.22, 0.24, 0.25, 0.25, 0.24],
+    }
+}
+
+/// Coffered wood ceiling.
+fn mat_coffered_ceiling() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.15, 0.14, 0.12, 0.10, 0.10, 0.12, 0.14, 0.16, 0.18, 0.18],
+        scattering: [0.15, 0.18, 0.22, 0.28, 0.32, 0.35, 0.38, 0.40, 0.40, 0.38],
+    }
+}
+
+/// Fully occupied upholstered seating (audience), per m² of floor.
+fn mat_occupied_seats() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.65, 0.68, 0.72, 0.80, 0.85, 0.88, 0.90, 0.90, 0.88, 0.84],
+        scattering: [0.10, 0.12, 0.15, 0.20, 0.25, 0.28, 0.30, 0.32, 0.32, 0.30],
+    }
+}
+
+/// Porous broadband studio absorber (front/side walls).
+fn mat_acoustic_panel() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.15, 0.25, 0.40, 0.45, 0.45, 0.45, 0.44, 0.42, 0.38, 0.34],
+        scattering: [0.15, 0.20, 0.28, 0.35, 0.40, 0.42, 0.42, 0.40, 0.38, 0.36],
+    }
+}
+
+/// QRD skyline diffuser (back wall): high ISO-17497 scattering at mid/high bands.
+fn mat_qrd_diffuser() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.05, 0.06, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.14],
+        scattering: [0.20, 0.30, 0.55, 0.75, 0.85, 0.88, 0.90, 0.90, 0.88, 0.84],
+    }
+}
+
+/// Wood floor (empty).
+fn mat_wood_floor() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.03, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.10],
+        scattering: [0.05, 0.06, 0.08, 0.12, 0.15, 0.18, 0.20, 0.20, 0.20, 0.18],
+    }
+}
+
+/// Suspended ceiling cloud.
+fn mat_ceiling_cloud() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.12, 0.22, 0.36, 0.40, 0.42, 0.42, 0.40, 0.38, 0.35, 0.32],
+        scattering: [0.10, 0.15, 0.25, 0.32, 0.38, 0.40, 0.40, 0.38, 0.36, 0.34],
+    }
+}
+
+/// Heavy carpet.
+fn mat_carpet() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.05, 0.08, 0.14, 0.20, 0.26, 0.28, 0.30, 0.30, 0.28, 0.25],
+        scattering: [0.05, 0.06, 0.08, 0.12, 0.18, 0.22, 0.25, 0.25, 0.24, 0.22],
+    }
+}
+
+/// Fabric-covered cinema wall / ceiling treatment. The 1 kHz value is fitted to
+/// the Tier-A cinema design target (`0.50 s` in `20 × 12 × 8 m`) together with
+/// the carpeted floor; the surrounding bands keep a smooth fabric curve.
+fn mat_cinema_fabric() -> WallMaterial {
+    WallMaterial {
+        absorption: [0.12, 0.18, 0.30, 0.42, 0.48, 0.515, 0.50, 0.46, 0.42, 0.38],
+        scattering: [0.10, 0.14, 0.20, 0.28, 0.32, 0.35, 0.35, 0.34, 0.32, 0.30],
+    }
 }
 
 impl RoomGeometry {
@@ -218,36 +720,37 @@ impl RoomGeometry {
                 name: "Anechoic Chamber".to_string(),
                 dims_m: [6.0, 5.0, 3.0],
                 listener_m: [3.0, 2.5, 1.3],
-                walls: [WallMaterial {
-                    absorption: [0.99; 6],
-                    scattering: 0.0,
-                }; 6],
+                walls: [WallMaterial::uniform(0.99, 0.0); 6],
                 bass_trap_admittance: 0.95,
                 target_rt60_s: 0.02,
+                targets: None,
                 edges: Vec::new(),
             },
             RoomPreset::ControlRoom => {
                 // ITU-R BS.1116-3 mastering control room: porous broadband absorbers on front/sides,
                 // QRD skyline diffuser on rear wall, damped floor/ceiling, mixing console edge.
+                // The 1 kHz column (index 5) and the mid-band scattering values are unchanged
+                // from the pre-ten-band preset, so existing room gates keep their calibrated
+                // material point.
                 let front = WallMaterial {
-                    absorption: [0.42, 0.55, 0.68, 0.74, 0.78, 0.82],
-                    scattering: 0.25,
+                    absorption: [0.30, 0.36, 0.42, 0.55, 0.68, 0.74, 0.78, 0.82, 0.84, 0.86],
+                    scattering: [0.18, 0.20, 0.22, 0.24, 0.25, 0.25, 0.26, 0.28, 0.28, 0.27],
                 };
                 let back_qrd = WallMaterial {
-                    absorption: [0.35, 0.38, 0.42, 0.45, 0.50, 0.56],
-                    scattering: 0.78,
+                    absorption: [0.28, 0.31, 0.35, 0.38, 0.42, 0.45, 0.50, 0.56, 0.58, 0.60],
+                    scattering: [0.20, 0.30, 0.50, 0.70, 0.78, 0.78, 0.80, 0.82, 0.80, 0.76],
                 };
                 let side = WallMaterial {
-                    absorption: [0.38, 0.48, 0.58, 0.65, 0.70, 0.75],
-                    scattering: 0.35,
+                    absorption: [0.26, 0.32, 0.38, 0.48, 0.58, 0.65, 0.70, 0.75, 0.77, 0.79],
+                    scattering: [0.22, 0.26, 0.30, 0.33, 0.35, 0.35, 0.36, 0.38, 0.38, 0.37],
                 };
                 let floor = WallMaterial {
-                    absorption: [0.12, 0.16, 0.24, 0.34, 0.44, 0.52],
-                    scattering: 0.15,
+                    absorption: [0.08, 0.10, 0.12, 0.16, 0.24, 0.34, 0.44, 0.52, 0.54, 0.56],
+                    scattering: [0.08, 0.10, 0.12, 0.14, 0.15, 0.15, 0.16, 0.18, 0.18, 0.17],
                 };
                 let ceiling = WallMaterial {
-                    absorption: [0.40, 0.55, 0.70, 0.76, 0.80, 0.84],
-                    scattering: 0.30,
+                    absorption: [0.28, 0.34, 0.40, 0.55, 0.70, 0.76, 0.80, 0.84, 0.86, 0.88],
+                    scattering: [0.20, 0.24, 0.27, 0.29, 0.30, 0.30, 0.31, 0.33, 0.33, 0.32],
                 };
                 Self {
                     name: "ITU-R BS.1116 Control Room".to_string(),
@@ -256,6 +759,14 @@ impl RoomGeometry {
                     walls: [front, back_qrd, side, side, floor, ceiling],
                     bass_trap_admittance: 0.16,
                     target_rt60_s: 0.25,
+                    targets: Some(standard_mid_band_targets(
+                        0.25,
+                        90.0,
+                        Some([0.20, 0.40]),
+                        "ITU-R BS.1116-3 / EBU Tech 3276: 0.2–0.4 s, \
+                         T = 0.25·(V/100)^(1/3) ≈ 0.241 s averaged 200 Hz–4 kHz, \
+                         +0.3 s allowed at 63 Hz",
+                    )),
                     edges: vec![DiffractionEdge {
                         // Virtual mixing desk front edge 0.75 m in front of listener, 0.85 m high.
                         p0: [3.35, 1.65, 0.85],
@@ -266,17 +777,19 @@ impl RoomGeometry {
                 }
             }
             RoomPreset::TheaterStage => {
+                // 1 kHz column (index 5) and mid-band scattering unchanged from the
+                // pre-ten-band preset.
                 let wall = WallMaterial {
-                    absorption: [0.24, 0.32, 0.40, 0.46, 0.52, 0.60],
-                    scattering: 0.45,
+                    absorption: [0.16, 0.20, 0.24, 0.32, 0.40, 0.46, 0.52, 0.60, 0.62, 0.64],
+                    scattering: [0.25, 0.32, 0.38, 0.42, 0.45, 0.45, 0.47, 0.50, 0.50, 0.48],
                 };
                 let back = WallMaterial {
-                    absorption: [0.30, 0.38, 0.46, 0.52, 0.58, 0.65],
-                    scattering: 0.65,
+                    absorption: [0.20, 0.25, 0.30, 0.38, 0.46, 0.52, 0.58, 0.65, 0.67, 0.69],
+                    scattering: [0.35, 0.45, 0.55, 0.62, 0.65, 0.65, 0.67, 0.70, 0.70, 0.68],
                 };
                 let floor = WallMaterial {
-                    absorption: [0.18, 0.28, 0.42, 0.55, 0.65, 0.72],
-                    scattering: 0.50,
+                    absorption: [0.10, 0.14, 0.18, 0.28, 0.42, 0.55, 0.65, 0.72, 0.74, 0.76],
+                    scattering: [0.30, 0.38, 0.44, 0.48, 0.50, 0.50, 0.52, 0.55, 0.55, 0.52],
                 };
                 Self {
                     name: "Reference Theater Mixing Stage".to_string(),
@@ -285,6 +798,13 @@ impl RoomGeometry {
                     walls: [wall, back, wall, wall, floor, wall],
                     bass_trap_admittance: 0.12,
                     target_rt60_s: 0.42,
+                    targets: Some(standard_mid_band_targets(
+                        0.42,
+                        592.8,
+                        None,
+                        "Reference theatrical mixing stage design target (research doc §4); \
+                         no public measured IR set, marked design target",
+                    )),
                     edges: vec![DiffractionEdge {
                         p0: [6.2, 3.4, 0.90],
                         p1: [6.2, 6.1, 0.90],
@@ -294,6 +814,328 @@ impl RoomGeometry {
                 }
             }
         }
+    }
+
+    /// Build one of the eight Tier-A shoebox presets.
+    pub fn from_shoebox_preset(preset: ShoeboxPreset) -> Self {
+        match preset {
+            ShoeboxPreset::ControlRoom => Self::from_preset(RoomPreset::ControlRoom),
+            ShoeboxPreset::TheaterStage => Self::from_preset(RoomPreset::TheaterStage),
+            ShoeboxPreset::StudioLiveRoom => {
+                let geom = Self {
+                    name: "Studio Live Room".to_string(),
+                    dims_m: [8.0, 6.0, 4.0],
+                    listener_m: [5.2, 3.0, 1.7],
+                    // Front wall is wood-panelled (less absorbent than the side
+                    // panels) so the Eyring 1 kHz fit lands on the 0.45 s design
+                    // target instead of 14% below it.
+                    walls: [
+                        mat_wood_panel(),
+                        mat_qrd_diffuser(),
+                        mat_acoustic_panel(),
+                        mat_acoustic_panel(),
+                        mat_wood_floor(),
+                        mat_ceiling_cloud(),
+                    ],
+                    bass_trap_admittance: 0.20,
+                    target_rt60_s: 0.45,
+                    targets: None,
+                    edges: Vec::new(),
+                };
+                geom.with_design_targets(
+                    0.45,
+                    [0.35, 0.55],
+                    192.0,
+                    1_000.0,
+                    "Tier-A small studio live room; RT design range 0.35–0.55 s calibrated to \
+                     BUT/ACE small rooms (research doc §4); material table is a design fit, not \
+                     measured",
+                )
+            }
+            ShoeboxPreset::LectureTheatre => {
+                let geom = Self {
+                    name: "Lecture Theatre".to_string(),
+                    dims_m: [15.0, 10.0, 6.0],
+                    listener_m: [10.5, 5.0, 1.2],
+                    // Wood-panelled ceiling: with the carpeted floor and side
+                    // panels this lands on the 0.8 s speech design target.
+                    walls: [
+                        mat_plaster(),
+                        mat_qrd_diffuser(),
+                        mat_acoustic_panel(),
+                        mat_acoustic_panel(),
+                        mat_carpet(),
+                        mat_wood_panel(),
+                    ],
+                    bass_trap_admittance: 0.12,
+                    target_rt60_s: 0.80,
+                    targets: None,
+                    edges: Vec::new(),
+                };
+                geom.with_design_targets(
+                    0.80,
+                    [0.70, 0.90],
+                    900.0,
+                    500.0,
+                    "Tier-A lecture theatre, speech clarity; RT design range 0.70–0.90 s, \
+                     ACE/BUT cross-check (research doc §4); material table is a design fit",
+                )
+            }
+            ShoeboxPreset::Cinema => {
+                let geom = Self {
+                    name: "Cinema Dubbing Stage".to_string(),
+                    dims_m: [20.0, 12.0, 8.0],
+                    listener_m: [14.0, 6.0, 1.2],
+                    walls: [
+                        mat_cinema_fabric(),
+                        mat_cinema_fabric(),
+                        mat_cinema_fabric(),
+                        mat_cinema_fabric(),
+                        mat_carpet(),
+                        mat_cinema_fabric(),
+                    ],
+                    bass_trap_admittance: 0.18,
+                    target_rt60_s: 0.50,
+                    targets: None,
+                    edges: Vec::new(),
+                };
+                geom.with_design_targets(
+                    0.50,
+                    [0.40, 0.60],
+                    1_920.0,
+                    500.0,
+                    "Tier-A cinema dubbing stage; RT design range 0.40–0.60 s (research doc §4); \
+                     material table is a design fit, not measured",
+                )
+            }
+            ShoeboxPreset::Musikverein => {
+                let geom = Self {
+                    name: "Vienna Musikverein, Grosser Saal".to_string(),
+                    dims_m: [48.8, 19.1, 17.75],
+                    listener_m: [46.5, 9.55, 2.0],
+                    walls: [
+                        mat_plaster(),
+                        mat_plaster(),
+                        mat_plaster(),
+                        mat_plaster(),
+                        mat_occupied_seats(),
+                        mat_coffered_ceiling(),
+                    ],
+                    bass_trap_admittance: 0.05,
+                    target_rt60_s: 2.0,
+                    targets: None,
+                    edges: Vec::new(),
+                };
+                geom.with_hall_targets(HallTargetInput {
+                    mid_rt60_s: 2.0,
+                    mid_rt60_alt_s: None,
+                    mid_edt_s: 2.0,
+                    strength_g_db: 4.0,
+                    clarity_c80_db: -1.0,
+                    bass_lf: 0.17,
+                    one_minus_iacc: Some(0.64),
+                    itdg_ms: 12.0,
+                    acoustic_volume_m3: 15_000.0,
+                    reference_source_m: [4.0, 9.55, 2.0],
+                    source: "Beranek 2004 via akuTEK Table 2 (T/EDT/G/C80/LF/1−IACC/ITDG); \
+                                 geometry Wikipedia (Musikverein); 15 000 m³ is the quoted \
+                                 acoustic volume, not L·W·H = 16 544 m³",
+                })
+            }
+            ShoeboxPreset::BostonSymphonyHall => {
+                let geom = Self {
+                    name: "Boston Symphony Hall".to_string(),
+                    dims_m: [38.1, 22.9, 18.6],
+                    listener_m: [35.5, 11.45, 2.0],
+                    walls: [
+                        mat_wood_panel(),
+                        mat_wood_panel(),
+                        mat_wood_panel(),
+                        mat_wood_panel(),
+                        mat_occupied_seats(),
+                        mat_coffered_ceiling(),
+                    ],
+                    bass_trap_admittance: 0.05,
+                    target_rt60_s: 1.9,
+                    targets: None,
+                    edges: Vec::new(),
+                };
+                geom.with_hall_targets(HallTargetInput {
+                    mid_rt60_s: 1.9,
+                    mid_rt60_alt_s: None,
+                    mid_edt_s: 1.9,
+                    strength_g_db: 2.0,
+                    clarity_c80_db: 0.0,
+                    bass_lf: 0.22,
+                    one_minus_iacc: Some(0.65),
+                    itdg_ms: 15.0,
+                    acoustic_volume_m3: 18_750.0,
+                    reference_source_m: [5.0, 11.45, 2.0],
+                    source: "Beranek 2004 via akuTEK Table 2 (T/EDT/G/C80/LF/1−IACC/ITDG); \
+                                 geometry Wikipedia (Symphony Hall, Boston); 18 750 m³ is the \
+                                 quoted acoustic volume, not L·W·H = 16 228 m³",
+                })
+            }
+            ShoeboxPreset::Concertgebouw => {
+                let geom = Self {
+                    name: "Amsterdam Concertgebouw, Grote Zaal".to_string(),
+                    dims_m: [44.0, 28.0, 17.0],
+                    listener_m: [40.4, 14.0, 2.0],
+                    walls: [
+                        mat_plaster(),
+                        mat_plaster(),
+                        mat_plaster(),
+                        mat_plaster(),
+                        mat_occupied_seats(),
+                        mat_coffered_ceiling(),
+                    ],
+                    bass_trap_admittance: 0.05,
+                    target_rt60_s: 2.0,
+                    targets: None,
+                    edges: Vec::new(),
+                };
+                geom.with_hall_targets(HallTargetInput {
+                    mid_rt60_s: 2.0,
+                    mid_rt60_alt_s: Some(2.2),
+                    mid_edt_s: 1.9,
+                    strength_g_db: 3.0,
+                    clarity_c80_db: -1.0,
+                    bass_lf: 0.18,
+                    one_minus_iacc: None,
+                    itdg_ms: 21.0,
+                    acoustic_volume_m3: 18_780.0,
+                    reference_source_m: [5.0, 14.0, 2.0],
+                    source: "Beranek 2004 via akuTEK Table 2 (T/EDT/G/C80/LF/ITDG); \
+                                 Concertgebouw geometry and RT 2.0 s occupied (Beranek) / \
+                                 2.2 s occupied, 2.8 s empty (hall), Wikipedia; 18 780 m³ is \
+                                 the quoted acoustic volume, not L·W·H = 20 944 m³",
+                })
+            }
+        }
+    }
+
+    /// Quoted acoustic volume when the preset carries one, else `L·W·H`.
+    pub fn acoustic_volume_m3(&self) -> f64 {
+        self.targets
+            .as_ref()
+            .and_then(|t| t.acoustic_volume_m3)
+            .unwrap_or(self.dims_m[0] * self.dims_m[1] * self.dims_m[2])
+    }
+
+    /// Total interior surface area of the shoebox (m²).
+    pub fn surface_area_m2(&self) -> f64 {
+        let [l, w, h] = self.dims_m;
+        2.0 * (l * w + l * h + w * h)
+    }
+
+    /// Per-wall areas in `RoomGeometry` wall order (m²).
+    fn wall_areas_m2(&self) -> [f64; 6] {
+        let [l, w, h] = self.dims_m;
+        [w * h, w * h, l * h, l * h, l * w, l * w]
+    }
+
+    /// Eyring (Norris–Eyring) reverberation time of one octave band (s):
+    ///
+    /// `T = 0.161 V / ( -S ln(1 - alpha_bar) + 4 m V )`
+    ///
+    /// with `alpha_bar` the six-wall area-weighted absorption at `ROOM_BANDS_HZ[band]`
+    /// and `m` the ISO 9613-1 energy attenuation coefficient in `1/m`
+    /// (`m = -2 ln(|H_air(1 m)|)` from [`AtmosphereCfg::air_gain_linear`]).
+    pub fn eyring_rt60_band(&self, atm: &AtmosphereCfg, band: usize) -> f64 {
+        let b = band.min(ROOM_BAND_COUNT - 1);
+        let f = ROOM_BANDS_HZ[b];
+        let areas = self.wall_areas_m2();
+        let s: f64 = areas.iter().sum();
+        let absorbed: f64 = areas
+            .iter()
+            .enumerate()
+            .map(|(i, a)| a * self.walls[i].alpha(b))
+            .sum();
+        let alpha_bar = (absorbed / s).clamp(1e-4, 0.999);
+        let v = self.dims_m[0] * self.dims_m[1] * self.dims_m[2];
+        let m = -2.0 * atm.air_gain_linear(f, 1.0).ln();
+        let denom = -s * (1.0 - alpha_bar).ln() + 4.0 * m * v;
+        0.161 * v / denom.max(1e-12)
+    }
+
+    /// Eyring reverberation time for all ten octave bands (s).
+    pub fn eyring_rt60_bands(&self, atm: &AtmosphereCfg) -> [f64; ROOM_BAND_COUNT] {
+        std::array::from_fn(|b| self.eyring_rt60_band(atm, b))
+    }
+
+    /// Attach a calibrated Eyring per-band design target to a hall preset whose
+    /// mid-band T is a measured value from the research doc.
+    fn with_hall_targets(mut self, input: HallTargetInput<'_>) -> Self {
+        let atm = AtmosphereCfg::default();
+        let eyring = self.eyring_rt60_bands(&atm);
+        // The FDTD wave solver owns everything below 250 Hz in the hall-scale
+        // 260k-voxel grid (achieved 6-PPW cutoff 132–144 Hz): the geometric
+        // targets start at the next octave, 250 Hz.
+        let geometric_bands_from_hz = 250.0;
+        let bands = std::array::from_fn(|i| {
+            (ROOM_BANDS_HZ[i] >= geometric_bands_from_hz).then_some(eyring[i])
+        });
+        let fit_residual_s = bands[ROOM_BAND_MID].map(|t| t - input.mid_rt60_s);
+        self.targets = Some(RoomAcousticTargets {
+            bands_hz: ROOM_BANDS_HZ,
+            rt60_bands_s: bands,
+            edt_bands_s: [None; ROOM_BAND_COUNT],
+            mid_rt60_s: input.mid_rt60_s,
+            mid_rt60_alt_s: input.mid_rt60_alt_s,
+            mid_edt_s: Some(input.mid_edt_s),
+            strength_g_db: Some(input.strength_g_db),
+            clarity_c80_db: Some(input.clarity_c80_db),
+            bass_lf: Some(input.bass_lf),
+            one_minus_iacc: input.one_minus_iacc,
+            itdg_ms: Some(input.itdg_ms),
+            mid_rt60_range_s: None,
+            acoustic_volume_m3: Some(input.acoustic_volume_m3),
+            geometric_bands_from_hz,
+            model: Rt60Model::EyringDesign,
+            reference_source_m: Some(input.reference_source_m),
+            fit_residual_s,
+            source: input.source.to_string(),
+        });
+        self
+    }
+
+    /// Attach an Eyring per-band design target to a standard/design room that
+    /// has no measured per-band source.
+    fn with_design_targets(
+        mut self,
+        mid_rt60_s: f64,
+        range: [f64; 2],
+        volume_m3: f64,
+        geometric_bands_from_hz: f64,
+        source: &str,
+    ) -> Self {
+        let atm = AtmosphereCfg::default();
+        let eyring = self.eyring_rt60_bands(&atm);
+        let bands = std::array::from_fn(|i| {
+            (ROOM_BANDS_HZ[i] >= geometric_bands_from_hz).then_some(eyring[i])
+        });
+        let fit_residual_s = bands[ROOM_BAND_MID].map(|t| t - mid_rt60_s);
+        self.targets = Some(RoomAcousticTargets {
+            bands_hz: ROOM_BANDS_HZ,
+            rt60_bands_s: bands,
+            edt_bands_s: [None; ROOM_BAND_COUNT],
+            mid_rt60_s,
+            mid_rt60_alt_s: None,
+            mid_edt_s: None,
+            strength_g_db: None,
+            clarity_c80_db: None,
+            bass_lf: None,
+            one_minus_iacc: None,
+            itdg_ms: None,
+            mid_rt60_range_s: Some(range),
+            acoustic_volume_m3: Some(volume_m3),
+            geometric_bands_from_hz,
+            model: Rt60Model::EyringDesign,
+            reference_source_m: None,
+            fit_residual_s,
+            source: source.to_string(),
+        });
+        self
     }
 
     pub fn from_json_file(path: &std::path::Path) -> std::result::Result<Self, String> {
@@ -326,7 +1168,143 @@ impl RoomGeometry {
                 self.target_rt60_s
             ));
         }
+        for (wi, wall) in self.walls.iter().enumerate() {
+            for (bi, &alpha) in wall.absorption.iter().enumerate() {
+                if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                    return Err(format!(
+                        "room.walls[{wi}].absorption[{bi}]={alpha} must be in 0.0..=1.0"
+                    ));
+                }
+            }
+            for (bi, &s) in wall.scattering.iter().enumerate() {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(format!(
+                        "room.walls[{wi}].scattering[{bi}]={s} must be in 0.0..=1.0"
+                    ));
+                }
+            }
+        }
+        if !self.bass_trap_admittance.is_finite()
+            || !(0.0..=1.0).contains(&self.bass_trap_admittance)
+        {
+            return Err(format!(
+                "room.bass_trap_admittance must be in 0.0..=1.0, got {}",
+                self.bass_trap_admittance
+            ));
+        }
+        if let Some(t) = &self.targets {
+            if t.bands_hz != ROOM_BANDS_HZ {
+                return Err(format!(
+                    "room.targets.bands_hz must be the ten ISO octaves {:?}, got {:?}",
+                    ROOM_BANDS_HZ, t.bands_hz
+                ));
+            }
+            if !t.mid_rt60_s.is_finite() || !(0.01..=6.0).contains(&t.mid_rt60_s) {
+                return Err(format!(
+                    "room.targets.mid_rt60_s must be in 0.01..=6.0 s, got {}",
+                    t.mid_rt60_s
+                ));
+            }
+            if let Some([lo, hi]) = t.mid_rt60_range_s {
+                if !lo.is_finite() || !hi.is_finite() || lo <= 0.0 || hi < lo {
+                    return Err(format!(
+                        "room.targets.mid_rt60_range_s must be [lo > 0, hi >= lo], got {lo}..{hi}"
+                    ));
+                }
+            }
+            for (bi, value) in t.rt60_bands_s.iter().enumerate() {
+                if let Some(v) = value {
+                    if !v.is_finite() || !(0.005..=60.0).contains(v) {
+                        return Err(format!(
+                            "room.targets.rt60_bands_s[{bi}]={v} must be in 0.005..=60.0 s"
+                        ));
+                    }
+                }
+            }
+            for (bi, value) in t.edt_bands_s.iter().enumerate() {
+                if let Some(v) = value {
+                    if !v.is_finite() || !(0.005..=60.0).contains(v) {
+                        return Err(format!(
+                            "room.targets.edt_bands_s[{bi}]={v} must be in 0.005..=60.0 s"
+                        ));
+                    }
+                }
+            }
+            if !t.geometric_bands_from_hz.is_finite()
+                || !(20.0..=20_000.0).contains(&t.geometric_bands_from_hz)
+            {
+                return Err(format!(
+                    "room.targets.geometric_bands_from_hz must be in 20..=20 000 Hz, got {}",
+                    t.geometric_bands_from_hz
+                ));
+            }
+            if let Some(p) = t.reference_source_m {
+                for i in 0..3 {
+                    if !p[i].is_finite() || p[i] < 0.0 || p[i] > self.dims_m[i] {
+                        return Err(format!(
+                            "room.targets.reference_source_m[{i}]={} must be inside dims {:?}",
+                            p[i], self.dims_m
+                        ));
+                    }
+                }
+            }
+            if let Some(v) = t.acoustic_volume_m3 {
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(format!(
+                        "room.targets.acoustic_volume_m3={v} must be finite and positive"
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// Inputs to [`RoomGeometry::with_hall_targets`] (keeps the preset table readable).
+struct HallTargetInput<'a> {
+    mid_rt60_s: f64,
+    mid_rt60_alt_s: Option<f64>,
+    mid_edt_s: f64,
+    strength_g_db: f64,
+    clarity_c80_db: f64,
+    bass_lf: f64,
+    one_minus_iacc: Option<f64>,
+    itdg_ms: f64,
+    acoustic_volume_m3: f64,
+    reference_source_m: [f64; 3],
+    source: &'a str,
+}
+
+/// Mid-band-only target used by the legacy control-room and theater presets.
+///
+/// `range_s` is the acceptance window when a standard specifies one (ITU-R
+/// BS.1116 gives 0.2–0.4 s for the control room); design-target presets whose
+/// research entry is a single value carry `None`.
+fn standard_mid_band_targets(
+    mid_rt60_s: f64,
+    volume_m3: f64,
+    range_s: Option<[f64; 2]>,
+    source: &str,
+) -> RoomAcousticTargets {
+    RoomAcousticTargets {
+        bands_hz: ROOM_BANDS_HZ,
+        rt60_bands_s: [None; ROOM_BAND_COUNT],
+        edt_bands_s: [None; ROOM_BAND_COUNT],
+        mid_rt60_s,
+        mid_rt60_alt_s: None,
+        mid_edt_s: None,
+        strength_g_db: None,
+        clarity_c80_db: None,
+        bass_lf: None,
+        one_minus_iacc: None,
+        itdg_ms: None,
+        mid_rt60_range_s: range_s,
+        acoustic_volume_m3: Some(volume_m3),
+        geometric_bands_from_hz: 1_000.0,
+        model: Rt60Model::MidBandOnly,
+        reference_source_m: None,
+        fit_residual_s: None,
+        source: source.to_string(),
     }
 }
 
@@ -768,8 +1746,8 @@ impl FdtdSolver3d {
     /// in just 2 FDTD runs!
     /// Run the 3D FDTD wave simulation, optionally offloading the zero-FMA 7-point SRL
     /// stencil to a live NVIDIA GPU via `g6me-cuda` when `use_cuda` is true and `--features cuda`
-    /// is compiled in. Falls back deterministically to the bit-identical CPU solver when no GPU
-    /// is attached.
+    /// is compiled in. Falls back deterministically to the CPU solver when no GPU is
+    /// attached.
     pub fn simulate_with_cuda(
         &self,
         src_voxel: (usize, usize, usize),
@@ -779,10 +1757,18 @@ impl FdtdSolver3d {
     ) -> Vec<Vec<f64>> {
         #[cfg(feature = "cuda")]
         if use_cuda {
-            if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
-                if let Ok(out) = self.simulate_on_cuda(&rt, src_voxel, receivers, steps) {
-                    return out;
-                }
+            match crate::blackwell::shared_cuda_runtime() {
+                Some(rt) => match self.simulate_on_cuda(&rt, src_voxel, receivers, steps) {
+                    Ok(out) => {
+                        crate::cuda_report::record_gpu(
+                            "fdtd",
+                            format!("{}x{}x{} voxels, {steps} steps", self.nx, self.ny, self.nz),
+                        );
+                        return out;
+                    }
+                    Err(e) => crate::cuda_report::record_cpu_fallback("fdtd", e),
+                },
+                None => crate::cuda_report::record_cpu_fallback("fdtd", "CUDA runtime unavailable"),
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -954,7 +1940,7 @@ impl FdtdSolver3d {
 
 // ============================================================================
 // 4. Layer 1 (> 500 Hz): 3D Image-Source Method (Orders 1–3) +
-//    Deterministic PCG64 Monte Carlo Ray Tracing (Orders 4–50 -> Order-7 HOA)
+//    Deterministic native Monte Carlo Ray Tracing (Orders 4–50 -> Order-7 HOA)
 // ============================================================================
 
 /// A single 3D geometric image-source reflection tap.
@@ -966,6 +1952,19 @@ pub struct ImageSourceTap {
     pub dist_m: f64,
     /// Bounce count on each of the 6 walls `[+x, -x, +y, -y, -z, +z]`.
     pub wall_hits: [u8; 6],
+    /// Per-band energy reflection product `∏_w (1 - alpha_{w,b})^{hits_w}` over
+    /// all wall bounces of this tap, using the ten-band material table. This is
+    /// the per-band image-source transport weight; the caller adds molecular
+    /// air absorption and geometric spreading per frequency.
+    pub band_reflection_energy: [f64; ROOM_BAND_COUNT],
+}
+
+impl ImageSourceTap {
+    /// Per-band amplitude reflection product `sqrt(energy_b)`.
+    #[inline]
+    pub fn band_reflection_amp(&self, band: usize) -> f64 {
+        self.band_reflection_energy[band.min(ROOM_BAND_COUNT - 1)].sqrt()
+    }
 }
 
 /// Allen & Berkley (JASA 1979) 3D shoebox Image-Source Method up to `max_order` (`<= 3`).
@@ -1031,12 +2030,26 @@ pub fn image_sources_3d(
                 let (hy_pos, hy_neg) = split_hits(ny);
                 let (hz_pos, hz_neg) = split_hits(nz);
 
+                let wall_hits = [hx_pos, hx_neg, hy_pos, hy_neg, hz_neg, hz_pos];
+                let band_reflection_energy = std::array::from_fn(|band| {
+                    wall_hits
+                        .iter()
+                        .enumerate()
+                        .fold(1.0_f64, |acc, (w, &hits)| {
+                            if hits == 0 {
+                                acc
+                            } else {
+                                acc * geom.walls[w].refl_energy(band).powi(hits as i32)
+                            }
+                        })
+                });
                 taps.push(ImageSourceTap {
                     delay_s,
                     az_deg,
                     el_deg,
                     dist_m: dist,
-                    wall_hits: [hx_pos, hx_neg, hy_pos, hy_neg, hz_neg, hz_pos],
+                    wall_hits,
+                    band_reflection_energy,
                 });
             }
         }
@@ -1044,19 +2057,24 @@ pub fn image_sources_3d(
     taps
 }
 
-/// Bit-exact Rust mirror of the PCG stream in `crates/g6me-cuda/kernels/raytrace_hoa.cu`.
+/// **Test-only** bit-exact Rust mirror of the PCG stream in
+/// `crates/g6me-cuda/kernels/raytrace_hoa.cu`.
 ///
-/// The kernel advances a 64-bit LCG state and emits an XSL-RR-permuted 32-bit word,
+/// The kernel advances a 64-bit LCG state and emits an XSH-RR-permuted 32-bit word,
 /// consuming two 64-bit words per `f64` uniform (`hi` supplies 21 bits, `lo` 32). The
-/// seeding, draw order and arithmetic below are identical to `pcg64_next` /
-/// `pcg64_uniform`, so the CPU and GPU ray streams are bit-identical.
+/// seeding, draw order and arithmetic below are identical to `pcg32_next` /
+/// `pcg32_uniform`; this oracle exists solely to prove that the CUDA kernel still
+/// produces the records it is specified to produce. It is **not** on any production
+/// path: [`raytrace_hoa_histogram`] uses the independent native CPU tracer below.
+#[cfg(all(test, feature = "cuda"))]
 #[derive(Debug, Clone, Copy)]
-struct RayPcg64 {
+struct RayPcg32 {
     state: u64,
     inc: u64,
 }
 
-impl RayPcg64 {
+#[cfg(all(test, feature = "cuda"))]
+impl RayPcg32 {
     /// Kernel seeding: `inc = 2*ray_id + 1`, `state = seed ^ ((ray_id + 1) * golden)`,
     /// then one discarded output.
     fn new(seed: u64, ray_id: usize) -> Self {
@@ -1080,7 +2098,7 @@ impl RayPcg64 {
         u64::from(xorshifted.rotate_right(rot))
     }
 
-    /// Uniform `f64` in `[0.0, 1.0)`, matching `pcg64_uniform` exactly.
+    /// Uniform `f64` in `[0.0, 1.0)`, matching `pcg32_uniform` exactly.
     #[inline]
     fn uniform(&mut self) -> f64 {
         let hi = self.next_u64();
@@ -1090,11 +2108,12 @@ impl RayPcg64 {
     }
 }
 
-/// One per-bounce trace record, ABI-compatible with the
-/// `(ray_delays, ray_energies, ray_dirs)` arrays returned by
+/// One per-bounce trace record produced by the **test-only** kernel mirror oracle,
+/// ABI-compatible with the `(ray_delays, ray_energies, ray_dirs)` arrays returned by
 /// `G6meCudaRuntime::run_raytrace_hoa_pass_with_scattering`.
 ///
 /// `delay_s == -1.0` / `energy == 0.0` marks a bounce with no receiver-sphere hit.
+#[cfg(all(test, feature = "cuda"))]
 #[derive(Debug, Clone, Copy)]
 struct RayHitRecord {
     delay_s: f64,
@@ -1103,13 +2122,17 @@ struct RayHitRecord {
     dir: [f64; 3],
 }
 
-/// Accumulate one per-bounce ray record into the Order-7 HOA histogram.
+/// Accumulate one per-bounce **GPU** ray record into the Order-7 HOA histogram.
 ///
-/// Both the CPU path ([`raytrace_hoa_histogram`]) and the GPU host reduction
-/// ([`raytrace_hoa_histogram_with_cuda`]) call this exact function with the same
-/// `(ray ascending, bounce ascending, channel ascending)` summation order, so a
-/// bit-identical record stream yields a bit-identical histogram. Bounces `1..=3` are
-/// skipped: orders 1–3 come from the exact image-source method.
+/// This is the GPU host reduction used by [`raytrace_hoa_histogram_on_runtime`] and
+/// [`raytrace_hoa_histogram_with_cuda`]: records arrive already in the kernel's
+/// `(ray ascending, bounce ascending)` layout and are summed in that order. The
+/// production CPU path ([`raytrace_hoa_histogram`]) does **not** call it — it runs the
+/// independent native tracer with its own per-chunk reduction. The only CPU caller is
+/// the `#[cfg(all(test, feature = "cuda"))]` bit-exact mirror oracle, which validates
+/// the kernel itself. Bounces `1..=3` are skipped: orders 1–3 come from the exact
+/// image-source method.
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn accumulate_hoa_hit(
     hist: &mut [[f64; HOA_CH]],
@@ -1119,6 +2142,38 @@ fn accumulate_hoa_hit(
     inc: [f64; 3],
     atm: &AtmosphereCfg,
     c_m_s: f64,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+) {
+    accumulate_hoa_hit_at(
+        hist,
+        bounce,
+        delay_s,
+        energy,
+        inc,
+        atm,
+        c_m_s,
+        RAY_AIR_REFERENCE_HZ,
+        n_time_bins,
+        bin_dt_s,
+    );
+}
+
+/// [`accumulate_hoa_hit`] at an explicit reference frequency. The per-band
+/// reduction passes the band centre (`ROOM_BANDS_HZ[band]`), so each band's
+/// molecular air absorption is evaluated at its own frequency instead of the
+/// legacy broadband 2 kHz reference.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn accumulate_hoa_hit_at(
+    hist: &mut [[f64; HOA_CH]],
+    bounce: usize,
+    delay_s: f64,
+    energy: f64,
+    inc: [f64; 3],
+    atm: &AtmosphereCfg,
+    c_m_s: f64,
+    f_air_hz: f64,
     n_time_bins: usize,
     bin_dt_s: f64,
 ) {
@@ -1136,19 +2191,22 @@ fn accumulate_hoa_hit(
     // `raytrace_hoa.cu` reports arrival time; recover the travelled distance for
     // molecular air absorption exactly as the GPU host reduction does.
     let d_hit = delay_s * c_m_s;
-    let air = atm.air_gain_linear(2_000.0, d_hit);
+    let air = atm.air_gain_linear(f_air_hz, d_hit);
     let w = energy * air * air;
     for c_idx in 0..HOA_CH {
         hist[bin][c_idx] += w * sh[c_idx];
     }
 }
 
-/// Trace one deterministic kernel-PCG64 ray (`ray_id`) through the shoebox room.
+/// **Test-only oracle:** trace one kernel-PCG32 ray (`ray_id`) through the shoebox
+/// room, mirroring `raytrace_hoa.cu` line for line.
 ///
-/// Every floating-point operation, PCG draw and branch mirrors `raytrace_hoa.cu` line
-/// for line (Marsaglia unit-sphere launch, same wall order, same receiver-sphere test,
-/// same wall absorption, same energy floor, same Lambertian scatter), so the returned
-/// records are bit-identical to the GPU's per-bounce arrays.
+/// Every floating-point operation, PCG draw and branch mirrors the CUDA kernel
+/// (Marsaglia unit-sphere launch, same wall order, same receiver-sphere test, same wall
+/// absorption, same energy floor, same Lambertian scatter), so the returned records are
+/// bit-identical to the GPU's per-bounce arrays. This is used only by the CUDA oracle
+/// test that keeps the kernel honest; it is not a CPU production implementation.
+#[cfg(all(test, feature = "cuda"))]
 fn trace_single_ray(
     geom: &RoomGeometry,
     atm: &AtmosphereCfg,
@@ -1163,7 +2221,7 @@ fn trace_single_ray(
     let [rx, ry, rz] = geom.listener_m;
     let rec_rad = 0.45_f64; // Acoustic receiver sphere radius (m)
     let rec_rad2 = rec_rad * rec_rad;
-    let mut rng = RayPcg64::new(seed, ray_id);
+    let mut rng = RayPcg32::new(seed, ray_id);
     let mut out = Vec::new();
 
     // Uniform random direction on the unit sphere via Marsaglia (1972) rejection,
@@ -1253,7 +2311,7 @@ fn trace_single_ray(
         py = (py + t_hit * dy).clamp(1e-6, ly - 1e-6);
         pz = (pz + t_hit * dz).clamp(1e-6, lz - 1e-6);
         total_dist += t_hit;
-        energy *= 1.0 - geom.walls[wall].absorption[3].clamp(0.01, 0.99);
+        energy *= geom.walls[wall].refl_energy(ROOM_BAND_MID);
 
         // Specular reflection (sign flip), then the shared energy-floor break.
         if wall < 2 {
@@ -1270,7 +2328,7 @@ fn trace_single_ray(
         // ISO-17497 Lambertian diffuse scattering blend. Cosine-weighted hemisphere via
         // Marsaglia unit-disk rejection plus the Lambert equal-area lift `z = sqrt(1 - s)`;
         // no libm trig, so this branch is bit-reproducible on both CPU and GPU.
-        if rng.uniform() < geom.walls[wall].scattering {
+        if rng.uniform() < geom.walls[wall].scatter(ROOM_BAND_MID) {
             let (sx, sy, sz) = loop {
                 let ux = 2.0 * rng.uniform() - 1.0;
                 let uy = 2.0 * rng.uniform() - 1.0;
@@ -1293,17 +2351,309 @@ fn trace_single_ray(
     out
 }
 
-/// Deterministic **PCG64** Monte Carlo Acoustic Ray Tracer (orders 4..=max_bounces) with
-/// Lambertian / ISO-17497 diffuse wall scattering, binning late directional energy into
-/// an Order-7 HOA (`64`-channel) impulse histogram ready for MagLS binaural decoding.
+/// Relative energy cutoff for a scattering ray, as a fraction of its launch energy.
+const RAY_ENERGY_FLOOR_REL: f64 = 1e-7;
+/// Acoustic receiver sphere radius (m). Shared physical specification binding both peers.
+const RAY_RECEIVER_RADIUS_M: f64 = 0.45;
+/// Reference frequency for molecular air absorption in the ray histogram (Hz).
+const RAY_AIR_REFERENCE_HZ: f64 = 2_000.0;
+/// Rays per partial-sum chunk in the native CPU reduction. Fixed, so the histogram does
+/// not depend on core count or scheduling.
+const CPU_REDUCE_CHUNK: usize = 64;
+
+/// One late-arrival record produced by the native CPU tracer.
 ///
-/// Parallelized across logical CPU cores via [`crate::util::par_map_indexed`] with an
-/// independent per-ray PCG64 stream and fixed ascending `ray_id` reduction, so every
-/// output bit is **100% bit-identical** regardless of CPU core count or scheduling.
+/// Only arrivals at bounce order >= 4 are emitted; orders 1–3 are supplied by the exact
+/// image-source method. `dir` points from the listener back toward the incoming ray
+/// (`-d`), the directional convention of [`eval_sh_order7`].
+struct NativeArrival {
+    delay_s: f64,
+    energy: f64,
+    dir: [f64; 3],
+}
+
+/// Trace one ray with the **native CPU** stochastic tracer for one octave band.
 ///
-/// The launch sampler, per-bounce arithmetic and histogram accumulator are the exact
-/// same ones used by `raytrace_hoa.cu` + [`raytrace_hoa_histogram_with_cuda`], so the CPU
-/// and GPU histograms are bit-identical for identical inputs.
+/// This is an independent CPU algorithm, not a reproduction of the CUDA kernel's
+/// instruction stream:
+///
+/// * RNG: deterministic PCG64 ([`Pcg64`]), streamed by `ray_id`.
+/// * Launch: stratified equal-solid-angle sampling — one jittered latitude band per ray
+///   (`Δz = 2/n_rays`, so every ray owns an equal-area band) plus a jittered
+///   golden-ratio azimuth, instead of per-ray rejection sampling.
+/// * Geometry: slab ray/AABB exit test (`1/d` multiply), instead of the kernel's
+///   per-plane division branches.
+/// * Receiver: analytic ray/sphere quadratic discriminant, instead of the kernel's
+///   projection-plus-perpendicular-distance test; both record the closest-approach
+///   time as the shared delay specification.
+/// * Scatter: Malley's inversion for a cosine-weighted hemisphere (`r = √u₁`,
+///   `φ = 2πu₂`), instead of Marsaglia rejection plus the equal-area lift.
+///
+/// The physical specification is shared with the GPU peer: same shoebox, source,
+/// listener, band-specific wall energy reflection `1 − clamp(α_b)`, band-specific
+/// ISO-17497 scattering probability, energy floor, receiver radius, and
+/// `(delay, energy, direction)` observable. Bands share the same per-ray random
+/// stream (common random numbers): where their scattering thresholds agree the
+/// paths coincide and only the energy differs, which is the ten-band transport
+/// specification. The CPU and GPU Monte Carlo streams differ, so the two
+/// implementations agree statistically, not bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn trace_native_ray_band(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    ray_id: usize,
+    n_rays: usize,
+    max_bounces: usize,
+    seed: u64,
+    band: usize,
+) -> Vec<NativeArrival> {
+    let band = band.min(ROOM_BAND_COUNT - 1);
+    let c = atm.speed_of_sound_m_s();
+    let [lx, ly, lz] = geom.dims_m;
+    let [rx, ry, rz] = geom.listener_m;
+    let rec_r2 = RAY_RECEIVER_RADIUS_M * RAY_RECEIVER_RADIUS_M;
+    let wall_refl: [f64; 6] = std::array::from_fn(|w| geom.walls[w].refl_energy(band));
+    let mut rng = Pcg64::new(seed, ray_id as u64);
+
+    // Stratified equal-solid-angle launch: ray `ray_id` owns the latitude band
+    // z ∈ [1 - 2(k+1)/n, 1 - 2k/n] and draws a uniform point inside it.
+    let z = 1.0 - 2.0 * ((ray_id as f64 + rng.next_f64()) / (n_rays as f64));
+    let phi = 2.0 * PI * (ray_id as f64 * 0.618_033_988_749_894_9 + rng.next_f64()).fract();
+    let r_xy = (1.0 - z * z).max(0.0).sqrt();
+    let mut d = [r_xy * phi.cos(), r_xy * phi.sin(), z];
+
+    let [mut px, mut py, mut pz] = src_m;
+    let mut energy = 1.0 / (n_rays as f64);
+    let energy_floor = RAY_ENERGY_FLOOR_REL * energy;
+    let mut total_dist = 0.0_f64;
+    let mut out = Vec::new();
+
+    for bounce in 0..max_bounces {
+        // Slab method: on each axis the exit is the larger of the two plane
+        // intersections; the smallest such exit is the first wall hit.
+        let mut t_hit = f64::INFINITY;
+        let mut wall = 0usize;
+        if d[0] != 0.0 {
+            let inv = 1.0 / d[0];
+            t_hit = ((lx - px) * inv).max(-px * inv);
+            wall = if d[0] > 0.0 { 0 } else { 1 };
+        }
+        if d[1] != 0.0 {
+            let inv = 1.0 / d[1];
+            let far = ((ly - py) * inv).max(-py * inv);
+            if far < t_hit {
+                t_hit = far;
+                wall = if d[1] > 0.0 { 2 } else { 3 };
+            }
+        }
+        if d[2] != 0.0 {
+            let inv = 1.0 / d[2];
+            let far = ((lz - pz) * inv).max(-pz * inv);
+            if far < t_hit {
+                t_hit = far;
+                wall = if d[2] > 0.0 { 5 } else { 4 };
+            }
+        }
+        if !t_hit.is_finite() || t_hit <= 1e-9 || t_hit > 1e20 {
+            break;
+        }
+
+        // Analytic receiver-sphere test via the ray/sphere quadratic. The shared
+        // physical observable is the time of **closest approach** to the listener
+        // center (`b`), recorded when the ray passes within the receiver radius and the
+        // closest point lies on the current segment. `disc >= 0` is exactly the
+        // within-radius condition; the quadratic is the CPU's own algebraic route to it.
+        let ox = rx - px;
+        let oy = ry - py;
+        let oz = rz - pz;
+        let b = ox * d[0] + oy * d[1] + oz * d[2];
+        let disc = b * b - (ox * ox + oy * oy + oz * oz - rec_r2);
+        if bounce >= 3 && disc >= 0.0 && b > 0.0 && b < t_hit {
+            out.push(NativeArrival {
+                delay_s: (total_dist + b) / c,
+                energy,
+                dir: [-d[0], -d[1], -d[2]],
+            });
+        }
+
+        // Advance onto the wall, keeping the point strictly inside the box.
+        px = (px + t_hit * d[0]).clamp(1e-6, lx - 1e-6);
+        py = (py + t_hit * d[1]).clamp(1e-6, ly - 1e-6);
+        pz = (pz + t_hit * d[2]).clamp(1e-6, lz - 1e-6);
+        total_dist += t_hit;
+        energy *= wall_refl[wall];
+
+        match wall {
+            0 | 1 => d[0] = -d[0],
+            2 | 3 => d[1] = -d[1],
+            _ => d[2] = -d[2],
+        }
+        if energy < energy_floor {
+            break;
+        }
+
+        // ISO-17497 diffuse scattering: cosine-weighted hemisphere by inversion
+        // around the wall normal, with this band's scattering probability.
+        if rng.next_f64() < geom.walls[wall].scatter(band) {
+            let u1 = rng.next_f64();
+            let u2 = rng.next_f64();
+            let r = u1.max(0.0).sqrt();
+            let ang = 2.0 * PI * u2;
+            let (sx, sy) = (r * ang.cos(), r * ang.sin());
+            let sz = (1.0 - u1).max(0.0).sqrt();
+            // Inward wall normal: wall 0 (+x) scatters toward -x, wall 1 (-x) toward
+            // +x, wall 2 (+y) toward -y, wall 3 (-y) toward +y, wall 4 (floor) toward
+            // +z, wall 5 (ceiling) toward -z.
+            d = match wall {
+                0 => [-sz, sx, sy],
+                1 => [sz, sx, sy],
+                2 => [sx, -sz, sy],
+                3 => [sx, sz, sy],
+                4 => [sx, sy, sz],
+                _ => [sx, sy, -sz],
+            };
+        }
+    }
+    out
+}
+
+/// Reduce per-ray native arrival lists to an Order-7 HOA histogram with the CPU's own
+/// association order: each fixed [`CPU_REDUCE_CHUNK`]-ray block is summed into a fresh
+/// partial histogram, then partials are folded in ascending chunk order. This differs
+/// from the GPU's single ray-major running accumulator and is independent of thread
+/// count and scheduling.
+fn reduce_native_arrivals(
+    per_ray: &[Vec<NativeArrival>],
+    atm: &AtmosphereCfg,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+) -> Vec<[f64; HOA_CH]> {
+    reduce_native_arrivals_at(per_ray, atm, n_time_bins, bin_dt_s, RAY_AIR_REFERENCE_HZ)
+}
+
+/// [`reduce_native_arrivals`] with an explicit molecular-air reference frequency.
+fn reduce_native_arrivals_at(
+    per_ray: &[Vec<NativeArrival>],
+    atm: &AtmosphereCfg,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    f_air_hz: f64,
+) -> Vec<[f64; HOA_CH]> {
+    let c = atm.speed_of_sound_m_s();
+    let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
+    if n_time_bins == 0 {
+        return hist;
+    }
+    for chunk in per_ray.chunks(CPU_REDUCE_CHUNK) {
+        let mut partial = vec![[0.0_f64; HOA_CH]; n_time_bins];
+        for arrivals in chunk {
+            for a in arrivals {
+                if a.delay_s <= 0.0 || a.energy <= 0.0 {
+                    continue;
+                }
+                let bin = (a.delay_s / bin_dt_s) as usize;
+                if bin >= n_time_bins {
+                    continue;
+                }
+                let az = a.dir[1].atan2(a.dir[0]);
+                let el = a.dir[2].clamp(-1.0, 1.0).asin();
+                let sh = eval_sh_order7(az, el);
+                let air = atm.air_gain_linear(f_air_hz, a.delay_s * c);
+                let w = a.energy * air * air;
+                for (cell, s) in partial[bin].iter_mut().zip(sh.iter()) {
+                    *cell += w * *s;
+                }
+            }
+        }
+        for (dst, src) in hist.iter_mut().zip(partial.iter()) {
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d += *s;
+            }
+        }
+    }
+    hist
+}
+
+/// Ten-band HOA histogram row: one Order-7 HOA vector per octave band.
+pub type RoomBandHistogram = [[f64; HOA_CH]; ROOM_BAND_COUNT];
+
+#[allow(clippy::too_many_arguments)]
+fn raytrace_hoa_histogram_band(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+    band: usize,
+) -> Vec<[f64; HOA_CH]> {
+    if n_rays == 0 || n_time_bins == 0 {
+        return vec![[0.0_f64; HOA_CH]; n_time_bins];
+    }
+    let per_ray = crate::util::par_map_indexed(n_rays, |ray_id| {
+        trace_native_ray_band(geom, atm, src_m, ray_id, n_rays, max_bounces, seed, band)
+    });
+    reduce_native_arrivals_at(
+        &per_ray,
+        atm,
+        n_time_bins,
+        bin_dt_s,
+        ROOM_BANDS_HZ[band.min(ROOM_BAND_COUNT - 1)],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raytrace_hoa_histogram_band_serial(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+    band: usize,
+) -> Vec<[f64; HOA_CH]> {
+    if n_rays == 0 || n_time_bins == 0 {
+        return vec![[0.0_f64; HOA_CH]; n_time_bins];
+    }
+    let per_ray: Vec<Vec<NativeArrival>> = (0..n_rays)
+        .map(|ray_id| {
+            trace_native_ray_band(geom, atm, src_m, ray_id, n_rays, max_bounces, seed, band)
+        })
+        .collect();
+    reduce_native_arrivals_at(
+        &per_ray,
+        atm,
+        n_time_bins,
+        bin_dt_s,
+        ROOM_BANDS_HZ[band.min(ROOM_BAND_COUNT - 1)],
+    )
+}
+
+/// Native CPU Monte Carlo Acoustic Ray Tracer (orders 4..=max_bounces) with
+/// Lambertian / ISO-17497 diffuse wall scattering, binning late directional energy
+/// into an Order-7 HOA (`64`-channel) impulse histogram ready for MagLS decoding.
+///
+/// This legacy single-band entry point evaluates the `1 kHz` octave
+/// ([`ROOM_BAND_MID`]) with the pre-ten-band broadband air-absorption reference
+/// ([`RAY_AIR_REFERENCE_HZ`]). It remains the compatibility slice used by the
+/// verifier and by the single-band CPU/GPU gates; the production hybrid tail
+/// uses [`raytrace_hoa_histogram_per_band`].
+///
+/// The CPU peer is an independent implementation (`trace_native_ray_band`):
+/// stratified equal-solid-angle launch, PCG64 streams, slab ray/box intersection,
+/// analytic ray/sphere receiver, Malley cosine-weighted scatter, and a chunked
+/// partial-sum reduction (`reduce_native_arrivals`). It shares only the physical
+/// specification with `raytrace_hoa.cu`, so the two paths agree within a measured
+/// Monte Carlo tolerance rather than bit-for-bit.
+///
+/// Parallelized across logical CPU cores via [`crate::util::par_map_indexed`]; the
+/// reduction association is fixed, so the output is bit-identical regardless of CPU
+/// core count or scheduling.
 #[allow(clippy::too_many_arguments)]
 pub fn raytrace_hoa_histogram(
     geom: &RoomGeometry,
@@ -1315,23 +2665,154 @@ pub fn raytrace_hoa_histogram(
     bin_dt_s: f64,
     seed: u64,
 ) -> Vec<[f64; HOA_CH]> {
-    let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
     if n_rays == 0 || n_time_bins == 0 {
-        return hist;
+        return vec![[0.0_f64; HOA_CH]; n_time_bins];
     }
-    let ray_init_energy = 1.0 / (n_rays as f64);
-    let c = atm.speed_of_sound_m_s();
     let per_ray = crate::util::par_map_indexed(n_rays, |ray_id| {
-        trace_single_ray(geom, atm, src_m, ray_id, ray_init_energy, max_bounces, seed)
+        trace_native_ray_band(
+            geom,
+            atm,
+            src_m,
+            ray_id,
+            n_rays,
+            max_bounces,
+            seed,
+            ROOM_BAND_MID,
+        )
     });
-    for hits in per_ray {
-        for (bounce, hit) in hits.iter().enumerate() {
+    // Legacy broadband air reference (2 kHz), preserving the pre-ten-band gate.
+    reduce_native_arrivals(&per_ray, atm, n_time_bins, bin_dt_s)
+}
+
+/// Ten-band native CPU Monte Carlo ray tracing (research doc §5 B1).
+///
+/// Every octave band owns an independent trace with its own wall absorption and
+/// ISO-17497 scattering probability. Bands share the per-ray random stream
+/// (common random numbers): where their scattering thresholds agree, paths
+/// coincide and only the band energy differs. Molecular air absorption is
+/// applied at the band centre, not at a single broadband reference. Returns one
+/// [`RoomBandHistogram`] per time bin (`hist[bin][band][channel]`).
+#[allow(clippy::too_many_arguments)]
+pub fn raytrace_hoa_histogram_per_band(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> Vec<RoomBandHistogram> {
+    let band_hists: Vec<Vec<[f64; HOA_CH]>> = (0..ROOM_BAND_COUNT)
+        .map(|band| {
+            raytrace_hoa_histogram_band(
+                geom,
+                atm,
+                src_m,
+                n_rays,
+                max_bounces,
+                n_time_bins,
+                bin_dt_s,
+                seed,
+                band,
+            )
+        })
+        .collect();
+    let mut rows = vec![[[0.0_f64; HOA_CH]; ROOM_BAND_COUNT]; n_time_bins];
+    for (bin, row) in rows.iter_mut().enumerate() {
+        for (dst, hist) in row.iter_mut().zip(&band_hists) {
+            *dst = hist[bin];
+        }
+    }
+    rows
+}
+
+/// Strictly single-threaded reference evaluation of
+/// [`raytrace_hoa_histogram_per_band`], used to verify thread-count invariance.
+#[allow(clippy::too_many_arguments)]
+pub fn raytrace_hoa_histogram_per_band_serial(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> Vec<RoomBandHistogram> {
+    let band_hists: Vec<Vec<[f64; HOA_CH]>> = (0..ROOM_BAND_COUNT)
+        .map(|band| {
+            raytrace_hoa_histogram_band_serial(
+                geom,
+                atm,
+                src_m,
+                n_rays,
+                max_bounces,
+                n_time_bins,
+                bin_dt_s,
+                seed,
+                band,
+            )
+        })
+        .collect();
+    let mut rows = vec![[[0.0_f64; HOA_CH]; ROOM_BAND_COUNT]; n_time_bins];
+    for (bin, row) in rows.iter_mut().enumerate() {
+        for (dst, hist) in row.iter_mut().zip(&band_hists) {
+            *dst = hist[bin];
+        }
+    }
+    rows
+}
+
+/// Run the GPU raytrace pass and rebuild the HOA histogram on the host. `Err` means
+/// the GPU pass itself failed, which lets a caller that must prove the kernel ran
+/// distinguish this from the deterministic CPU result.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn raytrace_hoa_histogram_on_runtime(
+    rt: &g6me_cuda::G6meCudaRuntime,
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> std::result::Result<Vec<[f64; HOA_CH]>, String> {
+    let c = atm.speed_of_sound_m_s();
+    // raytrace_hoa.cu uses the same RoomGeometry wall ordering
+    // (+x=0, -x=1, +y=2, -y=3, -z=4, +z=5), so the material tables pass through.
+    let wall_refl = std::array::from_fn(|idx| geom.walls[idx].refl_energy(ROOM_BAND_MID));
+    let wall_scatter = std::array::from_fn(|idx| geom.walls[idx].scatter(ROOM_BAND_MID));
+    let (delays, energies, dirs) = rt.run_raytrace_hoa_pass_with_scattering(
+        geom.dims_m,
+        src_m,
+        geom.listener_m,
+        wall_refl,
+        wall_scatter,
+        n_rays,
+        max_bounces,
+        c,
+        RAY_RECEIVER_RADIUS_M,
+        seed,
+    )?;
+    let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
+    // GPU-side reduction: the kernel's ray-major / bounce-ascending record layout is
+    // folded with one running accumulator. The CPU peer deliberately uses a different
+    // association (chunked partial sums), so parity is bounded by the measured
+    // Monte Carlo tolerance rather than by bit identity.
+    for ray_id in 0..n_rays {
+        let base = ray_id * max_bounces;
+        for bounce in 0..max_bounces {
+            let idx = base + bounce;
+            let inc = [dirs[idx * 3], dirs[idx * 3 + 1], dirs[idx * 3 + 2]];
             accumulate_hoa_hit(
                 &mut hist,
                 bounce,
-                hit.delay_s,
-                hit.energy,
-                hit.dir,
+                delays[idx],
+                energies[idx],
+                inc,
                 atm,
                 c,
                 n_time_bins,
@@ -1339,12 +2820,44 @@ pub fn raytrace_hoa_histogram(
             );
         }
     }
-    hist
+    Ok(hist)
 }
 
-/// Optional GPU-offloaded deterministic PCG64 Monte Carlo Acoustic Ray Tracer (`raytrace_hoa.cu`).
-/// Uses `g6me-cuda` when `use_cuda` is true and a live NVIDIA GPU is detected, otherwise falls
-/// back deterministically to [`raytrace_hoa_histogram`].
+/// GPU-only raytrace histogram: fails instead of falling back to the CPU. This is the
+/// entry point for parity checks that must prove the device kernel produced the
+/// result.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn raytrace_hoa_histogram_on_cuda(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> std::result::Result<Vec<[f64; HOA_CH]>, String> {
+    let rt = crate::blackwell::shared_cuda_runtime()
+        .ok_or_else(|| "CUDA runtime unavailable".to_string())?;
+    raytrace_hoa_histogram_on_runtime(
+        &rt,
+        geom,
+        atm,
+        src_m,
+        n_rays,
+        max_bounces,
+        n_time_bins,
+        bin_dt_s,
+        seed,
+    )
+}
+
+/// Optional GPU-offloaded deterministic Monte Carlo Acoustic Ray Tracer
+/// (`raytrace_hoa.cu`). Uses `g6me-cuda` when `use_cuda` is true and a live NVIDIA GPU
+/// is detected, otherwise falls back deterministically to the independent native CPU
+/// tracer [`raytrace_hoa_histogram`]. Every dispatch is recorded in
+/// [`crate::cuda_report`].
 #[allow(clippy::too_many_arguments)]
 pub fn raytrace_hoa_histogram_with_cuda(
     geom: &RoomGeometry,
@@ -1359,47 +2872,29 @@ pub fn raytrace_hoa_histogram_with_cuda(
 ) -> Vec<[f64; HOA_CH]> {
     #[cfg(feature = "cuda")]
     if use_cuda && n_rays > 0 && n_time_bins > 0 && max_bounces > 0 {
-        if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
-            let c = atm.speed_of_sound_m_s();
-            // raytrace_hoa.cu uses the same RoomGeometry wall ordering
-            // (+x=0, -x=1, +y=2, -y=3, -z=4, +z=5), so the material tables pass through.
-            let wall_refl =
-                std::array::from_fn(|idx| 1.0 - geom.walls[idx].absorption[3].clamp(0.01, 0.99));
-            let wall_scatter = std::array::from_fn(|idx| geom.walls[idx].scattering);
-            if let Ok((delays, energies, dirs)) = rt.run_raytrace_hoa_pass_with_scattering(
-                geom.dims_m,
+        match crate::blackwell::shared_cuda_runtime() {
+            Some(rt) => match raytrace_hoa_histogram_on_runtime(
+                &rt,
+                geom,
+                atm,
                 src_m,
-                geom.listener_m,
-                wall_refl,
-                wall_scatter,
                 n_rays,
                 max_bounces,
-                c,
-                0.45,
+                n_time_bins,
+                bin_dt_s,
                 seed,
             ) {
-                let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
-                // Same ray-major / bounce-ascending order and the same accumulator as the
-                // CPU path, so identical records produce a bit-identical histogram.
-                for ray_id in 0..n_rays {
-                    let base = ray_id * max_bounces;
-                    for bounce in 0..max_bounces {
-                        let idx = base + bounce;
-                        let inc = [dirs[idx * 3], dirs[idx * 3 + 1], dirs[idx * 3 + 2]];
-                        accumulate_hoa_hit(
-                            &mut hist,
-                            bounce,
-                            delays[idx],
-                            energies[idx],
-                            inc,
-                            atm,
-                            c,
-                            n_time_bins,
-                            bin_dt_s,
-                        );
-                    }
+                Ok(hist) => {
+                    crate::cuda_report::record_gpu(
+                        "raytrace-hoa",
+                        format!("{n_rays} rays x {max_bounces} bounces"),
+                    );
+                    return hist;
                 }
-                return hist;
+                Err(e) => crate::cuda_report::record_cpu_fallback("raytrace-hoa", e),
+            },
+            None => {
+                crate::cuda_report::record_cpu_fallback("raytrace-hoa", "CUDA runtime unavailable")
             }
         }
     }
@@ -1417,8 +2912,163 @@ pub fn raytrace_hoa_histogram_with_cuda(
     )
 }
 
+/// Run the GPU raytrace pass once per octave band and rebuild the ten-band HOA
+/// histogram on the host (research doc §5 B1).
+///
+/// `raytrace_hoa.cu` is the band-native peer: each launch receives that band's
+/// six wall reflection coefficients and six ISO-17497 scattering probabilities
+/// and applies them at every bounce. Bands share `seed` (common random numbers),
+/// so where their scattering thresholds agree the trajectories coincide and
+/// only the energy differs. The host reduction evaluates ISO 9613-1 molecular
+/// absorption at the band centre. `Err` means at least one GPU launch failed;
+/// no band is silently produced on the CPU.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn raytrace_hoa_histogram_per_band_on_runtime(
+    rt: &g6me_cuda::G6meCudaRuntime,
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> std::result::Result<Vec<RoomBandHistogram>, String> {
+    let c = atm.speed_of_sound_m_s();
+    let mut rows = vec![[[0.0_f64; HOA_CH]; ROOM_BAND_COUNT]; n_time_bins];
+    for band in 0..ROOM_BAND_COUNT {
+        let wall_refl = std::array::from_fn(|w| geom.walls[w].refl_energy(band));
+        let wall_scatter = std::array::from_fn(|w| geom.walls[w].scatter(band));
+        let (delays, energies, dirs) = rt.run_raytrace_hoa_pass_with_scattering(
+            geom.dims_m,
+            src_m,
+            geom.listener_m,
+            wall_refl,
+            wall_scatter,
+            n_rays,
+            max_bounces,
+            c,
+            RAY_RECEIVER_RADIUS_M,
+            seed,
+        )?;
+        let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
+        for ray_id in 0..n_rays {
+            let base = ray_id * max_bounces;
+            for bounce in 0..max_bounces {
+                let idx = base + bounce;
+                let inc = [dirs[idx * 3], dirs[idx * 3 + 1], dirs[idx * 3 + 2]];
+                accumulate_hoa_hit_at(
+                    &mut hist,
+                    bounce,
+                    delays[idx],
+                    energies[idx],
+                    inc,
+                    atm,
+                    c,
+                    ROOM_BANDS_HZ[band],
+                    n_time_bins,
+                    bin_dt_s,
+                );
+            }
+        }
+        for (bin, row) in hist.iter().enumerate() {
+            rows[bin][band] = *row;
+        }
+    }
+    Ok(rows)
+}
+
+/// GPU-only ten-band raytrace histogram: fails instead of falling back to the CPU.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn raytrace_hoa_histogram_per_band_on_cuda(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+) -> std::result::Result<Vec<RoomBandHistogram>, String> {
+    let rt = crate::blackwell::shared_cuda_runtime()
+        .ok_or_else(|| "CUDA runtime unavailable".to_string())?;
+    raytrace_hoa_histogram_per_band_on_runtime(
+        &rt,
+        geom,
+        atm,
+        src_m,
+        n_rays,
+        max_bounces,
+        n_time_bins,
+        bin_dt_s,
+        seed,
+    )
+}
+
+/// Optional GPU-offloaded ten-band Monte Carlo ray tracing. Uses the per-band
+/// `raytrace_hoa.cu` launches when `use_cuda` is true and a live NVIDIA GPU is
+/// detected, otherwise falls back deterministically to
+/// [`raytrace_hoa_histogram_per_band`]. Every dispatch is recorded in
+/// [`crate::cuda_report`].
+#[allow(clippy::too_many_arguments)]
+pub fn raytrace_hoa_histogram_per_band_with_cuda(
+    geom: &RoomGeometry,
+    atm: &AtmosphereCfg,
+    src_m: [f64; 3],
+    n_rays: usize,
+    max_bounces: usize,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+    seed: u64,
+    use_cuda: bool,
+) -> Vec<RoomBandHistogram> {
+    #[cfg(feature = "cuda")]
+    if use_cuda && n_rays > 0 && n_time_bins > 0 && max_bounces > 0 {
+        match crate::blackwell::shared_cuda_runtime() {
+            Some(rt) => match raytrace_hoa_histogram_per_band_on_runtime(
+                &rt,
+                geom,
+                atm,
+                src_m,
+                n_rays,
+                max_bounces,
+                n_time_bins,
+                bin_dt_s,
+                seed,
+            ) {
+                Ok(hist) => {
+                    crate::cuda_report::record_gpu(
+                        "raytrace-hoa-bands",
+                        format!("{ROOM_BAND_COUNT} bands x {n_rays} rays x {max_bounces} bounces"),
+                    );
+                    return hist;
+                }
+                Err(e) => crate::cuda_report::record_cpu_fallback("raytrace-hoa-bands", e),
+            },
+            None => crate::cuda_report::record_cpu_fallback(
+                "raytrace-hoa-bands",
+                "CUDA runtime unavailable",
+            ),
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = use_cuda;
+    raytrace_hoa_histogram_per_band(
+        geom,
+        atm,
+        src_m,
+        n_rays,
+        max_bounces,
+        n_time_bins,
+        bin_dt_s,
+        seed,
+    )
+}
+
 /// Strictly single-threaded reference evaluation of [`raytrace_hoa_histogram`] (used to
-/// verify bit-for-bit thread-count invariance).
+/// verify bit-for-bit thread-count invariance of the native CPU tracer).
 #[allow(clippy::too_many_arguments)]
 pub fn raytrace_hoa_histogram_serial(
     geom: &RoomGeometry,
@@ -1430,29 +3080,24 @@ pub fn raytrace_hoa_histogram_serial(
     bin_dt_s: f64,
     seed: u64,
 ) -> Vec<[f64; HOA_CH]> {
-    let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
     if n_rays == 0 || n_time_bins == 0 {
-        return hist;
+        return vec![[0.0_f64; HOA_CH]; n_time_bins];
     }
-    let ray_init_energy = 1.0 / (n_rays as f64);
-    let c = atm.speed_of_sound_m_s();
-    for ray_id in 0..n_rays {
-        let hits = trace_single_ray(geom, atm, src_m, ray_id, ray_init_energy, max_bounces, seed);
-        for (bounce, hit) in hits.iter().enumerate() {
-            accumulate_hoa_hit(
-                &mut hist,
-                bounce,
-                hit.delay_s,
-                hit.energy,
-                hit.dir,
+    let per_ray: Vec<Vec<NativeArrival>> = (0..n_rays)
+        .map(|ray_id| {
+            trace_native_ray_band(
+                geom,
                 atm,
-                c,
-                n_time_bins,
-                bin_dt_s,
-            );
-        }
-    }
-    hist
+                src_m,
+                ray_id,
+                n_rays,
+                max_bounces,
+                seed,
+                ROOM_BAND_MID,
+            )
+        })
+        .collect();
+    reduce_native_arrivals(&per_ray, atm, n_time_bins, bin_dt_s)
 }
 
 /// Synthesize a complete **Hybrid 3D Room BRIR** (`spec_l_add`, `spec_r_add`) for a virtual
@@ -1461,7 +3106,7 @@ pub fn raytrace_hoa_histogram_serial(
 /// 2. Analytic BTM edge diffraction around room/desk edges,
 /// 3. Reciprocal 3D FDTD modal room response below `500 Hz` (passed in from the 2-run
 ///    acoustic-reciprocity FDTD cache),
-/// 4. Deterministic PCG64 Monte Carlo ray-traced Order-7 HOA late reflections decoded via MagLS,
+/// 4. Deterministic native Monte Carlo ray-traced Order-7 HOA late reflections decoded via MagLS,
 ///    optionally enriched with Paraunitary Scattering FDN + Velvet Noise diffusion!
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize_hybrid_room_reflections(
@@ -1502,7 +3147,8 @@ pub fn synthesize_hybrid_room_reflections(
 }
 
 /// Same as [`synthesize_hybrid_room_reflections`] with opt-in zero-FMA CUDA GPU offload for
-/// stochastic PCG64 ray tracing (`raytrace_hoa.cu`).
+/// stochastic ray tracing (`raytrace_hoa.cu`; GPU path is the CUDA peer of the native CPU
+/// tracer, parity bounded by a measured Monte Carlo tolerance).
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize_hybrid_room_reflections_with_cuda(
     geom: &RoomGeometry,
@@ -1624,7 +3270,7 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
         }
     }
 
-    // 3. Layer 1b: Parallel deterministic PCG64 Monte Carlo Ray Tracing ->
+    // 3. Layer 1b: Parallel deterministic native Monte Carlo Ray Tracing ->
     //    time-varying Order-7 HOA spatial-temporal histogram (`4 ms` bins across `tail_dur`)
     //    decoded through MagLS in 4 directional time zones modulated by the measured ray-traced
     //    energy envelope + Paraunitary Scattering FDN / ternary Velvet Noise diffusion.
@@ -1634,7 +3280,7 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
         RoomQuality::Preview => (2_048usize, 48usize),
         RoomQuality::Production => (50_000usize, 72usize),
     };
-    let hist = raytrace_hoa_histogram_with_cuda(
+    let hist_bands = raytrace_hoa_histogram_per_band_with_cuda(
         geom,
         atm,
         src_m,
@@ -1645,11 +3291,17 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
         seed,
         use_cuda,
     );
-    let bin_energies: Vec<f64> = hist
-        .iter()
-        .map(|b| b.iter().map(|x| x * x).sum::<f64>().sqrt())
-        .collect();
-    let max_bin_e = bin_energies.iter().copied().fold(0.0_f64, f64::max);
+    // Per-band W-channel energy envelope and its global maximum (one common
+    // normalisation, so the relative decay of the bands is preserved).
+    let mut band_bin_energies = vec![vec![0.0_f64; n_bins]; ROOM_BAND_COUNT];
+    let mut max_bin_e = 0.0_f64;
+    for (t, row) in hist_bands.iter().enumerate() {
+        for band in 0..ROOM_BAND_COUNT {
+            let e = row[band].iter().map(|x| x * x).sum::<f64>().sqrt();
+            band_bin_energies[band][t] = e;
+            max_bin_e = max_bin_e.max(e);
+        }
+    }
 
     if max_bin_e > 1e-12 {
         let tail_len = ((tail_dur * fs).round() as usize).min(n_fft.saturating_sub(512));
@@ -1680,6 +3332,14 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
             (bl, br)
         };
 
+        // Octave-band spectral partition: adjacent triangular weights sum to
+        // one at every frequency, so the per-band tails combine into the same
+        // overall tail level the single-band renderer used.
+        let band_weights: Vec<[f64; ROOM_BAND_COUNT]> = freqs
+            .iter()
+            .map(|&f| std::array::from_fn(|band| octave_band_weight(f, band)))
+            .collect();
+
         const N_ZONES: usize = 4;
         let bins_per_zone = n_bins / N_ZONES;
         let pre_smp = ((pre_delay_s + 0.012) * fs).round() as usize;
@@ -1696,56 +3356,76 @@ pub fn synthesize_hybrid_room_reflections_with_cuda(
             } else {
                 (z + 1) * bins_per_zone
             };
-            let mut sh_zone = [0.0_f64; HOA_CH];
-            for row in hist.iter().take(b1).skip(b0) {
-                for (acc, &val) in sh_zone.iter_mut().zip(row.iter()) {
-                    *acc += val;
-                }
-            }
-            let z_norm = sh_zone.iter().map(|x| x * x).sum::<f64>().sqrt();
-            if z_norm <= 1e-12 {
-                continue;
-            }
-            for x in &mut sh_zone {
-                *x /= z_norm;
-            }
-            let (hl_hoa, hr_hoa) = magls.decode_sh_spectrum(&sh_zone);
-
-            zone_l.fill(0.0);
-            zone_r.fill(0.0);
-            let s0 = ((b0 as f64) * bin_dt_s * fs).round() as usize;
-            let s1 = (((b1 as f64) * bin_dt_s * fs).round() as usize).min(tail_len);
-            let xfade = ((0.004 * fs).round() as usize).max(16);
-            for i in s0..s1 {
-                let dst = pre_smp + i;
-                if dst >= n_fft {
-                    break;
-                }
-                let bin_idx = (((i as f64) / fs) / bin_dt_s).floor() as usize;
-                let e_rel = (bin_energies[bin_idx.min(n_bins - 1)] / max_bin_e)
-                    .sqrt()
-                    .clamp(0.15, 1.0);
-                // Raised-cosine zone edge fade prevents clicks between HOA spatial zones.
-                let mut win = 1.0_f64;
-                if z > 0 && i - s0 < xfade {
-                    win *= 0.5 * (1.0 - (PI * ((i - s0) as f64) / (xfade as f64)).cos());
-                }
-                if z + 1 < N_ZONES && s1 - i <= xfade {
-                    win *= 0.5 * (1.0 - (PI * ((s1 - i) as f64) / (xfade as f64)).cos());
-                }
-                zone_l[dst] = base_l[i] * e_rel * win;
-                zone_r[dst] = base_r[i] * e_rel * win;
-            }
-
-            plan.rfft(&zone_l, &mut scratch, &mut sl_zone);
-            plan.rfft(&zone_r, &mut scratch, &mut sr_zone);
             let zone_dist_m = d_dir + (0.5 * ((b0 + b1) as f64) * bin_dt_s) * c;
-            for (k, &f) in freqs.iter().enumerate() {
-                let x_hp = f / f_xover.max(200.0);
-                let hp = (x_hp * x_hp) / (1.0 + x_hp * x_hp);
-                let air = atm.air_gain_linear(f, zone_dist_m.min(60.0));
-                out_l[k] = out_l[k].add(sl_zone[k].mul(hl_hoa[k]).scale(0.18 * hp * air));
-                out_r[k] = out_r[k].add(sr_zone[k].mul(hr_hoa[k]).scale(0.18 * hp * air));
+            // High-pass (FDTD owns the modal band) and ISO 9613-1 air gain at
+            // this zone's mean travelled distance; band-independent.
+            let hp_air: Vec<f64> = freqs
+                .iter()
+                .map(|&f| {
+                    let x_hp = f / f_xover.max(200.0);
+                    let hp = (x_hp * x_hp) / (1.0 + x_hp * x_hp);
+                    hp * atm.air_gain_linear(f, zone_dist_m.min(60.0))
+                })
+                .collect();
+
+            for band in 0..ROOM_BAND_COUNT {
+                // A band with no recorded late energy contributes nothing; skip
+                // its FFT rather than render a silent zone.
+                if band_bin_energies[band].iter().all(|&e| e <= 1e-300) {
+                    continue;
+                }
+                let mut sh_zone = [0.0_f64; HOA_CH];
+                for row in hist_bands.iter().take(b1).skip(b0) {
+                    for (acc, &val) in sh_zone.iter_mut().zip(row[band].iter()) {
+                        *acc += val;
+                    }
+                }
+                let z_norm = sh_zone.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if z_norm <= 1e-12 {
+                    continue;
+                }
+                for x in &mut sh_zone {
+                    *x /= z_norm;
+                }
+                let (hl_hoa, hr_hoa) = magls.decode_sh_spectrum(&sh_zone);
+
+                zone_l.fill(0.0);
+                zone_r.fill(0.0);
+                let s0 = ((b0 as f64) * bin_dt_s * fs).round() as usize;
+                let s1 = (((b1 as f64) * bin_dt_s * fs).round() as usize).min(tail_len);
+                let xfade = ((0.004 * fs).round() as usize).max(16);
+                for i in s0..s1 {
+                    let dst = pre_smp + i;
+                    if dst >= n_fft {
+                        break;
+                    }
+                    let bin_idx = (((i as f64) / fs) / bin_dt_s).floor() as usize;
+                    let e_rel = (band_bin_energies[band][bin_idx.min(n_bins - 1)] / max_bin_e)
+                        .sqrt()
+                        .clamp(0.15, 1.0);
+                    // Raised-cosine zone edge fade prevents clicks between HOA spatial zones.
+                    let mut win = 1.0_f64;
+                    if z > 0 && i - s0 < xfade {
+                        win *= 0.5 * (1.0 - (PI * ((i - s0) as f64) / (xfade as f64)).cos());
+                    }
+                    if z + 1 < N_ZONES && s1 - i <= xfade {
+                        win *= 0.5 * (1.0 - (PI * ((s1 - i) as f64) / (xfade as f64)).cos());
+                    }
+                    zone_l[dst] = base_l[i] * e_rel * win;
+                    zone_r[dst] = base_r[i] * e_rel * win;
+                }
+
+                plan.rfft(&zone_l, &mut scratch, &mut sl_zone);
+                plan.rfft(&zone_r, &mut scratch, &mut sr_zone);
+                for (k, _f) in freqs.iter().enumerate() {
+                    let w = band_weights[k][band];
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let scale = 0.18 * hp_air[k] * w;
+                    out_l[k] = out_l[k].add(sl_zone[k].mul(hl_hoa[k]).scale(scale));
+                    out_r[k] = out_r[k].add(sr_zone[k].mul(hr_hoa[k]).scale(scale));
+                }
             }
         }
     }
@@ -1922,7 +3602,7 @@ mod tests {
     }
 
     #[test]
-    fn pcg64_raytracer_is_bit_exact_and_populates_order7_hoa_histogram() {
+    fn native_raytracer_is_thread_count_invariant_and_populates_order7_hoa_histogram() {
         let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
         let atm = AtmosphereCfg::default();
         let src = [4.3, 3.5, 1.25];
@@ -1931,11 +3611,11 @@ mod tests {
             raytrace_hoa_histogram_serial(&geom, &atm, src, 512, 24, 24, 0.004, 0xCAFE_BABE);
         assert_eq!(h_par.len(), h_ser.len());
         for (b, (rp, rs)) in h_par.iter().zip(&h_ser).enumerate() {
-            for c in 0..HOA_CH {
+            for (c, (&x, &y)) in rp.iter().zip(rs.iter()).enumerate() {
                 assert_eq!(
-                    rp[c].to_bits(),
-                    rs[c].to_bits(),
-                    "parallel vs serial PCG64 raytracer bit mismatch at bin={b} ch={c}"
+                    x.to_bits(),
+                    y.to_bits(),
+                    "native raytracer parallel vs serial bit mismatch at bin={b} ch={c}"
                 );
             }
         }
@@ -1944,55 +3624,449 @@ mod tests {
             tot_w > 1e-6,
             "ray tracer recorded zero HOA W-channel energy"
         );
+        // The seed must actually drive the PCG64 streams: a seed-plumbing regression
+        // would otherwise leave this deterministic tracer silently seed-independent.
+        let h_other = raytrace_hoa_histogram(&geom, &atm, src, 512, 24, 24, 0.004, 0xCAFE_BABF);
+        assert!(
+            h_par.iter().zip(&h_other).any(|(a, b)| a
+                .iter()
+                .zip(b.iter())
+                .any(|(&x, &y)| x.to_bits() != y.to_bits())),
+            "native raytracer ignored the seed"
+        );
     }
 
-    /// Compare two full HOA histograms channel by channel and return
-    /// `(max_abs_diff, mismatched_bit_patterns)`.
+    /// Physical agreement metrics between two HOA histograms. Cell-by-cell L1 is not
+    /// usable: the observable has `n_bins × 64` mostly-sparse cells, far more than the
+    /// number of late receiver hits, so two independent Monte Carlo streams disagree on
+    /// most fine cells even with identical physics. These aggregates are the physical
+    /// quantities the two peers must reproduce:
+    ///
+    /// * `max_abs_cell` — largest absolute per-(bin, channel) difference (reported only).
+    /// * `rel_w_total` — relative difference of total omnidirectional W energy
+    ///   (`W = channel 0 = 1` for N3D Order-0 SH, so `Σ_t h[t][0]` is captured energy).
+    /// * `band_l1` — L1 distance between the normalized W-energy temporal envelopes in
+    ///   `n_bands` equal-width time bands (`Σ_b |p_cpu[b] - p_gpu[b]|` with each
+    ///   envelope normalized to unit sum).
+    /// * `chan_l1` — L1 distance between the normalized directional distributions
+    ///   `E_c / E_0` over all 64 HOA channels, with `E_c = Σ_t h[t][c]`. This is
+    ///   reported but not gated: the higher-order moments of a diffuse late field are
+    ///   zero-mean, so two independent streams differ there by pure √N noise.
+    /// * `order_l1` — L1 distance between the normalized per-SH-order powers
+    ///   `P_n = Σ_{c∈order n} E_c²`. Aggregating `2n+1` channels per order makes this
+    ///   the directional-HOA statistic that carries a reproducible signal.
+    /// * `mean_t_diff_s` — absolute difference of the energy-weighted mean arrival time
+    ///   `Σ_b t_b W_b / Σ_b W_b` (bin centers). The 8-band envelope is nearly flat across
+    ///   the mixing time, so it is insensitive to a global timing offset; this metric
+    ///   pins the time axis on which both peers must agree.
     #[cfg(feature = "cuda")]
-    fn histogram_delta(cpu: &[[f64; HOA_CH]], gpu: &[[f64; HOA_CH]]) -> (f64, usize) {
-        let mut max_diff = 0.0_f64;
-        let mut mismatched = 0usize;
+    #[derive(Debug, Clone, Copy, Default)]
+    struct HistAgreement {
+        max_abs_cell: f64,
+        rel_w_total: f64,
+        band_l1: f64,
+        chan_l1: f64,
+        order_l1: f64,
+        mean_t_diff_s: f64,
+    }
+
+    #[cfg(feature = "cuda")]
+    fn histogram_agreement(
+        cpu: &[[f64; HOA_CH]],
+        gpu: &[[f64; HOA_CH]],
+        n_bands: usize,
+        bin_dt_s: f64,
+    ) -> HistAgreement {
+        let n_bins = cpu.len();
+        let mut max_abs_cell = 0.0_f64;
+        let mut w_cpu = 0.0_f64;
+        let mut w_gpu = 0.0_f64;
+        let mut tw_cpu = 0.0_f64;
+        let mut tw_gpu = 0.0_f64;
+        let mut e_cpu = [0.0_f64; HOA_CH];
+        let mut e_gpu = [0.0_f64; HOA_CH];
         for (bin, (a, b)) in cpu.iter().zip(gpu).enumerate() {
-            for c in 0..HOA_CH {
-                let d = (a[c] - b[c]).abs();
-                if d > max_diff {
-                    max_diff = d;
-                }
-                if a[c].to_bits() != b[c].to_bits() {
-                    mismatched += 1;
-                    assert!(
-                        d < 1e-12,
-                        "CPU/GPU raytrace histogram mismatch at bin={bin} ch={c}: \
-                         cpu={:e} gpu={:e} |d|={d:e}",
-                        a[c],
-                        b[c]
-                    );
-                }
+            for (c, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+                max_abs_cell = max_abs_cell.max((x - y).abs());
+                e_cpu[c] += x;
+                e_gpu[c] += y;
+            }
+            let t = (bin as f64 + 0.5) * bin_dt_s;
+            w_cpu += a[0];
+            w_gpu += b[0];
+            tw_cpu += t * a[0];
+            tw_gpu += t * b[0];
+        }
+        let mean_t_diff_s =
+            (tw_cpu / w_cpu.max(f64::MIN_POSITIVE) - tw_gpu / w_gpu.max(f64::MIN_POSITIVE)).abs();
+        let band_of = |bin: usize| (bin * n_bands / n_bins.max(1)).min(n_bands - 1);
+        let mut band_cpu = vec![0.0_f64; n_bands];
+        let mut band_gpu = vec![0.0_f64; n_bands];
+        for (bin, (a, b)) in cpu.iter().zip(gpu).enumerate() {
+            band_cpu[band_of(bin)] += a[0];
+            band_gpu[band_of(bin)] += b[0];
+        }
+        let sum_c: f64 = band_cpu.iter().sum();
+        let sum_g: f64 = band_gpu.iter().sum();
+        let band_l1 = band_cpu
+            .iter()
+            .zip(&band_gpu)
+            .map(|(a, b)| {
+                (a / sum_c.max(f64::MIN_POSITIVE) - b / sum_g.max(f64::MIN_POSITIVE)).abs()
+            })
+            .sum();
+        let chan_l1 = e_cpu
+            .iter()
+            .zip(&e_gpu)
+            .map(|(a, b)| {
+                (a / w_cpu.max(f64::MIN_POSITIVE) - b / w_gpu.max(f64::MIN_POSITIVE)).abs()
+            })
+            .sum();
+        let mut order_cpu = [0.0_f64; 8];
+        let mut order_gpu = [0.0_f64; 8];
+        for n in 0..8usize {
+            for c in n * n..(n + 1) * (n + 1) {
+                order_cpu[n] += e_cpu[c] * e_cpu[c];
+                order_gpu[n] += e_gpu[c] * e_gpu[c];
             }
         }
-        (max_diff, mismatched)
+        let p_cpu: f64 = order_cpu.iter().sum();
+        let p_gpu: f64 = order_gpu.iter().sum();
+        let order_l1 = order_cpu
+            .iter()
+            .zip(&order_gpu)
+            .map(|(a, b)| {
+                (a / p_cpu.max(f64::MIN_POSITIVE) - b / p_gpu.max(f64::MIN_POSITIVE)).abs()
+            })
+            .sum();
+        HistAgreement {
+            max_abs_cell,
+            rel_w_total: (w_cpu - w_gpu).abs()
+                / w_cpu.abs().max(w_gpu.abs()).max(f64::MIN_POSITIVE),
+            band_l1,
+            chan_l1,
+            order_l1,
+            mean_t_diff_s,
+        }
     }
 
-    /// Live CPU-vs-GPU bit-exactness of the stochastic raytrace -> Order-7 HOA histogram,
+    /// Bit-exact oracle histogram from the test-only kernel mirror.
+    #[cfg(all(test, feature = "cuda"))]
+    #[allow(clippy::too_many_arguments)]
+    fn oracle_raytrace_hoa_histogram(
+        geom: &RoomGeometry,
+        atm: &AtmosphereCfg,
+        src_m: [f64; 3],
+        n_rays: usize,
+        max_bounces: usize,
+        n_time_bins: usize,
+        bin_dt_s: f64,
+        seed: u64,
+    ) -> Vec<[f64; HOA_CH]> {
+        let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
+        let c = atm.speed_of_sound_m_s();
+        let ray_init_energy = 1.0 / (n_rays as f64);
+        for ray_id in 0..n_rays {
+            let hits =
+                trace_single_ray(geom, atm, src_m, ray_id, ray_init_energy, max_bounces, seed);
+            for (bounce, hit) in hits.iter().enumerate() {
+                accumulate_hoa_hit(
+                    &mut hist,
+                    bounce,
+                    hit.delay_s,
+                    hit.energy,
+                    hit.dir,
+                    atm,
+                    c,
+                    n_time_bins,
+                    bin_dt_s,
+                );
+            }
+        }
+        hist
+    }
+
+    /// Live CPU-vs-GPU agreement of the stochastic raytrace -> Order-7 HOA histogram,
     /// with the production Control Room ISO-17497 scattering coefficients (0.15–0.78)
-    /// active on every wall. Skips cleanly when no NVIDIA GPU is present.
+    /// active on every wall.
+    ///
+    /// The CPU path is the independent native tracer ([`trace_native_ray`]: stratified
+    /// equal-solid-angle launch, PCG64, slab intersection, ray/sphere receiver, chunked
+    /// reduction); the GPU path is the zero-FMA `raytrace_hoa.cu` kernel. The two Monte
+    /// Carlo streams are independent, so bit identity is neither expected nor claimed.
+    /// The gate bounds the sampling envelope measured across the seeds below, plus a
+    /// stated margin. Skips cleanly when no NVIDIA GPU is present.
     #[cfg(all(test, feature = "cuda"))]
     #[test]
-    fn cuda_raytrace_hoa_histogram_is_bit_identical_to_cpu() {
+    fn cuda_raytrace_hoa_histogram_agrees_with_native_cpu_within_measured_tolerance() {
         if crate::blackwell::shared_cuda_runtime().is_none() {
             eprintln!(
-                "SKIP cuda_raytrace_hoa_histogram_is_bit_identical_to_cpu: \
+                "SKIP cuda_raytrace_hoa_histogram_agrees_with_native_cpu_within_measured_tolerance: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        const SEEDS: [u64; 8] = [
+            0xCAFE_BABE,
+            0x5EED_1234,
+            0x0D15_EA5E,
+            0x6736_4D45_5241_5954,
+            0x0123_4567_89AB_CDEF,
+            0xA5A5_5A5A_5A5A_A5A5,
+            0x0BAD_C0DE_F00D_D00D,
+            0x1357_9BDF_2468_ACE0,
+        ];
+        const N_BANDS: usize = 8;
+        // Measured worst over the 8 seeds at this exact configuration (65 536 rays x
+        // 24 bounces): rel W total = 0.0526, band L1 = 0.0688, order L1 = 0.0995
+        // (RTX 5070, 2026-11-28). Bounds = 1.5 x measured max + 0.02 absolute margin
+        // for seed-to-seed Monte Carlo scatter.
+        const MAX_REL_W_TOTAL_TOL: f64 = 0.13;
+        const MAX_BAND_L1_TOL: f64 = 0.13;
+        const MAX_ORDER_L1_TOL: f64 = 0.18;
+        // Energy-weighted mean arrival time must agree far more tightly than the
+        // envelope: the worst of the 8 seeds is 0.32 ms, so the bound is
+        // 1.5 x 0.32 ms + 1.0 ms margin, rounded up to 1.5 ms. This pins the time axis
+        // the coarse band envelope leaves loose.
+        const MAX_MEAN_T_DIFF_TOL: f64 = 0.0015;
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.25];
+        let (n_rays, max_bounces, n_bins, bin_dt_s) = (65_536usize, 24usize, 128usize, 0.002_f64);
+
+        let mut worst = HistAgreement::default();
+        for &seed in &SEEDS {
+            let h_cpu = raytrace_hoa_histogram(
+                &geom,
+                &atm,
+                src,
+                n_rays,
+                max_bounces,
+                n_bins,
+                bin_dt_s,
+                seed,
+            );
+            let h_gpu = raytrace_hoa_histogram_on_cuda(
+                &geom,
+                &atm,
+                src,
+                n_rays,
+                max_bounces,
+                n_bins,
+                bin_dt_s,
+                seed,
+            )
+            .unwrap_or_else(|e| panic!("direct GPU kernel path failed for seed {seed:#x}: {e}"));
+            let m = histogram_agreement(&h_cpu, &h_gpu, N_BANDS, bin_dt_s);
+            eprintln!(
+                "ControlRoom seed={seed:#x}: max cell |d| = {:.3e}, rel W total = {:.4}, \
+                 band L1 = {:.4}, chan L1 = {:.4}, order L1 = {:.4}, mean t |d| = {:.2} ms \
+                 ({n_rays} rays x {max_bounces} bounces x {n_bins} bins)",
+                m.max_abs_cell,
+                m.rel_w_total,
+                m.band_l1,
+                m.chan_l1,
+                m.order_l1,
+                m.mean_t_diff_s * 1e3
+            );
+            worst.max_abs_cell = worst.max_abs_cell.max(m.max_abs_cell);
+            worst.rel_w_total = worst.rel_w_total.max(m.rel_w_total);
+            worst.band_l1 = worst.band_l1.max(m.band_l1);
+            worst.chan_l1 = worst.chan_l1.max(m.chan_l1);
+            worst.order_l1 = worst.order_l1.max(m.order_l1);
+            worst.mean_t_diff_s = worst.mean_t_diff_s.max(m.mean_t_diff_s);
+        }
+        eprintln!(
+            "ControlRoom worst over {} seeds: max cell |d| = {:.3e}, rel W total = {:.4} \
+             (tol {MAX_REL_W_TOTAL_TOL}), band L1 = {:.4} (tol {MAX_BAND_L1_TOL}), chan L1 = \
+             {:.4}, order L1 = {:.4} (tol {MAX_ORDER_L1_TOL}), mean t |d| = {:.2} ms (tol {:.1} \
+             ms)",
+            SEEDS.len(),
+            worst.max_abs_cell,
+            worst.rel_w_total,
+            worst.band_l1,
+            worst.chan_l1,
+            worst.order_l1,
+            worst.mean_t_diff_s * 1e3,
+            MAX_MEAN_T_DIFF_TOL * 1e3
+        );
+        assert!(
+            worst.rel_w_total < MAX_REL_W_TOTAL_TOL,
+            "native CPU vs GPU raytrace W-energy rel diff = {:.4} >= {MAX_REL_W_TOTAL_TOL}",
+            worst.rel_w_total
+        );
+        assert!(
+            worst.band_l1 < MAX_BAND_L1_TOL,
+            "native CPU vs GPU raytrace temporal-envelope L1 = {:.4} >= {MAX_BAND_L1_TOL}",
+            worst.band_l1
+        );
+        assert!(
+            worst.order_l1 < MAX_ORDER_L1_TOL,
+            "native CPU vs GPU raytrace per-order power L1 = {:.4} >= {MAX_ORDER_L1_TOL}",
+            worst.order_l1
+        );
+        assert!(
+            worst.mean_t_diff_s < MAX_MEAN_T_DIFF_TOL,
+            "native CPU vs GPU raytrace mean arrival-time diff = {:.3} ms >= {:.1} ms",
+            worst.mean_t_diff_s * 1e3,
+            MAX_MEAN_T_DIFF_TOL * 1e3
+        );
+        assert!(
+            worst.max_abs_cell.is_finite(),
+            "CPU/GPU histogram comparison produced a non-finite cell difference"
+        );
+    }
+
+    /// Second live agreement scenario: large theater stage (different geometry, wall
+    /// reflectances and scattering probabilities).
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn cuda_raytrace_hoa_histogram_agrees_with_native_cpu_on_theater_stage() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP cuda_raytrace_hoa_histogram_agrees_with_native_cpu_on_theater_stage: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        const SEEDS: [u64; 8] = [
+            0xCAFE_BABE,
+            0x5EED_1234,
+            0x0D15_EA5E,
+            0x6736_4D45_5241_5954,
+            0x0123_4567_89AB_CDEF,
+            0xA5A5_5A5A_5A5A_A5A5,
+            0x0BAD_C0DE_F00D_D00D,
+            0x1357_9BDF_2468_ACE0,
+        ];
+        const N_BANDS: usize = 8;
+        // Measured worst over the 8 seeds at this exact configuration (65 536 rays x
+        // 16 bounces): rel W total = 0.0673, band L1 = 0.0631, order L1 = 0.0571
+        // (RTX 5070, 2026-11-28). Bounds = 1.5 x measured max + 0.02 absolute margin
+        // for seed-to-seed Monte Carlo scatter.
+        const MAX_REL_W_TOTAL_TOL: f64 = 0.13;
+        const MAX_BAND_L1_TOL: f64 = 0.13;
+        const MAX_ORDER_L1_TOL: f64 = 0.18;
+        // Energy-weighted mean arrival time: the worst of the 8 seeds is 1.06 ms, so the
+        // bound is 1.5 x 1.06 ms + 1.0 ms margin, rounded up to 2.6 ms.
+        const MAX_MEAN_T_DIFF_TOL: f64 = 0.0026;
+        let geom = RoomGeometry::from_preset(RoomPreset::TheaterStage);
+        let atm = AtmosphereCfg::default();
+        let src = [6.2, 4.0, 1.35];
+        let (n_rays, max_bounces, n_bins, bin_dt_s) = (65_536usize, 16usize, 128usize, 0.002_f64);
+
+        let mut worst = HistAgreement::default();
+        for &seed in &SEEDS {
+            let h_cpu = raytrace_hoa_histogram(
+                &geom,
+                &atm,
+                src,
+                n_rays,
+                max_bounces,
+                n_bins,
+                bin_dt_s,
+                seed,
+            );
+            let h_gpu = raytrace_hoa_histogram_on_cuda(
+                &geom,
+                &atm,
+                src,
+                n_rays,
+                max_bounces,
+                n_bins,
+                bin_dt_s,
+                seed,
+            )
+            .unwrap_or_else(|e| panic!("direct GPU kernel path failed for seed {seed:#x}: {e}"));
+            let m = histogram_agreement(&h_cpu, &h_gpu, N_BANDS, bin_dt_s);
+            eprintln!(
+                "TheaterStage seed={seed:#x}: max cell |d| = {:.3e}, rel W total = {:.4}, \
+                 band L1 = {:.4}, chan L1 = {:.4}, order L1 = {:.4}, mean t |d| = {:.2} ms \
+                 ({n_rays} rays x {max_bounces} bounces x {n_bins} bins)",
+                m.max_abs_cell,
+                m.rel_w_total,
+                m.band_l1,
+                m.chan_l1,
+                m.order_l1,
+                m.mean_t_diff_s * 1e3
+            );
+            worst.max_abs_cell = worst.max_abs_cell.max(m.max_abs_cell);
+            worst.rel_w_total = worst.rel_w_total.max(m.rel_w_total);
+            worst.band_l1 = worst.band_l1.max(m.band_l1);
+            worst.chan_l1 = worst.chan_l1.max(m.chan_l1);
+            worst.order_l1 = worst.order_l1.max(m.order_l1);
+            worst.mean_t_diff_s = worst.mean_t_diff_s.max(m.mean_t_diff_s);
+        }
+        eprintln!(
+            "TheaterStage worst over {} seeds: max cell |d| = {:.3e}, rel W total = {:.4} \
+             (tol {MAX_REL_W_TOTAL_TOL}), band L1 = {:.4} (tol {MAX_BAND_L1_TOL}), chan L1 = \
+             {:.4}, order L1 = {:.4} (tol {MAX_ORDER_L1_TOL}), mean t |d| = {:.2} ms (tol {:.1} \
+             ms)",
+            SEEDS.len(),
+            worst.max_abs_cell,
+            worst.rel_w_total,
+            worst.band_l1,
+            worst.chan_l1,
+            worst.order_l1,
+            worst.mean_t_diff_s * 1e3,
+            MAX_MEAN_T_DIFF_TOL * 1e3
+        );
+        assert!(
+            worst.rel_w_total < MAX_REL_W_TOTAL_TOL,
+            "TheaterStage native CPU vs GPU raytrace W-energy rel diff = {:.4} >= \
+             {MAX_REL_W_TOTAL_TOL}",
+            worst.rel_w_total
+        );
+        assert!(
+            worst.band_l1 < MAX_BAND_L1_TOL,
+            "TheaterStage native CPU vs GPU raytrace temporal-envelope L1 = {:.4} >= \
+             {MAX_BAND_L1_TOL}",
+            worst.band_l1
+        );
+        assert!(
+            worst.order_l1 < MAX_ORDER_L1_TOL,
+            "TheaterStage native CPU vs GPU raytrace per-order power L1 = {:.4} >= \
+             {MAX_ORDER_L1_TOL}",
+            worst.order_l1
+        );
+        assert!(
+            worst.mean_t_diff_s < MAX_MEAN_T_DIFF_TOL,
+            "TheaterStage native CPU vs GPU raytrace mean arrival-time diff = {:.3} ms >= \
+             {:.1} ms",
+            worst.mean_t_diff_s * 1e3,
+            MAX_MEAN_T_DIFF_TOL * 1e3
+        );
+        assert!(
+            worst.max_abs_cell.is_finite(),
+            "TheaterStage CPU/GPU histogram comparison produced a non-finite cell difference"
+        );
+    }
+
+    /// The test-only bit-exact mirror (`RayPcg32` + `trace_single_ray` +
+    /// [`accumulate_hoa_hit`]) still reproduces the CUDA kernel record for record. This
+    /// keeps `raytrace_hoa.cu` itself validated even though the production CPU path is
+    /// now an independent native tracer.
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn cuda_raytrace_kernel_matches_the_test_only_bit_exact_oracle() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP cuda_raytrace_kernel_matches_the_test_only_bit_exact_oracle: \
                  no live NVIDIA GPU detected"
             );
             return;
         }
         let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
         let atm = AtmosphereCfg::default();
-        let src = [4.3, 3.5, 1.25];
-        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
-            (2048usize, 16usize, 256usize, 0.004_f64, 0xCAFE_BABE_u64);
-
-        let h_cpu = raytrace_hoa_histogram(
+        let src = [1.5, 2.0, 1.2];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) = (
+            512usize,
+            12usize,
+            128usize,
+            0.002_f64,
+            0x6736_4D45_5241_5954_u64,
+        );
+        let oracle = oracle_raytrace_hoa_histogram(
             &geom,
             &atm,
             src,
@@ -2002,7 +4076,7 @@ mod tests {
             bin_dt_s,
             seed,
         );
-        let h_gpu = raytrace_hoa_histogram_with_cuda(
+        let gpu = raytrace_hoa_histogram_on_cuda(
             &geom,
             &atm,
             src,
@@ -2011,77 +4085,22 @@ mod tests {
             n_bins,
             bin_dt_s,
             seed,
-            true,
-        );
-        assert_eq!(h_cpu.len(), h_gpu.len());
-
-        let (max_diff, mismatched) = histogram_delta(&h_cpu, &h_gpu);
-        let total = n_bins * HOA_CH;
-        eprintln!(
-            "CPU vs GPU raytrace HOA parity: max |d| = {max_diff:e}, \
-             mismatched bit patterns = {mismatched}/{total} \
-             ({n_rays} rays x {max_bounces} bounces x {n_bins} bins)"
-        );
-        assert!(
-            max_diff < 1e-12,
-            "CPU vs GPU raytrace histogram max |d| = {max_diff:e} >= 1e-12"
-        );
-
-        let energy: f64 = h_cpu.iter().flat_map(|b| b.iter()).map(|x| x.abs()).sum();
+        )
+        .expect("direct GPU kernel path failed");
+        for (bin, (a, b)) in oracle.iter().zip(&gpu).enumerate() {
+            for (c, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "kernel vs bit-exact oracle mismatch at bin={bin} ch={c}: \
+                     oracle={x:e} gpu={y:e}"
+                );
+            }
+        }
+        let energy: f64 = oracle.iter().flat_map(|b| b.iter()).map(|x| x.abs()).sum();
         assert!(
             energy > 1e-6,
-            "CPU/GPU parity run recorded no HOA energy (sum |h| = {energy:e})"
-        );
-    }
-
-    /// Second live parity scenario: large theater stage (different geometry, wall
-    /// reflectances and scattering probabilities), 1024 rays x 12 bounces x 128 bins.
-    #[cfg(all(test, feature = "cuda"))]
-    #[test]
-    fn cuda_raytrace_hoa_histogram_matches_cpu_on_theater_stage() {
-        if crate::blackwell::shared_cuda_runtime().is_none() {
-            eprintln!(
-                "SKIP cuda_raytrace_hoa_histogram_matches_cpu_on_theater_stage: \
-                 no live NVIDIA GPU detected"
-            );
-            return;
-        }
-        let geom = RoomGeometry::from_preset(RoomPreset::TheaterStage);
-        let atm = AtmosphereCfg::default();
-        let src = [6.2, 4.0, 1.35];
-        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
-            (1024usize, 12usize, 128usize, 0.004_f64, 0x5EED_1234_u64);
-
-        let h_cpu = raytrace_hoa_histogram(
-            &geom,
-            &atm,
-            src,
-            n_rays,
-            max_bounces,
-            n_bins,
-            bin_dt_s,
-            seed,
-        );
-        let h_gpu = raytrace_hoa_histogram_with_cuda(
-            &geom,
-            &atm,
-            src,
-            n_rays,
-            max_bounces,
-            n_bins,
-            bin_dt_s,
-            seed,
-            true,
-        );
-        let (max_diff, mismatched) = histogram_delta(&h_cpu, &h_gpu);
-        eprintln!(
-            "CPU vs GPU TheaterStage raytrace HOA parity: max |d| = {max_diff:e}, \
-             mismatched bit patterns = {mismatched}/{}",
-            n_bins * HOA_CH
-        );
-        assert!(
-            max_diff < 1e-12,
-            "CPU vs GPU TheaterStage raytrace histogram max |d| = {max_diff:e} >= 1e-12"
+            "kernel/oracle parity run recorded no HOA energy (sum |h| = {energy:e})"
         );
     }
 
@@ -2132,6 +4151,788 @@ mod tests {
             "ControlRoom FDTD 6-PPW bandwidth must reach 500 Hz, got {:.1} Hz (dx={:.3} m)",
             fdtd.max_freq_6ppw(344.854),
             fdtd.dx_m
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Ten-band room model, Tier-A preset library and per-band transport.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn octave_band_weights_partition_unity_and_hold_at_edges() {
+        assert_eq!(ROOM_BAND_COUNT, 10);
+        assert_eq!(
+            ROOM_BANDS_HZ,
+            [31.5, 63.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0]
+        );
+        assert_eq!(ROOM_BAND_MID, 5);
+        assert_eq!(ROOM_BANDS_HZ[ROOM_BAND_MID], 1_000.0);
+
+        // Partition of unity over a dense log sweep: every frequency is covered
+        // by exactly one full weight, split between the two adjacent bands.
+        let mut f = 20.0_f64;
+        while f <= 20_000.0 {
+            let sum: f64 = (0..ROOM_BAND_COUNT).map(|b| octave_band_weight(f, b)).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-12,
+                "octave weights at {f} Hz sum to {sum}, not 1"
+            );
+            f *= 1.01;
+        }
+        // Geometric midpoint between 1 kHz and 2 kHz is an exact 50/50 split.
+        let f_mid = (1_000.0_f64 * 2_000.0).sqrt();
+        assert!((octave_band_weight(f_mid, 5) - 0.5).abs() < 1e-12);
+        assert!((octave_band_weight(f_mid, 6) - 0.5).abs() < 1e-12);
+        // Edge bands hold full weight outside the covered range.
+        assert_eq!(octave_band_weight(10.0, 0), 1.0);
+        assert_eq!(octave_band_weight(30_000.0, 9), 1.0);
+        assert_eq!(octave_band_weight(31.5, 0), 1.0);
+        assert_eq!(octave_band_weight(16_000.0, 9), 1.0);
+        assert_eq!(octave_band_weight(f64::NAN, 3), 0.0);
+        assert_eq!(octave_band_weight(1_000.0, ROOM_BAND_COUNT), 0.0);
+    }
+
+    #[test]
+    fn legacy_six_band_room_json_expands_to_ten_bands() {
+        // Pre-ten-band `--room-json` schema: six-band absorption and a scalar
+        // scattering coefficient. Must keep loading with the documented
+        // log-frequency expansion and the 1 kHz column unchanged.
+        let wall = r#"{"absorption": [0.10, 0.20, 0.30, 0.40, 0.50, 0.60], "scattering": 0.25}"#;
+        let json = format!(
+            r#"{{
+                "name": "Legacy Six Band Room",
+                "dims_m": [6.0, 5.0, 3.0],
+                "listener_m": [2.6, 2.5, 1.25],
+                "walls": [{wall}, {wall}, {wall}, {wall}, {wall}, {wall}],
+                "bass_trap_admittance": 0.16,
+                "target_rt60_s": 0.25
+            }}"#
+        );
+        let geom: RoomGeometry = serde_json::from_str(&json).expect("legacy room JSON must load");
+        geom.validate().expect("expanded legacy room must validate");
+        assert!(geom.targets.is_none());
+        let m = &geom.walls[0];
+        // 125, 250, 500, 1k, 2k, 4k map onto bands 2..=7 exactly; 31.5/63 hold
+        // the 125 Hz value and 8k/16k hold the 4 kHz value.
+        assert_eq!(
+            m.absorption,
+            [0.10, 0.10, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.60, 0.60]
+        );
+        for (band, &s) in m.scattering.iter().enumerate() {
+            assert_eq!(s, 0.25, "legacy scalar scattering lost at band {band}");
+        }
+
+        // Current ten-band schema round-trips. serde_json's default (non
+        // `float_roundtrip`) float parser is specified within 1 ULP, so the
+        // check is 2 ULP absolute; every coefficient must survive.
+        let ten = WallMaterial {
+            absorption: std::array::from_fn(|b| 0.05 + 0.05 * b as f64),
+            scattering: std::array::from_fn(|b| 0.10 + 0.01 * b as f64),
+        };
+        let text = serde_json::to_string(&ten).expect("serialize ten-band material");
+        let back: WallMaterial = serde_json::from_str(&text).expect("reload ten-band material");
+        for (band, (&x, &y)) in back
+            .absorption
+            .iter()
+            .zip(ten.absorption.iter())
+            .enumerate()
+        {
+            let tol = 2.0 * f64::EPSILON * y.abs().max(1.0);
+            assert!(
+                (x - y).abs() <= tol,
+                "ten-band absorption band {band} round-trip {x} != {y}"
+            );
+        }
+        for (band, (&x, &y)) in back
+            .scattering
+            .iter()
+            .zip(ten.scattering.iter())
+            .enumerate()
+        {
+            let tol = 2.0 * f64::EPSILON * y.abs().max(1.0);
+            assert!(
+                (x - y).abs() <= tol,
+                "ten-band scattering band {band} round-trip {x} != {y}"
+            );
+        }
+    }
+
+    /// One row of the research doc §4 Tier-A table: preset, dimensions, quoted
+    /// acoustic volume, mid T, then EDT/G/C80/LF/1−IACC/ITDG.
+    #[allow(clippy::type_complexity)]
+    type PresetDocRow = (
+        ShoeboxPreset,
+        [f64; 3],
+        f64,
+        f64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    );
+
+    #[test]
+    fn shoebox_preset_metadata_matches_research_doc_tables() {
+        for &preset in &ShoeboxPreset::ALL {
+            let geom = RoomGeometry::from_shoebox_preset(preset);
+            geom.validate()
+                .unwrap_or_else(|e| panic!("{} preset invalid: {e}", preset.label()));
+            assert!(
+                geom.targets.is_some(),
+                "{} preset carries no acoustic targets",
+                preset.label()
+            );
+        }
+
+        // Tier-A table (`docs/ROOM_PRESETS_RESEARCH.md` §4), transcribed exactly.
+        let cases: [PresetDocRow; 6] = [
+            (
+                ShoeboxPreset::Musikverein,
+                [48.8, 19.1, 17.75],
+                15_000.0,
+                2.0,
+                Some(2.0),
+                Some(4.0),
+                Some(-1.0),
+                Some(0.17),
+                Some(0.64),
+                Some(12.0),
+            ),
+            (
+                ShoeboxPreset::BostonSymphonyHall,
+                [38.1, 22.9, 18.6],
+                18_750.0,
+                1.9,
+                Some(1.9),
+                Some(2.0),
+                Some(0.0),
+                Some(0.22),
+                Some(0.65),
+                Some(15.0),
+            ),
+            (
+                ShoeboxPreset::Concertgebouw,
+                [44.0, 28.0, 17.0],
+                18_780.0,
+                2.0,
+                Some(1.9),
+                Some(3.0),
+                Some(-1.0),
+                Some(0.18),
+                None,
+                Some(21.0),
+            ),
+            (
+                ShoeboxPreset::StudioLiveRoom,
+                [8.0, 6.0, 4.0],
+                192.0,
+                0.45,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                ShoeboxPreset::LectureTheatre,
+                [15.0, 10.0, 6.0],
+                900.0,
+                0.80,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                ShoeboxPreset::Cinema,
+                [20.0, 12.0, 8.0],
+                1_920.0,
+                0.50,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        for &(preset, dims, volume, t_mid, edt, g, c80, lf, iacc, itdg) in &cases {
+            let geom = RoomGeometry::from_shoebox_preset(preset);
+            let t = geom.targets.as_ref().unwrap();
+            assert_eq!(geom.dims_m, dims, "{} dimensions", preset.label());
+            assert_eq!(
+                geom.acoustic_volume_m3(),
+                volume,
+                "{} quoted acoustic volume",
+                preset.label()
+            );
+            assert_eq!(t.mid_rt60_s, t_mid, "{} T", preset.label());
+            assert_eq!(t.mid_edt_s, edt, "{} EDT", preset.label());
+            assert_eq!(t.strength_g_db, g, "{} G", preset.label());
+            assert_eq!(t.clarity_c80_db, c80, "{} C80", preset.label());
+            assert_eq!(t.bass_lf, lf, "{} LF", preset.label());
+            assert_eq!(t.one_minus_iacc, iacc, "{} 1−IACC", preset.label());
+            assert_eq!(t.itdg_ms, itdg, "{} ITDG", preset.label());
+        }
+
+        // Curve provenance and FDTD handoff per preset class.
+        let model = |p| RoomGeometry::from_shoebox_preset(p).targets.unwrap().model;
+        let geo_from = |p| {
+            RoomGeometry::from_shoebox_preset(p)
+                .targets
+                .unwrap()
+                .geometric_bands_from_hz
+        };
+        assert_eq!(model(ShoeboxPreset::ControlRoom), Rt60Model::MidBandOnly);
+        assert_eq!(model(ShoeboxPreset::TheaterStage), Rt60Model::MidBandOnly);
+        for p in [
+            ShoeboxPreset::StudioLiveRoom,
+            ShoeboxPreset::LectureTheatre,
+            ShoeboxPreset::Cinema,
+            ShoeboxPreset::Musikverein,
+            ShoeboxPreset::BostonSymphonyHall,
+            ShoeboxPreset::Concertgebouw,
+        ] {
+            assert_eq!(model(p), Rt60Model::EyringDesign, "{} model", p.label());
+        }
+        assert_eq!(geo_from(ShoeboxPreset::ControlRoom), 1_000.0);
+        assert_eq!(geo_from(ShoeboxPreset::TheaterStage), 1_000.0);
+        assert_eq!(geo_from(ShoeboxPreset::StudioLiveRoom), 1_000.0);
+        assert_eq!(geo_from(ShoeboxPreset::LectureTheatre), 500.0);
+        assert_eq!(geo_from(ShoeboxPreset::Cinema), 500.0);
+        for p in ShoeboxPreset::HALLS {
+            assert_eq!(geo_from(p), 250.0, "{} hall FDTD handoff", p.label());
+        }
+
+        // Documented ranges, and no range where the source gives one number.
+        let range = |p| {
+            RoomGeometry::from_shoebox_preset(p)
+                .targets
+                .unwrap()
+                .mid_rt60_range_s
+        };
+        assert_eq!(range(ShoeboxPreset::ControlRoom), Some([0.20, 0.40]));
+        assert_eq!(range(ShoeboxPreset::TheaterStage), None);
+        assert_eq!(range(ShoeboxPreset::StudioLiveRoom), Some([0.35, 0.55]));
+        assert_eq!(range(ShoeboxPreset::LectureTheatre), Some([0.70, 0.90]));
+        assert_eq!(range(ShoeboxPreset::Cinema), Some([0.40, 0.60]));
+        for p in ShoeboxPreset::HALLS {
+            assert_eq!(range(p), None, "{}", p.label());
+        }
+        assert_eq!(
+            RoomGeometry::from_shoebox_preset(ShoeboxPreset::Concertgebouw)
+                .targets
+                .unwrap()
+                .mid_rt60_alt_s,
+            Some(2.2)
+        );
+    }
+
+    #[test]
+    fn eyring_design_targets_are_reproducible_and_respond_to_material_changes() {
+        let atm = AtmosphereCfg::default();
+        let mut design_presets = 0usize;
+        for &preset in &ShoeboxPreset::ALL {
+            let geom = RoomGeometry::from_shoebox_preset(preset);
+            let t = geom.targets.as_ref().unwrap();
+            let recomputed = geom.eyring_rt60_bands(&atm);
+            for (band, stored) in t.rt60_bands_s.iter().enumerate() {
+                let expected = (t.model == Rt60Model::EyringDesign
+                    && ROOM_BANDS_HZ[band] >= t.geometric_bands_from_hz)
+                    .then_some(recomputed[band]);
+                match (stored, expected) {
+                    (None, None) => {}
+                    (&Some(s), Some(e)) => assert!(
+                        (s - e).abs() < 1e-12,
+                        "{} band {band}: stored target {s} != Eyring material value {e}",
+                        preset.label()
+                    ),
+                    (s, e) => panic!(
+                        "{} band {band}: stored target {s:?} but geometric model expects {e:?}",
+                        preset.label()
+                    ),
+                }
+            }
+            if t.model == Rt60Model::EyringDesign {
+                design_presets += 1;
+                let mid = t.rt60_bands_s[ROOM_BAND_MID]
+                    .expect("Eyring design preset must target the 1 kHz band");
+                let residual = mid - t.mid_rt60_s;
+                assert!(
+                    (residual - t.fit_residual_s.unwrap()).abs() < 1e-12,
+                    "{} fit_residual_s does not match T(1 kHz) - T_mid",
+                    preset.label()
+                );
+                assert!(
+                    residual.abs() / t.mid_rt60_s <= 0.05,
+                    "{} Eyring 1 kHz fit residual {residual:.3} s ({:.2}%) exceeds 5%",
+                    preset.label(),
+                    100.0 * residual.abs() / t.mid_rt60_s
+                );
+                let first_geo = t
+                    .rt60_bands_s
+                    .iter()
+                    .flatten()
+                    .next()
+                    .copied()
+                    .expect("Eyring design preset must have a geometric band");
+                eprintln!(
+                    "{}: T_mid={:.2} s, Eyring T(1k)={:.3} s, residual={:+.2}%, \
+                     T(lowest geometric)={:.3}, T(8k)={:.3} s",
+                    preset.label(),
+                    t.mid_rt60_s,
+                    mid,
+                    100.0 * residual / t.mid_rt60_s,
+                    first_geo,
+                    t.rt60_bands_s[8].expect("8 kHz is always a geometric band")
+                );
+            }
+
+            // Sabotage (research doc §5 B5): a 10% change to one band's floor
+            // absorption must move the design target this gate reads, so a
+            // hard-coded RT curve cannot pass. The 1 kHz floor is the largest
+            // surface, making this the most conservative perturbation.
+            if t.model == Rt60Model::EyringDesign {
+                let mut sabotaged = geom.clone();
+                let alpha = sabotaged.walls[4].absorption[ROOM_BAND_MID];
+                sabotaged.walls[4].absorption[ROOM_BAND_MID] = (alpha * 1.10).min(0.99);
+                let t_orig = geom.eyring_rt60_band(&atm, ROOM_BAND_MID);
+                let t_sab = sabotaged.eyring_rt60_band(&atm, ROOM_BAND_MID);
+                let rel = (t_sab - t_orig).abs() / t_orig;
+                assert!(
+                    rel > 1e-3,
+                    "{}: 10% floor-alpha perturbation moved Eyring 1 kHz RT by only {:.4}%",
+                    preset.label(),
+                    100.0 * rel
+                );
+            }
+        }
+        assert_eq!(design_presets, 6, "expected six EyringDesign presets");
+    }
+
+    #[test]
+    fn hall_itdg_matches_documented_first_reflection_gap() {
+        let atm = AtmosphereCfg::default();
+        let c = atm.speed_of_sound_m_s();
+        let first_gap_ms = |geom: &RoomGeometry, src: [f64; 3]| -> f64 {
+            image_sources_3d(geom, src, c, 1)
+                .iter()
+                .filter(|tap| tap.wall_hits[4] == 0) // floor excluded from Beranek's ITDG
+                .map(|tap| tap.delay_s * 1_000.0)
+                .fold(f64::INFINITY, f64::min)
+        };
+        for (preset, doc_ms) in [
+            (ShoeboxPreset::Musikverein, 12.0),
+            (ShoeboxPreset::BostonSymphonyHall, 15.0),
+            (ShoeboxPreset::Concertgebouw, 21.0),
+        ] {
+            let geom = RoomGeometry::from_shoebox_preset(preset);
+            let t = geom.targets.as_ref().unwrap();
+            assert_eq!(t.itdg_ms, Some(doc_ms), "{} ITDG metadata", preset.label());
+            let src = t
+                .reference_source_m
+                .expect("hall preset must carry a reference source");
+            let geometric_ms = first_gap_ms(&geom, src);
+            eprintln!(
+                "{}: documented ITDG {doc_ms:.1} ms, shoebox first non-floor reflection \
+                 {geometric_ms:.3} ms",
+                preset.label()
+            );
+            assert!(
+                geometric_ms.is_finite() && (geometric_ms - doc_ms).abs() <= 0.25,
+                "{}: shoebox ITDG {geometric_ms:.3} ms deviates from documented {doc_ms} ms \
+                 by more than 0.25 ms",
+                preset.label()
+            );
+        }
+
+        // Sabotage: a 1 m source move must move the geometric gap, so this gate
+        // is measuring geometry and not echoing a stored constant.
+        let geom = RoomGeometry::from_shoebox_preset(ShoeboxPreset::Musikverein);
+        let src = geom.targets.as_ref().unwrap().reference_source_m.unwrap();
+        let moved = [src[0] + 1.0, src[1], src[2]];
+        let delta = (first_gap_ms(&geom, moved) - first_gap_ms(&geom, src)).abs();
+        assert!(
+            delta > 0.1,
+            "moving the reference source by 1 m changed the geometric ITDG by only {delta:.3} ms"
+        );
+    }
+
+    #[test]
+    fn image_source_taps_carry_per_band_energy_and_isolate_material_band_changes() {
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let src = [4.3, 3.5, 1.3];
+        let c = AtmosphereCfg::default().speed_of_sound_m_s();
+        let taps = image_sources_3d(&geom, src, c, 2);
+        assert!(!taps.is_empty(), "control-room ISM produced no taps");
+        for tap in &taps {
+            for band in 0..ROOM_BAND_COUNT {
+                let expected = tap
+                    .wall_hits
+                    .iter()
+                    .enumerate()
+                    .fold(1.0_f64, |acc, (w, &h)| {
+                        if h == 0 {
+                            acc
+                        } else {
+                            acc * geom.walls[w].refl_energy(band).powi(h as i32)
+                        }
+                    });
+                assert!(
+                    (tap.band_reflection_energy[band] - expected).abs() < 1e-12,
+                    "ISM tap band {band} energy {} != wall product {expected}",
+                    tap.band_reflection_energy[band]
+                );
+                assert!((0.0..=1.0).contains(&tap.band_reflection_energy[band]));
+            }
+        }
+
+        // Band isolation: perturbing the ceiling's 8 kHz alpha must change only
+        // band 7, and only on taps that actually hit the ceiling.
+        let mut sabotaged = geom.clone();
+        let alpha = sabotaged.walls[5].absorption[7];
+        sabotaged.walls[5].absorption[7] = (alpha * 1.10).min(0.99);
+        let sab_taps = image_sources_3d(&sabotaged, src, c, 2);
+        assert_eq!(taps.len(), sab_taps.len());
+        let mut ceiling_taps = 0usize;
+        for (a, b) in taps.iter().zip(&sab_taps) {
+            assert_eq!(a.wall_hits, b.wall_hits);
+            assert_eq!(a.delay_s.to_bits(), b.delay_s.to_bits());
+            if a.wall_hits[5] == 0 {
+                for band in 0..ROOM_BAND_COUNT {
+                    assert_eq!(
+                        a.band_reflection_energy[band].to_bits(),
+                        b.band_reflection_energy[band].to_bits(),
+                        "non-ceiling tap changed in band {band}"
+                    );
+                }
+            } else {
+                ceiling_taps += 1;
+                assert!(
+                    (a.band_reflection_energy[7] - b.band_reflection_energy[7]).abs() > 1e-6,
+                    "ceiling tap's 8 kHz energy did not respond to a ceiling alpha change"
+                );
+                for band in 0..ROOM_BAND_COUNT {
+                    if band != 7 {
+                        assert_eq!(
+                            a.band_reflection_energy[band].to_bits(),
+                            b.band_reflection_energy[band].to_bits(),
+                            "ceiling tap leaked an 8 kHz material change into band {band}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            ceiling_taps > 0,
+            "control-room ISM produced no ceiling reflection taps"
+        );
+    }
+
+    #[test]
+    fn per_band_histogram_isolates_band_material_changes_and_is_thread_invariant() {
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.25];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (256usize, 12usize, 16usize, 0.004_f64, 0x05EE_D0B1_u64);
+
+        let base = raytrace_hoa_histogram_per_band(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        let serial = raytrace_hoa_histogram_per_band_serial(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        assert_eq!(base.len(), n_bins);
+        for (bin, (a, b)) in base.iter().zip(&serial).enumerate() {
+            for band in 0..ROOM_BAND_COUNT {
+                for (ch, (&x, &y)) in a[band].iter().zip(b[band].iter()).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "per-band parallel/serial bit mismatch at bin={bin} band={band} ch={ch}"
+                    );
+                }
+            }
+        }
+
+        // Band isolation: only band 7 (8 kHz) may see the ceiling change.
+        let mut sabotaged = geom.clone();
+        let alpha = sabotaged.walls[5].absorption[7];
+        sabotaged.walls[5].absorption[7] = (alpha * 1.10).min(0.99);
+        let pert = raytrace_hoa_histogram_per_band(
+            &sabotaged,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        let mut band7_changed = false;
+        for (bin, (a, b)) in base.iter().zip(&pert).enumerate() {
+            for band in 0..ROOM_BAND_COUNT {
+                if band == 7 {
+                    if a[band]
+                        .iter()
+                        .zip(b[band].iter())
+                        .any(|(&x, &y)| x.to_bits() != y.to_bits())
+                    {
+                        band7_changed = true;
+                    }
+                } else {
+                    for (ch, (&x, &y)) in a[band].iter().zip(b[band].iter()).enumerate() {
+                        assert_eq!(
+                            x.to_bits(),
+                            y.to_bits(),
+                            "ceiling 8 kHz change leaked into bin={bin} band={band} ch={ch}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            band7_changed,
+            "ceiling 8 kHz alpha change did not alter the 8 kHz per-band histogram"
+        );
+    }
+
+    #[test]
+    fn per_band_histogram_applies_band_centre_air_absorption() {
+        // Uniform material isolates the molecular-air term: the ten bands see
+        // identical reflection/scattering tables and identical ray paths, so the
+        // only band-to-band difference in the recorded energy is ISO 9613-1 air
+        // absorption evaluated at each band centre. A single broadband air
+        // reference (the pre-ten-band behaviour) would leave W(16 kHz) ≈ W(32 Hz).
+        let geom = RoomGeometry {
+            name: "Uniform Air Test Room".to_string(),
+            dims_m: [20.0, 15.0, 10.0],
+            listener_m: [10.0, 7.5, 2.0],
+            walls: [WallMaterial::uniform(0.05, 0.10); 6],
+            bass_trap_admittance: 0.05,
+            target_rt60_s: 1.0,
+            targets: None,
+            edges: Vec::new(),
+        };
+        geom.validate()
+            .expect("uniform air-test room must validate");
+        let atm = AtmosphereCfg::default();
+        let src = [2.0, 7.5, 2.0];
+        let rows =
+            raytrace_hoa_histogram_per_band(&geom, &atm, src, 1_024, 32, 128, 0.0025, 0xA17_0B1u64);
+        let w = |band: usize| rows.iter().map(|row| row[band][0]).sum::<f64>();
+        let (w_low, w_high) = (w(0), w(ROOM_BAND_COUNT - 1));
+        assert!(
+            w_low > 1e-9 && w_high > 1e-9,
+            "air-absorption test room recorded no energy: W(32 Hz)={w_low:e}, W(16 kHz)={w_high:e}"
+        );
+        let ratio = w_high / w_low;
+        eprintln!(
+            "uniform room W(16 kHz)/W(31.5 Hz) = {ratio:.4} (ISO 9613-1 at the band centres)"
+        );
+        assert!(
+            ratio < 0.75,
+            "16 kHz late energy is not attenuated relative to 31.5 Hz (ratio {ratio:.4}); \
+             the per-band air reference is not wired"
+        );
+    }
+
+    /// Live GPU peer of the ten-band transport: one kernel launch per octave
+    /// band, each with that band's wall tables and the same seed. The gate uses
+    /// the same measured Monte Carlo bounds as the single-band CUDA gate.
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn per_band_cuda_histogram_agrees_with_native_cpu_within_measured_tolerance() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP per_band_cuda_histogram_agrees_with_native_cpu_within_measured_tolerance: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        const MAX_REL_W_TOTAL_TOL: f64 = 0.13;
+        const MAX_BAND_L1_TOL: f64 = 0.13;
+        const MAX_ORDER_L1_TOL: f64 = 0.18;
+        const MAX_MEAN_T_DIFF_TOL: f64 = 0.0015;
+        const N_BANDS: usize = 8;
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.25];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (65_536usize, 24usize, 128usize, 0.002_f64, 0xCAFE_BABEu64);
+
+        let cpu = raytrace_hoa_histogram_per_band(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        let gpu = raytrace_hoa_histogram_per_band_on_cuda(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        )
+        .unwrap_or_else(|e| panic!("per-band CUDA raytrace failed: {e}"));
+
+        let mut worst = HistAgreement::default();
+        for band in 0..ROOM_BAND_COUNT {
+            let cpu_band: Vec<[f64; HOA_CH]> = cpu.iter().map(|row| row[band]).collect();
+            let gpu_band: Vec<[f64; HOA_CH]> = gpu.iter().map(|row| row[band]).collect();
+            let w_cpu: f64 = cpu_band.iter().map(|row| row[0]).sum();
+            let w_gpu: f64 = gpu_band.iter().map(|row| row[0]).sum();
+            assert!(
+                w_cpu > 1e-9 && w_gpu > 1e-9,
+                "band {band} ({:.0} Hz) has no late W energy: cpu={w_cpu:e}, gpu={w_gpu:e}",
+                ROOM_BANDS_HZ[band]
+            );
+            let m = histogram_agreement(&cpu_band, &gpu_band, N_BANDS, bin_dt_s);
+            eprintln!(
+                "band {band:2} ({:5.0} Hz): rel W = {:.4}, band L1 = {:.4}, order L1 = {:.4}, \
+                 mean t |d| = {:.3} ms",
+                ROOM_BANDS_HZ[band],
+                m.rel_w_total,
+                m.band_l1,
+                m.order_l1,
+                m.mean_t_diff_s * 1e3
+            );
+            worst.rel_w_total = worst.rel_w_total.max(m.rel_w_total);
+            worst.band_l1 = worst.band_l1.max(m.band_l1);
+            worst.order_l1 = worst.order_l1.max(m.order_l1);
+            worst.mean_t_diff_s = worst.mean_t_diff_s.max(m.mean_t_diff_s);
+            worst.max_abs_cell = worst.max_abs_cell.max(m.max_abs_cell.abs());
+        }
+        eprintln!(
+            "per-band worst over {} bands: rel W = {:.4} (tol {MAX_REL_W_TOTAL_TOL}), band L1 = \
+             {:.4} (tol {MAX_BAND_L1_TOL}), order L1 = {:.4} (tol {MAX_ORDER_L1_TOL}), mean t |d| \
+             = {:.3} ms (tol {:.1} ms)",
+            ROOM_BAND_COUNT,
+            worst.rel_w_total,
+            worst.band_l1,
+            worst.order_l1,
+            worst.mean_t_diff_s * 1e3,
+            MAX_MEAN_T_DIFF_TOL * 1e3
+        );
+        assert!(
+            worst.rel_w_total < MAX_REL_W_TOTAL_TOL,
+            "native CPU vs GPU per-band W-energy rel diff = {:.4} >= {MAX_REL_W_TOTAL_TOL}",
+            worst.rel_w_total
+        );
+        assert!(
+            worst.band_l1 < MAX_BAND_L1_TOL,
+            "native CPU vs GPU per-band temporal-envelope L1 = {:.4} >= {MAX_BAND_L1_TOL}",
+            worst.band_l1
+        );
+        assert!(
+            worst.order_l1 < MAX_ORDER_L1_TOL,
+            "native CPU vs GPU per-band per-order power L1 = {:.4} >= {MAX_ORDER_L1_TOL}",
+            worst.order_l1
+        );
+        assert!(
+            worst.mean_t_diff_s < MAX_MEAN_T_DIFF_TOL,
+            "native CPU vs GPU per-band mean arrival-time diff = {:.3} ms >= {:.1} ms",
+            worst.mean_t_diff_s * 1e3,
+            MAX_MEAN_T_DIFF_TOL * 1e3
+        );
+    }
+
+    /// Every GPU band launch must be driven by its own wall tables: a
+    /// single-band material change may alter only that band's histogram, and
+    /// the other nine launches (same seed, same tables) must stay bit-identical.
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn per_band_cuda_perturbation_isolates_the_changed_band() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP per_band_cuda_perturbation_isolates_the_changed_band: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.25];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (4_096usize, 16usize, 32usize, 0.004_f64, 0xBA9D_5EEDu64);
+        let base = raytrace_hoa_histogram_per_band_on_cuda(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        )
+        .unwrap_or_else(|e| panic!("base per-band CUDA raytrace failed: {e}"));
+        let mut sabotaged = geom.clone();
+        let alpha = sabotaged.walls[5].absorption[7];
+        sabotaged.walls[5].absorption[7] = (alpha * 1.10).min(0.99);
+        let pert = raytrace_hoa_histogram_per_band_on_cuda(
+            &sabotaged,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        )
+        .unwrap_or_else(|e| panic!("perturbed per-band CUDA raytrace failed: {e}"));
+
+        let mut band7_changed = false;
+        for (bin, (a, b)) in base.iter().zip(&pert).enumerate() {
+            for band in 0..ROOM_BAND_COUNT {
+                if band == 7 {
+                    if a[band]
+                        .iter()
+                        .zip(b[band].iter())
+                        .any(|(&x, &y)| x.to_bits() != y.to_bits())
+                    {
+                        band7_changed = true;
+                    }
+                } else {
+                    for (ch, (&x, &y)) in a[band].iter().zip(b[band].iter()).enumerate() {
+                        assert_eq!(
+                            x.to_bits(),
+                            y.to_bits(),
+                            "GPU ceiling 8 kHz change leaked into bin={bin} band={band} ch={ch}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            band7_changed,
+            "GPU ceiling 8 kHz alpha change did not alter the 8 kHz per-band histogram"
         );
     }
 }

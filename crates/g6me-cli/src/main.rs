@@ -145,7 +145,8 @@ pub struct Cli {
     #[arg(long)]
     pub plus_slepian: bool,
 
-    /// Enable Paraunitary Scattering FDN + ternary Velvet Noise late externalization tail.
+    /// Enable orthogonal-scattering FDN (lossless Schlecht-Habets prototype, scalar
+    /// per-line absorption) + ternary Velvet Noise late externalization tail.
     #[arg(long)]
     pub plus_fdn: bool,
 
@@ -173,8 +174,10 @@ pub struct Cli {
     #[arg(long, default_value = "anechoic", value_parser = parse_room_preset)]
     pub room: RoomPreset,
 
-    /// 3D Room synthesis quality tier: `preview` (fast 500 Hz 6-PPW FDTD + 2048 rays, default)
-    /// or `production` (670 Hz 6-PPW FDTD + 50,000 rays + extended UPOLA tail).
+    /// 3D Room synthesis quality tier: `preview` (65k-voxel FDTD + 2,048 rays, default)
+    /// or `production` (260k-voxel FDTD + 50,000 rays). The FDTD band limit is
+    /// room-dependent: 500/670 Hz at 6 PPW in the 6x5x3 m control room, 275/437 Hz in
+    /// the 12x9.5x5.2 m theater. IR length follows the room RT60, not the tier.
     #[arg(long, default_value = "preview", value_parser = parse_room_quality)]
     pub room_quality: RoomQuality,
 
@@ -1240,6 +1243,22 @@ fn bar(frac: f32, width: usize) -> String {
     format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled))
 }
 
+/// Why a `--cuda` request cannot run any GPU stage in this configuration, if it cannot.
+///
+/// The reference renderer is a bit-exact CPU port and never constructs `PlusCfg`, so
+/// `--cuda` there is a no-op. Saying so is the difference between a flag that is off
+/// and a flag that lies.
+fn cuda_idle_reason(cli: &Cli) -> Option<String> {
+    if !cli.cuda || cli.mode != RendererMode::Reference {
+        return None;
+    }
+    Some(
+        "the reference renderer has no GPU stages; pass --mode plus (with --room \
+         control-room/theater or --head-mesh for room/BEM synthesis) to offload G6+ work"
+            .to_string(),
+    )
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.cuda {
@@ -1271,6 +1290,9 @@ fn main() -> ExitCode {
             "warning: --cuda requested but this binary was built without the `cuda` feature; \
              running the CPU pipeline"
         );
+    }
+    if let Some(reason) = cuda_idle_reason(&cli) {
+        eprintln!("warning: --cuda requested but this mode has no GPU work — {reason}. GPU stages run: 0.");
     }
     let tools = Tools::discover();
 
@@ -1418,6 +1440,9 @@ fn render_batch(cli: &Cli, cfg: BatchCfg, tools: &Tools, caps: &Caps) -> ExitCod
     ui.clear_status();
 
     print_summary(cli, &cfg, &outcome, started.elapsed());
+    // One line per GPU stage, once per run. A CUDA banner is not evidence that any
+    // stage ran on the device; this is.
+    g6me_core::cuda_report::print_summary(cli.cuda);
     ExitCode::from(outcome.exit_code().clamp(0, 255) as u8)
 }
 
@@ -1968,6 +1993,32 @@ mod tests {
         assert!(cfg.plus.use_cuda);
         assert_eq!(cfg.out.dither, Dither::Wannamaker);
         assert_eq!(cfg.transducer, TransducerProfile::StudioMonitor5In);
+    }
+
+    #[test]
+    fn cuda_with_the_default_reference_mode_says_it_has_no_gpu_work() {
+        let c = Cli::try_parse_from(["g6me", "--cuda", "x.mka"]).unwrap();
+        assert_eq!(c.mode, RendererMode::Reference);
+        let reason = cuda_idle_reason(&c).expect("reference mode must explain the idle GPU");
+        assert!(reason.contains("no GPU stages"), "{reason}");
+        assert!(reason.contains("--mode plus"), "{reason}");
+        // The flag still reaches PlusCfg, so switching to plus needs no second flag.
+        assert!(c.render_cfg().unwrap().plus.use_cuda);
+    }
+
+    #[test]
+    fn cuda_with_plus_mode_has_gpu_work() {
+        let c = Cli::try_parse_from([
+            "g6me",
+            "--cuda",
+            "--mode",
+            "plus",
+            "--room",
+            "control-room",
+            "x.mka",
+        ])
+        .unwrap();
+        assert!(cuda_idle_reason(&c).is_none());
     }
 
     #[test]

@@ -4,18 +4,21 @@
 //! 1. **Duda & Martens (JASA 1998)** — *"Range dependence of the response of a
 //!    spherical head model"*: solves the 3D Helmholtz boundary-value problem outside
 //!    a rigid sphere via Legendre polynomials `P_m(cos θ)` and spherical Hankel
-//!    functions of the second kind `h_m^(2)(kr) = j_m(kr) - i y_m(kr)` computed
-//!    with Miller downward recurrence for `j_m` and upward recurrence for `y_m`,
-//!    converged to `< 1e-15` in `f64`. Yields exact near-field acoustic parallax
+//!    functions of the second kind `h_m^(2)(kr) = j_m(kr) - i y_m(kr)`. `j_m` uses
+//!    Miller's downward recurrence; the Hankel sequence is evaluated in the scaled
+//!    form `H_m(z) = h_m(z) / A_m(ka)` (`A_m(x) = (2m-1)!!/x^(m+1)`) so the
+//!    evanescent tail does not overflow `f64`. Yields exact near-field acoustic parallax
 //!    (e.g., `0.3 m` vs `3.0 m`) and satisfies exact Helmholtz reciprocity
 //!    `|G(r1 -> r2) - G(r2 -> r1)| < 1e-13`.
-//! 2. **Algazi, Duda, Duraiswami, Gumerov & Tang (JASA 2002)** — *"Approximating
-//!    the HRTF using simple geometric models of the head and torso"* (Snowman Model):
-//!    couples the rigid head sphere (`radius a`) with a rigid torso sphere (`radius b`,
-//!    below the neck) using reciprocal two-sphere multipole scattering (direct field +
-//!    head-diffracted field + torso-scattered shoulder reflection + head-torso
-//!    coupling), synthesizing physical `700 Hz – 3 kHz` shoulder-bounce cues while
-//!    strictly preserving acoustic reciprocity `G_snowman(r1, r2) == G_snowman(r2, r1)`.
+//! 2. **Head + torso two-sphere scattering in the snowman geometry of Algazi, Duda,
+//!    Duraiswami, Gumerov & Tang (JASA 2002)**: couples the rigid head sphere (`radius a`)
+//!    with a rigid torso sphere (`radius b`, below the neck) using a reciprocal
+//!    **single-scattering approximation** (direct field + head-diffracted field +
+//!    torso-scattered field + one symmetric head<->torso saddle coupling).
+//!    This is *not* Algazi's multipole re-expansion of the coupled two-sphere
+//!    boundary-value problem, which requires the Gumerov–Duraiswami translation and
+//!    re-expansion coefficients; it reproduces the `700 Hz – 3 kHz` shoulder-bounce band
+//!    qualitatively while preserving exact reciprocity `G(r1, r2) == G(r2, r1)`.
 //! 3. **Webster's 1D Horn Equation Ear-Canal Acoustic Impedance**: stepped-segment
 //!    ABCD transmission-matrix solution of the tapered viscothermal ear canal with
 //!    physical tympanic-membrane termination (`--ear-canal-mm <MM>`).
@@ -39,7 +42,9 @@ pub const DEFAULT_EAR_CANAL_MM: f64 = 25.0;
 ///
 /// Uses stable upward recurrence for `y_m(x)` and Miller's backward recurrence for
 /// `j_m(x)` normalized against `j_0(x) = sin(x)/x` so precision holds to `< 1e-15`
-/// even deep into the evanescent regime `m >> x`.
+/// even deep into the evanescent regime `m >> x`. The `y` output saturates at
+/// `±1e280` once the true value leaves the `f64` range (`m` around 150 at `x ~ 1.6`);
+/// callers that need that tail use the scaled Hankel sequence instead.
 pub fn sph_bessel_jy(x: f64, m_max: usize) -> (Vec<f64>, Vec<f64>) {
     let len = m_max + 2;
     let mut y = vec![0.0_f64; len];
@@ -105,13 +110,44 @@ pub fn sph_bessel_jy(x: f64, m_max: usize) -> (Vec<f64>, Vec<f64>) {
     (j, y)
 }
 
+/// Scaled spherical Hankel function of the second kind,
+/// `H_m(z) = h_m^(2)(z) / A_m(x0)` with `A_m(x) = (2m-1)!! / x^(m+1)`.
+///
+/// In the evanescent tail `h_m^(2)(z) ~ -i (2m-1)!! / z^(m+1)`, which overflows
+/// `f64` around `m ~ 150` for low `ka`; dividing by `A_m(x0)` keeps both `H_m` and
+/// the forward recurrence
+/// `H_{m+1} = (x0/z) H_m - x0^2 H_{m-1} / ((2m+1)(2m-1))`
+/// bounded, so the adaptive near-field cutoff can be honoured without saturation.
+/// The recurrence selects the dominant (Hankel) solution; the omitted
+/// `j_m / A_m(x0)` solution decays like `(x0 z)^m / ((2m+1)!! (2m-1)!!)`.
+fn sph_hankel2_scaled(x0: f64, z: f64, m_max: usize) -> Vec<Complex> {
+    let mut h = vec![Complex::ZERO; m_max + 2];
+    // h_0^(2)(z) = i e^{-i z} / z, so H_0 = i (x0/z) e^{-i z}.
+    h[0] = Complex::from_polar(x0 / z, 0.5 * PI - z);
+    // h_1^(2)(z) = (sin z / z^2 - cos z / z) + i (cos z / z^2 + sin z / z);
+    // H_1 = h_1^(2)(z) * x0^2.
+    let (sz, cz) = (z.sin(), z.cos());
+    let inv_z = 1.0 / z;
+    let h1_re = sz * inv_z * inv_z - cz * inv_z;
+    let h1_im = cz * inv_z * inv_z + sz * inv_z;
+    h[1] = Complex::new(h1_re * x0 * x0, h1_im * x0 * x0);
+    let x2 = x0 * x0;
+    for m in 1..=m_max {
+        let mf = m as f64;
+        let c = x2 / ((2.0 * mf + 1.0) * (2.0 * mf - 1.0));
+        h[m + 1] = h[m].scale(x0 / z).sub(h[m - 1].scale(c));
+    }
+    h
+}
+
 /// Exact 3D Helmholtz Green's function `G_sphere(r1, r2)` outside a rigid sphere
 /// of radius `a` centered at the origin, where `r1 = ||p1|| >= a`, `r2 = ||p2|| >= a`,
 /// and `cos_theta = dot(p1, p2) / (r1 * r2)`.
 ///
 /// Time convention `exp(+i ω t)` with outgoing wave `exp(-i k R) / (4 π R)`.
-/// Uses `h_m^(2)(x) = j_m(x) - i y_m(x)` and converges the multipole series to
-/// `< 1e-15` relative tolerance. By exact symmetry in `(r1, r2)`, satisfies acoustic
+/// Uses `h_m^(2)(x) = j_m(x) - i y_m(x)` and converges the multipole series to the
+/// `f64` floor (`~1e-16` relative in the near field, `≲ 1e-13` in the worst measured
+/// far-field geometry). By exact symmetry in `(r1, r2)`, satisfies acoustic
 /// reciprocity `G(r1, r2) == G(r2, r1)` to machine precision.
 pub fn rigid_sphere_green(k: f64, a: f64, r1: f64, r2: f64, cos_theta: f64) -> Complex {
     let cos_th = cos_theta.clamp(-1.0, 1.0);
@@ -126,15 +162,51 @@ pub fn rigid_sphere_green(k: f64, a: f64, r1: f64, r2: f64, cos_theta: f64) -> C
     }
 
     let ka = k * a;
-    let m_max = ((ka as usize) + 32).clamp(32, 160);
-    let (ja, ya) = sph_bessel_jy(ka, m_max);
+    // The angular series tail decays like (a/r_lo)^m in the near field, so the cutoff
+    // must follow the exterior radius ratio as well as ka. 38/ln(rho) is the number of
+    // terms needed for a 1e-16 relative tail; the hard cap only guards pathological
+    // near-surface points and is never reached at the CLI's 0.25 m minimum range.
+    let rho_lo = (r_lo / a).max(1.0 + 1e-12);
+    let near_field_terms = (38.0 / rho_lo.ln().max(1e-6)).ceil() as usize;
+    let m_max = ((ka as usize) + 32)
+        .max(near_field_terms + 8)
+        .clamp(64, 512);
     let on_surface = (r_lo - a).abs() <= 1e-13 * a.max(1.0);
-    let (jlo, ylo) = if on_surface {
-        (Vec::new(), Vec::new())
+
+    // Work with the scaled Hankel sequence (see `sph_hankel2_scaled`). The unscaled
+    // y_m leaves the f64 range in exactly the high-m terms the adaptive cutoff needs
+    // for a near-surface observation point; the scaled recurrence is bounded.
+    let hx = sph_hankel2_scaled(ka, ka, m_max);
+    let hhi = sph_hankel2_scaled(ka, k * r_hi, m_max);
+    let hlo = if on_surface {
+        hx.clone()
     } else {
-        sph_bessel_jy(k * r_lo, m_max)
+        sph_hankel2_scaled(ka, k * r_lo, m_max)
     };
-    let (jhi, yhi) = sph_bessel_jy(k * r_hi, m_max);
+
+    // Unscaled j_m at ka and k r_lo for the off-surface bracket, plus
+    // ln((2m-1)!!) so the product j_m A_m(ka) can be assembled without either
+    // factor leaving the f64 range.
+    let (ja, jlo, ln_odd_prefix) = if on_surface {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        let (ja, _) = sph_bessel_jy(ka, m_max);
+        let (jlo, _) = sph_bessel_jy(k * r_lo, m_max);
+        let mut prefix = vec![0.0_f64; m_max + 3];
+        for m in 1..prefix.len() {
+            prefix[m] = prefix[m - 1] + (2.0 * m as f64 - 1.0).ln();
+        }
+        (ja, jlo, prefix)
+    };
+    let ln_ka = ka.ln();
+    let j_times_a = |m: usize, jm: f64| -> f64 {
+        if m == 0 {
+            jm / ka
+        } else {
+            let log2_a = (ln_odd_prefix[m] - (m as f64 + 1.0) * ln_ka) / std::f64::consts::LN_2;
+            jm.signum() * (jm.abs().log2() + log2_a).exp2()
+        }
+    };
 
     let mut p_prev = 0.0_f64;
     let mut p_curr = 1.0_f64;
@@ -152,33 +224,45 @@ pub fn rigid_sphere_green(k: f64, a: f64, r1: f64, r2: f64, cos_theta: f64) -> C
         p_prev = p_curr;
         p_curr = pm;
 
-        // h_m^(2)(ka) and its derivative h_m^(2)'(ka) = (m/ka) h_m^(2)(ka) - h_{m+1}^(2)(ka).
         let mf = m as f64;
-        let ha = Complex::new(ja[m], -ya[m]);
-        let ha_next = Complex::new(ja[m + 1], -ya[m + 1]);
-        let ha_p = ha.scale(mf / ka).sub(ha_next);
-        if ha_p.norm_sq() < 1e-300 {
+        // D_m = h_m^(2)'(ka) / A_m(ka) = (m/ka) H_m(ka) - ((2m+1)/ka) H_{m+1}(ka).
+        let d = hx[m]
+            .scale(mf / ka)
+            .sub(hx[m + 1].scale((2.0 * mf + 1.0) / ka));
+        if d.norm_sq() < 1e-300 {
             break;
         }
 
-        let radial = if on_surface {
+        let term = if on_surface {
             // Wronskian identity: j_m(ka) h_m^(2)'(ka) - j_m'(ka) h_m^(2)(ka) = -i / (ka)^2.
-            Complex::new(0.0, -1.0 / (ka * ka)).div(ha_p)
+            // radial = -i / (ka^2 h_m^(2)'(ka)); with h_m(k r_hi) = A_m(ka) H_m(k r_hi),
+            // term = -i (2m+1) P_m H_m(k r_hi) / (ka^2 D_m).
+            let t = hhi[m].div(d);
+            Complex::new(t.im, -t.re).scale((2.0 * mf + 1.0) * pm / (ka * ka))
         } else {
-            let ja_p = (mf / ka) * ja[m] - ja[m + 1];
-            let hlo = Complex::new(jlo[m], -ylo[m]);
-            let ratio = Complex::new(ja_p, 0.0).div(ha_p);
-            Complex::new(jlo[m], 0.0).sub(ratio.mul(hlo))
+            // bracket = j_m(k r_lo) - (j_m'(ka)/h_m^(2)'(ka)) h_m^(2)(k r_lo).
+            // With h_m(z) = A_m(ka) H_m(z), bracket * h_m(k r_hi) becomes
+            //   (j_m(k r_lo) A_m(ka)) H_m(k r_hi)
+            //   - (j_m'(ka) A_m(ka)) H_m(k r_lo) H_m(k r_hi) / D_m,
+            // and j_m'(ka) A_m(ka) = (m/ka) j_m A_m(ka) - (ka/(2m+1)) j_{m+1} A_{m+1}(ka).
+            if ja[m] == 0.0 || ja[m + 1] == 0.0 || jlo[m] == 0.0 {
+                break;
+            }
+            let j_a_lo = j_times_a(m, jlo[m]);
+            let j_a_x = j_times_a(m, ja[m]);
+            let j_a_x_next = j_times_a(m + 1, ja[m + 1]);
+            let q = j_a_x * (mf / ka) - j_a_x_next * (ka / (2.0 * mf + 1.0));
+            let t1 = hhi[m].scale(j_a_lo);
+            let t2 = hlo[m].mul(hhi[m]).div(d).scale(q);
+            t1.sub(t2).scale((2.0 * mf + 1.0) * pm)
         };
 
-        let hhi = Complex::new(jhi[m], -yhi[m]);
-        let term = radial.mul(hhi).scale((2 * m + 1) as f64 * pm);
         if !term.re.is_finite() || !term.im.is_finite() {
             break;
         }
         sum = sum.add(term);
 
-        if (m as f64) > ka + 6.0 && term.norm() < 1e-16 * sum.norm().max(1e-300) {
+        if mf > ka + 6.0 && term.norm() < 1e-16 * sum.norm().max(1e-300) {
             break;
         }
     }
@@ -272,17 +356,19 @@ impl SnowmanGeom {
     }
 }
 
-/// Coupled Snowman (Head + Torso) 3D Helmholtz Green's function `G_snowman(p1, p2)`.
+/// Coupled Snowman (Head + Torso) two-sphere Green's function `G_snowman(p1, p2)`.
 ///
-/// Combines:
+/// This is a reciprocal **single-scattering approximation** to the two-sphere
+/// boundary-value problem, not Algazi et al.'s multipole re-expansion. It combines:
 /// - Exact rigid-head Helmholtz Green's function `G_head(p1, p2)` (direct + head-diffracted),
-/// - Exact rigid-torso scattered multipole field `G_scat_torso(p1, p2)` (synthesizing the
-///   physical `700 Hz – 3 kHz` shoulder-bounce reflection and elevation notches),
-/// - Symmetric head-torso secondary multipole coupling `T_ht(p1, p2) + T_ht(p2, p1)`
-///   evaluated via the reciprocal torso-apex reflection point `p_sh = (0, 0, -torso_drop + b)`.
+/// - Exact rigid-torso scattered field `G_scat_torso(p1, p2)` (the `700 Hz – 3 kHz`
+///   shoulder-bounce band and elevation notches),
+/// - One symmetric head-torso coupling term evaluated at the torso-apex saddle point
+///   `p_sh = (0, 0, -torso_drop + b)`.
 ///
 /// By construction, EVERY term is strictly symmetric in `(p1, p2)`, guaranteeing
 /// exact Helmholtz reciprocity `|G_snowman(p1, p2) - G_snowman(p2, p1)| < 1e-13`.
+/// Multiple head<->torso scattering events are neglected.
 pub fn snowman_green(k: f64, geom: SnowmanGeom, p1: [f64; 3], p2: [f64; 3]) -> Complex {
     let r1 = (p1[0] * p1[0] + p1[1] * p1[1] + p1[2] * p1[2]).sqrt();
     let r2 = (p2[0] * p2[0] + p2[1] * p2[1] + p2[2] * p2[2]).sqrt();
@@ -292,7 +378,7 @@ pub fn snowman_green(k: f64, geom: SnowmanGeom, p1: [f64; 3], p2: [f64; 3]) -> C
     // 1. Exact rigid-head boundary-value Green's function (direct + head diffraction).
     let g_head = rigid_sphere_green(k, geom.head_radius_m, r1, r2, cos_th);
 
-    // 2. Exact rigid-torso multipole scattered wave (shoulder bounce 700 Hz – 3 kHz).
+    // 2. Exact single-sphere rigid-torso scattered wave (shoulder bounce 700 Hz – 3 kHz).
     let g_torso_scat = rigid_sphere_scattered(k, geom.torso_center(), geom.torso_radius_m, p1, p2);
 
     // 3. Reciprocal 2nd-order head<->torso scattering coupling (monopole-dipole image
@@ -449,6 +535,36 @@ mod tests {
                 serr < 1e-13,
                 "rigid sphere surface reciprocity failed at {f} Hz: rel err = {serr:e}"
             );
+        }
+    }
+
+    #[test]
+    fn near_field_series_matches_high_precision_reference() {
+        // 60-digit mpmath evaluation of the exterior rigid-sphere series at rho = 1.25,
+        // theta = pi. The old m_max = ka + 32 cutoff gave 1.4e-3 / 6.8e-4 relative error
+        // here, so a 1e-9 tolerance discriminates the adaptive cutoff.
+        let c = 344.854_f64;
+        let a = DEFAULT_HEAD_RADIUS_M;
+        for (f, re, im) in [
+            (
+                1_000.0_f64,
+                -0.385_783_444_255_766_2,
+                0.097_099_711_997_860_93,
+            ),
+            (
+                4_000.0_f64,
+                0.163_898_508_173_518_33,
+                -0.268_133_591_841_351_1,
+            ),
+        ] {
+            let k = 2.0 * PI * f / c;
+            let r = 1.25 * a;
+            let g = rigid_sphere_green(k, a, r, a, -1.0);
+            let g_ref = Complex::from_polar(1.0 / (4.0 * PI * r), -k * r);
+            let h = g.div(g_ref);
+            let expect = Complex::new(re, im);
+            let rel = h.sub(expect).norm() / expect.norm();
+            assert!(rel < 1e-9, "near-field series error at {f} Hz: {rel:e}");
         }
     }
 

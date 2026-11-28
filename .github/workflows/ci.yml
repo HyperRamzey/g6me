@@ -107,6 +107,26 @@ jobs:
   # where the mingw toolchain is a package and not a shell-PATH lottery. (An earlier
   # version of this job ran inside msys2 and died with exit 127: `cargo` was on the
   # Windows PATH, which the msys2 login shell does not inherit the way you expect.)
+  # The Lean development has its own purity gate (`lean/check_axioms.sh`):
+  # forbidden tokens, `lake build`, theorem coverage against the EXPECTED
+  # registry, and `#print axioms` for every registered theorem. Running it here
+  # is what makes the README's "266 theorems, propext/Quot.sound only" claim a
+  # CI-enforced fact rather than a local observation.
+  lean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain is pinned in lean/lean-toolchain; elan installs exactly it.
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Lean purity gate
+        working-directory: lean
+        run: ./check_axioms.sh
+
   windows-gnu:
     runs-on: ubuntu-latest
     env:

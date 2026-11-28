@@ -1116,6 +1116,10 @@ pub struct FmmBemSolver {
     pub chief_points: Vec<[f64; 3]>,
     /// Effective spherical radius `sqrt(area / (4 pi))` in meters.
     pub eff_radius_m: f64,
+    /// True when `solid_angle_diag` was assembled by the CUDA kernel rather than the
+    /// CPU `par_map_indexed` loop. A caller that must prove the GPU path ran checks
+    /// this instead of inferring it from a successful solve.
+    pub solid_angle_diag_on_gpu: bool,
 }
 
 impl FmmBemSolver {
@@ -1141,20 +1145,43 @@ impl FmmBemSolver {
         // multiply/add) to ~1 ULP; any failure falls back to the CPU `par_map_indexed`
         // assembly. Only an explicit `use_cuda` opt-in touches the GPU.
         #[cfg(feature = "cuda")]
-        let solid_angle_diag = if use_cuda {
-            match crate::blackwell::shared_cuda_runtime()
-                .and_then(|rt| solid_angle_diag_on_cuda(&rt, &elements).ok())
-            {
-                Some(diag) if diag.len() == n => diag,
-                _ => solid_angle_diag_cpu(&elements),
+        let (solid_angle_diag, solid_angle_diag_on_gpu) = if use_cuda {
+            match crate::blackwell::shared_cuda_runtime() {
+                Some(rt) => match solid_angle_diag_on_cuda(&rt, &elements) {
+                    Ok(diag) if diag.len() == n => {
+                        crate::cuda_report::record_gpu(
+                            "bem-solid-angle",
+                            format!("n={n} elements"),
+                        );
+                        (diag, true)
+                    }
+                    Ok(diag) => {
+                        crate::cuda_report::record_cpu_fallback(
+                            "bem-solid-angle",
+                            format!("GPU returned {} of {n} diagonals", diag.len()),
+                        );
+                        (solid_angle_diag_cpu(&elements), false)
+                    }
+                    Err(e) => {
+                        crate::cuda_report::record_cpu_fallback("bem-solid-angle", e);
+                        (solid_angle_diag_cpu(&elements), false)
+                    }
+                },
+                None => {
+                    crate::cuda_report::record_cpu_fallback(
+                        "bem-solid-angle",
+                        "CUDA runtime unavailable",
+                    );
+                    (solid_angle_diag_cpu(&elements), false)
+                }
             }
         } else {
-            solid_angle_diag_cpu(&elements)
+            (solid_angle_diag_cpu(&elements), false)
         };
         #[cfg(not(feature = "cuda"))]
-        let solid_angle_diag = {
+        let (solid_angle_diag, solid_angle_diag_on_gpu) = {
             let _ = use_cuda;
-            solid_angle_diag_cpu(&elements)
+            (solid_angle_diag_cpu(&elements), false)
         };
 
         // Locate anatomical left (+y) and right (-y) ear-canal entrance elements near the
@@ -1210,6 +1237,7 @@ impl FmmBemSolver {
             right_ear_elem,
             chief_points,
             eff_radius_m,
+            solid_angle_diag_on_gpu,
         })
     }
 
@@ -1768,15 +1796,29 @@ impl FmmBemSolver {
         // longer silently downgrades large meshes to the dense exact operator.
         #[cfg(feature = "cuda")]
         let mut cuda_op: Option<g6me_cuda::CudaBemOperator> = if use_cuda {
-            crate::blackwell::shared_cuda_runtime().and_then(|rt| {
+            let built = crate::blackwell::shared_cuda_runtime().map(|rt| {
                 if use_fmm && n > 192 {
                     let plan = self.build_cuda_fmm_plan(k, adjoint);
-                    rt.bem_fmm_operator(&plan, adjoint).ok()
+                    rt.bem_fmm_operator(&plan, adjoint)
                 } else {
                     let (mat_re, mat_im) = self.dense_matrix(k, adjoint);
-                    rt.bem_dense_operator(&mat_re, &mat_im, n).ok()
+                    rt.bem_dense_operator(&mat_re, &mat_im, n)
                 }
-            })
+            });
+            match built {
+                Some(Ok(op)) => Some(op),
+                Some(Err(e)) => {
+                    crate::cuda_report::record_cpu_fallback("bem-matvec", e);
+                    None
+                }
+                None => {
+                    crate::cuda_report::record_cpu_fallback(
+                        "bem-matvec",
+                        "CUDA runtime unavailable",
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1789,12 +1831,24 @@ impl FmmBemSolver {
             let gpu_raw: Option<Vec<Complex>> = cuda_op.as_mut().and_then(|op| {
                 let x_re: Vec<f64> = v.iter().map(|c| c.re).collect();
                 let x_im: Vec<f64> = v.iter().map(|c| c.im).collect();
-                op.apply(&x_re, &x_im).ok().map(|(yr, yi)| {
-                    yr.into_iter()
-                        .zip(yi)
-                        .map(|(r, im)| Complex::new(r, im))
-                        .collect()
-                })
+                match op.apply(&x_re, &x_im) {
+                    Ok((yr, yi)) => {
+                        crate::cuda_report::record_gpu(
+                            "bem-matvec",
+                            format!("n={n}, fmm={use_fmm}"),
+                        );
+                        Some(
+                            yr.into_iter()
+                                .zip(yi)
+                                .map(|(r, im)| Complex::new(r, im))
+                                .collect(),
+                        )
+                    }
+                    Err(e) => {
+                        crate::cuda_report::record_cpu_fallback("bem-matvec", e);
+                        None
+                    }
+                }
             });
             #[cfg(not(feature = "cuda"))]
             let gpu_raw: Option<Vec<Complex>> = None;

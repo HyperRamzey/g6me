@@ -1,16 +1,33 @@
 // Zero-FMA Stochastic Monte Carlo Ray-Tracing -> Order-7 HOA Energy Histogram Kernel.
 // Compiled with: nvcc --fmad=false -Xcompiler -ffp-contract=off -O3
-// Deterministic per-ray PCG64 stream with IEEE-754 __dadd_rn / __dmul_rn. No libm
+// Deterministic per-ray PCG32 stream with IEEE-754 __dadd_rn / __dmul_rn. No libm
 // transcendentals: the uniform-sphere launch and the cosine-weighted Lambertian wall
 // scatter both use Marsaglia (1972) rejection on the unit disk, so the PTX carries zero
 // fma.rn. IEEE `sqrt.rn.f64` / `div.rn.f64` remain; ptxas lowers those to
 // MUFU + DFMA microcode, which is the hardware implementation of one correctly-rounded
 // operation (bit-identical to CPU f64), not a contraction of this kernel's arithmetic.
 //
-// The CPU tracer in `g6me-core/src/room.rs` (`RayPcg64`, `trace_single_ray`) mirrors every
-// floating-point operation, PCG64 draw and branch below line for line, and both sides feed
-// one shared host accumulator (`accumulate_hoa_hit`), so CPU and GPU produce bit-identical
-// (delay, energy, direction) records and therefore bit-identical HOA histograms.
+// This kernel is the native CUDA peer. The production CPU path is an independent native
+// tracer in `g6me-core/src/room.rs` (`trace_native_ray_band`, `reduce_native_arrivals_at`):
+// its own stratified equal-solid-angle launch, PCG64 streams, slab ray/box intersection,
+// ray/sphere receiver test, Malley cosine-weighted scatter and chunked partial-sum
+// reduction. Both peers share only the physical specification (room, source, listener,
+// wall reflection/scattering, receiver radius, HOA observable), so CPU/GPU parity is
+// gated by a measured Monte Carlo histogram tolerance, not bit identity.
+//
+// Ten-band transport: the host launches this kernel once per ISO octave band, passing
+// that band's `wall_refl[6]` and `wall_scatter[6]` tables and the *same* `base_seed`.
+// Common random numbers across bands make the ten launches one path set whose decay
+// differs only by the per-band reflection coefficients, which is exactly the CPU peer's
+// per-band specification (`trace_native_ray_band` reuses one per-ray RNG stream the same
+// way). Host-side air absorption is applied per band during histogram reduction. The
+// kernel itself performs no frequency-domain arithmetic, so it stays bit-reproducible and
+// its single-band output is unchanged.
+//
+// A test-only oracle (`RayPcg32`, `trace_single_ray` in `room.rs`, compiled only under
+// `cfg(all(test, feature = "cuda"))`) still mirrors every floating-point operation, PCG32
+// draw and branch below line for line to keep this kernel itself validated; it is not on
+// any production path.
 //
 // Wall indexing is the CPU `RoomGeometry` ordering:
 //   0 = +x (front), 1 = -x (back), 2 = +y (left), 3 = -y (right), 4 = -z (floor),
@@ -18,7 +35,7 @@
 
 #include <stdint.h>
 
-__device__ __forceinline__ uint64_t pcg64_next(uint64_t* state, uint64_t inc) {
+__device__ __forceinline__ uint64_t pcg32_next(uint64_t* state, uint64_t inc) {
     uint64_t oldstate = *state;
     *state = oldstate * 6364136223846793005ULL + inc;
     uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
@@ -26,9 +43,9 @@ __device__ __forceinline__ uint64_t pcg64_next(uint64_t* state, uint64_t inc) {
     return (uint64_t)((xorshifted >> rot) | (xorshifted << ((-rot) & 31u)));
 }
 
-__device__ __forceinline__ double pcg64_uniform(uint64_t* state, uint64_t inc) {
-    uint64_t hi = pcg64_next(state, inc);
-    uint64_t lo = pcg64_next(state, inc);
+__device__ __forceinline__ double pcg32_uniform(uint64_t* state, uint64_t inc) {
+    uint64_t hi = pcg32_next(state, inc);
+    uint64_t lo = pcg32_next(state, inc);
     uint64_t bits = ((hi & 0x1FFFFFULL) << 32) | lo;
     return __dmul_rn((double)bits, 1.1102230246251565e-16); // 2^-53
 }
@@ -53,15 +70,15 @@ extern "C" __global__ void g6me_raytrace_hoa_pass(
 
     uint64_t inc = ((uint64_t)ray_id << 1) | 1ULL;
     uint64_t state = base_seed ^ ((uint64_t)(ray_id + 1) * 0x9E3779B97F4A7C15ULL);
-    (void)pcg64_next(&state, inc);
+    (void)pcg32_next(&state, inc);
 
     // Uniform sphere launch direction via Marsaglia (1972) rejection on the unit disk.
-    // Each ray owns an independent PCG64 stream, so the variable draw count stays
+    // Each ray owns an independent PCG32 stream, so the variable draw count stays
     // deterministic per ray.
     double ux, uy, s;
     do {
-        ux = __dadd_rn(__dmul_rn(2.0, pcg64_uniform(&state, inc)), -1.0);
-        uy = __dadd_rn(__dmul_rn(2.0, pcg64_uniform(&state, inc)), -1.0);
+        ux = __dadd_rn(__dmul_rn(2.0, pcg32_uniform(&state, inc)), -1.0);
+        uy = __dadd_rn(__dmul_rn(2.0, pcg32_uniform(&state, inc)), -1.0);
         s = __dadd_rn(__dmul_rn(ux, ux), __dmul_rn(uy, uy));
     } while (s >= 1.0 || s == 0.0);
     double f = __dmul_rn(2.0, sqrt(__dadd_rn(1.0, -s)));
@@ -116,7 +133,8 @@ extern "C" __global__ void g6me_raytrace_hoa_pass(
             }
         }
 
-        // Advance to wall (clamped exactly like the CPU tracer) and apply mid-band absorption
+        // Advance onto the wall (clamped strictly inside the box) and apply this launch's
+        // band absorption (wall_refl is the per-band table selected by the host)
         px = fmin(fmax(__dadd_rn(px, __dmul_rn(t_hit, dx)), 1e-6), __dadd_rn(lx, -1e-6));
         py = fmin(fmax(__dadd_rn(py, __dmul_rn(t_hit, dy)), 1e-6), __dadd_rn(ly, -1e-6));
         pz = fmin(fmax(__dadd_rn(pz, __dmul_rn(t_hit, dz)), 1e-6), __dadd_rn(lz, -1e-6));
@@ -133,11 +151,11 @@ extern "C" __global__ void g6me_raytrace_hoa_pass(
         // ISO-17497 Lambertian diffuse scattering blend. Cosine-weighted hemisphere via
         // Marsaglia unit-disk rejection plus the Lambert equal-area lift z = sqrt(1 - s):
         // no libm sin/cos, so this branch is bit-reproducible on the CPU.
-        if (pcg64_uniform(&state, inc) < wall_scatter[wall]) {
+        if (pcg32_uniform(&state, inc) < wall_scatter[wall]) {
             double sx, sy, s2;
             do {
-                sx = __dadd_rn(__dmul_rn(2.0, pcg64_uniform(&state, inc)), -1.0);
-                sy = __dadd_rn(__dmul_rn(2.0, pcg64_uniform(&state, inc)), -1.0);
+                sx = __dadd_rn(__dmul_rn(2.0, pcg32_uniform(&state, inc)), -1.0);
+                sy = __dadd_rn(__dmul_rn(2.0, pcg32_uniform(&state, inc)), -1.0);
                 s2 = __dadd_rn(__dmul_rn(sx, sx), __dmul_rn(sy, sy));
             } while (s2 >= 1.0 || s2 == 0.0);
             double sz = sqrt(__dadd_rn(1.0, -s2));

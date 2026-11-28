@@ -12,7 +12,13 @@
 //! g6me-verify --group bitexact # one family
 //! g6me-verify --seconds 300    # longer drift run
 //! g6me-verify --require-all    # treat SKIP as failure
+//! g6me-verify --require-cuda   # no toolkit/GPU is a failure
 //! ```
+//!
+//! `--require-all` also implies `--require-cuda` when this binary was built with
+//! `--features cuda`: a CUDA-enabled release gate must not stay green on a host
+//! that never compiled or ran a kernel. A default-features build is unaffected,
+//! so the CUDA-free CI jobs keep their existing meaning.
 
 mod checks;
 mod reference;
@@ -31,6 +37,7 @@ struct Args {
     frames: usize,
     audit_cochlea: bool,
     audit_wav: Option<std::path::PathBuf>,
+    require_cuda: bool,
 }
 
 fn main() {
@@ -55,6 +62,10 @@ fn main() {
     let builds = reference::builds();
     let scratch = checks::Scratch::new("run");
     let mut all: Vec<Check> = Vec::new();
+    // A CUDA-enabled build under `--require-all` must not pass by reporting that it
+    // had no toolkit or GPU; `--require-cuda` asks for the same strictness directly.
+    // A default-features build is not affected, so CUDA-free CI keeps its meaning.
+    let require_cuda = args.require_cuda || (args.require_all && cfg!(feature = "cuda"));
 
     // Environment first: a report that does not say what it was measured on is
     // not reproducible, so this is part of the output rather than a debug line.
@@ -116,7 +127,7 @@ fn main() {
         all.extend(checks::adversarial(&builds, &scratch, args.frames));
     }
     if wanted(&args, "asm") {
-        all.extend(checks::asm_guard(&builds));
+        all.extend(checks::asm_guard(&builds, args.require_all));
     }
     if wanted(&args, "acoustics") {
         all.extend(checks::acoustics());
@@ -140,7 +151,7 @@ fn main() {
         all.extend(checks::mastering());
     }
     if wanted(&args, "cuda") {
-        all.extend(checks::cuda());
+        all.extend(checks::cuda(require_cuda));
     }
 
     let fails = all.iter().filter(|c| c.status == Status::Fail).count();
@@ -266,6 +277,7 @@ fn parse() -> Result<Args, String> {
         match flag {
             "--json" => a.json = true,
             "--require-all" => a.require_all = true,
+            "--require-cuda" => a.require_cuda = true,
             "--group" => {
                 a.group = Some(value_at(&argv, i, "--group")?);
                 i += 1;
@@ -300,8 +312,11 @@ fn parse() -> Result<Args, String> {
             "-h" | "--help" => {
                 println!(
                     "usage: g6me-verify [--json] [--group NAME] [--seconds N] [--frames N] \
-                     [--require-all] [--audit-cochlea [WAV]]\ngroups: bitexact builds width chunk \
-                     continuity phase drift contraction asm acoustics cochlea blackwell ntt bem scan mastering cuda"
+                     [--require-all] [--require-cuda] [--audit-cochlea [WAV]]\ngroups: bitexact \
+                     builds width chunk continuity phase drift contraction asm acoustics cochlea \
+                     blackwell ntt bem scan mastering cuda\n\
+                     --require-all fails on SKIP, and (when built with --features cuda) on a \
+                     missing CUDA toolkit or GPU; --require-cuda requests that independently"
                 );
                 std::process::exit(0);
             }
@@ -354,7 +369,7 @@ mod suite {
         all.extend(checks::drift(&builds, &scratch, 5));
         all.extend(checks::contraction());
         all.extend(checks::adversarial(&builds, &scratch, frames));
-        all.extend(checks::asm_guard(&builds));
+        all.extend(checks::asm_guard(&builds, false));
         all.extend(checks::acoustics());
         all.extend(checks::cochlea());
         all.extend(checks::blackwell());
@@ -362,7 +377,7 @@ mod suite {
         all.extend(checks::bem());
         all.extend(checks::scan());
         all.extend(checks::mastering());
-        all.extend(checks::cuda());
+        all.extend(checks::cuda(false));
 
         let failed: Vec<&Check> = all.iter().filter(|c| c.status == Status::Fail).collect();
         let skipped: Vec<&Check> = all.iter().filter(|c| c.status == Status::Skip).collect();

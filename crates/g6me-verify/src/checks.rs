@@ -11,8 +11,8 @@
 //! | `continuity` | does filter state carry across block boundaries exactly? |
 //! | `drift` | over a minute of material, does anything accumulate, wander, or blow up? |
 //! | `phase` | do the two paths' delays, polarities and per-slot timings match sample-for-sample? |
-//! | `contraction` | is any mul+add in this binary being contracted into FMA? |
-//! | `asm` | does the disassembler agree? |
+//! | `contraction` | is this binary's mul+add being contracted into FMA by the compiler? (a build-flag check; the DSP numerics are covered by `bitexact`) |
+//! | `asm` | does the disassembler agree, is every required DSP module present, and is a deliberately FMA-contracted Rust binary caught? |
 
 use crate::reference::{self, RefBuild, MASK_7_1, REF_BLOCK, SLOTS_8};
 use crate::signal::{self, Diff, Kind};
@@ -926,6 +926,11 @@ pub fn drift(builds: &[RefBuild], scratch: &Scratch, seconds: u64) -> Vec<Check>
 /// gives exactly zero; a fused multiply-add keeps the unrounded product and gives
 /// `2^-104`. So a non-zero answer means the compiler contracted — which in a
 /// recursive IIR is a different filter, not a faster one of the same filter.
+///
+/// Scope: this is a check on the *compiler and build flags* for this binary, not
+/// on the DSP algorithm. It proves LLVM did not contract this expression here; the
+/// downmixer's own numerics are covered by the `bitexact`/`builds` groups, and the
+/// per-module disassembly in `asm` covers the shipped code.
 pub fn contraction() -> Vec<Check> {
     let out = vec![check_f64_contraction()];
     out
@@ -966,8 +971,17 @@ fn check_f64_contraction() -> Check {
     }
 }
 
-/// `asm`: agree with the disassembler, and check the reference binaries too.
-pub fn asm_guard(builds: &[RefBuild]) -> Vec<Check> {
+/// `asm`: agree with the disassembler, cover every required DSP module, and prove
+/// the scanner is not vacuous.
+///
+/// The per-module allowlist is what stops a module silently dropping out of the
+/// binary: a required module with no symbol blocks is a FAIL, not a SKIP, because
+/// "0 FMA" means nothing if the code was never scanned. The sibling `fma_probe`
+/// binary is the Rust-side sabotage control — it really contains a fused
+/// multiply-add — so a green result here proves the mnemonic matcher can see one
+/// (the C counter-example only proves that for the C compiler). Under
+/// `--require-all`, the sibling CLI and the probe must both exist.
+pub fn asm_guard(builds: &[RefBuild], require_all: bool) -> Vec<Check> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => return vec![skip("asm", "current executable", e.to_string())],
@@ -982,16 +996,76 @@ pub fn asm_guard(builds: &[RefBuild]) -> Vec<Check> {
     // Also scan the shipped sibling `g6me` binary when built in the same profile directory
     // so every production DSP module (dsp, stn, enhance, unmask, upmix, plus, limiter,
     // room, scattering, ntt, hoa, bem, pcm, transducer) is audited end-to-end.
-    if let Some(dir) = exe.parent() {
-        let cli_bin = dir.join(if cfg!(windows) { "g6me.exe" } else { "g6me" });
-        if cli_bin.is_file() {
+    let mut bins: Vec<(&'static str, PathBuf)> = vec![("verify", exe.clone())];
+    let cli_bin = exe
+        .parent()
+        .map(|dir| dir.join(if cfg!(windows) { "g6me.exe" } else { "g6me" }));
+    let cli_present = cli_bin.as_ref().map(|p| p.is_file()).unwrap_or(false);
+    if let Some(cli) = &cli_bin {
+        if cli_present {
             out.push(scan_binary(
                 "rust dsp (g6me cli)",
-                &cli_bin,
+                cli,
                 &["g6me"],
                 ExpectFma::No,
             ));
+            bins.push(("g6me cli", cli.clone()));
+        } else if require_all {
+            out.push(fail(
+                "asm",
+                "rust dsp (g6me cli)",
+                format!(
+                    "--require-all: sibling CLI not found next to {}; build the workspace first",
+                    exe.display()
+                ),
+            ));
+        } else {
+            out.push(skip(
+                "asm",
+                "rust dsp (g6me cli)",
+                "sibling `g6me` binary not present; build the workspace to audit the shipped CLI",
+            ));
         }
+    }
+
+    if cli_present {
+        out.extend(module_guard(&bins));
+    } else {
+        out.push(skip(
+            "asm",
+            "module coverage (required DSP modules)",
+            "needs the sibling `g6me` CLI to define the production module set",
+        ));
+    }
+
+    // Sabotage control: this Rust binary is built with a real fused multiply-add.
+    let probe = exe.parent().map(|dir| {
+        dir.join(if cfg!(windows) {
+            "fma_probe.exe"
+        } else {
+            "fma_probe"
+        })
+    });
+    match probe.as_ref().filter(|p| p.is_file()) {
+        Some(p) => out.push(scan_binary(
+            "rust fma probe (sabotage control)",
+            p,
+            &["fma_probe"],
+            ExpectFma::Expected,
+        )),
+        None if require_all => out.push(fail(
+            "asm",
+            "rust fma probe (sabotage control)",
+            format!(
+                "--require-all: `fma_probe` not found next to {}; `cargo build --workspace` builds it",
+                exe.display()
+            ),
+        )),
+        None => out.push(skip(
+            "asm",
+            "rust fma probe (sabotage control)",
+            "`fma_probe` not built; `cargo build --workspace` builds the deliberately contracted control",
+        )),
     }
     for b in contract_builds(builds, "f64") {
         // The reference must show no FMA either: that is what `-ffp-contract=off`
@@ -1018,6 +1092,190 @@ pub fn asm_guard(builds: &[RefBuild]) -> Vec<Check> {
         out.push(c);
     }
     out
+}
+
+/// Production DSP modules that must have generated code in a release build, with
+/// the minimum instruction count expected across the scanned binaries. The floors
+/// are roughly 40-50% of the counts observed on the x86-64 release build, so
+/// ordinary codegen drift passes while a module that vanished, was renamed, or
+/// became a stub fails.
+const REQUIRED_MODULES: &[(&str, usize)] = &[
+    ("stn", 1_500),
+    ("enhance", 1_200),
+    ("unmask", 1_000),
+    ("upmix", 250),
+    ("plus", 7_000),
+    ("limiter", 800),
+    ("room", 5_000),
+    ("scattering", 500),
+    ("ntt", 80),
+    ("dsp", 400),
+];
+
+const FMA_MNEMONICS: &[&str] = &[
+    "vfmadd", "vfmsub", "vfnmadd", "vfnmsub", // x86 AVX-FMA
+    "fmadd", "fmsub", "fnmadd", "fnmsub", // aarch64
+    "fma.",   // ppc
+];
+
+#[derive(Clone, Copy, Default)]
+struct ModuleStat {
+    blocks: usize,
+    instrs: usize,
+    fma: usize,
+}
+
+/// Rust v0 and legacy mangling both carry the module path as `9g6me_core`
+/// followed by the length-prefixed module name, e.g. `9g6me_core3stn`.
+fn module_pattern(module: &str) -> String {
+    format!("9g6me_core{}{}", module.len(), module)
+}
+
+/// One check per required module: zero blocks is a failure, an instruction count
+/// below the floor is a failure, and any FMA in the module's own symbols is a
+/// failure.
+fn module_guard(bins: &[(&'static str, PathBuf)]) -> Vec<Check> {
+    let Some(tool) = find_objdump() else {
+        return vec![skip(
+            "asm",
+            "module coverage",
+            "no objdump available to inspect codegen",
+        )];
+    };
+    let mut totals = vec![ModuleStat::default(); REQUIRED_MODULES.len()];
+    let mut unreadable: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for (label, path) in bins {
+        match scan_modules(&tool, path) {
+            Ok(stats) => {
+                scanned += 1;
+                for (total, s) in totals.iter_mut().zip(stats.iter()) {
+                    total.blocks += s.blocks;
+                    total.instrs += s.instrs;
+                    total.fma += s.fma;
+                }
+            }
+            Err(e) => unreadable.push(format!("{label}: {e}")),
+        }
+    }
+    if scanned == 0 {
+        return vec![skip(
+            "asm",
+            "module coverage",
+            format!(
+                "no binary could be disassembled ({})",
+                unreadable.join("; ")
+            ),
+        )];
+    }
+    let mut out = Vec::new();
+    for (i, (module, floor)) in REQUIRED_MODULES.iter().enumerate() {
+        let s = totals[i];
+        let name = format!("module coverage: {module}");
+        if s.blocks == 0 {
+            out.push(fail(
+                "asm",
+                name,
+                format!(
+                    "0 symbol blocks across {scanned} scanned binaries — module missing from the build"
+                ),
+            ));
+        } else if s.instrs < *floor {
+            out.push(fail(
+                "asm",
+                name,
+                format!(
+                    "{} block(s) but only {} instruction(s), below the {floor}-instruction floor",
+                    s.blocks, s.instrs
+                ),
+            ));
+        } else if s.fma > 0 {
+            out.push(fail(
+                "asm",
+                name,
+                format!(
+                    "{} FMA instruction(s) in {module} code — bit-exactness is void",
+                    s.fma
+                ),
+            ));
+        } else {
+            out.push(pass(
+                "asm",
+                name,
+                format!(
+                    "{} block(s), {} instruction(s) >= {floor}, 0 FMA",
+                    s.blocks, s.instrs
+                ),
+            ));
+        }
+    }
+    if !unreadable.is_empty() {
+        // Not evidence either way: surface it so `--require-all` (which makes SKIP
+        // fatal) still gates a binary the disassembler could not read.
+        out.push(skip(
+            "asm",
+            "module coverage: unreadable binary",
+            unreadable.join("; "),
+        ));
+    }
+    out
+}
+
+fn scan_modules(tool: &str, path: &PathBuf) -> Result<Vec<ModuleStat>, String> {
+    let o = std::process::Command::new(tool)
+        .arg("-d")
+        .arg("--no-show-raw-insn")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("{tool} could not read {}: {e}", path.display()))?;
+    let txt = String::from_utf8_lossy(&o.stdout);
+    if txt.trim().is_empty() {
+        return Err(format!(
+            "{tool} produced no disassembly for {}",
+            path.display()
+        ));
+    }
+    Ok(parse_module_stats(&txt))
+}
+
+/// Count module blocks, instructions and FMA mnemonics from objdump text. Split
+/// out from `scan_modules` so the classification can be unit-tested against a
+/// synthetic disassembly without needing a real binary.
+fn parse_module_stats(txt: &str) -> Vec<ModuleStat> {
+    let patterns: Vec<String> = REQUIRED_MODULES
+        .iter()
+        .map(|(m, _)| module_pattern(m))
+        .collect();
+    let mut stats = vec![ModuleStat::default(); REQUIRED_MODULES.len()];
+    let mut current: Option<usize> = None;
+    for line in txt.lines() {
+        if let Some(sym) = symbol_header(line) {
+            current = patterns.iter().position(|p| sym.contains(p.as_str()));
+            if let Some(i) = current {
+                stats[i].blocks += 1;
+            }
+            continue;
+        }
+        let Some(i) = current else { continue };
+        if !is_instruction(line) {
+            continue;
+        }
+        stats[i].instrs += 1;
+        if FMA_MNEMONICS.iter().any(|m| mnemonic(line).starts_with(m)) {
+            stats[i].fma += 1;
+        }
+    }
+    stats
+}
+
+/// `  1194:\tmovsd ...` is an instruction line; `<sym>:` headers are handled
+/// before this is called.
+fn is_instruction(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some((addr, _)) = t.split_once(':') else {
+        return false;
+    };
+    !addr.is_empty() && addr.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1061,11 +1319,7 @@ fn scan_binary(what: &str, path: &PathBuf, want_symbols: &[&str], expect: Expect
     //   0000000000001160 <g6ct_process>:
     //   1160:  f2 0f 10 05 …   movsd 0x…(%rip),%xmm1
     // so a symbol boundary is any line containing `<name>`.
-    let fma_mnemonics = [
-        "vfmadd", "vfmsub", "vfnmadd", "vfnmsub", // x86 AVX-FMA
-        "fmadd", "fmsub", "fnmadd", "fnmsub", // aarch64
-        "fma.",   // ppc
-    ];
+    let fma_mnemonics = FMA_MNEMONICS;
     let mut inside = false;
     let mut hits = 0usize;
     let mut inspected = 0usize;
@@ -1442,7 +1696,8 @@ pub fn acoustics() -> Vec<Check> {
 }
 
 /// `cochlea`: Zilany-Bruce-Carney biophysical auditory-nerve neurogram NSIM,
-/// Baumgartner-Majdak Bayesian Auditory Externalization, and Hear-to-Hear BALD personalization.
+/// Baumgartner-Majdak Bayesian Auditory Externalization, and BALD personalization over
+/// three anatomy scalars.
 pub fn cochlea() -> Vec<Check> {
     use g6me_core::cochlea::{
         baumgartner_majdak_externalization, compute_neurogram, nsim, AnatomyParams,
@@ -1490,7 +1745,10 @@ pub fn cochlea() -> Vec<Check> {
         json!({ "nsim_same": s_same, "nsim_distorted": s_clip }),
     ));
 
-    // 2. Baumgartner-Majdak Externalization: G6+ Studio & 3D ControlRoom > G6+ Pure.
+    // 2. Baumgartner-Majdak Externalization: the model's own externalized DTF template
+    // must sit at the top of the Eq. 10 scale while a dry in-head diotic impulse scores
+    // low. The production tiers are reported as metrics; the paper's model predicts cue
+    // match against a listener template, not a monotone room-tier ordering.
     let bank_pure = KernelBank::synthesize(PlusCfg::from_profile(PlusProfile::Pure), fs);
     let bank_studio = KernelBank::synthesize(PlusCfg::from_profile(PlusProfile::Studio), fs);
     let mut ctrl_cfg = PlusCfg::from_profile(PlusProfile::Studio);
@@ -1499,6 +1757,15 @@ pub fn cochlea() -> Vec<Check> {
     ctrl_cfg.use_slepian_tail = true;
     ctrl_cfg.use_fdn_velvet = true;
     let bank_ctrl = KernelBank::synthesize(ctrl_cfg, fs);
+
+    let (tpl_l, tpl_r) =
+        g6me_core::externalization::externalization_template_ir(4096, fs as f64, 30.0);
+    let e_tpl = baumgartner_majdak_externalization(&tpl_l, &tpl_r, fs);
+    let mut dry_l = vec![0.0_f64; 4096];
+    let mut dry_r = vec![0.0_f64; 4096];
+    dry_l[240] = 1.0;
+    dry_r[240] = 1.0;
+    let e_dry = baumgartner_majdak_externalization(&dry_l, &dry_r, fs);
 
     let e_pure =
         baumgartner_majdak_externalization(&bank_pure.ir_l[SLOT_FL], &bank_pure.ir_r[SLOT_FL], fs);
@@ -1511,13 +1778,16 @@ pub fn cochlea() -> Vec<Check> {
         baumgartner_majdak_externalization(&bank_ctrl.ir_l[SLOT_FL], &bank_ctrl.ir_r[SLOT_FL], fs);
 
     out.push(with_metric(
-        if e_studio.score > e_pure.score && e_ctrl.score > e_pure.score {
+        if e_tpl.score > 0.90
+            && e_dry.score < 0.60
+            && e_tpl.score > e_dry.score + 0.30
+        {
             pass(
                 "cochlea",
                 "Baumgartner-Majdak Bayesian externalization",
                 format!(
-                    "E(Pure)={:.3} < E(Studio)={:.3}, E(3D ControlRoom)={:.3}",
-                    e_pure.score, e_studio.score, e_ctrl.score
+                    "E(template)={:.3} > E(dry in-head)={:.3}; tiers Pure={:.3}, Studio={:.3}, 3D ControlRoom={:.3}",
+                    e_tpl.score, e_dry.score, e_pure.score, e_studio.score, e_ctrl.score
                 ),
             )
         } else {
@@ -1525,19 +1795,22 @@ pub fn cochlea() -> Vec<Check> {
                 "cochlea",
                 "Baumgartner-Majdak Bayesian externalization",
                 format!(
-                    "expected Studio ({:.3}) & ControlRoom ({:.3}) > Pure ({:.3})",
-                    e_studio.score, e_ctrl.score, e_pure.score
+                    "expected template ({:.3}) > 0.90 and dry ({:.3}) < 0.60 by 0.30",
+                    e_tpl.score, e_dry.score
                 ),
             )
         },
         json!({
+            "template": e_tpl.score,
+            "dry_in_head": e_dry.score,
             "pure": e_pure.score,
             "studio": e_studio.score,
             "control_room": e_ctrl.score,
         }),
     ));
 
-    // 3. Hear-to-Hear Bayesian Active Personalization convergence in 12 clicks.
+    // 3. BALD personalization over 3 anatomy scalars: convergence in 12 clicks with an
+    // independent L1 oracle that does not share the session's likelihood geometry.
     let truth = AnatomyParams {
         head_radius_m: 0.093,
         torso_height_m: 0.29,
@@ -1547,13 +1820,12 @@ pub fn cochlea() -> Vec<Check> {
     let h0 = sess.entropy_bits();
     for _ in 0..12 {
         let (a, b) = sess.pair_params();
-        let da = ((truth.head_radius_m - a.head_radius_m) / 0.008).powi(2)
-            + ((truth.torso_height_m - a.torso_height_m) / 0.040).powi(2)
-            + ((truth.pinna_shelf_db - a.pinna_shelf_db) / 1.5).powi(2);
-        let db = ((truth.head_radius_m - b.head_radius_m) / 0.008).powi(2)
-            + ((truth.torso_height_m - b.torso_height_m) / 0.040).powi(2)
-            + ((truth.pinna_shelf_db - b.pinna_shelf_db) / 1.5).powi(2);
-        sess.record_choice(da < db);
+        let err = |x: AnatomyParams| -> f64 {
+            (x.head_radius_m - truth.head_radius_m).abs() / 0.010
+                + (x.torso_height_m - truth.torso_height_m).abs() / 0.045
+                + 0.5 * (x.pinna_shelf_db - truth.pinna_shelf_db).abs() / 1.8
+        };
+        sess.record_choice(err(a) < err(b));
     }
     let h12 = sess.entropy_bits();
     let est = sess.posterior_mean();
@@ -1565,7 +1837,7 @@ pub fn cochlea() -> Vec<Check> {
         if ok_p {
             pass(
                 "cochlea",
-                "Hear-to-Hear BALD personalization (12 clicks)",
+                "BALD personalization over 3 anatomy scalars (12 clicks)",
                 format!(
                     "entropy {h0:.2} -> {h12:.2} bits; head={:.4}m torso={:.3}m pinna={:+.2}dB",
                     est.head_radius_m, est.torso_height_m, est.pinna_shelf_db
@@ -1574,7 +1846,7 @@ pub fn cochlea() -> Vec<Check> {
         } else {
             fail(
                 "cochlea",
-                "Hear-to-Hear BALD personalization (12 clicks)",
+                "BALD personalization over 3 anatomy scalars (12 clicks)",
                 format!(
                     "did not converge: H {h0:.2}->{h12:.2}, est=({:.4}, {:.3}, {:+.2})",
                     est.head_radius_m, est.torso_height_m, est.pinna_shelf_db
@@ -1628,6 +1900,87 @@ pub fn blackwell() -> Vec<Check> {
             )
         },
         json!({ "abs_err": k_err }),
+    ));
+
+    // 1b. Randomized catastrophic cancellation against an exact integer reference.
+    // Every value is `m * 2^-30` with `|m| <= 2^53`, so the exact sum is an i128
+    // integer sum scaled by a power of two and converts to f64 without rounding.
+    // Each case holds +2^53, then many +1 terms, then -2^53: a naive left-to-right
+    // f64 sum must lose the +1s (they are below the ulp at 2^53), while the
+    // Kulisch accumulator must return them exactly. `naive_wrong > 0` is asserted
+    // so the corpus cannot silently stop being adversarial.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    const SCALE_BITS: i32 = 30;
+    let scale = 2f64.powi(-SCALE_BITS);
+    let mut cases = 0usize;
+    let mut wrong = 0usize;
+    let mut naive_wrong = 0usize;
+    let mut max_err = 0.0_f64;
+    for _ in 0..64 {
+        let tiny = 2 + (next() % 19) as i64; // 2..=20 unit terms
+        let n = (tiny + 2) as usize;
+        // Even offsets keep `huge` exactly representable above 2^53 (spacing 2),
+        // while +1 remains below the ulp.
+        let huge = (1i64 << 53) + 2 * (next() % 256) as i64;
+        let mut ms = vec![1i64; n];
+        ms[0] = huge;
+        ms[n - 1] = -huge;
+        let exact_sum: i128 = ms.iter().map(|&m| m as i128).sum();
+        let exact = (exact_sum as f64) * scale;
+        let values: Vec<f64> = ms.iter().map(|&m| (m as f64) * scale).collect();
+        let mut acc = KulischAcc::new();
+        for v in &values {
+            acc.add(*v);
+        }
+        let got = acc.finalize();
+        if got.to_bits() != exact.to_bits() {
+            wrong += 1;
+            max_err = max_err.max((got - exact).abs());
+        }
+        let mut naive = 0.0_f64;
+        for v in &values {
+            naive += *v;
+        }
+        if naive.to_bits() != exact.to_bits() {
+            naive_wrong += 1;
+        }
+        cases += 1;
+    }
+    out.push(with_metric(
+        if wrong == 0 && naive_wrong > 0 {
+            pass(
+                "blackwell",
+                "Kulisch randomized catastrophic cancellation (exact reference)",
+                format!(
+                    "{cases} cases (2^53 +/- unit terms at 2^-{SCALE_BITS}): 0 Kulisch mismatches; \
+                     naive f64 sum wrong on {naive_wrong}/{cases}"
+                ),
+            )
+        } else if wrong > 0 {
+            fail(
+                "blackwell",
+                "Kulisch randomized catastrophic cancellation (exact reference)",
+                format!("{wrong}/{cases} Kulisch mismatches, max |err| = {max_err:.3e}"),
+            )
+        } else {
+            fail(
+                "blackwell",
+                "Kulisch randomized catastrophic cancellation (exact reference)",
+                "corpus did not discriminate: the naive f64 sum matched every exact reference",
+            )
+        },
+        json!({
+            "cases": cases,
+            "kulisch_mismatches": wrong,
+            "max_abs_err": max_err,
+            "naive_wrong": naive_wrong,
+        }),
     ));
 
     // 2. Ozaki-I INT8 + Ozaki-II CRT across INT8, FP8 E4M3, and Blackwell FP4 E2M1 Base-13.
@@ -1825,7 +2178,6 @@ pub fn audit_cochlea(wav_path: Option<&std::path::Path>, as_json: bool) -> Resul
     use g6me_core::cochlea::{baumgartner_majdak_externalization, compute_neurogram, nsim};
     use g6me_core::plus::{KernelBank, PhysicsEngine, PlusCfg, PlusProfile};
     use g6me_core::room::RoomPreset;
-    use std::f64::consts::PI;
     use std::io::{Read, Seek, SeekFrom};
 
     const SLOT_FL: usize = 0;
@@ -1849,16 +2201,21 @@ pub fn audit_cochlea(wav_path: Option<&std::path::Path>, as_json: bool) -> Resul
     let e_ctrl =
         baumgartner_majdak_externalization(&bank_ctrl.ir_l[SLOT_FL], &bank_ctrl.ir_r[SLOT_FL], fs);
 
-    // Biophysical cochlea NSIM between direct anechoic vs studio/control-room on a 120 ms complex tone.
-    let n = 5760usize;
-    let mut dry_tone = vec![0.0_f64; n];
-    for (i, s) in dry_tone.iter_mut().enumerate() {
-        let t = (i as f64) / (fs as f64);
-        *s = 0.22 * (2.0 * PI * 330.0 * t).sin()
-            + 0.18 * (2.0 * PI * 1_100.0 * t).sin()
-            + 0.14 * (2.0 * PI * 3_500.0 * t).sin();
-    }
-    let ng_ref = compute_neurogram(&dry_tone, fs, 24);
+    // Model validation uses the published construct: the externalized DTF template must
+    // receive the maximum Eq. 10 rating and a dry in-head diotic impulse a low one. The
+    // per-profile scores below measure cue match against that template; the paper does
+    // not predict a monotone room-tier ordering.
+    let (tpl_l, tpl_r) =
+        g6me_core::externalization::externalization_template_ir(4096, fs as f64, 30.0);
+    let e_tpl = baumgartner_majdak_externalization(&tpl_l, &tpl_r, fs);
+    let mut dry_audit_l = vec![0.0_f64; 4096];
+    let mut dry_audit_r = vec![0.0_f64; 4096];
+    dry_audit_l[240] = 1.0;
+    dry_audit_r[240] = 1.0;
+    let e_dry = baumgartner_majdak_externalization(&dry_audit_l, &dry_audit_r, fs);
+
+    // No synthetic self-comparison is reported: `nsim(x, x) == 1` by construction
+    // and says nothing about the model. The WAV path below compares two real channels.
 
     let wav_audit = if let Some(path) = wav_path {
         let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1923,11 +2280,11 @@ pub fn audit_cochlea(wav_path: Option<&std::path::Path>, as_json: bool) -> Resul
         None
     };
 
-    let self_nsim = nsim(&ng_ref, &ng_ref);
     let report = json!({
         "cochlea_model": "Zilany-Bruce-Carney (JASA 2014 / 2018) 24-CF IHC/ANF Neurogram",
         "externalization_model": "Baumgartner & Majdak (2021) Bayesian Auditory Externalization",
-        "reference_nsim_self": self_nsim,
+        "externalization_template": e_tpl.score,
+        "externalization_dry_in_head": e_dry.score,
         "profiles": {
             "pure": {
                 "externalization": e_pure.score,
@@ -1959,7 +2316,6 @@ pub fn audit_cochlea(wav_path: Option<&std::path::Path>, as_json: bool) -> Resul
     } else {
         println!("Biophysical Cochlea & Bayesian Externalization Audit");
         println!("----------------------------------------------------");
-        println!("  Zilany-Bruce-Carney Neurogram NSIM (self): {self_nsim:.6}");
         println!(
             "  G6+ Pure         : E = {:.3} (monaural={:.3}, binaural={:.3}, IACC={:.3}, ER={:+.1} dB)",
             e_pure.score, e_pure.monaural_cue, e_pure.binaural_cue, e_pure.iacc, e_pure.early_refl_db
@@ -1977,10 +2333,10 @@ pub fn audit_cochlea(wav_path: Option<&std::path::Path>, as_json: bool) -> Resul
         }
     }
 
-    if !(e_studio.score > e_pure.score && e_ctrl.score > e_pure.score) {
+    if !(e_tpl.score > 0.90 && e_dry.score < 0.60 && e_tpl.score > e_dry.score + 0.30) {
         return Err(format!(
-            "externalization gate failed: Pure={:.3}, Studio={:.3}, ControlRoom={:.3}",
-            e_pure.score, e_studio.score, e_ctrl.score
+            "externalization gate failed: template={:.3}, dry in-head={:.3}, Pure={:.3}, Studio={:.3}, ControlRoom={:.3}",
+            e_tpl.score, e_dry.score, e_pure.score, e_studio.score, e_ctrl.score
         ));
     }
     Ok(())
@@ -3174,7 +3530,8 @@ pub fn mastering() -> Vec<Check> {
         json!({ "peak": peak, "ceiling_lin": ceiling_lin }),
     ));
 
-    // 4. Parallel PCG64 HOA raytracing bit-exactness + UPOLA room tail + SHA-256 KernelBank cache.
+    // 4. Parallel native HOA raytracing thread-invariance + UPOLA room tail + SHA-256
+    //    KernelBank cache.
     let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
     let atm = AtmosphereCfg::default();
     let src = [4.2, 3.6, 1.35];
@@ -3198,7 +3555,7 @@ pub fn mastering() -> Vec<Check> {
         if rt_exact && cache_hit {
             pass(
                 "mastering",
-                "Parallel PCG64 raytracing + UPOLA SHA-256 KernelBank cache",
+                "Parallel native raytracing + UPOLA SHA-256 KernelBank cache",
                 format!(
                     "parallel vs serial raytrace 0-bit diff, ControlRoom N_IR={} ({:.1} ms), Arc::ptr_eq cache hit",
                     n_ir,
@@ -3208,7 +3565,7 @@ pub fn mastering() -> Vec<Check> {
         } else {
             fail(
                 "mastering",
-                "Parallel PCG64 raytracing + UPOLA SHA-256 KernelBank cache",
+                "Parallel native raytracing + UPOLA SHA-256 KernelBank cache",
                 format!("rt_exact={rt_exact}, cache_hit={cache_hit}, n_ir={n_ir}"),
             )
         },
@@ -3218,11 +3575,242 @@ pub fn mastering() -> Vec<Check> {
     out
 }
 
+/// Read interleaved `f32` samples from a RIFF/WAVE file (the CLI's `--format wav
+/// --depth f32` output). Chunk sizes are honoured, not assumed to be 44 bytes.
+#[cfg(feature = "cuda")]
+fn read_wav_f32(path: &std::path::Path) -> Result<Vec<f32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(format!("{} is not a RIFF/WAVE file", path.display()));
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = pos + 8;
+        if id == b"data" {
+            let end = body.saturating_add(size).min(bytes.len());
+            let mut out = Vec::with_capacity((end - body) / 4);
+            for chunk in bytes[body..end].as_chunks::<4>().0 {
+                out.push(f32::from_le_bytes(*chunk));
+            }
+            return Ok(out);
+        }
+        pos = body.saturating_add(size).saturating_add(size & 1);
+    }
+    Err(format!("{} has no data chunk", path.display()))
+}
+
+/// End-to-end CLI render: the same short programme through `g6me --mode plus
+/// --room control-room` with and without `--cuda`. The GPU run must report every
+/// stage on the GPU (no `CPU fallback` line) and the rendered float samples must
+/// agree at the tolerance the in-tree synthesis note measured (~1.4e-4).
+#[cfg(feature = "cuda")]
+fn cuda_cli_end_to_end() -> Check {
+    use std::process::{Command, Stdio};
+
+    const NAME: &str = "Live CLI end-to-end --cuda room render parity";
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return skip("cuda", NAME, e.to_string()),
+    };
+    let Some(dir) = exe.parent() else {
+        return skip("cuda", NAME, "verifier has no parent directory");
+    };
+    let cli = dir.join(if cfg!(windows) { "g6me.exe" } else { "g6me" });
+    if !cli.is_file() {
+        return skip(
+            "cuda",
+            NAME,
+            "sibling `g6me` binary not built; build the workspace to run the end-to-end check",
+        );
+    }
+    let ffmpeg = std::env::var("G6ME_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+    let ffmpeg_ok = Command::new(&ffmpeg)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ffmpeg_ok {
+        return skip("cuda", NAME, format!("{ffmpeg} not available"));
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!("g6me-cuda-e2e-{}-{stamp}", std::process::id()));
+    let input = root.join("e2e_input.wav");
+    let cpu_dir = root.join("cpu");
+    let gpu_dir = root.join("gpu");
+    let setup = (|| -> Result<(), String> {
+        std::fs::create_dir_all(&cpu_dir).map_err(|e| format!("create cpu dir: {e}"))?;
+        std::fs::create_dir_all(&gpu_dir).map_err(|e| format!("create gpu dir: {e}"))?;
+        // 5.1, not stereo: `BinauralPlus::process` passes `MASK_STEREO` through
+        // untouched, so a stereo input would exercise the room synthesis but never
+        // convolve it. Six channels force the UPOLA FFT path that is under test.
+        let mut wav = g6me_core::wav::WavWriter::create(&input, 48_000, 6, 32, true, Some(0x3F))
+            .map_err(|e| format!("create input wav: {e}"))?;
+        let frames = 19_200usize; // 0.4 s
+        let tones = [440.0_f64, 554.0, 659.0, 80.0, 880.0, 988.0];
+        let mut pcm = Vec::with_capacity(frames * tones.len() * 4);
+        for n in 0..frames {
+            let t = n as f64 / 48_000.0;
+            for tone in tones {
+                let s = 0.2 * (2.0 * std::f64::consts::PI * tone * t).sin();
+                pcm.extend_from_slice(&(s as f32).to_le_bytes());
+            }
+        }
+        wav.write(&pcm)
+            .map_err(|e| format!("write input wav: {e}"))?;
+        wav.finish().map_err(|e| format!("finish input wav: {e}"))?;
+        Ok(())
+    })();
+    if let Err(e) = setup {
+        let _ = std::fs::remove_dir_all(&root);
+        return fail("cuda", NAME, e);
+    }
+
+    let run = |extra: &[&str], out_dir: &std::path::Path| -> Result<String, String> {
+        let mut cmd = Command::new(&cli);
+        cmd.arg("--mode")
+            .arg("plus")
+            .arg("--room")
+            .arg("control-room")
+            .arg("--room-quality")
+            .arg("preview")
+            .arg("--format")
+            .arg("wav")
+            .arg("--depth")
+            .arg("f32")
+            .args(extra)
+            .arg("-o")
+            .arg(out_dir)
+            .arg(&input);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("spawn {}: {e}", cli.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{} exited {:?}: {}",
+                cli.display(),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    let result = (|| -> Result<(f64, f64, f64, String), String> {
+        let _cpu_err = run(&[], &cpu_dir)?;
+        let gpu_err = run(&["--cuda"], &gpu_dir)?;
+        let name = input.file_name().unwrap();
+        let cpu = read_wav_f32(&cpu_dir.join(name))?;
+        let gpu = read_wav_f32(&gpu_dir.join(name))?;
+        if cpu.len() != gpu.len() {
+            return Err(format!(
+                "sample counts differ: cpu {} vs gpu {}",
+                cpu.len(),
+                gpu.len()
+            ));
+        }
+        let mut max_diff = 0.0_f64;
+        let mut sum_sq = 0.0_f64;
+        let mut peak = 0.0_f64;
+        for (&a, &b) in cpu.iter().zip(&gpu) {
+            if !a.is_finite() || !b.is_finite() {
+                return Err("non-finite sample in CPU or GPU render".into());
+            }
+            peak = peak.max(a.abs() as f64);
+            let d = (a as f64 - b as f64).abs();
+            max_diff = max_diff.max(d);
+            sum_sq += d * d;
+        }
+        let rms = (sum_sq / cpu.len().max(1) as f64).sqrt();
+        Ok((max_diff, peak, rms, gpu_err))
+    })();
+    let _ = std::fs::remove_dir_all(&root);
+
+    match result {
+        Err(e) => fail("cuda", NAME, e),
+        Ok((max_diff, peak, rms, gpu_err)) => {
+            let required = [
+                "stage fdtd: GPU",
+                "stage raytrace-hoa: GPU",
+                "stage fft: GPU",
+            ];
+            let missing: Vec<&str> = required
+                .iter()
+                .copied()
+                .filter(|needle| !gpu_err.contains(needle))
+                .collect();
+            let fallbacks = gpu_err
+                .lines()
+                .filter(|l| l.contains("[cuda]") && l.contains("CPU fallback"))
+                .count();
+            let gpu_report = gpu_err
+                .lines()
+                .filter(|l| l.starts_with("[cuda]"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if !missing.is_empty() || fallbacks > 0 {
+                return fail(
+                    "cuda",
+                    NAME,
+                    format!(
+                        "GPU run did not use every stage (missing: {:?}, fallback lines: {fallbacks}); report: {gpu_report}",
+                        missing
+                    ),
+                );
+            }
+            // 1e-3 leaves ~7x headroom over the ~1.4e-4 synthesis-order delta recorded
+            // in the in-tree parity test, and still rejects a CPU/GPU render mismatch
+            // an order of magnitude smaller than the programme's own peak.
+            const MAX_ABS: f64 = 1e-3;
+            let ok = max_diff <= MAX_ABS;
+            with_metric(
+                if ok {
+                    pass(
+                        "cuda",
+                        NAME,
+                        format!(
+                            "max |gpu - cpu| = {max_diff:.3e} (<= 1e-3), peak = {peak:.4}, rms = {rms:.3e}; all stages GPU, 0 fallbacks"
+                        ),
+                    )
+                } else {
+                    fail(
+                        "cuda",
+                        NAME,
+                        format!(
+                            "max |gpu - cpu| = {max_diff:.3e} > 1e-3 (peak = {peak:.4}, rms = {rms:.3e}); report: {gpu_report}"
+                        ),
+                    )
+                },
+                json!({
+                    "max_abs_diff": max_diff,
+                    "peak": peak,
+                    "rms_diff": rms,
+                    "tolerance": MAX_ABS,
+                    "gpu_stages": required.len(),
+                    "fallback_lines": fallbacks,
+                }),
+            )
+        }
+    }
+}
+
 /// `cuda`: real CUDA `.cu` -> `.cubin` (`nvcc --fmad=false`) -> `cuobjdump --dump-sass`
 /// zero-FMA audit across all 6 kernels + 5-architecture Ozaki-II Tensor Core SASS audit
 /// (`sm_120a`, `sm_90`, `sm_89`, `sm_80`, `sm_75`) + `--fmad=true` sabotage negative control
 /// + live GPU-vs-CPU parity verification for all 6 kernels when a physical NVIDIA GPU is present.
-pub fn cuda() -> Vec<Check> {
+///
+/// `require_cuda` (set by `--require-cuda`, or by `--require-all` when this binary was
+/// built with `--features cuda`) makes a missing toolkit or missing live GPU a FAIL
+/// instead of an informational note. A CUDA-enabled release gate should not stay green
+/// on a host that never compiled or ran a kernel.
+pub fn cuda(require_cuda: bool) -> Vec<Check> {
     let mut out = Vec::new();
     #[cfg(feature = "cuda")]
     {
@@ -3331,11 +3919,22 @@ pub fn cuda() -> Vec<Check> {
                     || e.contains("not installed")
                     || e.contains("unavailable")
                 {
-                    out.push(info(
-                        "cuda",
-                        "6 CUDA kernels nvcc --fmad=false PTX+SASS audit",
-                        format!("CUDA toolkit probe: {e}"),
-                    ));
+                    if require_cuda {
+                        out.push(fail(
+                            "cuda",
+                            "6 CUDA kernels nvcc --fmad=false PTX+SASS audit",
+                            format!(
+                                "CUDA-enabled build but no CUDA toolkit: {e} \
+                                 (--require-all with the cuda feature / --require-cuda makes absence fatal)"
+                            ),
+                        ));
+                    } else {
+                        out.push(info(
+                            "cuda",
+                            "6 CUDA kernels nvcc --fmad=false PTX+SASS audit",
+                            format!("CUDA toolkit probe: {e}"),
+                        ));
+                    }
                 } else {
                     out.push(fail(
                         "cuda",
@@ -3387,6 +3986,55 @@ pub fn cuda() -> Vec<Check> {
                         ));
                     }
                     Err(e) => out.push(fail("cuda", "Live GPU FDTD 3D zero-FMA parity", e)),
+                }
+
+                // 4a2. Production-shaped FDTD: 65,610 voxels x 128 steps. The 4,096-voxel
+                // toy above cannot catch a defect that only appears once the grid exceeds
+                // a launch tile, an index width, or the production receiver count.
+                let prod =
+                    g6me_core::room::FdtdSolver3d::for_room_budget(&geom, 344.0, 520.0, 65_000);
+                let prod_src = (prod.nx / 2, prod.ny / 2, prod.nz / 2);
+                let prod_recs = [
+                    (prod.nx / 3, prod.ny / 3, prod.nz / 2),
+                    (prod.nx / 3, 2 * prod.ny / 3, prod.nz / 2),
+                ];
+                let prod_steps = 128usize;
+                let cpu_prod = prod.simulate(prod_src, &prod_recs, prod_steps);
+                match prod.simulate_on_cuda(&rt, prod_src, &prod_recs, prod_steps) {
+                    Ok(gpu_prod) => {
+                        let max_diff = cpu_prod
+                            .iter()
+                            .zip(&gpu_prod)
+                            .flat_map(|(a, b)| a.iter().zip(b))
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0_f64, f64::max);
+                        let voxels = prod.nx * prod.ny * prod.nz;
+                        out.push(with_metric(
+                            if max_diff < 1e-13 {
+                                pass(
+                                    "cuda",
+                                    "Live GPU FDTD production-grid parity",
+                                    format!(
+                                        "{voxels} voxels x {prod_steps} steps, max |gpu - cpu| = {max_diff:.3e} (< 1e-13)"
+                                    ),
+                                )
+                            } else {
+                                fail(
+                                    "cuda",
+                                    "Live GPU FDTD production-grid parity",
+                                    format!(
+                                        "{voxels} voxels x {prod_steps} steps, max |gpu - cpu| = {max_diff:.3e} >= 1e-13"
+                                    ),
+                                )
+                            },
+                            json!({
+                                "voxels": voxels,
+                                "steps": prod_steps,
+                                "max_abs_diff": max_diff,
+                            }),
+                        ));
+                    }
+                    Err(e) => out.push(fail("cuda", "Live GPU FDTD production-grid parity", e)),
                 }
 
                 // 4b. Ozaki-II CRT Tensor Core GEMM live parity across supported precisions
@@ -3659,7 +4307,13 @@ pub fn cuda() -> Vec<Check> {
                 {
                     use g6me_core::bem::{FmmBemSolver, TriangleMesh};
                     let mesh = TriangleMesh::procedural_head_with_pinnae(0.0875, 3);
-                    match FmmBemSolver::new(&mesh) {
+                    match FmmBemSolver::new_with_cuda(&mesh, true) {
+                        Ok(solver) if !solver.solid_angle_diag_on_gpu => out.push(fail(
+                            "cuda",
+                            "Live GPU FMM-BEM reciprocal solve parity",
+                            "FmmBemSolver::new_with_cuda(_, true) did not use the GPU \
+                             solid-angle diagonal (silent CPU assembly)",
+                        )),
                         Ok(solver) => {
                             let sources = [
                                 [0.0, 0.0, 1.0],
@@ -3694,7 +4348,7 @@ pub fn cuda() -> Vec<Check> {
                                         "cuda",
                                         "Live GPU FMM-BEM reciprocal solve parity",
                                         format!(
-                                            "n={} elements, max |gpu - cpu| = {max_diff:.3e} (< 1e-10)",
+                                            "n={} elements, GPU solid-angle diag, max |gpu - cpu| = {max_diff:.3e} (< 1e-10)",
                                             solver.elements.len()
                                         ),
                                     )
@@ -3710,6 +4364,7 @@ pub fn cuda() -> Vec<Check> {
                                 },
                                 json!({
                                     "elements": solver.elements.len(),
+                                    "gpu_solid_angle_diag": solver.solid_angle_diag_on_gpu,
                                     "max_abs_diff": max_diff,
                                     "frequency_hz": f_hz,
                                 }),
@@ -3758,76 +4413,238 @@ pub fn cuda() -> Vec<Check> {
                     Err(e) => out.push(fail("cuda", "Live GPU RayTrace HOA zero-FMA kernel", e)),
                 }
 
-                // 4g. CPU-vs-GPU ray-traced HOA histogram, production scattering, bit-exact
+                // 4g. CPU-vs-GPU ray-traced HOA histogram: independent native CPU tracer
+                // vs the zero-FMA CUDA kernel. The Monte Carlo streams differ, so the gate
+                // is the measured sampling envelope of the physical aggregates (total W
+                // energy, coarse temporal envelope, energy-weighted mean arrival time,
+                // per-SH-order power), not bit identity.
+                // Cell-level L1 is intentionally not gated: the 128x64-cell observable is
+                // far sparser than the late-hit count, so independent streams disagree on
+                // most fine cells even with identical physics.
                 {
                     use g6me_core::atmosphere::AtmosphereCfg;
                     use g6me_core::hoa::HOA_CH;
-                    use g6me_core::room::{
-                        raytrace_hoa_histogram, raytrace_hoa_histogram_with_cuda,
-                    };
+                    use g6me_core::room::{raytrace_hoa_histogram, raytrace_hoa_histogram_on_cuda};
+
+                    /// `(max_abs_cell, rel_w_total, band_l1, order_l1, mean_t_diff_s)`.
+                    fn agreement(
+                        cpu: &[[f64; HOA_CH]],
+                        gpu: &[[f64; HOA_CH]],
+                        n_bands: usize,
+                        bin_dt_s: f64,
+                    ) -> (f64, f64, f64, f64, f64) {
+                        let n_bins = cpu.len();
+                        let mut max_abs = 0.0_f64;
+                        let mut w_cpu = 0.0_f64;
+                        let mut w_gpu = 0.0_f64;
+                        let mut tw_cpu = 0.0_f64;
+                        let mut tw_gpu = 0.0_f64;
+                        let mut e_cpu = [0.0_f64; HOA_CH];
+                        let mut e_gpu = [0.0_f64; HOA_CH];
+                        for (bin, (a, b)) in cpu.iter().zip(gpu).enumerate() {
+                            for (c, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+                                max_abs = max_abs.max((x - y).abs());
+                                e_cpu[c] += x;
+                                e_gpu[c] += y;
+                            }
+                            let t = (bin as f64 + 0.5) * bin_dt_s;
+                            w_cpu += a[0];
+                            w_gpu += b[0];
+                            tw_cpu += t * a[0];
+                            tw_gpu += t * b[0];
+                        }
+                        let mut band_cpu = vec![0.0_f64; n_bands];
+                        let mut band_gpu = vec![0.0_f64; n_bands];
+                        for (bin, (a, b)) in cpu.iter().zip(gpu).enumerate() {
+                            let band = (bin * n_bands / n_bins.max(1)).min(n_bands - 1);
+                            band_cpu[band] += a[0];
+                            band_gpu[band] += b[0];
+                        }
+                        let sc: f64 = band_cpu.iter().sum();
+                        let sg: f64 = band_gpu.iter().sum();
+                        let band_l1 = band_cpu
+                            .iter()
+                            .zip(&band_gpu)
+                            .map(|(a, b)| {
+                                (a / sc.max(f64::MIN_POSITIVE) - b / sg.max(f64::MIN_POSITIVE))
+                                    .abs()
+                            })
+                            .sum();
+                        let mut p_cpu = [0.0_f64; 8];
+                        let mut p_gpu = [0.0_f64; 8];
+                        for n in 0..8usize {
+                            for c in n * n..(n + 1) * (n + 1) {
+                                p_cpu[n] += e_cpu[c] * e_cpu[c];
+                                p_gpu[n] += e_gpu[c] * e_gpu[c];
+                            }
+                        }
+                        let tc: f64 = p_cpu.iter().sum();
+                        let tg: f64 = p_gpu.iter().sum();
+                        let order_l1 = p_cpu
+                            .iter()
+                            .zip(&p_gpu)
+                            .map(|(a, b)| {
+                                (a / tc.max(f64::MIN_POSITIVE) - b / tg.max(f64::MIN_POSITIVE))
+                                    .abs()
+                            })
+                            .sum();
+                        (
+                            max_abs,
+                            (w_cpu - w_gpu).abs()
+                                / w_cpu.abs().max(w_gpu.abs()).max(f64::MIN_POSITIVE),
+                            band_l1,
+                            order_l1,
+                            (tw_cpu / w_cpu.max(f64::MIN_POSITIVE)
+                                - tw_gpu / w_gpu.max(f64::MIN_POSITIVE))
+                            .abs(),
+                        )
+                    }
+
+                    const N_BANDS: usize = 8;
+                    const SEEDS: [u64; 8] = [
+                        0x6736_4D45_5241_5954,
+                        0xCAFE_BABE,
+                        0x5EED_1234,
+                        0x0D15_EA5E,
+                        0x0123_4567_89AB_CDEF,
+                        0xA5A5_5A5A_5A5A_A5A5,
+                        0x0BAD_C0DE_F00D_D00D,
+                        0x1357_9BDF_2468_ACE0,
+                    ];
+                    // Measured worst over the 8 seeds at this exact configuration
+                    // (ControlRoom, src [1.5, 2.0, 1.2], 65 536 rays x 24 bounces, 128
+                    // bins of 2 ms; RTX 5070, 2026-11-28): rel W total = 0.0516,
+                    // band L1 = 0.058, order L1 = 0.069. Bounds = 1.5 x measured max +
+                    // 0.02 absolute margin for seed-to-seed Monte Carlo scatter.
+                    const MAX_REL_W_TOTAL_TOL: f64 = 0.10;
+                    const MAX_BAND_L1_TOL: f64 = 0.11;
+                    const MAX_ORDER_L1_TOL: f64 = 0.13;
+                    // Energy-weighted mean arrival time: worst of the 8 seeds measured
+                    // 0.43 ms at this configuration, so the bound is 1.5 x 0.43 ms + 1.0 ms
+                    // margin, rounded up to 1.7 ms. This pins the time axis the coarse
+                    // band envelope leaves loose.
+                    const MAX_MEAN_T_DIFF_TOL: f64 = 0.0017;
+
                     let atm = AtmosphereCfg::default();
                     let src = [1.5, 2.0, 1.2];
-                    let (n_rays, bounces, bins, dt, seed) = (
-                        512usize,
-                        12usize,
-                        128usize,
-                        0.002_f64,
-                        0x6736_4D45_5241_5954u64,
-                    );
-                    let cpu =
-                        raytrace_hoa_histogram(&geom, &atm, src, n_rays, bounces, bins, dt, seed);
-                    let gpu = raytrace_hoa_histogram_with_cuda(
-                        &geom, &atm, src, n_rays, bounces, bins, dt, seed, true,
-                    );
-                    let mut mismatches = 0usize;
-                    let mut max_diff = 0.0_f64;
-                    for (cb, gb) in cpu.iter().zip(&gpu) {
-                        for c in 0..HOA_CH {
-                            if cb[c].to_bits() != gb[c].to_bits() {
-                                mismatches += 1;
+                    let (n_rays, bounces, bins, dt) = (65_536usize, 24usize, 128usize, 0.002_f64);
+                    let mut worst = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+                    let mut detail = String::new();
+                    let mut ok = true;
+                    for &seed in &SEEDS {
+                        let cpu = raytrace_hoa_histogram(
+                            &geom, &atm, src, n_rays, bounces, bins, dt, seed,
+                        );
+                        // Direct kernel entry: fails instead of falling back, so a silent
+                        // CPU run cannot masquerade as a GPU pass.
+                        match raytrace_hoa_histogram_on_cuda(
+                            &geom, &atm, src, n_rays, bounces, bins, dt, seed,
+                        ) {
+                            Err(e) => {
+                                ok = false;
+                                detail = format!(
+                                    "direct GPU kernel path failed (no CPU fallback) for seed \
+                                     {seed:#x}: {e}"
+                                );
+                                break;
                             }
-                            max_diff = max_diff.max((cb[c] - gb[c]).abs());
+                            Ok(gpu) => {
+                                let (m_abs, m_w, m_band, m_order, m_t) =
+                                    agreement(&cpu, &gpu, N_BANDS, dt);
+                                detail.push_str(&format!(
+                                    "seed {seed:#x}: rel W {:.2}%, band L1 {:.3}, order L1 \
+                                     {:.3}, mean t |d| {:.2} ms, max cell |d| {m_abs:.2e}; ",
+                                    m_w * 100.0,
+                                    m_band,
+                                    m_order,
+                                    m_t * 1e3
+                                ));
+                                worst.0 = worst.0.max(m_w);
+                                worst.1 = worst.1.max(m_band);
+                                worst.2 = worst.2.max(m_order);
+                                worst.3 = worst.3.max(m_t);
+                                if m_w >= MAX_REL_W_TOTAL_TOL
+                                    || m_band >= MAX_BAND_L1_TOL
+                                    || m_order >= MAX_ORDER_L1_TOL
+                                    || m_t >= MAX_MEAN_T_DIFF_TOL
+                                {
+                                    ok = false;
+                                }
+                            }
                         }
                     }
-                    let cells = cpu.len() * HOA_CH;
+                    let title = "Live CPU/GPU RayTrace HOA histogram tolerance parity";
+                    detail.push_str(&format!(
+                        "| worst of {} seeds: rel W {:.2}% (tol {:.0}%), band L1 {:.3} (tol \
+                         {:.2}), order L1 {:.3} (tol {:.2}), mean t |d| {:.2} ms (tol {:.1} \
+                         ms); {n_rays} rays x {bounces} bounces",
+                        SEEDS.len(),
+                        worst.0 * 100.0,
+                        MAX_REL_W_TOTAL_TOL * 100.0,
+                        worst.1,
+                        MAX_BAND_L1_TOL,
+                        worst.2,
+                        MAX_ORDER_L1_TOL,
+                        worst.3 * 1e3,
+                        MAX_MEAN_T_DIFF_TOL * 1e3
+                    ));
                     out.push(with_metric(
-                        if mismatches == 0 {
-                            pass(
-                                "cuda",
-                                "Live CPU/GPU RayTrace HOA histogram bit-exact parity",
-                                format!(
-                                    "{cells} bins bit-identical (Lambertian scattering, max |d| = 0.0)"
-                                ),
-                            )
+                        if ok {
+                            pass("cuda", title, detail)
                         } else {
-                            fail(
-                                "cuda",
-                                "Live CPU/GPU RayTrace HOA histogram bit-exact parity",
-                                format!("{mismatches}/{cells} bins differ, max |d| = {max_diff:.3e}"),
-                            )
+                            fail("cuda", title, detail)
                         },
                         json!({
-                            "cells": cells,
-                            "bit_mismatches": mismatches,
-                            "max_abs_diff": max_diff,
+                            "seeds": SEEDS.len(),
+                            "rel_w_total_max": worst.0,
+                            "band_l1_max": worst.1,
+                            "order_l1_max": worst.2,
+                            "mean_t_diff_ms_max": worst.3 * 1e3,
+                            "tol_rel_w_total": MAX_REL_W_TOTAL_TOL,
+                            "tol_band_l1": MAX_BAND_L1_TOL,
+                            "tol_order_l1": MAX_ORDER_L1_TOL,
+                            "tol_mean_t_diff_ms": MAX_MEAN_T_DIFF_TOL * 1e3,
                             "rays": n_rays,
                             "bounces": bounces,
+                            "bins": bins,
+                            "direct_kernel_path": true,
                         }),
                     ));
                 }
+
+                // 4h. End-to-end CLI render: CPU vs `--cuda` on the real production
+                // entry point, asserting the stage report contains no CPU fallback.
+                out.push(cuda_cli_end_to_end());
             }
             None => {
-                out.push(info(
-                    "cuda",
-                    "live NVIDIA GPU runtime",
-                    "no live NVIDIA GPU detected on this host (deterministic CPU f64 fallback active; 6-kernel + 5-arch SASS audits ran via nvcc/cuobjdump)",
-                ));
+                if require_cuda {
+                    out.push(fail(
+                        "cuda",
+                        "live NVIDIA GPU runtime",
+                        "no live NVIDIA GPU detected; --require-all with the cuda feature / \
+                         --require-cuda makes GPU absence fatal, because the live parity checks \
+                         cannot run",
+                    ));
+                } else {
+                    out.push(info(
+                        "cuda",
+                        "live NVIDIA GPU runtime",
+                        "no live NVIDIA GPU detected on this host (deterministic CPU f64 fallback active; 6-kernel + 5-arch SASS audits ran via nvcc/cuobjdump)",
+                    ));
+                }
             }
         }
     }
     #[cfg(not(feature = "cuda"))]
     {
         use g6me_core::blackwell::{compile_and_audit_cuda_sass, CudaAuditStatus};
+        if require_cuda {
+            out.push(fail(
+                "cuda",
+                "--require-cuda",
+                "g6me-verify was built without `--features cuda`; no CUDA verification can run",
+            ));
+        }
         match compile_and_audit_cuda_sass("sm_75") {
             CudaAuditStatus::VerifiedSass {
                 arch,
@@ -3882,6 +4699,43 @@ mod tests {
             mnemonic("    1194:      \tvfmadd231sd\t%xmm2, %xmm1, %xmm0"),
             "vfmadd231sd"
         );
+    }
+
+    fn module_index(name: &str) -> usize {
+        REQUIRED_MODULES
+            .iter()
+            .position(|(m, _)| *m == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn module_patterns_are_length_prefixed_paths() {
+        assert_eq!(module_pattern("stn"), "9g6me_core3stn");
+        assert_eq!(module_pattern("scattering"), "9g6me_core10scattering");
+    }
+
+    #[test]
+    fn module_parser_counts_blocks_instructions_and_fma() {
+        // Synthetic objdump output: one stn block with a real FMA, one room block
+        // without, and no dsp block at all.
+        let txt = "\
+0000000000001000 <_RNvCs123_9g6me_core3stn4main>:
+    1000:\tvmovsd %xmm0,%xmm1
+    1004:\tvfmadd132sd %xmm2,%xmm1,%xmm0
+    1008:\tret
+0000000000002000 <_RNvCs123_9g6me_core4room4main>:
+    2000:\tret
+";
+        let stats = parse_module_stats(txt);
+        let stn = stats[module_index("stn")];
+        assert_eq!((stn.blocks, stn.instrs, stn.fma), (1, 3, 1));
+        let room = stats[module_index("room")];
+        assert_eq!((room.blocks, room.instrs, room.fma), (1, 1, 0));
+        // A required module absent from the text must read as zero blocks — the
+        // case `module_guard` turns into a FAIL, not a SKIP. If the parser ever
+        // counted a symbol header or a label as an instruction, the 3 and 1 above
+        // would differ, so this test discriminates.
+        assert_eq!(stats[module_index("dsp")].blocks, 0);
     }
 
     #[test]
