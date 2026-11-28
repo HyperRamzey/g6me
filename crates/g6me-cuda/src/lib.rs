@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cudarc::driver::{
-    sys, CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -385,6 +385,164 @@ fn ozaki2_shift_bits(k_dim: usize) -> i32 {
 /// `(ray_delays, ray_energies, ray_dirs)` from [`G6meCudaRuntime::run_raytrace_hoa_pass`].
 pub type RayTraceHoaOutput = (Vec<f64>, Vec<f64>, Vec<f64>);
 
+/// Host-built, x-independent FMM interaction plan for the zero-FMA BEM operator.
+///
+/// The caller (G6ME core) builds this once per `(solver, k, adjoint)` from the same
+/// octree, admissibility test and coefficient formulas used by the CPU FMM matvec.
+/// [`G6meCudaRuntime::bem_fmm_operator`] uploads it to the device exactly once; every
+/// subsequent [`CudaBemOperator::apply`] only ships the `2n` vector components and runs
+/// the kernels. All arrays are flat and C-order so they map directly to device buffers.
+#[derive(Debug, Clone, Default)]
+pub struct BemFmmPlan {
+    /// Number of BEM elements.
+    pub n: usize,
+    /// Number of octree nodes (pre-order ids; every child id > its parent id).
+    pub node_count: usize,
+    /// Deepest octree level index (root level is 0).
+    pub max_level: usize,
+    /// Exact CPU solid-angle diagonal `A_ii`.
+    pub diag: Vec<f64>,
+    /// Per-source `-area` (the CPU `w = x[j] * -area` left factor).
+    pub src_scale: Vec<f64>,
+    /// Per-source outward normal, x components (`[n]`; `src_ny` / `src_nz` likewise).
+    pub src_nx: Vec<f64>,
+    pub src_ny: Vec<f64>,
+    pub src_nz: Vec<f64>,
+    /// Leaf node id containing each source element.
+    pub src_leaf: Vec<i32>,
+    /// Flattened octree child lists (`[node_count + 1]` offsets).
+    pub child_start: Vec<i32>,
+    pub children: Vec<i32>,
+    /// Flattened leaf source lists (`[node_count + 1]` offsets), stored in CPU order.
+    pub leaf_start: Vec<i32>,
+    pub leaf_src: Vec<i32>,
+    /// Node ids grouped by depth (`[max_level + 2]` offsets).
+    pub level_offsets: Vec<i32>,
+    pub level_nodes: Vec<i32>,
+    /// Forward per-target interaction list in CPU DFS order (`[n + 1]` offsets).
+    pub fwd_start: Vec<i32>,
+    /// 0 = near element, 1 = far octree node.
+    pub fwd_kind: Vec<i32>,
+    pub fwd_index: Vec<i32>,
+    /// Near: exact complex coefficient. Far: exact complex cluster scalar.
+    pub fwd_a: Vec<f64>,
+    pub fwd_b: Vec<f64>,
+    /// Far only: `node.center - x_target` components.
+    pub fwd_dx: Vec<f64>,
+    pub fwd_dy: Vec<f64>,
+    pub fwd_dz: Vec<f64>,
+    /// Adjoint near list, bucketed per source in ascending target order (`[n + 1]`).
+    pub adj_src_start: Vec<i32>,
+    pub adj_src_i: Vec<i32>,
+    pub adj_src_cr: Vec<f64>,
+    pub adj_src_ci: Vec<f64>,
+    /// Adjoint far list, bucketed per octree node in ascending target order.
+    pub adj_node_start: Vec<i32>,
+    pub adj_node_i: Vec<i32>,
+    pub adj_node_sr: Vec<f64>,
+    pub adj_node_si: Vec<f64>,
+    pub adj_node_dx: Vec<f64>,
+    pub adj_node_dy: Vec<f64>,
+    pub adj_node_dz: Vec<f64>,
+}
+
+/// Cached zero-FMA BEM operator for one `(solver, k, adjoint)` solve.
+///
+/// Construction uploads the full dense matrix (explicit path) or the FMM interaction
+/// plan once. [`Self::apply`] performs no `n^2` host work and re-uploads no coefficient
+/// data: it ships `x` (`2n` doubles), launches the kernels, and reads back `y`.
+pub struct CudaBemOperator {
+    stream: Arc<CudaStream>,
+    n: usize,
+    d_xr: CudaSlice<f64>,
+    d_xi: CudaSlice<f64>,
+    d_yr: CudaSlice<f64>,
+    d_yi: CudaSlice<f64>,
+    kind: BemOperatorKind,
+}
+
+enum BemOperatorKind {
+    Dense {
+        d_mat_re: CudaSlice<f64>,
+        d_mat_im: CudaSlice<f64>,
+        func: CudaFunction,
+    },
+    FmmForward(Box<BemFmmForwardDevice>),
+    FmmAdjoint(Box<BemFmmAdjointDevice>),
+}
+
+struct BemFmmForwardDevice {
+    /// `(begin, count)` into `d_level_nodes` for each depth, root first.
+    level_ranges: Vec<(i32, i32)>,
+    d_src_scale: CudaSlice<f64>,
+    d_src_nx: CudaSlice<f64>,
+    d_src_ny: CudaSlice<f64>,
+    d_src_nz: CudaSlice<f64>,
+    d_child_start: CudaSlice<i32>,
+    d_children: CudaSlice<i32>,
+    d_leaf_start: CudaSlice<i32>,
+    d_leaf_src: CudaSlice<i32>,
+    d_level_nodes: CudaSlice<i32>,
+    d_diag: CudaSlice<f64>,
+    d_mom: CudaSlice<f64>,
+    d_f_start: CudaSlice<i32>,
+    d_f_kind: CudaSlice<i32>,
+    d_f_index: CudaSlice<i32>,
+    d_f_a: CudaSlice<f64>,
+    d_f_b: CudaSlice<f64>,
+    d_f_dx: CudaSlice<f64>,
+    d_f_dy: CudaSlice<f64>,
+    d_f_dz: CudaSlice<f64>,
+    fn_upward: CudaFunction,
+    fn_forward: CudaFunction,
+}
+
+struct BemFmmAdjointDevice {
+    node_count: usize,
+    level_ranges: Vec<(i32, i32)>,
+    d_src_scale: CudaSlice<f64>,
+    d_src_nx: CudaSlice<f64>,
+    d_src_ny: CudaSlice<f64>,
+    d_src_nz: CudaSlice<f64>,
+    d_src_leaf: CudaSlice<i32>,
+    d_child_start: CudaSlice<i32>,
+    d_children: CudaSlice<i32>,
+    d_level_nodes: CudaSlice<i32>,
+    d_diag: CudaSlice<f64>,
+    d_a_src_start: CudaSlice<i32>,
+    d_a_src_i: CudaSlice<i32>,
+    d_a_src_cr: CudaSlice<f64>,
+    d_a_src_ci: CudaSlice<f64>,
+    d_a_node_start: CudaSlice<i32>,
+    d_a_node_i: CudaSlice<i32>,
+    d_a_node_sr: CudaSlice<f64>,
+    d_a_node_si: CudaSlice<f64>,
+    d_a_node_dx: CudaSlice<f64>,
+    d_a_node_dy: CudaSlice<f64>,
+    d_a_node_dz: CudaSlice<f64>,
+    d_grad: CudaSlice<f64>,
+    fn_nodes: CudaFunction,
+    fn_push: CudaFunction,
+    fn_sources: CudaFunction,
+}
+
+/// `(x_re, x_im, y_re, y_im)` device buffers reused across every [`CudaBemOperator::apply`].
+type BemIoBuffers = (
+    CudaSlice<f64>,
+    CudaSlice<f64>,
+    CudaSlice<f64>,
+    CudaSlice<f64>,
+);
+
+#[inline]
+fn bem_grid(count: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((count.max(1) as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 impl G6meCudaRuntime {
     /// Initialize CUDA device 0 and compile + load all 6 zero-FMA PTX modules via `nvcc --fmad=false`.
     pub fn init() -> Result<Self, String> {
@@ -559,6 +717,9 @@ impl G6meCudaRuntime {
     }
 
     /// Execute a zero-FMA complex Helmholtz BEM matrix-vector product `y = A * x` on the GPU.
+    ///
+    /// One-shot convenience wrapper around [`Self::bem_dense_operator`]; the cached
+    /// operator path used by GMRES uploads the matrix once for the whole solve.
     pub fn run_bem_matvec(
         &self,
         mat_re: &[f64],
@@ -567,65 +728,255 @@ impl G6meCudaRuntime {
         x_im: &[f64],
     ) -> Result<(Vec<f64>, Vec<f64>), String> {
         let n = x_re.len();
-        if x_im.len() != n || mat_re.len() != n * n || mat_im.len() != n * n {
+        let mut op = self.bem_dense_operator(mat_re, mat_im, n)?;
+        op.apply(x_re, x_im)
+    }
+
+    /// Build a cached dense complex BEM operator: uploads the `n x n` row-major matrix
+    /// exactly once, then [`CudaBemOperator::apply`] only ships/receives `2n` doubles.
+    pub fn bem_dense_operator(
+        &self,
+        mat_re: &[f64],
+        mat_im: &[f64],
+        n: usize,
+    ) -> Result<CudaBemOperator, String> {
+        if n == 0 || mat_re.len() != n * n || mat_im.len() != n * n {
             return Err("BEM matvec dimension mismatch".into());
         }
-        let d_mr = self
-            .stream
-            .clone_htod(mat_re)
-            .map_err(|e| format!("htod mat_re: {e}"))?;
-        let d_mi = self
-            .stream
-            .clone_htod(mat_im)
-            .map_err(|e| format!("htod mat_im: {e}"))?;
-        let d_xr = self
-            .stream
-            .clone_htod(x_re)
-            .map_err(|e| format!("htod x_re: {e}"))?;
-        let d_xi = self
-            .stream
-            .clone_htod(x_im)
-            .map_err(|e| format!("htod x_im: {e}"))?;
-        let mut d_yr = self
-            .stream
-            .alloc_zeros::<f64>(n)
-            .map_err(|e| format!("alloc y_re: {e}"))?;
-        let mut d_yi = self
-            .stream
-            .alloc_zeros::<f64>(n)
-            .map_err(|e| format!("alloc y_im: {e}"))?;
-
-        let func: CudaFunction = self
+        let func = self
             .bem_mod
             .load_function("g6me_bem_complex_matvec")
             .map_err(|e| format!("load g6me_bem_complex_matvec: {e}"))?;
-        let cfg = LaunchConfig {
-            grid_dim: ((n as u32).div_ceil(128), 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
+        let d_mat_re = self
+            .stream
+            .clone_htod(mat_re)
+            .map_err(|e| format!("htod mat_re: {e}"))?;
+        let d_mat_im = self
+            .stream
+            .clone_htod(mat_im)
+            .map_err(|e| format!("htod mat_im: {e}"))?;
+        let (d_xr, d_xi, d_yr, d_yi) = self.bem_io_buffers(n)?;
+        Ok(CudaBemOperator {
+            stream: self.stream.clone(),
+            n,
+            d_xr,
+            d_xi,
+            d_yr,
+            d_yi,
+            kind: BemOperatorKind::Dense {
+                d_mat_re,
+                d_mat_im,
+                func,
+            },
+        })
+    }
+
+    /// Build a cached zero-FMA FMM BEM operator for one `(solver, k, adjoint)` solve.
+    /// All interaction coefficients are uploaded once; `apply` does no host `O(n^2)` work.
+    pub fn bem_fmm_operator(
+        &self,
+        plan: &BemFmmPlan,
+        adjoint: bool,
+    ) -> Result<CudaBemOperator, String> {
+        if plan.n == 0
+            || plan.diag.len() != plan.n
+            || plan.src_scale.len() != plan.n
+            || plan.src_nx.len() != plan.n
+            || plan.src_ny.len() != plan.n
+            || plan.src_nz.len() != plan.n
+            || plan.src_leaf.len() != plan.n
+        {
+            return Err("FMM BEM plan dimension mismatch".into());
+        }
+        if plan.child_start.len() != plan.node_count + 1
+            || plan.leaf_start.len() != plan.node_count + 1
+            || plan.level_offsets.len() != plan.max_level + 2
+        {
+            return Err("FMM BEM plan octree layout mismatch".into());
+        }
+        let (d_xr, d_xi, d_yr, d_yi) = self.bem_io_buffers(plan.n)?;
+        let up = |v: &[f64], what: &str| -> Result<CudaSlice<f64>, String> {
+            self.stream
+                .clone_htod(v)
+                .map_err(|e| format!("htod {what}: {e}"))
         };
+        let upi = |v: &[i32], what: &str| -> Result<CudaSlice<i32>, String> {
+            self.stream
+                .clone_htod(v)
+                .map_err(|e| format!("htod {what}: {e}"))
+        };
+        let level_ranges: Vec<(i32, i32)> = (0..plan.max_level + 1)
+            .map(|l| {
+                (
+                    plan.level_offsets[l],
+                    plan.level_offsets[l + 1] - plan.level_offsets[l],
+                )
+            })
+            .collect();
+
+        let kind = if adjoint {
+            if plan.adj_src_start.len() != plan.n + 1
+                || plan.adj_node_start.len() != plan.node_count + 1
+            {
+                return Err("FMM BEM adjoint plan layout mismatch".into());
+            }
+            let fn_nodes = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_adjoint_nodes")
+                .map_err(|e| format!("load g6me_bem_fmm_adjoint_nodes: {e}"))?;
+            let fn_push = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_adjoint_push")
+                .map_err(|e| format!("load g6me_bem_fmm_adjoint_push: {e}"))?;
+            let fn_sources = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_adjoint_sources")
+                .map_err(|e| format!("load g6me_bem_fmm_adjoint_sources: {e}"))?;
+            BemOperatorKind::FmmAdjoint(Box::new(BemFmmAdjointDevice {
+                node_count: plan.node_count,
+                level_ranges,
+                d_src_scale: up(&plan.src_scale, "src_scale")?,
+                d_src_nx: up(&plan.src_nx, "src_nx")?,
+                d_src_ny: up(&plan.src_ny, "src_ny")?,
+                d_src_nz: up(&plan.src_nz, "src_nz")?,
+                d_src_leaf: upi(&plan.src_leaf, "src_leaf")?,
+                d_child_start: upi(&plan.child_start, "child_start")?,
+                d_children: upi(&plan.children, "children")?,
+                d_level_nodes: upi(&plan.level_nodes, "level_nodes")?,
+                d_diag: up(&plan.diag, "diag")?,
+                d_a_src_start: upi(&plan.adj_src_start, "adj_src_start")?,
+                d_a_src_i: upi(&plan.adj_src_i, "adj_src_i")?,
+                d_a_src_cr: up(&plan.adj_src_cr, "adj_src_cr")?,
+                d_a_src_ci: up(&plan.adj_src_ci, "adj_src_ci")?,
+                d_a_node_start: upi(&plan.adj_node_start, "adj_node_start")?,
+                d_a_node_i: upi(&plan.adj_node_i, "adj_node_i")?,
+                d_a_node_sr: up(&plan.adj_node_sr, "adj_node_sr")?,
+                d_a_node_si: up(&plan.adj_node_si, "adj_node_si")?,
+                d_a_node_dx: up(&plan.adj_node_dx, "adj_node_dx")?,
+                d_a_node_dy: up(&plan.adj_node_dy, "adj_node_dy")?,
+                d_a_node_dz: up(&plan.adj_node_dz, "adj_node_dz")?,
+                d_grad: self
+                    .stream
+                    .alloc_zeros::<f64>(6 * plan.node_count)
+                    .map_err(|e| format!("alloc adjoint grad: {e}"))?,
+                fn_nodes,
+                fn_push,
+                fn_sources,
+            }))
+        } else {
+            if plan.fwd_start.len() != plan.n + 1 {
+                return Err("FMM BEM forward plan layout mismatch".into());
+            }
+            let fn_upward = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_upward")
+                .map_err(|e| format!("load g6me_bem_fmm_upward: {e}"))?;
+            let fn_forward = self
+                .bem_mod
+                .load_function("g6me_bem_fmm_forward")
+                .map_err(|e| format!("load g6me_bem_fmm_forward: {e}"))?;
+            BemOperatorKind::FmmForward(Box::new(BemFmmForwardDevice {
+                level_ranges,
+                d_src_scale: up(&plan.src_scale, "src_scale")?,
+                d_src_nx: up(&plan.src_nx, "src_nx")?,
+                d_src_ny: up(&plan.src_ny, "src_ny")?,
+                d_src_nz: up(&plan.src_nz, "src_nz")?,
+                d_child_start: upi(&plan.child_start, "child_start")?,
+                d_children: upi(&plan.children, "children")?,
+                d_leaf_start: upi(&plan.leaf_start, "leaf_start")?,
+                d_leaf_src: upi(&plan.leaf_src, "leaf_src")?,
+                d_level_nodes: upi(&plan.level_nodes, "level_nodes")?,
+                d_diag: up(&plan.diag, "diag")?,
+                d_mom: self
+                    .stream
+                    .alloc_zeros::<f64>(6 * plan.node_count)
+                    .map_err(|e| format!("alloc fmm moments: {e}"))?,
+                d_f_start: upi(&plan.fwd_start, "fwd_start")?,
+                d_f_kind: upi(&plan.fwd_kind, "fwd_kind")?,
+                d_f_index: upi(&plan.fwd_index, "fwd_index")?,
+                d_f_a: up(&plan.fwd_a, "fwd_a")?,
+                d_f_b: up(&plan.fwd_b, "fwd_b")?,
+                d_f_dx: up(&plan.fwd_dx, "fwd_dx")?,
+                d_f_dy: up(&plan.fwd_dy, "fwd_dy")?,
+                d_f_dz: up(&plan.fwd_dz, "fwd_dz")?,
+                fn_upward,
+                fn_forward,
+            }))
+        };
+
+        Ok(CudaBemOperator {
+            stream: self.stream.clone(),
+            n: plan.n,
+            d_xr,
+            d_xi,
+            d_yr,
+            d_yi,
+            kind,
+        })
+    }
+
+    /// Assemble the exact closed-surface solid-angle diagonal on the GPU with a
+    /// zero-FMA kernel (host precomputes nothing that depends on target/source pairs).
+    /// Returns `None`-style errors so callers can fall back bit-identically to the CPU
+    /// `par_map_indexed` assembly.
+    pub fn bem_solid_angle_diag(
+        &self,
+        centroids: &[f64],
+        normals: &[f64],
+        areas: &[f64],
+    ) -> Result<Vec<f64>, String> {
+        let n = areas.len();
+        if n == 0 || centroids.len() != 3 * n || normals.len() != 3 * n {
+            return Err("BEM solid-angle dimension mismatch".into());
+        }
+        let d_cen = self
+            .stream
+            .clone_htod(centroids)
+            .map_err(|e| format!("htod centroids: {e}"))?;
+        let d_nrm = self
+            .stream
+            .clone_htod(normals)
+            .map_err(|e| format!("htod normals: {e}"))?;
+        let d_area = self
+            .stream
+            .clone_htod(areas)
+            .map_err(|e| format!("htod areas: {e}"))?;
+        let mut d_diag = self
+            .stream
+            .alloc_zeros::<f64>(n)
+            .map_err(|e| format!("alloc solid-angle diag: {e}"))?;
+        let func = self
+            .bem_mod
+            .load_function("g6me_bem_solid_angle_diag")
+            .map_err(|e| format!("load g6me_bem_solid_angle_diag: {e}"))?;
         let n_i = n as i32;
         let mut builder = self.stream.launch_builder(&func);
         builder
-            .arg(&d_mr)
-            .arg(&d_mi)
-            .arg(&d_xr)
-            .arg(&d_xi)
-            .arg(&mut d_yr)
-            .arg(&mut d_yi)
+            .arg(&d_cen)
+            .arg(&d_nrm)
+            .arg(&d_area)
+            .arg(&mut d_diag)
             .arg(&n_i);
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("launch bem_matvec: {e}"))?;
+        unsafe { builder.launch(bem_grid(n)) }
+            .map_err(|e| format!("launch solid-angle diag: {e}"))?;
+        self.stream
+            .clone_dtoh(&d_diag)
+            .map_err(|e| format!("dtoh solid-angle diag: {e}"))
+    }
 
-        let yr = self
-            .stream
-            .clone_dtoh(&d_yr)
-            .map_err(|e| format!("dtoh y_re: {e}"))?;
-        let yi = self
-            .stream
-            .clone_dtoh(&d_yi)
-            .map_err(|e| format!("dtoh y_im: {e}"))?;
+    fn bem_io_buffers(&self, n: usize) -> Result<BemIoBuffers, String> {
         let _ = &self.ctx;
-        Ok((yr, yi))
+        let alloc = |what: &str| {
+            self.stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|e| format!("alloc {what}: {e}"))
+        };
+        Ok((
+            alloc("bem x_re")?,
+            alloc("bem x_im")?,
+            alloc("bem y_re")?,
+            alloc("bem y_im")?,
+        ))
     }
 
     /// Execute the full 4-stage device-side Ozaki-II CRT FP64-on-Tensor-Core GEMM `C = A * B`
@@ -1577,6 +1928,199 @@ impl G6meCudaRuntime {
         self.stream
             .clone_dtoh(&d_buf)
             .map_err(|e| format!("dtoh ntt out: {e}"))
+    }
+}
+
+impl CudaBemOperator {
+    /// Number of BEM elements this operator acts on.
+    pub fn dim(&self) -> usize {
+        self.n
+    }
+
+    /// Apply the cached zero-FMA BEM operator: `y = A x` (or `A^T x`), where the
+    /// orientation was fixed at construction. Only `x` is uploaded per call; all
+    /// coefficients and interaction lists stay resident on the device.
+    pub fn apply(&mut self, x_re: &[f64], x_im: &[f64]) -> Result<(Vec<f64>, Vec<f64>), String> {
+        if x_re.len() != self.n || x_im.len() != self.n {
+            return Err("BEM operator input dimension mismatch".into());
+        }
+        let stream = self.stream.clone();
+        stream
+            .memcpy_htod(x_re, &mut self.d_xr)
+            .map_err(|e| format!("htod x_re: {e}"))?;
+        stream
+            .memcpy_htod(x_im, &mut self.d_xi)
+            .map_err(|e| format!("htod x_im: {e}"))?;
+
+        match &mut self.kind {
+            BemOperatorKind::Dense {
+                d_mat_re,
+                d_mat_im,
+                func,
+            } => {
+                let n_i = self.n as i32;
+                let mut builder = stream.launch_builder(func);
+                builder
+                    .arg(d_mat_re)
+                    .arg(d_mat_im)
+                    .arg(&self.d_xr)
+                    .arg(&self.d_xi)
+                    .arg(&mut self.d_yr)
+                    .arg(&mut self.d_yi)
+                    .arg(&n_i);
+                unsafe { builder.launch(bem_grid(self.n)) }
+                    .map_err(|e| format!("launch bem_matvec: {e}"))?;
+            }
+            BemOperatorKind::FmmForward(dev) => {
+                dev.apply(
+                    &stream,
+                    &self.d_xr,
+                    &self.d_xi,
+                    &mut self.d_yr,
+                    &mut self.d_yi,
+                    self.n,
+                )?;
+            }
+            BemOperatorKind::FmmAdjoint(dev) => {
+                dev.apply(
+                    &stream,
+                    &self.d_xr,
+                    &self.d_xi,
+                    &mut self.d_yr,
+                    &mut self.d_yi,
+                    self.n,
+                )?;
+            }
+        }
+
+        let yr = stream
+            .clone_dtoh(&self.d_yr)
+            .map_err(|e| format!("dtoh y_re: {e}"))?;
+        let yi = stream
+            .clone_dtoh(&self.d_yi)
+            .map_err(|e| format!("dtoh y_im: {e}"))?;
+        Ok((yr, yi))
+    }
+}
+
+impl BemFmmForwardDevice {
+    fn apply(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        xr: &CudaSlice<f64>,
+        xi: &CudaSlice<f64>,
+        yr: &mut CudaSlice<f64>,
+        yi: &mut CudaSlice<f64>,
+        n: usize,
+    ) -> Result<(), String> {
+        // Upward pass: deepest level first, so every child moment is final before
+        // its parent reads it. One launch per depth level, deterministic per node.
+        for &(begin, count) in self.level_ranges.iter().rev() {
+            let mut b = stream.launch_builder(&self.fn_upward);
+            b.arg(xr)
+                .arg(xi)
+                .arg(&self.d_src_scale)
+                .arg(&self.d_src_nx)
+                .arg(&self.d_src_ny)
+                .arg(&self.d_src_nz)
+                .arg(&self.d_child_start)
+                .arg(&self.d_children)
+                .arg(&self.d_leaf_start)
+                .arg(&self.d_leaf_src)
+                .arg(&self.d_level_nodes)
+                .arg(&begin)
+                .arg(&count)
+                .arg(&mut self.d_mom);
+            unsafe { b.launch(bem_grid(count as usize)) }
+                .map_err(|e| format!("launch fmm upward: {e}"))?;
+        }
+        let n_i = n as i32;
+        let mut b = stream.launch_builder(&self.fn_forward);
+        b.arg(xr)
+            .arg(xi)
+            .arg(&self.d_diag)
+            .arg(&self.d_f_start)
+            .arg(&self.d_f_kind)
+            .arg(&self.d_f_index)
+            .arg(&self.d_f_a)
+            .arg(&self.d_f_b)
+            .arg(&self.d_f_dx)
+            .arg(&self.d_f_dy)
+            .arg(&self.d_f_dz)
+            .arg(&self.d_mom)
+            .arg(yr)
+            .arg(yi)
+            .arg(&n_i);
+        unsafe { b.launch(bem_grid(n)) }
+            .map(|_| ())
+            .map_err(|e| format!("launch fmm forward: {e}"))
+    }
+}
+
+impl BemFmmAdjointDevice {
+    fn apply(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        xr: &CudaSlice<f64>,
+        xi: &CudaSlice<f64>,
+        yr: &mut CudaSlice<f64>,
+        yi: &mut CudaSlice<f64>,
+        n: usize,
+    ) -> Result<(), String> {
+        // Direct far-field adjoint gradients per node (ascending target order).
+        let nc_i = self.node_count as i32;
+        let mut b = stream.launch_builder(&self.fn_nodes);
+        b.arg(xr)
+            .arg(xi)
+            .arg(&self.d_a_node_start)
+            .arg(&self.d_a_node_i)
+            .arg(&self.d_a_node_sr)
+            .arg(&self.d_a_node_si)
+            .arg(&self.d_a_node_dx)
+            .arg(&self.d_a_node_dy)
+            .arg(&self.d_a_node_dz)
+            .arg(&mut self.d_grad)
+            .arg(&nc_i);
+        unsafe { b.launch(bem_grid(self.node_count)) }
+            .map_err(|e| format!("launch fmm adjoint nodes: {e}"))?;
+
+        // Downward push: root level first, then each deeper level. Each child has a
+        // unique parent, so the level-ordered launches are race-free and deterministic.
+        let push_levels = self.level_ranges.len().saturating_sub(1);
+        for &(begin, count) in self.level_ranges.iter().take(push_levels) {
+            let mut b = stream.launch_builder(&self.fn_push);
+            b.arg(&self.d_child_start)
+                .arg(&self.d_children)
+                .arg(&self.d_level_nodes)
+                .arg(&begin)
+                .arg(&count)
+                .arg(&mut self.d_grad);
+            unsafe { b.launch(bem_grid(count as usize)) }
+                .map_err(|e| format!("launch fmm adjoint push: {e}"))?;
+        }
+
+        // Per-source diagonal + near + leaf L2P accumulation.
+        let n_i = n as i32;
+        let mut b = stream.launch_builder(&self.fn_sources);
+        b.arg(xr)
+            .arg(xi)
+            .arg(&self.d_diag)
+            .arg(&self.d_a_src_start)
+            .arg(&self.d_a_src_i)
+            .arg(&self.d_a_src_cr)
+            .arg(&self.d_a_src_ci)
+            .arg(&self.d_src_scale)
+            .arg(&self.d_src_nx)
+            .arg(&self.d_src_ny)
+            .arg(&self.d_src_nz)
+            .arg(&self.d_src_leaf)
+            .arg(&self.d_grad)
+            .arg(yr)
+            .arg(yi)
+            .arg(&n_i);
+        unsafe { b.launch(bem_grid(n)) }
+            .map(|_| ())
+            .map_err(|e| format!("launch fmm adjoint sources: {e}"))
     }
 }
 
