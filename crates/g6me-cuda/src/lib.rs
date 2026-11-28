@@ -1107,8 +1107,12 @@ impl G6meCudaRuntime {
         Ok((out, prec))
     }
 
-    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass on the GPU.
-    /// Returns `(ray_delays, ray_energies, ray_dirs)` of lengths `n_rays * max_bounces` (and `* 3`).
+    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass on the GPU,
+    /// specular-only (`wall_scatter` = 0). Prefer [`Self::run_raytrace_hoa_pass_with_scattering`]
+    /// when the room materials carry ISO-17497 scattering.
+    ///
+    /// Returns `(ray_delays, ray_energies, ray_dirs)` of lengths `n_rays * max_bounces`
+    /// (and `* 3`). Wall ordering is `[+x, -x, +y, -y, -z, +z]`, matching `RoomGeometry`.
     #[allow(clippy::too_many_arguments)]
     pub fn run_raytrace_hoa_pass(
         &self,
@@ -1116,6 +1120,46 @@ impl G6meCudaRuntime {
         src_pos: [f64; 3],
         lst_pos: [f64; 3],
         wall_refl: [f64; 6],
+        n_rays: usize,
+        max_bounces: usize,
+        c_air: f64,
+        det_radius: f64,
+        base_seed: u64,
+    ) -> Result<RayTraceHoaOutput, String> {
+        self.run_raytrace_hoa_pass_with_scattering(
+            room_dims,
+            src_pos,
+            lst_pos,
+            wall_refl,
+            [0.0; 6],
+            n_rays,
+            max_bounces,
+            c_air,
+            det_radius,
+            base_seed,
+        )
+    }
+
+    /// Execute the zero-FMA stochastic PCG64 acoustic ray-tracing pass with per-wall
+    /// ISO-17497 scattering coefficients.
+    ///
+    /// `wall_refl` is the mid-band energy reflection coefficient `1 - alpha_1k` and
+    /// `wall_scatter` the Lambertian scattering probability, both in `RoomGeometry` wall
+    /// ordering `[+x, -x, +y, -y, -z, +z]`. Each scattered ray samples the cosine-weighted
+    /// hemisphere with a Marsaglia unit-disk rejection (no device `sin`/`cos`), so the
+    /// trajectory stream is bit-identical to the CPU tracer in `g6me-core/src/room.rs`.
+    ///
+    /// Returns `(ray_delays, ray_energies, ray_dirs)` of lengths `n_rays * max_bounces`
+    /// (and `* 3`); `ray_delays == -1.0` / `ray_energies == 0.0` marks a bounce with no
+    /// receiver hit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_raytrace_hoa_pass_with_scattering(
+        &self,
+        room_dims: [f64; 3],
+        src_pos: [f64; 3],
+        lst_pos: [f64; 3],
+        wall_refl: [f64; 6],
+        wall_scatter: [f64; 6],
         n_rays: usize,
         max_bounces: usize,
         c_air: f64,
@@ -1142,6 +1186,10 @@ impl G6meCudaRuntime {
             .stream
             .clone_htod(&wall_refl)
             .map_err(|e| format!("htod wall_refl: {e}"))?;
+        let d_scatter = self
+            .stream
+            .clone_htod(&wall_scatter)
+            .map_err(|e| format!("htod wall_scatter: {e}"))?;
         let mut d_delays = self
             .stream
             .alloc_zeros::<f64>(total)
@@ -1171,6 +1219,7 @@ impl G6meCudaRuntime {
             .arg(&d_src)
             .arg(&d_lst)
             .arg(&d_refl)
+            .arg(&d_scatter)
             .arg(&mut d_delays)
             .arg(&mut d_energies)
             .arg(&mut d_dirs)

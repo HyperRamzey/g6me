@@ -1044,9 +1044,111 @@ pub fn image_sources_3d(
     taps
 }
 
-/// Trace one deterministic PCG64 ray (`ray_id`) through the shoebox room and return its
-/// Order-7 HOA hit tuples `(time_bin, energy_weight, sh_coeffs)` for orders `4..=max_bounces`.
+/// Bit-exact Rust mirror of the PCG stream in `crates/g6me-cuda/kernels/raytrace_hoa.cu`.
+///
+/// The kernel advances a 64-bit LCG state and emits an XSL-RR-permuted 32-bit word,
+/// consuming two 64-bit words per `f64` uniform (`hi` supplies 21 bits, `lo` 32). The
+/// seeding, draw order and arithmetic below are identical to `pcg64_next` /
+/// `pcg64_uniform`, so the CPU and GPU ray streams are bit-identical.
+#[derive(Debug, Clone, Copy)]
+struct RayPcg64 {
+    state: u64,
+    inc: u64,
+}
+
+impl RayPcg64 {
+    /// Kernel seeding: `inc = 2*ray_id + 1`, `state = seed ^ ((ray_id + 1) * golden)`,
+    /// then one discarded output.
+    fn new(seed: u64, ray_id: usize) -> Self {
+        let rid = ray_id as u64;
+        let mut rng = Self {
+            state: seed ^ rid.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            inc: (rid << 1) | 1,
+        };
+        let _ = rng.next_u64();
+        rng
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let old = self.state;
+        self.state = old
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(self.inc);
+        let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
+        let rot = (old >> 59) as u32;
+        u64::from(xorshifted.rotate_right(rot))
+    }
+
+    /// Uniform `f64` in `[0.0, 1.0)`, matching `pcg64_uniform` exactly.
+    #[inline]
+    fn uniform(&mut self) -> f64 {
+        let hi = self.next_u64();
+        let lo = self.next_u64();
+        let bits = ((hi & 0x1F_FFFF) << 32) | lo;
+        (bits as f64) * 1.110_223_024_625_156_5e-16 // 2^-53
+    }
+}
+
+/// One per-bounce trace record, ABI-compatible with the
+/// `(ray_delays, ray_energies, ray_dirs)` arrays returned by
+/// `G6meCudaRuntime::run_raytrace_hoa_pass_with_scattering`.
+///
+/// `delay_s == -1.0` / `energy == 0.0` marks a bounce with no receiver-sphere hit.
+#[derive(Debug, Clone, Copy)]
+struct RayHitRecord {
+    delay_s: f64,
+    energy: f64,
+    /// Direction from the listener back toward the incoming ray (`-dir`).
+    dir: [f64; 3],
+}
+
+/// Accumulate one per-bounce ray record into the Order-7 HOA histogram.
+///
+/// Both the CPU path ([`raytrace_hoa_histogram`]) and the GPU host reduction
+/// ([`raytrace_hoa_histogram_with_cuda`]) call this exact function with the same
+/// `(ray ascending, bounce ascending, channel ascending)` summation order, so a
+/// bit-identical record stream yields a bit-identical histogram. Bounces `1..=3` are
+/// skipped: orders 1–3 come from the exact image-source method.
 #[allow(clippy::too_many_arguments)]
+fn accumulate_hoa_hit(
+    hist: &mut [[f64; HOA_CH]],
+    bounce: usize,
+    delay_s: f64,
+    energy: f64,
+    inc: [f64; 3],
+    atm: &AtmosphereCfg,
+    c_m_s: f64,
+    n_time_bins: usize,
+    bin_dt_s: f64,
+) {
+    // Orders 4..=max_bounces (0-indexed `bounce >= 3`) only.
+    if bounce < 3 || delay_s <= 0.0 || energy <= 0.0 {
+        return;
+    }
+    let bin = (delay_s / bin_dt_s) as usize;
+    if bin >= n_time_bins {
+        return;
+    }
+    let az = inc[1].atan2(inc[0]);
+    let el = inc[2].clamp(-1.0, 1.0).asin();
+    let sh = eval_sh_order7(az, el);
+    // `raytrace_hoa.cu` reports arrival time; recover the travelled distance for
+    // molecular air absorption exactly as the GPU host reduction does.
+    let d_hit = delay_s * c_m_s;
+    let air = atm.air_gain_linear(2_000.0, d_hit);
+    let w = energy * air * air;
+    for c_idx in 0..HOA_CH {
+        hist[bin][c_idx] += w * sh[c_idx];
+    }
+}
+
+/// Trace one deterministic kernel-PCG64 ray (`ray_id`) through the shoebox room.
+///
+/// Every floating-point operation, PCG draw and branch mirrors `raytrace_hoa.cu` line
+/// for line (Marsaglia unit-sphere launch, same wall order, same receiver-sphere test,
+/// same wall absorption, same energy floor, same Lambertian scatter), so the returned
+/// records are bit-identical to the GPU's per-bounce arrays.
 fn trace_single_ray(
     geom: &RoomGeometry,
     atm: &AtmosphereCfg,
@@ -1054,148 +1156,141 @@ fn trace_single_ray(
     ray_id: usize,
     ray_init_energy: f64,
     max_bounces: usize,
-    n_time_bins: usize,
-    bin_dt_s: f64,
     seed: u64,
-) -> Vec<(usize, f64, [f64; HOA_CH])> {
+) -> Vec<RayHitRecord> {
     let c = atm.speed_of_sound_m_s();
     let l = geom.dims_m;
-    let rec = geom.listener_m;
+    let [rx, ry, rz] = geom.listener_m;
     let rec_rad = 0.45_f64; // Acoustic receiver sphere radius (m)
     let rec_rad2 = rec_rad * rec_rad;
-    let stream_seq = 0x5241_5954_5241_4345u64 ^ (ray_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut rng = Pcg64::new(seed, stream_seq);
-    let mut hits = Vec::new();
+    let mut rng = RayPcg64::new(seed, ray_id);
+    let mut out = Vec::new();
 
-    // Uniform random direction on unit sphere.
-    let z = 2.0 * rng.next_f64() - 1.0;
-    let phi = 2.0 * PI * rng.next_f64();
-    let r_xy = (1.0 - z * z).max(0.0).sqrt();
-    let mut dir = [r_xy * phi.cos(), r_xy * phi.sin(), z];
-    let mut pos = src_m;
-    let mut dist_total = 0.0_f64;
+    // Uniform random direction on the unit sphere via Marsaglia (1972) rejection,
+    // identical draws to the kernel launch sampler.
+    let (mut dx, mut dy, mut dz) = loop {
+        let ux = 2.0 * rng.uniform() - 1.0;
+        let uy = 2.0 * rng.uniform() - 1.0;
+        let s = ux * ux + uy * uy;
+        if s >= 1.0 || s == 0.0 {
+            continue;
+        }
+        let f = 2.0 * (1.0 - s).sqrt();
+        break (ux * f, uy * f, 1.0 - 2.0 * s);
+    };
+
+    let [mut px, mut py, mut pz] = src_m;
+    let [lx, ly, lz] = l;
+    let mut total_dist = 0.0_f64;
     let mut energy = ray_init_energy;
+    let energy_floor = 1e-7 * ray_init_energy;
 
-    for bounce in 1..=max_bounces {
-        // Find earliest intersection with the 6 shoebox planes.
-        let mut t_min = f64::INFINITY;
-        let mut wall_idx = 0usize;
-        for axis in 0..3 {
-            if dir[axis] > 1e-12 {
-                let t = (l[axis] - pos[axis]) / dir[axis];
-                if t > 1e-9 && t < t_min {
-                    t_min = t;
-                    wall_idx = match axis {
-                        0 => 0, // +x front
-                        1 => 2, // +y left
-                        _ => 5, // +z ceiling
-                    };
-                }
-            } else if dir[axis] < -1e-12 {
-                let t = -pos[axis] / dir[axis];
-                if t > 1e-9 && t < t_min {
-                    t_min = t;
-                    wall_idx = match axis {
-                        0 => 1, // -x back
-                        1 => 3, // -y right
-                        _ => 4, // -z floor
-                    };
-                }
-            }
-        }
-        if !t_min.is_finite() {
-            break;
-        }
-
-        // Check if ray segment passes through the listener detection sphere (orders >= 4).
-        if bounce >= 4 {
-            let oc = [rec[0] - pos[0], rec[1] - pos[1], rec[2] - pos[2]];
-            let proj = oc[0] * dir[0] + oc[1] * dir[1] + oc[2] * dir[2];
-            if proj > 0.0 && proj < t_min {
-                let closest_sq = (oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2]) - proj * proj;
-                if closest_sq <= rec_rad2 {
-                    let d_hit = dist_total + proj;
-                    let t_hit = d_hit / c;
-                    let bin = (t_hit / bin_dt_s) as usize;
-                    if bin < n_time_bins {
-                        // Direction from listener back toward incoming ray (-dir).
-                        let inc = [-dir[0], -dir[1], -dir[2]];
-                        let az = inc[1].atan2(inc[0]);
-                        let el = inc[2].clamp(-1.0, 1.0).asin();
-                        let sh = eval_sh_order7(az, el);
-                        let air = atm.air_gain_linear(2_000.0, d_hit);
-                        let w = energy * air * air;
-                        hits.push((bin, w, sh));
-                    }
-                }
-            }
-        }
-
-        // Advance ray to hit point and apply wall reflection + Lambertian scattering.
-        pos[0] = (pos[0] + dir[0] * t_min).clamp(1e-6, l[0] - 1e-6);
-        pos[1] = (pos[1] + dir[1] * t_min).clamp(1e-6, l[1] - 1e-6);
-        pos[2] = (pos[2] + dir[2] * t_min).clamp(1e-6, l[2] - 1e-6);
-        dist_total += t_min;
-
-        let mat = geom.walls[wall_idx];
-        // Mid-band wall energy survival (1 - alpha_1k).
-        let refl = 1.0 - mat.absorption[3].clamp(0.01, 0.99);
-        energy *= refl;
-        if energy < 1e-7 * ray_init_energy {
-            break;
-        }
-
-        // Specular reflection vector.
-        let mut spec = dir;
-        let normal = match wall_idx {
-            0 => {
-                spec[0] = -spec[0];
-                [-1.0, 0.0, 0.0]
-            }
-            1 => {
-                spec[0] = -spec[0];
-                [1.0, 0.0, 0.0]
-            }
-            2 => {
-                spec[1] = -spec[1];
-                [0.0, -1.0, 0.0]
-            }
-            3 => {
-                spec[1] = -spec[1];
-                [0.0, 1.0, 0.0]
-            }
-            4 => {
-                spec[2] = -spec[2];
-                [0.0, 0.0, 1.0]
-            }
-            _ => {
-                spec[2] = -spec[2];
-                [0.0, 0.0, -1.0]
-            }
+    for _ in 0..max_bounces {
+        let mut hit = RayHitRecord {
+            delay_s: -1.0,
+            energy: 0.0,
+            dir: [0.0; 3],
         };
 
-        // ISO-17497 Lambertian diffuse scattering blend.
-        if rng.next_f64() < mat.scattering {
-            // Cosine-weighted hemisphere around wall normal.
-            let u1 = rng.next_f64();
-            let u2 = 2.0 * PI * rng.next_f64();
-            let r = u1.sqrt();
-            let lx = r * u2.cos();
-            let ly = r * u2.sin();
-            let lz = (1.0 - u1).max(0.0).sqrt();
-            let normal: [f64; 3] = normal;
-            dir = if normal[0].abs() > 0.5 {
-                [normal[0] * lz, lx, ly]
-            } else if normal[1].abs() > 0.5 {
-                [lx, normal[1] * lz, ly]
-            } else {
-                [lx, ly, normal[2] * lz]
-            };
+        // Earliest intersection with the six shoebox planes (kernel branch order).
+        let tx = if dx > 1e-12 {
+            (lx - px) / dx
+        } else if dx < -1e-12 {
+            -px / dx
         } else {
-            dir = spec;
+            1e30
+        };
+        let ty = if dy > 1e-12 {
+            (ly - py) / dy
+        } else if dy < -1e-12 {
+            -py / dy
+        } else {
+            1e30
+        };
+        let tz = if dz > 1e-12 {
+            (lz - pz) / dz
+        } else if dz < -1e-12 {
+            -pz / dz
+        } else {
+            1e30
+        };
+
+        let mut t_hit = tx;
+        let mut wall = if dx > 0.0 { 0usize } else { 1 };
+        if ty < t_hit {
+            t_hit = ty;
+            wall = if dy > 0.0 { 2 } else { 3 };
+        }
+        if tz < t_hit {
+            t_hit = tz;
+            wall = if dz > 0.0 { 5 } else { 4 };
+        }
+        if t_hit <= 1e-9 || t_hit > 1e20 {
+            out.push(hit);
+            break;
+        }
+
+        // Receiver-sphere overlap on the segment `[0, t_hit]` (kernel arithmetic).
+        let ocx = rx - px;
+        let ocy = ry - py;
+        let ocz = rz - pz;
+        let proj = ocx * dx + ocy * dy + ocz * dz;
+        if proj > 0.0 && proj < t_hit {
+            let cx = ocx - proj * dx;
+            let cy = ocy - proj * dy;
+            let cz = ocz - proj * dz;
+            let d2 = cx * cx + cy * cy + cz * cz;
+            if d2 <= rec_rad2 {
+                hit.delay_s = (total_dist + proj) / c;
+                hit.energy = energy;
+                hit.dir = [-dx, -dy, -dz];
+            }
+        }
+        out.push(hit);
+
+        // Advance to the wall (same clamp as the kernel) and apply mid-band absorption.
+        px = (px + t_hit * dx).clamp(1e-6, lx - 1e-6);
+        py = (py + t_hit * dy).clamp(1e-6, ly - 1e-6);
+        pz = (pz + t_hit * dz).clamp(1e-6, lz - 1e-6);
+        total_dist += t_hit;
+        energy *= 1.0 - geom.walls[wall].absorption[3].clamp(0.01, 0.99);
+
+        // Specular reflection (sign flip), then the shared energy-floor break.
+        if wall < 2 {
+            dx = -dx;
+        } else if wall < 4 {
+            dy = -dy;
+        } else {
+            dz = -dz;
+        }
+        if energy < energy_floor {
+            break;
+        }
+
+        // ISO-17497 Lambertian diffuse scattering blend. Cosine-weighted hemisphere via
+        // Marsaglia unit-disk rejection plus the Lambert equal-area lift `z = sqrt(1 - s)`;
+        // no libm trig, so this branch is bit-reproducible on both CPU and GPU.
+        if rng.uniform() < geom.walls[wall].scattering {
+            let (sx, sy, sz) = loop {
+                let ux = 2.0 * rng.uniform() - 1.0;
+                let uy = 2.0 * rng.uniform() - 1.0;
+                let s = ux * ux + uy * uy;
+                if s >= 1.0 || s == 0.0 {
+                    continue;
+                }
+                break (ux, uy, (1.0 - s).sqrt());
+            };
+            (dx, dy, dz) = match wall {
+                0 => (-sz, sx, sy),
+                1 => (sz, sx, sy),
+                2 => (sx, -sz, sy),
+                3 => (sx, sz, sy),
+                4 => (sx, sy, sz),
+                _ => (sx, sy, -sz),
+            };
         }
     }
-    hits
+    out
 }
 
 /// Deterministic **PCG64** Monte Carlo Acoustic Ray Tracer (orders 4..=max_bounces) with
@@ -1205,6 +1300,10 @@ fn trace_single_ray(
 /// Parallelized across logical CPU cores via [`crate::util::par_map_indexed`] with an
 /// independent per-ray PCG64 stream and fixed ascending `ray_id` reduction, so every
 /// output bit is **100% bit-identical** regardless of CPU core count or scheduling.
+///
+/// The launch sampler, per-bounce arithmetic and histogram accumulator are the exact
+/// same ones used by `raytrace_hoa.cu` + [`raytrace_hoa_histogram_with_cuda`], so the CPU
+/// and GPU histograms are bit-identical for identical inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn raytrace_hoa_histogram(
     geom: &RoomGeometry,
@@ -1221,24 +1320,23 @@ pub fn raytrace_hoa_histogram(
         return hist;
     }
     let ray_init_energy = 1.0 / (n_rays as f64);
+    let c = atm.speed_of_sound_m_s();
     let per_ray = crate::util::par_map_indexed(n_rays, |ray_id| {
-        trace_single_ray(
-            geom,
-            atm,
-            src_m,
-            ray_id,
-            ray_init_energy,
-            max_bounces,
-            n_time_bins,
-            bin_dt_s,
-            seed,
-        )
+        trace_single_ray(geom, atm, src_m, ray_id, ray_init_energy, max_bounces, seed)
     });
     for hits in per_ray {
-        for (bin, w, sh) in hits {
-            for c_idx in 0..HOA_CH {
-                hist[bin][c_idx] += w * sh[c_idx];
-            }
+        for (bounce, hit) in hits.iter().enumerate() {
+            accumulate_hoa_hit(
+                &mut hist,
+                bounce,
+                hit.delay_s,
+                hit.energy,
+                hit.dir,
+                atm,
+                c,
+                n_time_bins,
+                bin_dt_s,
+            );
         }
     }
     hist
@@ -1263,15 +1361,17 @@ pub fn raytrace_hoa_histogram_with_cuda(
     if use_cuda && n_rays > 0 && n_time_bins > 0 && max_bounces > 0 {
         if let Some(rt) = crate::blackwell::shared_cuda_runtime() {
             let c = atm.speed_of_sound_m_s();
-            // Map RoomGeometry wall ordering (+x=0, -x=1, +y=2, -y=3, -z=4, +z=5) to
-            // raytrace_hoa.cu axis-aligned ordering (-x=0, +x=1, -y=2, +y=3, -z=4, +z=5).
-            let r_of = |idx: usize| 1.0 - geom.walls[idx].absorption[3].clamp(0.01, 0.99);
-            let wall_refl = [r_of(1), r_of(0), r_of(3), r_of(2), r_of(4), r_of(5)];
-            if let Ok((delays, energies, dirs)) = rt.run_raytrace_hoa_pass(
+            // raytrace_hoa.cu uses the same RoomGeometry wall ordering
+            // (+x=0, -x=1, +y=2, -y=3, -z=4, +z=5), so the material tables pass through.
+            let wall_refl =
+                std::array::from_fn(|idx| 1.0 - geom.walls[idx].absorption[3].clamp(0.01, 0.99));
+            let wall_scatter = std::array::from_fn(|idx| geom.walls[idx].scattering);
+            if let Ok((delays, energies, dirs)) = rt.run_raytrace_hoa_pass_with_scattering(
                 geom.dims_m,
                 src_m,
                 geom.listener_m,
                 wall_refl,
+                wall_scatter,
                 n_rays,
                 max_bounces,
                 c,
@@ -1279,30 +1379,24 @@ pub fn raytrace_hoa_histogram_with_cuda(
                 seed,
             ) {
                 let mut hist = vec![[0.0_f64; HOA_CH]; n_time_bins];
+                // Same ray-major / bounce-ascending order and the same accumulator as the
+                // CPU path, so identical records produce a bit-identical histogram.
                 for ray_id in 0..n_rays {
                     let base = ray_id * max_bounces;
-                    // Orders >= 4 (0-indexed bounce >= 3); orders 1..=3 come from exact ISM.
-                    for b in 3..max_bounces {
-                        let idx = base + b;
-                        let t_hit = delays[idx];
-                        let energy = energies[idx];
-                        if t_hit <= 0.0 || energy <= 0.0 {
-                            continue;
-                        }
-                        let bin = (t_hit / bin_dt_s) as usize;
-                        if bin >= n_time_bins {
-                            continue;
-                        }
+                    for bounce in 0..max_bounces {
+                        let idx = base + bounce;
                         let inc = [dirs[idx * 3], dirs[idx * 3 + 1], dirs[idx * 3 + 2]];
-                        let az = inc[1].atan2(inc[0]);
-                        let el = inc[2].clamp(-1.0, 1.0).asin();
-                        let sh = eval_sh_order7(az, el);
-                        let d_hit = t_hit * c;
-                        let air = atm.air_gain_linear(2_000.0, d_hit);
-                        let w = energy * air * air;
-                        for c_idx in 0..HOA_CH {
-                            hist[bin][c_idx] += w * sh[c_idx];
-                        }
+                        accumulate_hoa_hit(
+                            &mut hist,
+                            bounce,
+                            delays[idx],
+                            energies[idx],
+                            inc,
+                            atm,
+                            c,
+                            n_time_bins,
+                            bin_dt_s,
+                        );
                     }
                 }
                 return hist;
@@ -1341,22 +1435,21 @@ pub fn raytrace_hoa_histogram_serial(
         return hist;
     }
     let ray_init_energy = 1.0 / (n_rays as f64);
+    let c = atm.speed_of_sound_m_s();
     for ray_id in 0..n_rays {
-        let hits = trace_single_ray(
-            geom,
-            atm,
-            src_m,
-            ray_id,
-            ray_init_energy,
-            max_bounces,
-            n_time_bins,
-            bin_dt_s,
-            seed,
-        );
-        for (bin, w, sh) in hits {
-            for c_idx in 0..HOA_CH {
-                hist[bin][c_idx] += w * sh[c_idx];
-            }
+        let hits = trace_single_ray(geom, atm, src_m, ray_id, ray_init_energy, max_bounces, seed);
+        for (bounce, hit) in hits.iter().enumerate() {
+            accumulate_hoa_hit(
+                &mut hist,
+                bounce,
+                hit.delay_s,
+                hit.energy,
+                hit.dir,
+                atm,
+                c,
+                n_time_bins,
+                bin_dt_s,
+            );
         }
     }
     hist
@@ -1850,6 +1943,145 @@ mod tests {
         assert!(
             tot_w > 1e-6,
             "ray tracer recorded zero HOA W-channel energy"
+        );
+    }
+
+    /// Compare two full HOA histograms channel by channel and return
+    /// `(max_abs_diff, mismatched_bit_patterns)`.
+    #[cfg(feature = "cuda")]
+    fn histogram_delta(cpu: &[[f64; HOA_CH]], gpu: &[[f64; HOA_CH]]) -> (f64, usize) {
+        let mut max_diff = 0.0_f64;
+        let mut mismatched = 0usize;
+        for (bin, (a, b)) in cpu.iter().zip(gpu).enumerate() {
+            for c in 0..HOA_CH {
+                let d = (a[c] - b[c]).abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+                if a[c].to_bits() != b[c].to_bits() {
+                    mismatched += 1;
+                    assert!(
+                        d < 1e-12,
+                        "CPU/GPU raytrace histogram mismatch at bin={bin} ch={c}: \
+                         cpu={:e} gpu={:e} |d|={d:e}",
+                        a[c],
+                        b[c]
+                    );
+                }
+            }
+        }
+        (max_diff, mismatched)
+    }
+
+    /// Live CPU-vs-GPU bit-exactness of the stochastic raytrace -> Order-7 HOA histogram,
+    /// with the production Control Room ISO-17497 scattering coefficients (0.15–0.78)
+    /// active on every wall. Skips cleanly when no NVIDIA GPU is present.
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn cuda_raytrace_hoa_histogram_is_bit_identical_to_cpu() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP cuda_raytrace_hoa_histogram_is_bit_identical_to_cpu: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        let geom = RoomGeometry::from_preset(RoomPreset::ControlRoom);
+        let atm = AtmosphereCfg::default();
+        let src = [4.3, 3.5, 1.25];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (2048usize, 16usize, 256usize, 0.004_f64, 0xCAFE_BABE_u64);
+
+        let h_cpu = raytrace_hoa_histogram(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        let h_gpu = raytrace_hoa_histogram_with_cuda(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+            true,
+        );
+        assert_eq!(h_cpu.len(), h_gpu.len());
+
+        let (max_diff, mismatched) = histogram_delta(&h_cpu, &h_gpu);
+        let total = n_bins * HOA_CH;
+        eprintln!(
+            "CPU vs GPU raytrace HOA parity: max |d| = {max_diff:e}, \
+             mismatched bit patterns = {mismatched}/{total} \
+             ({n_rays} rays x {max_bounces} bounces x {n_bins} bins)"
+        );
+        assert!(
+            max_diff < 1e-12,
+            "CPU vs GPU raytrace histogram max |d| = {max_diff:e} >= 1e-12"
+        );
+
+        let energy: f64 = h_cpu.iter().flat_map(|b| b.iter()).map(|x| x.abs()).sum();
+        assert!(
+            energy > 1e-6,
+            "CPU/GPU parity run recorded no HOA energy (sum |h| = {energy:e})"
+        );
+    }
+
+    /// Second live parity scenario: large theater stage (different geometry, wall
+    /// reflectances and scattering probabilities), 1024 rays x 12 bounces x 128 bins.
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn cuda_raytrace_hoa_histogram_matches_cpu_on_theater_stage() {
+        if crate::blackwell::shared_cuda_runtime().is_none() {
+            eprintln!(
+                "SKIP cuda_raytrace_hoa_histogram_matches_cpu_on_theater_stage: \
+                 no live NVIDIA GPU detected"
+            );
+            return;
+        }
+        let geom = RoomGeometry::from_preset(RoomPreset::TheaterStage);
+        let atm = AtmosphereCfg::default();
+        let src = [6.2, 4.0, 1.35];
+        let (n_rays, max_bounces, n_bins, bin_dt_s, seed) =
+            (1024usize, 12usize, 128usize, 0.004_f64, 0x5EED_1234_u64);
+
+        let h_cpu = raytrace_hoa_histogram(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+        );
+        let h_gpu = raytrace_hoa_histogram_with_cuda(
+            &geom,
+            &atm,
+            src,
+            n_rays,
+            max_bounces,
+            n_bins,
+            bin_dt_s,
+            seed,
+            true,
+        );
+        let (max_diff, mismatched) = histogram_delta(&h_cpu, &h_gpu);
+        eprintln!(
+            "CPU vs GPU TheaterStage raytrace HOA parity: max |d| = {max_diff:e}, \
+             mismatched bit patterns = {mismatched}/{}",
+            n_bins * HOA_CH
+        );
+        assert!(
+            max_diff < 1e-12,
+            "CPU vs GPU TheaterStage raytrace histogram max |d| = {max_diff:e} >= 1e-12"
         );
     }
 
